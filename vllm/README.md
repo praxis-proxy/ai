@@ -249,9 +249,9 @@ vLLM base image pin. `cargo xtask bump-pins` rewrites all five — this file, th
 `tests/integration/fixtures/`, and `VLLM_GPU_IMAGE` in `vllm-dev-endpoint.yaml`
 — and `cargo xtask check-pins` (part of `make lint`) fails if any of them
 disagree, so a bump has to land as one change. The weekly `Bump Pins` workflow
-opens that change as a draft PR. The GPU acceptance lanes serve the baked image
-built from this file, so the manifests' `base_image` is the immutable record of
-the vLLM build those lanes ran.
+opens that change as a draft PR. The Qwen3-8B acceptance lanes serve the baked image
+built from this file. A Codex candidate dispatch uses the same pinned
+`base_image` directly to serve the selected checkpoint.
 
 Dependabot deliberately does not manage this file. It understands only the
 `FROM` line, so the PR it opens leaves the pin manifests and workflows stale and

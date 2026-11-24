@@ -167,8 +167,8 @@ The downstream task-completion oracle is an **XFAIL on Qwen3-8B**:
   proofs, the downstream
   task-completion assertions (correct `result.txt`, wire ordering of the write
   after compaction, the ordered JSONL trace, `./verify.sh`) are **skipped** when
-  the live model matches `COMPACTION_XFAIL_MODEL` (`qwen3-8b`), with an
-  `XFAIL (...)` line logged.
+  the non-candidate lane serves the exact alias `qwen3-8b`, with an
+  `XFAIL (...)` line logged. A candidate dispatch never uses this fallback.
 - **Claude Code.** After the hard proofs (self-compaction boundary and the
   pre-compaction Read carrying the marker through Praxis), the test checks for a
   post-compaction tool call. On Qwen3-8B, an absent call is logged as an expected
@@ -191,6 +191,42 @@ dispatch `vllm-integration.yaml` with `run_compaction_only=true` **alone** (do
 NOT also pass `run_live_vllm=true`, which would trigger the full suite): it
 provisions the GPU runner and runs only the Codex and Claude Code compaction
 steps, skipping the full Responses suite and every other acceptance step.
+
+### Qualifying a Codex candidate checkpoint
+
+Manually dispatch `vllm-integration.yaml` with `run_codex_acceptance=true`
+and every other `run_*` input false, including `run_compaction_only`. Set
+`codex_model` to the Hugging Face checkpoint ID and
+`codex_served_model_name` to a slash-free alias. This runs the Codex GPU job
+without holding the candidate GPU for the Qwen3-8B full suite. Scheduled and
+labeled jobs keep their Qwen3-8B settings. Candidate dispatches use the
+manifest's digest-pinned upstream vLLM image and download the selected
+checkpoint at its resolved Hugging Face revision.
+
+Set `gpu_instance_type`, `codex_tensor_parallel_size`, and
+`codex_max_model_len` for the checkpoint and runner. The context length must
+exceed Codex's 16,000-token test window. Select `codex_tool_call_parser` and
+`codex_reasoning_parser` from the pinned vLLM version. The value `none` omits
+the corresponding server flag. For `openai/gpt-oss-120b`, use the alias
+`gpt-oss-120b`, tool parser `openai`, and reasoning parser `openai_gptoss`.
+For Gemma 4 and Nemotron 3, select the exact checkpoint and matching parsers;
+these are candidates, not claims of passing GPU runs.
+
+The native test requires a completed `apply_patch` edit through
+`openai_client_tool_compat` and positive reasoning-token usage in a completed
+Codex turn. The compaction test requires Codex's own compaction request,
+continued traffic through Praxis, and a correct result that passes verification.
+`codex_skip_translated=true` skips only the translated Chat case and its
+preflight; both native gates still run.
+
+Download `qualification.json` from the `vllm-qualification` artifact. Under
+`suites.codex_acceptance`, `cases` contains the scenario results and
+`provenance` contains the checkpoint and alias, the Hugging Face commit SHA
+pinned for candidate runs, the pinned vLLM image, parser and
+GPU settings, Codex version, and ordered Praxis filter names by case. The
+report only merges Codex evidence matching its run ID, attempt, and checkout
+SHA. The top-level `not_requested` status on a Codex-only run refers to the
+full Responses suite, not the Codex cases.
 
 ### Known model limitation: server-side web search on Qwen3-8B
 
@@ -252,14 +288,14 @@ XFAIL — tracked separately as a possible filter feature, not done here.
 
 ## Reusing published images
 
-Neither nightly rebuilds the model-baked image by default. Each GPU job calls
+Neither nightly rebuilds the model-baked image by default. Each job serving a baked model calls
 [`resolve-vllm-gpu-image`](../../.github/actions/resolve-vllm-gpu-image/action.yml),
 which pulls the published tag and keeps it only when the image's provenance
 labels match that checkout — the same `vllm/Containerfile` hash, model ID, and
 pinned model revision. On a mismatch, an unreachable registry, or a tag that
 does not exist yet, it falls back to building from source.
 
-In the main suite, every GPU job goes through
+In the main suite, each Qwen3-8B job goes through
 [`prepare-vllm-gpu-image`](../../.github/actions/prepare-vllm-gpu-image/action.yml),
 which builds the image if resolution fails, including when GHCR login fails. The jobs run
 one after another on the same instance, so the client acceptance jobs first
@@ -280,7 +316,7 @@ run or, worse, qualifying a stale backend.
 
 The qualification record reports which happened: `backend.image_source` is
 `registry` or `local-build`, and `backend.registry_digest` is populated only
-for a pulled image. Each client acceptance suite also records the image its own
+for a pulled image. Each client lane using baked weights also records the image its own
 container served under `suites.<client>_acceptance.backend`: the tag, local
 image ID, model, revision, base image, and `image_source` (`registry`, `runner`
 for an image an earlier job prepared, or `build`), with the registry digest

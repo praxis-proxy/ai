@@ -1312,11 +1312,14 @@ of truth for that client. The vLLM backend is pinned in two layers in the
   [Existing or local vLLM](#existing-or-local-vllm), passing
   `--model Qwen/Qwen3-8B` in place of the in-image path.
 - `baked_image` names the [`vllm/images.json`](../../vllm/images.json) entry the
-  GPU lanes actually serve: the same build with the model weights baked in, so
-  no lane downloads weights or holds a Hugging Face token. That entry owns the
+  GPU lanes serve by default. The weights are already in the image, so these
+  containers start without downloading weights or using a Hugging Face token. That entry owns the
   model and its Hugging Face revision. Its published tag is mutable, so each
   lane records the image it served (local image ID, and registry digest when
   pulled) in the qualification report rather than in the manifest.
+
+For a Codex candidate dispatch, the lane loads the requested checkpoint with
+the pinned upstream image. See [Qualifying a Codex candidate checkpoint](gpu-nightly-suite.md#qualifying-a-codex-candidate-checkpoint).
 
 `cargo xtask check-pins` (part of `make lint`) fails if any harness constant,
 workflow, checksum fixture, or image reference disagrees with them, or if a

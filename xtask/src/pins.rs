@@ -144,6 +144,7 @@ fn backend_outputs(manifests: &Manifests) -> Vec<(&'static str, String)> {
         ("vllm_baked_image", claude.baked_image.clone()),
         ("vllm_served_model", claude.served_model_name.clone()),
         ("vllm_flags", claude.launch.flags.join(" ")),
+        ("codex_vllm_base_image", codex.base_image.clone()),
         ("codex_vllm_baked_image", codex.baked_image.clone()),
         ("codex_vllm_served_model", codex.served_model_name.clone()),
         ("codex_vllm_flags", codex.launch.flags.join(" ")),

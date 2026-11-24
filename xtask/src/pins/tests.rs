@@ -59,6 +59,14 @@ fn repository_pins_agree() {
 }
 
 #[test]
+fn candidate_codex_exports_its_pinned_upstream_image() {
+    let repo = Repo::new(workspace_root());
+    let mut manifests = Manifests::load(&repo).expect("manifests should parse");
+    manifests.codex.vllm.base_image = "candidate-image-pin".into();
+    assert!(outputs(&manifests).contains(&("codex_vllm_base_image", "candidate-image-pin".into())));
+}
+
+#[test]
 fn outputs_match_the_pins_job_contract() {
     // Every key the GPU lanes read through `needs.pins.outputs.*` must be
     // exported, and nothing else: a renamed key would hand a lane an empty pin.

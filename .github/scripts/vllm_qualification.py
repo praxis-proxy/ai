@@ -264,6 +264,8 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
     # lane's backend provenance, not the full suite's.
     if isinstance(raw.get("backend"), dict):
         result["backend"] = raw["backend"]
+    if isinstance(raw.get("provenance"), dict):
+        result["provenance"] = raw["provenance"]
     return result
 
 
