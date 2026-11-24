@@ -1679,7 +1679,10 @@ jobs:
           PRAXIS_TEST_CODEX_CANDIDATE: ${{ env.CODEX_CANDIDATE }}
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp -d "$RUNNER_TEMP/codex-native-evidence.XXXXXX")/evidence.json"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_NATIVE_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
@@ -1703,7 +1706,10 @@ jobs:
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp -d "$RUNNER_TEMP/codex-translated-evidence.XXXXXX")/evidence.json"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_TRANSLATED_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
@@ -1734,7 +1740,10 @@ jobs:
           # test-local HTTP observer between Codex and Praxis captures the
           # compaction request on the wire; the egress namespace guarantees the
           # client's only route is Praxis.
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp -d "$RUNNER_TEMP/codex-compaction-evidence.XXXXXX")/evidence.json"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_COMPACTION_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
             "$TEST_BIN" \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
@@ -1784,16 +1793,17 @@ jobs:
           CODEX_GPU_INSTANCE_TYPE: >-
             ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
         run: |
+          python3 .github/scripts/vllm_qualification.py capture-codex --output "$RUNNER_TEMP/codex-acceptance.json"
           python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
-          import json, os, pathlib, subprocess, sys
-          cases = []
+          import json, os, pathlib, sys
+          data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          statuses = {case["id"]: case["status"] for case in data["cases"]}
           filter_chains = {}
           missing_chains = []
           prefix = "Codex acceptance filter chain: "
           for path in ("native", "translated", "compaction"):
               name = f"codex_{path}"
-              status = os.environ[name.upper()] or "unexecuted"
-              cases.append({"id": name, "status": status})
+              status = statuses[name]
               log = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"codex-acceptance-{path}.log"
               if log.is_file():
                   with log.open(errors="replace") as lines:
@@ -1803,28 +1813,22 @@ jobs:
                               break
               if status == "success" and not filter_chains.get(name):
                   missing_chains.append(name)
-          data = {
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "cases": cases,
-              "provenance": {
-                  "candidate": os.environ["CODEX_CANDIDATE"] == "true",
-                  "codex_version": os.environ["CODEX_VERSION"],
-                  "backend": {
-                      "model": os.environ["CODEX_MODEL"],
-                      "resolved_revision": os.environ.get("CODEX_MODEL_REVISION"),
-                      "served_model_name": os.environ["CODEX_VLLM_MODEL"],
-                      "vllm_image": os.environ["VLLM_GPU_IMAGE"],
-                      "tensor_parallel_size": int(os.environ["CODEX_TENSOR_PARALLEL_SIZE"]),
-                      "max_model_len": int(os.environ["CODEX_MAX_MODEL_LEN"]),
-                      "tool_call_parser": os.environ["CODEX_TOOL_CALL_PARSER"],
-                      "reasoning_parser": os.environ["CODEX_REASONING_PARSER"],
-                  },
-                  "runner": {"instance_type": os.environ["CODEX_GPU_INSTANCE_TYPE"],
-                             "name": os.environ.get("RUNNER_NAME")},
-                  "filter_chains": filter_chains,
+          data["provenance"] = {
+              "candidate": os.environ["CODEX_CANDIDATE"] == "true",
+              "codex_version": os.environ["CODEX_VERSION"],
+              "backend": {
+                  "model": os.environ["CODEX_MODEL"],
+                  "resolved_revision": os.environ.get("CODEX_MODEL_REVISION"),
+                  "served_model_name": os.environ["CODEX_VLLM_MODEL"],
+                  "vllm_image": os.environ["VLLM_GPU_IMAGE"],
+                  "tensor_parallel_size": int(os.environ["CODEX_TENSOR_PARALLEL_SIZE"]),
+                  "max_model_len": int(os.environ["CODEX_MAX_MODEL_LEN"]),
+                  "tool_call_parser": os.environ["CODEX_TOOL_CALL_PARSER"],
+                  "reasoning_parser": os.environ["CODEX_REASONING_PARSER"],
               },
+              "runner": {"instance_type": os.environ["CODEX_GPU_INSTANCE_TYPE"],
+                         "name": os.environ.get("RUNNER_NAME")},
+              "filter_chains": filter_chains,
           }
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
           if missing_chains:
