@@ -1180,7 +1180,7 @@
           "label": "Streaming",
           "status": "translated",
           "note": null,
-          "evidence": "apis/src/bedrock/converse/response.rs:286-310; apis/src/bedrock/converse/response.rs:317-511",
+          "evidence": "apis/src/bedrock/converse/response.rs:315-340; apis/src/bedrock/converse/response.rs:346-510",
           "blocker": null
         },
         {
@@ -1196,7 +1196,7 @@
           "label": "Mid-stream upstream failure is surfaced",
           "status": "translated",
           "note": "Exception and truncated frames become an in-band SSE error frame with a typed code and no [DONE].",
-          "evidence": "apis/src/bedrock/converse/mod.rs:414-430; apis/src/bedrock/converse/mod.rs:453-509; apis/src/bedrock/converse/response.rs:514-552",
+          "evidence": "apis/src/bedrock/converse/mod.rs:414-430; apis/src/bedrock/converse/mod.rs:453-509; apis/src/bedrock/converse/response.rs:543-601",
           "blocker": null
         },
         {
@@ -1212,7 +1212,7 @@
           "label": "Token usage accounting",
           "status": "translated-lossy",
           "note": "Missing token fields default to 0 rather than erroring.",
-          "evidence": "apis/src/bedrock/converse/response.rs:221-240",
+          "evidence": "apis/src/bedrock/converse/response.rs:250-269",
           "blocker": null
         },
         {
@@ -1220,7 +1220,7 @@
           "label": "Prompt-cache token accounting",
           "status": "dropped",
           "note": "cacheReadInputTokens and cacheWriteInputTokens are discarded.",
-          "evidence": "apis/src/bedrock/converse/response.rs:221-240",
+          "evidence": "apis/src/bedrock/converse/response.rs:250-269",
           "blocker": "https://github.com/praxis-proxy/ai/issues/2054"
         },
         {
@@ -1228,7 +1228,7 @@
           "label": "Reasoning / thinking content",
           "status": "dropped",
           "note": "Finite and streaming reasoningContent is omitted while adjacent answer text is preserved. Streaming citation, toolResult and image deltas take the same path and vanish silently.",
-          "evidence": "apis/src/bedrock/converse/response.rs:167-190; apis/src/bedrock/converse/response.rs:445-455",
+          "evidence": "apis/src/bedrock/converse/response.rs:162-222; apis/src/bedrock/converse/response.rs:470-477",
           "blocker": "https://github.com/praxis-proxy/ai/issues/2055"
         },
         {
