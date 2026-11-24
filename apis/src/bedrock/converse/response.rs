@@ -208,6 +208,9 @@ fn extract_content_block<'a>(
             tool_calls.push(translate_tool_use_block(tool_use)?);
         },
         Some((variant, Value::Object(reasoning))) if variant == "reasoningContent" => {
+            if reasoning.len() != 1 {
+                return Err("Bedrock reasoningContent block must contain exactly one union variant".to_owned());
+            }
             debug!(
                 reasoning_field_count = reasoning.len(),
                 "omitting Bedrock reasoning content from finite Chat Completions response"
@@ -783,15 +786,10 @@ mod tests {
     }
 
     #[test]
-    fn transform_response_omits_object_reasoning_payloads_like_streaming() {
+    fn transform_response_omits_single_variant_reasoning_payloads() {
         for reasoning in [
-            serde_json::json!({}),
             serde_json::json!({"reasoningText": "future shape"}),
             serde_json::json!({"futureVariant": {"opaque": true}}),
-            serde_json::json!({
-                "reasoningText": {"text": "ambiguous"},
-                "redactedContent": "b3BhcXVl"
-            }),
         ] {
             let bedrock = serde_json::json!({
                 "output": {"message": {"content": [
@@ -805,6 +803,31 @@ mod tests {
                 serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap())
                     .unwrap();
             assert_eq!(result["choices"][0]["message"]["content"], "visible answer");
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_empty_or_mixed_reasoning_union() {
+        for reasoning in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "reasoningText": {"text": "ambiguous"},
+                "redactedContent": "b3BhcXVl"
+            }),
+        ] {
+            let bedrock = serde_json::json!({
+                "output": {"message": {"content": [
+                    {"reasoningContent": reasoning},
+                    {"text": "must not survive an invalid union"}
+                ]}},
+                "stopReason": "end_turn"
+            });
+
+            let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+            assert_eq!(
+                error,
+                "Bedrock reasoningContent block must contain exactly one union variant"
+            );
         }
     }
 

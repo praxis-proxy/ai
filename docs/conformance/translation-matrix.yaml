@@ -871,9 +871,11 @@ surfaces:
       reasoning-content:
         status: dropped
         note: >-
-          Finite and streaming reasoningContent is omitted while adjacent answer
-          text is preserved. Streaming citation, toolResult and image deltas
-          take the same path and vanish silently.
+          Finite single-member object reasoningContent and streaming object
+          reasoningContent are omitted while adjacent answer text is preserved;
+          finite empty or multi-member reasoning unions are rejected. Streaming
+          citation, toolResult and image deltas take the same path and vanish
+          silently.
         blocker: https://github.com/praxis-proxy/ai/issues/2055
         evidence: apis/src/bedrock/converse/response.rs:162-222; apis/src/bedrock/converse/response.rs:470-477
       request-reasoning-cache-controls:
