@@ -109,19 +109,8 @@ impl SseParser {
         end_of_stream: bool,
         max_partial_event_bytes: usize,
     ) -> Result<Vec<SseEvent>, StreamError> {
-        let text = self.decode_utf8(chunk, end_of_stream)?;
-        let text = if !self.started && !text.is_empty() {
-            self.started = true;
-            text.strip_prefix('\u{feff}').unwrap_or(&text)
-        } else {
-            &text
-        };
-
-        // Append the newly decoded text onto the retained partial in place,
-        // normalizing line endings as it goes, instead of rebuilding the whole
-        // buffer each chunk (which was quadratic across a long fragmented event).
         let prev_len = self.line_buffer.len();
-        self.normalize_into_buffer(text);
+        self.append_chunk(chunk, end_of_stream)?;
 
         // A `\n\n` terminator can only straddle the old/new boundary when the
         // last retained byte was already a `\n`; every other complete event lies
@@ -150,20 +139,26 @@ impl SseParser {
             from = consumed;
         }
 
-        // Bound the retained partial as well as complete events.
-        if self.line_buffer.len()
-            - consumed
-            - usize::from(
-                self.line_buffer
-                    .get(consumed..)
-                    .is_some_and(|tail| tail.ends_with('\n')),
-            )
-            > max_partial_event_bytes
-        {
+        // A trailing LF can be the first byte of the event delimiter.
+        let tail = self.line_buffer.get(consumed..).ok_or(StreamError::MalformedEvent)?;
+        if tail.strip_suffix('\n').unwrap_or(tail).len() > max_partial_event_bytes {
             return Err(StreamError::OversizedPartialEvent);
         }
         self.line_buffer.drain(..consumed);
         Ok(events)
+    }
+
+    /// Decode and append only the newly completed characters.
+    fn append_chunk(&mut self, chunk: &[u8], end_of_stream: bool) -> Result<(), StreamError> {
+        let text = self.decode_utf8(chunk, end_of_stream)?;
+        let text = if !self.started && !text.is_empty() {
+            self.started = true;
+            text.strip_prefix('\u{feff}').unwrap_or(&text)
+        } else {
+            &text
+        };
+        self.normalize_into_buffer(text);
+        Ok(())
     }
 
     /// Append `text` to `line_buffer`, normalizing `\r\n` and lone `\r` to `\n`.
@@ -387,6 +382,16 @@ pub(super) enum BlockPresentation {
     Replace(Value),
 }
 
+/// Point at which the adapter validates the current round.
+#[derive(PartialEq, Eq)]
+enum StopValidation {
+    /// Let web search classify its response at transport completion.
+    AtEof,
+    /// Validate MCP rounds when their protocol stop arrives.
+    #[cfg(feature = "anthropic-mcp-connector")]
+    AtMessageStop,
+}
+
 /// A coherent Anthropic Messages SSE lifecycle assembled across IRR rounds.
 pub(super) struct MessagesStream {
     /// Per-round native-Messages SSE parser.
@@ -414,7 +419,7 @@ pub(super) struct MessagesStream {
     /// Whether the stream has failed closed; once set, no more bytes are forwarded.
     failed: bool,
     /// Validate the message when the backend emits its stop event.
-    validate_stop: bool,
+    stop_validation: StopValidation,
     /// Current round reconstruction and forwarding state.
     round: RoundState,
 }
@@ -435,7 +440,7 @@ impl MessagesStream {
             output_tokens_details_total: None,
             server_tool_use_total: None,
             failed: false,
-            validate_stop: false,
+            stop_validation: StopValidation::AtEof,
             round: RoundState::default(),
         }
     }
@@ -505,7 +510,7 @@ impl MessagesStream {
         for event in events {
             self.process_event(event, output, &mut present)
                 .inspect_err(|_| self.fail())?;
-            if self.failed || (self.validate_stop && self.round.message_stopped) {
+            if self.failed || (self.stop_validation != StopValidation::AtEof && self.round.message_stopped) {
                 break;
             }
         }
@@ -545,7 +550,7 @@ impl MessagesStream {
             // arrives fails closed instead of fabricating a successful terminal.
             EventKind::MessageStop => {
                 self.round.message_stopped = true;
-                if self.validate_stop {
+                if self.stop_validation != StopValidation::AtEof {
                     self.require_complete_lifecycle()?;
                 }
                 Ok(())
@@ -745,11 +750,7 @@ impl MessagesStream {
             .and_then(Value::as_str)
             .ok_or(StreamError::MalformedEvent)?;
         self.charge_fragment_bytes(fragment.len())?;
-        if field == "partial_json" {
-            if !fragment.is_empty() {
-                self.round.partial_json.entry(index).or_default().push_str(fragment);
-            }
-        } else {
+        if field != "partial_json" {
             let block = self.round.content.get_mut(index).ok_or(StreamError::MalformedEvent)?;
             if block[field].is_null() {
                 block[field] = Value::String(String::new());
@@ -758,6 +759,8 @@ impl MessagesStream {
                 return Err(StreamError::MalformedEvent);
             };
             text.push_str(fragment);
+        } else if !fragment.is_empty() {
+            self.round.partial_json.entry(index).or_default().push_str(fragment);
         }
         Ok(())
     }
@@ -856,7 +859,7 @@ impl MessagesStream {
     /// Apply the receiving step's bound without resetting the logical message.
     #[cfg(feature = "anthropic-mcp-connector")]
     pub(super) fn set_round_limit(&mut self, limit: usize) {
-        self.validate_stop = true;
+        self.stop_validation = StopValidation::AtMessageStop;
         self.max_body_bytes = limit;
         self.max_partial_event_bytes = limit;
     }
