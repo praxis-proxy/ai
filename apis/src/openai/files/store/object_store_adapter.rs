@@ -18,6 +18,9 @@ use crate::openai::files::FileStream;
 /// buffered and in-flight bytes.
 const DEFAULT_MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 
+/// Minimum size for an input to keep its own zero-copy payload segment.
+const MIN_ZERO_COPY_CHUNK_BYTES: usize = 8 * 1024;
+
 /// Common Files byte operations over a configured object store.
 pub(super) struct ObjectStoreFileStore {
     /// The configured store behind a provider-independent interface.
@@ -88,11 +91,16 @@ impl FileStoreWriter for ObjectStoreFileWriter {
 
         // BufWriter checks concurrency before each put. Splitting a large
         // input chunk keeps a single call from queuing many parts at once.
-        while !chunk.is_empty() {
+        while chunk.len() >= MIN_ZERO_COPY_CHUNK_BYTES {
             self.writer
                 .put(chunk.split_to(chunk.len().min(DEFAULT_MULTIPART_PART_BYTES)))
                 .await
                 .map_err(backend)?;
+        }
+        if !chunk.is_empty() {
+            // AsyncWrite coalesces small writes into blocks. Each put would
+            // retain a separate Bytes entry until the payload is ready.
+            self.writer.write_all(&chunk).await.map_err(backend)?;
         }
         self.written = written;
         Ok(())

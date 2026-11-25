@@ -322,15 +322,22 @@ mod tests {
         let config = RustFs::from_env();
         let store = config.store();
         let key = "files/multipart";
-        let segments = [(b'a', PART_BYTES - 3), (b'b', 7), (b'c', PART_BYTES + 5), (b'd', 4)];
-        let expected_len: usize = segments.iter().map(|(_, len)| len).sum();
+        // Send the bytes at the first part boundary and the file tail one byte at a time.
+        let segments = [
+            (b'a', PART_BYTES - 3, PART_BYTES),
+            (b'b', 7, 1),
+            (b'c', PART_BYTES + 5, PART_BYTES + 5),
+            (b'd', 4, 1),
+        ];
+        let expected_len: usize = segments.iter().map(|(_, len, _)| len).sum();
         // Give a larger allowance so the return value must be the counted bytes.
         let mut upload = store.begin_write(key, u64::MAX).await.expect("begin multipart upload");
-        for &(byte, len) in &segments {
-            upload
-                .write_chunk(Bytes::from(vec![byte; len]))
-                .await
-                .expect("write multipart chunk");
+        for &(byte, len, fragment_bytes) in &segments {
+            let mut data = Bytes::from(vec![byte; len]);
+            while !data.is_empty() {
+                let fragment = data.split_to(data.len().min(fragment_bytes));
+                upload.write_chunk(fragment).await.expect("write multipart fragment");
+            }
         }
         assert_eq!(
             config.uploads(),
@@ -354,7 +361,7 @@ mod tests {
             while !remaining.is_empty() {
                 let (expected_byte, segment_end) = segments
                     .iter()
-                    .scan(0, |end, (byte, len)| {
+                    .scan(0, |end, (byte, len, _)| {
                         *end += len;
                         Some((*byte, *end))
                     })

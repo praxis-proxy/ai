@@ -204,6 +204,38 @@ async fn small_and_empty_objects_round_trip_and_delete_is_idempotent() {
     ));
 }
 
+#[test]
+fn fragmented_writes_bound_retained_memory() {
+    const FRAGMENT_COUNT: i64 = 64 * 1024;
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let store = store();
+
+    // Measure while buffering the initial PUT and while filling a later part.
+    for prefix_bytes in [0, DEFAULT_MULTIPART_PART_BYTES] {
+        let mut upload = runtime
+            .block_on(store.begin_write("files/fragmented", u64::MAX))
+            .unwrap();
+        if prefix_bytes > 0 {
+            runtime
+                .block_on(upload.write_chunk(Bytes::from(vec![0; prefix_bytes])))
+                .unwrap();
+        }
+
+        let allocations = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                for _ in 0..FRAGMENT_COUNT {
+                    upload.write_chunk(Bytes::from_static(b"x")).await.unwrap();
+                }
+            });
+        });
+        assert!(
+            allocations.bytes_current <= 2 * FRAGMENT_COUNT,
+            "retained memory after {FRAGMENT_COUNT} one-byte writes with a {prefix_bytes}-byte prefix: {allocations:?}"
+        );
+        runtime.block_on(upload.abort()).unwrap();
+    }
+}
+
 #[expect(clippy::too_many_lines, reason = "linear multipart upload assertions")]
 #[tokio::test]
 async fn multipart_upload_preserves_chunks_and_actual_count() {
@@ -219,6 +251,7 @@ async fn multipart_upload_preserves_chunks_and_actual_count() {
         .await
         .unwrap();
     upload.write_chunk(first).await.unwrap();
+    upload.write_chunk(Bytes::from_static(b"ab")).await.unwrap();
     upload.write_chunk(second).await.unwrap();
     upload.write_chunk(last).await.unwrap();
     assert!(matches!(
@@ -227,23 +260,19 @@ async fn multipart_upload_preserves_chunks_and_actual_count() {
     ));
     assert_eq!(
         upload.finish().await.unwrap(),
-        u64::try_from(2 * DEFAULT_MULTIPART_PART_BYTES + 3).unwrap()
+        u64::try_from(2 * DEFAULT_MULTIPART_PART_BYTES + 5).unwrap()
     );
 
     let chunks = store.read("files/large").await.unwrap().collect::<Vec<_>>().await;
     let data = chunks.into_iter().map(Result::unwrap).collect::<Vec<_>>().concat();
-    assert_eq!(data.len(), 2 * DEFAULT_MULTIPART_PART_BYTES + 3);
+    assert_eq!(data.len(), 2 * DEFAULT_MULTIPART_PART_BYTES + 5);
+    assert!(data[..DEFAULT_MULTIPART_PART_BYTES].iter().all(|byte| *byte == b'a'));
     assert!(
-        data[..DEFAULT_MULTIPART_PART_BYTES - 1]
-            .iter()
-            .all(|byte| *byte == b'a')
-    );
-    assert!(
-        data[DEFAULT_MULTIPART_PART_BYTES - 1..2 * DEFAULT_MULTIPART_PART_BYTES]
+        data[DEFAULT_MULTIPART_PART_BYTES..2 * DEFAULT_MULTIPART_PART_BYTES + 2]
             .iter()
             .all(|byte| *byte == b'b')
     );
-    assert_eq!(&data[2 * DEFAULT_MULTIPART_PART_BYTES..], b"end");
+    assert_eq!(&data[2 * DEFAULT_MULTIPART_PART_BYTES + 2..], b"end");
 }
 
 #[tokio::test]
