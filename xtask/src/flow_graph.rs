@@ -433,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_thirty_four_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_five_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
-        assert_eq!(nodes.len(), 34, "21 main + 13 IRR-step filters");
+        assert_eq!(nodes.len(), 35, "21 main + 13 IRR-step + 1 fallback filter");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -484,6 +484,7 @@ mod tests {
                 "openai_responses_proxy",
                 "openai_responses_to_chat_completions",
                 "path_rewrite",
+                "static_response",
             ],
             "all main and inference-step filter types must retain their declared order"
         );
@@ -498,9 +499,13 @@ mod tests {
             nodes
                 .iter()
                 .skip(21)
+                .take(13)
                 .all(|node| node.depth == 1 && node.irr_step.as_deref() == Some("inference")),
             "all inference-step filters have depth one and retain their step owner"
         );
+        let fallback = nodes.last().expect("unsupported-method fallback exists");
+        assert_eq!(fallback.depth, 0);
+        assert!(fallback.irr_step.is_none());
     }
 
     #[test]
