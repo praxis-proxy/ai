@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+      - uses: praxis-proxy/conventions/.github/actions/setup-rust@8ba98632ca71176aa3e92b2017af2bcf5548d9d1 # v0.6.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
