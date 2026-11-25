@@ -76,6 +76,14 @@ pub const METRIC_MCP_FILTER_REJECTIONS_TOTAL: &str = "praxis_mcp_filter_rejectio
 /// Using `filter_state` (keyed by `current_filter_id`) instead of shared
 /// `filter_metadata` ensures that two MCP filter instances in the same
 /// pipeline do not overwrite each other's timing or tool name.
+// This PR (#2, audit logging) introduces `AuditState` as a superset of
+// `McpMetricsState`, carrying both the metrics fields (start, tool_name)
+// and audit fields (method, session_id, protocol_version, tenant).
+// All `McpMetricsState` usage in mod.rs is replaced by `AuditState`,
+// leaving this struct unused. The struct is retained so the metrics PR
+// (#2030) can be reviewed and merged independently. Once both PRs land,
+// this struct and annotation can be removed.
+#[allow(dead_code)]
 pub(crate) struct McpMetricsState {
     /// Monotonic start time for duration measurement.
     ///
