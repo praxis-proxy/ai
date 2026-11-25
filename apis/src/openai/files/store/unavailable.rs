@@ -9,12 +9,18 @@ use super::{FileStore, FileStoreError, FileStoreWriter};
 use crate::openai::files::FileStream;
 
 /// A [`FileStore`] that fails every operation with a backend error.
-#[expect(dead_code, reason = "wired by the openai_files filter (#499 step 4)")]
+#[cfg_attr(
+    not(all(test, feature = "_store-postgres")),
+    expect(dead_code, reason = "wired by the openai_files filter (#499 step 4); tests use it")
+)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UnavailableFileStore;
 
 /// Build the error shared by every operation.
-#[expect(dead_code, reason = "wired by the openai_files filter (#499 step 4)")]
+#[cfg_attr(
+    not(all(test, feature = "_store-postgres")),
+    expect(dead_code, reason = "wired by the openai_files filter (#499 step 4); tests use it")
+)]
 fn unavailable() -> FileStoreError {
     FileStoreError::Backend("no file store configured".into())
 }
