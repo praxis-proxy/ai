@@ -164,7 +164,7 @@ pub(crate) enum CalloutContextMissing {
 
 /// Required configured-connector context missing before MCP dispatch.
 #[derive(Debug)]
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) enum McpCalloutContextMissing {
     /// Trusted owner attribution is absent.
     Owner,
@@ -180,7 +180,7 @@ pub(crate) enum McpCalloutContextMissing {
 /// constructs destination-bound headers. This value is never serialized into
 /// the MCP tool map or deferred connector state.
 #[derive(Clone)]
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) struct McpCalloutIdentity {
     /// Trusted owner projected into the filtered child request.
     owner: StateOwner,
@@ -190,7 +190,7 @@ pub(crate) struct McpCalloutIdentity {
     authorization: Option<SecretString>,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl McpCalloutIdentity {
     /// Borrow the trusted connector owner.
     pub(crate) fn owner(&self) -> &StateOwner {
@@ -222,7 +222,7 @@ impl McpCalloutIdentity {
     }
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl std::fmt::Debug for McpCalloutIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpCalloutIdentity")
@@ -240,7 +240,7 @@ impl std::fmt::Debug for McpCalloutIdentity {
 /// connector subrequest; when no owner is available, the prior context-free
 /// behavior is preserved. Configuring either request-scoped slot makes trusted
 /// owner attribution mandatory and makes that slot fail closed.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[expect(
     clippy::too_many_lines,
     reason = "owner plus two optional fail-closed slots are staged together"
@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_without_slots_projects_available_owner() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_without_slots_or_owner_preserves_context_free_behavior() {
         let req = make_request(Method::POST, "/v1/responses");
         let ctx = make_filter_context(&req);
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_configured_slot_requires_owner() {
         let req = make_request(Method::POST, "/v1/responses");
         let ctx = make_filter_context(&req);
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_configured_credential_must_be_populated() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_configured_assertion_must_be_populated() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_reads_credential_and_assertion_from_one_typed_context() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);

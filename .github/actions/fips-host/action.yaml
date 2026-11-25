@@ -37,7 +37,7 @@ runs:
   steps:
       # The attestation tool and runtime probe build on the host.
     - name: Set up Rust
-      uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+      uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
       with:
         cache-suffix: fips-host
         cache-target: "false"

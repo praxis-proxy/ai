@@ -101,7 +101,12 @@ development practices.
 
 ## Quick start
 
-Build and start the gateway with its built-in configuration:
+The fastest path is the published container image. The
+[Quickstart](docs/getting-started/quickstart.md) runs `ghcr.io/praxis-proxy/ai`
+with a minimal configuration and forwards a first OpenAI Responses request.
+
+To build from source instead, build and start the gateway with its built-in
+configuration:
 
 ```console
 make release
@@ -123,7 +128,7 @@ curl http://127.0.0.1:8080/
 {"status": "ok", "server": "praxis-ai"}
 ```
 
-Ready to connect a backend? Follow the [quickstart](docs/quickstart.md), or
+Ready to connect a backend? Follow [Build from source](docs/getting-started/build-from-source.md), or
 choose from the [example configurations](examples/README.md) for OpenAI,
 Anthropic, MCP, A2A, routing, guardrails, token usage, and more.
 
@@ -131,13 +136,13 @@ Anthropic, MCP, A2A, routing, guardrails, token usage, and more.
 
 | If you want to… | Start here |
 | --- | --- |
-| Run Praxis AI locally | [Quickstart](docs/quickstart.md) |
-| Choose an API and provider | [Client/provider selector](docs/client-provider-paths.md) |
-| Follow an operator recipe | [Recipe index](docs/recipes/README.md) |
+| Run Praxis AI locally | [Quickstart](docs/getting-started/quickstart.md) |
+| Choose an API and provider | [Choose a client and provider](docs/getting-started/choose-client-and-provider.md) |
+| Follow a task guide | [Guides](docs/guides/README.md) |
 | Browse supported capabilities | [Capability overview](docs/filters/README.md) |
 | Configure a filter | [Generated filter reference](docs/filters/reference.md) |
-| Deploy or troubleshoot | [Operations guide](docs/operations.md) |
-| Understand the design | [Architecture docs](docs/README.md#architecture) |
+| Deploy or troubleshoot | [Operations guide](docs/operations/README.md) |
+| Understand the design | [Architecture docs](docs/README.md#concepts-and-architecture) |
 | Build or test the workspace | [Development guide](docs/developing/getting-started.md) |
 | Add a new filter | [Adding filters](docs/developing/adding-filters.md) |
 
@@ -158,14 +163,14 @@ development instructions are in the [development guide].
 docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
-Podman can pull the same OCI image. See the [quickstart] for a source build
+Podman can pull the same OCI image. See the [quickstart] to run it
 and the [release documentation] for image contents and tagging. An image
 with the experimental OpenAI Responses filters and SQLite and PostgreSQL
 stores is published with an `-experimental` suffix (for example
 `nightly-experimental`). A FIPS 140-3
 build for Red Hat Enterprise Linux hosts is published under the same tags
 with a `-fips` suffix (for example `latest-fips`); see
-[FIPS 140-3](docs/fips.md).
+[FIPS 140-3](docs/operations/fips.md).
 
 ## Contributing
 
@@ -185,8 +190,8 @@ For larger changes, open a [feature request] and follow the
 [container images]: https://github.com/praxis-proxy/ai/pkgs/container/ai
 [development guide]: docs/developing/getting-started.md
 [feature request]: https://github.com/praxis-proxy/ai/issues/new?template=feature-request.yml
-[quickstart]: docs/quickstart.md
-[release documentation]: docs/release.md
+[quickstart]: docs/getting-started/quickstart.md
+[release documentation]: docs/developing/release.md
 [security policy]: .github/SECURITY.md
 
 ## Community

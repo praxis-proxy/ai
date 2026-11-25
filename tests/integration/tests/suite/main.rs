@@ -77,6 +77,7 @@ mod inference_fixtures;
 mod live_vllm;
 mod mcp;
 mod mcp_broker;
+mod mcp_broker_sessions;
 #[cfg(feature = "openai-mcp-tools")]
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;

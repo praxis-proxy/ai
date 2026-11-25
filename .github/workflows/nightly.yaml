@@ -35,7 +35,7 @@ jobs:
 
 
       - name: Setup Rust (lint)
-        uses: praxis-proxy/conventions/.github/actions/setup-rust-lint@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust-lint@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       # 0.10.1 uses Path::is_empty, which is unstable on Rust 1.96.
       - name: Install cargo-machete
@@ -62,7 +62,7 @@ jobs:
 
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           cache-suffix: doc
 
@@ -85,7 +85,7 @@ jobs:
 
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       - name: Unit tests
         run: make test-unit
@@ -106,7 +106,7 @@ jobs:
 
 
       - name: Supply chain audit
-        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@5925567b3cd1c3f97ac6c5f8862db988e6321b55 # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
   # ----------------------------------------------------------------------------
   # Coverage gate
@@ -124,4 +124,4 @@ jobs:
 
 
       - name: Coverage check
-        uses: praxis-proxy/conventions/.github/actions/coverage-check@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/coverage-check@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0

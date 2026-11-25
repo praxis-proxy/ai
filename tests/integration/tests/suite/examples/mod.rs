@@ -11,6 +11,8 @@ pub use test_utils::load_example_config;
 mod agentic_routing;
 mod anthropic_full_flow_agentic;
 mod anthropic_full_flow_agentic_chat;
+#[cfg(feature = "anthropic-mcp-connector-filter")]
+mod anthropic_mcp_connector;
 #[cfg(feature = "openai-responses")]
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;

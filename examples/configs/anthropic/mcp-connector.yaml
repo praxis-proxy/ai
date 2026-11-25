@@ -1,0 +1,151 @@
+# Anthropic Messages MCP Connector — executed by Praxis
+#
+# Anthropic's MCP connector (`mcp_servers` plus `mcp_toolset` tools, beta
+# `mcp-client-2025-11-20`) is normally run by Anthropic's servers, so a vLLM
+# or Chat Completions backend cannot honor it. `anthropic_mcp_connector` runs
+# it inside Praxis instead, for both backend wire formats from one config:
+#
+#   * a backend that speaks Anthropic Messages natively (for example vLLM's
+#     `/v1/messages` endpoint), and
+#   * a Chat-Completions-only backend reached through the Anthropic <-> Chat
+#     Completions translation filters.
+#
+# On the first round the filter lists each declared server's tools, keeps the
+# ones the `mcp_toolset` enables, and sends them to the model as plain tools
+# named `{server}__{tool}`. When the model calls one, the filter runs it over
+# MCP and loops through `iterative_request_router`. The final response carries
+# Anthropic's `mcp_tool_use` / `mcp_tool_result` blocks for every call. Replayed
+# `mcp_tool_use` / `mcp_tool_result` history in later turns is converted back
+# into ordinary tool turns for the backend.
+#
+# A client `mcp_servers` entry is executed only when its `url` matches a
+# configured connector's `server_url`. Other URLs get a 400 unless
+# `allow_client_servers: true`. Streaming (`stream: true`) requests that use
+# the connector are rejected for now; requests without the connector are
+# unaffected, streamed or not.
+#
+# Filter ordering inside the inference step matters: `anthropic_mcp_connector`
+# is FIRST, so it rewrites the request before translation and, because
+# response filters run in reverse, sees the response after it is translated
+# back to Anthropic Messages.
+#
+# Run an MCP server on 127.0.0.1:9100/mcp, a native Messages backend on
+# 127.0.0.1:8000, and a Chat Completions backend on 127.0.0.1:8001, then:
+#   VLLM_API_KEY="$VLLM_API_KEY" cargo run -p praxis-ai-proxy \
+#     --features anthropic-mcp-connector-filter -- \
+#     -c examples/configs/anthropic/mcp-connector.yaml
+#
+#   curl http://127.0.0.1:8080/v1/messages \
+#     -H 'content-type: application/json' \
+#     -H 'anthropic-beta: mcp-client-2025-11-20' \
+#     -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"messages":[{"role":"user","content":"What is the weather in Paris?"}],"mcp_servers":[{"type":"url","url":"http://127.0.0.1:9100/mcp","name":"weather"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"weather"}]}'
+#
+# Send `"model":"Qwen/Qwen3-8B"` to take the Chat Completions route.
+
+listeners:
+  - name: anthropic-mcp-connector
+    address: "127.0.0.1:8080"
+    filter_chains: [mcp-connector]
+
+filter_chains:
+  - name: mcp-connector
+    filters:
+      - filter: anthropic_messages_request
+        on_invalid: reject
+
+      # Freeze one logical cluster per request so every round reaches the same
+      # backend. The classifier promotes the model to `x-praxis-ai-model`.
+      - filter: router
+        routes:
+          - path_prefix: "/v1/messages"
+            headers:
+              x-praxis-ai-model: "Qwen/Qwen3-8B"
+            cluster: chat-completions-backend
+          - path_prefix: "/v1/messages"
+            cluster: messages-backend
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 6
+        timeout_ms: 90000
+        steps:
+          - name: inference
+            filters:
+              # FIRST in the step: rewrites the request before translation and
+              # observes the response after translation.
+              - filter: anthropic_mcp_connector
+                connectors:
+                  - id: weather
+                    server_url: http://127.0.0.1:9100/mcp
+                    tool_policy: allow_all
+                timeout_ms: 30000
+
+              - filter: load_balancer
+                cluster_source: bound_upstream
+                clusters:
+                  - name: messages-backend
+                    http:
+                      application_protocol: anthropic_messages
+                      application_provider: vllm
+                    endpoints: ["127.0.0.1:8000"]
+                  - name: chat-completions-backend
+                    http:
+                      application_protocol: openai_chat_completions
+                    endpoints: ["127.0.0.1:8001"]
+
+              # Native path only. Its MCP connector refusal stays the fallback
+              # for routes without anthropic_mcp_connector; here the connector
+              # is already resolved, so the request is forwarded.
+              - filter: anthropic_messages_protocol
+                default_version: "2023-06-01"
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: anthropic_messages
+
+              # Chat path only: translate Anthropic Messages <-> Chat Completions.
+              - filter: anthropic_messages_to_chat_completions
+                max_body_bytes: 1048576
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+
+              # Chat path only: convert streamed Chat Completions back into
+              # Anthropic Messages SSE for requests without the connector.
+              - filter: anthropic_messages_to_chat_completions_stream
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/messages$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+                      path_prefix: "/v1/messages"
+                      methods: [POST]
+
+              - filter: credential_injection
+                clusters:
+                  - name: chat-completions-backend
+                    header: Authorization
+                    env_var: VLLM_API_KEY
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+            on_result:
+              - filter: anthropic_mcp_connector
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
+  # Required for the loopback MCP server. Production connectors are public.
+  allow_private_upstreams: true

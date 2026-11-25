@@ -59,6 +59,7 @@ for how these are authored and regenerated.
 | [llmd-ext-proc-routing.yaml](configs/llmd-ext-proc-routing.yaml) | A real llm-d EPP or test processor returns the trusted x-gateway-destination-endpoint header |
 | [llmisvc-model-provider-resolver.yaml](configs/llmisvc-model-provider-resolver.yaml) | Rewrites publisher-ID body `model` values to the short model name for LLMISvc / KServe routing; the routing header (default `X-Model`) is left unchanged so routing can still use the publisher ID |
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
+| [mcp-session-broker.yaml](configs/mcp-session-broker.yaml) | Static-catalog MCP broker for stateful backends |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
 | [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
@@ -94,6 +95,7 @@ for how these are authored and regenerated.
 | File | Description |
 | ------ | ------------- |
 | [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR), serves BOTH streaming and buffered clients from one pipeline, and adapts to BOTH backend wire formats from one config |
+| [mcp-connector.yaml](configs/anthropic/mcp-connector.yaml) | Anthropic's MCP connector (`mcp_servers` plus `mcp_toolset` tools, beta `mcp-client-2025-11-20`) is normally run by Anthropic's servers, so a vLLM or Chat Completions backend cannot honor it. `anthropic_mcp_connector` runs it inside Praxis instead, for both backend wire formats from one config |
 | [messages-native-vllm.yaml](configs/anthropic/messages-native-vllm.yaml) | Routes native Anthropic Messages API traffic (`/v1/messages` and `/v1/messages/count_tokens`) to a vLLM backend that natively serves the Anthropic Messages API, WITHOUT any request or response body translation |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
 | [messages-to-openai-degrade-fixture.yaml](configs/anthropic/messages-to-openai-degrade-fixture.yaml) | Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching, extended thinking, and mid-conversation system instructions into approved degradation |

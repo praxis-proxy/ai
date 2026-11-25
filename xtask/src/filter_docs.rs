@@ -6,8 +6,9 @@
 //! Parses Rust source files under `filters/src/` and `apis/src/` with
 //! [`syn`] to extract config structs, field metadata, YAML examples,
 //! and filter descriptions. Produces one markdown file per filter at
-//! `docs/filters/{filter_name}.md` and a reference index at
-//! `docs/filters/reference.md`.
+//! `docs/filters/{doc_category}/{filter_name}.md` and a reference index at
+//! `docs/filters/reference.md`. [`DOC_CATEGORIES`] defines the reader-facing
+//! categories and [`doc_category`] assigns each filter to one of them.
 //!
 //! The maintained `intelligent_route` reference is rendered verbatim from
 //! `xtask/assets/filter-docs/intelligent_route.md.in`. Generation and drift checks
@@ -51,7 +52,10 @@ pub(crate) fn generate(_args: GenerateArgs) {
     create_dir_all_or_exit(&docs_dir);
 
     for entry in &all_filters {
-        let path = docs_dir.join(format!("{}.md", entry.filter.name));
+        let path = docs_dir.join(doc_rel_path(entry));
+        if let Some(parent) = path.parent() {
+            create_dir_all_or_exit(parent);
+        }
         let content = render_filter_doc(entry);
         write_or_exit(&path, &content);
         print_relative(&root, &path, "wrote");
@@ -110,7 +114,7 @@ fn collect_stale_doc_paths(root: &Path, docs_dir: &Path, all_filters: &[FilterEn
     let mut stale = Vec::new();
 
     for entry in all_filters {
-        let path = docs_dir.join(format!("{}.md", entry.filter.name));
+        let path = docs_dir.join(doc_rel_path(entry));
         let expected = render_filter_doc(entry);
         if !file_matches(&path, &expected) {
             stale.push(relative_path(root, &path));
@@ -1327,7 +1331,7 @@ fn has_from_config_method(imp: &syn::ItemImpl) -> bool {
 
 /// Extract the config type name from `let cfg: T = parse_filter_config(...)`.
 ///
-/// Scans the filter factory (`from_config` or `from_config_with_binding`)
+/// Scans the filter factories (`from_config` and `from_config_with_binding`)
 /// first. When the factory delegates to a private helper (e.g. `build`), the
 /// `parse_filter_config` call lives there instead, so we fall back to scanning
 /// other methods in the same impl block.
@@ -1338,8 +1342,12 @@ fn extract_config_type_name(imp: &syn::ItemImpl) -> Option<String> {
         .filter_map(|item| if let syn::ImplItem::Fn(m) = item { Some(m) } else { None })
         .collect();
 
-    if let Some(factory) = methods.iter().find(|m| is_factory_method(m))
-        && let Some(name) = scan_method_for_config_type(factory)
+    // A filter may expose both factories, with `from_config` delegating to
+    // `from_config_with_binding`; scan every factory before helper methods.
+    if let Some(name) = methods
+        .iter()
+        .filter(|m| is_factory_method(m))
+        .find_map(|m| scan_method_for_config_type(m))
     {
         return Some(name);
     }
@@ -1836,20 +1844,106 @@ fn render_yaml_examples(out: &mut String, examples: &[String]) {
     }
 }
 
+/// Reader-facing filter documentation categories, in reference index order.
+///
+/// Each entry is `(slug, title, summary)`. The slug is the subdirectory under
+/// `docs/filters/` that holds the category's generated pages.
+const DOC_CATEGORIES: &[(&str, &str, &str)] = &[
+    (
+        "apis",
+        "Client APIs and translation",
+        "Parse client request bodies, publish protocol facts, and translate between OpenAI and Anthropic request and stream formats.",
+    ),
+    (
+        "providers",
+        "Provider adapters and credentials",
+        "Adapt requests to cloud provider dialects and attach provider, cloud identity, or callout credentials.",
+    ),
+    (
+        "routing",
+        "Routing",
+        "Promote model names and select upstream clusters or provider-local backends.",
+    ),
+    (
+        "control",
+        "Guardrails, limits, and metering",
+        "Screen content, guard identity headers, bound token use, track in-flight work, and check balances.",
+    ),
+    (
+        "agents",
+        "Agents, tools, and state",
+        "Route MCP and A2A traffic, manage Responses and Conversations state, and execute gateway-owned tools.",
+    ),
+    (
+        "observability",
+        "Observability and usage",
+        "Extract token usage and emit usage headers, usage metrics, and latency signals.",
+    ),
+    (
+        "core",
+        "Core building blocks",
+        "Classify operations, call external services, change prompts, and establish state ownership.",
+    ),
+];
+
+/// Filters whose reader-facing category differs from their source category.
+const DOC_CATEGORY_OVERRIDES: &[(&str, &str)] = &[
+    ("anthropic_mcp_connector", "agents"),
+    ("anthropic_web_search", "agents"),
+    ("callout_credentials", "providers"),
+    ("credential_inject", "providers"),
+    ("openai_agentic_loop", "agents"),
+    ("openai_conversations", "agents"),
+    ("openai_doc_extract", "agents"),
+    ("openai_file_resolve", "agents"),
+    ("openai_file_search_dispatch", "agents"),
+    ("openai_mcp_dispatch", "agents"),
+    ("openai_mcp_tool_resolve", "agents"),
+    ("openai_responses_compact", "agents"),
+    ("openai_responses_proxy", "agents"),
+    ("openai_responses_rehydrate", "agents"),
+    ("openai_responses_store", "agents"),
+    ("openai_web_search_dispatch", "agents"),
+    ("token_ceiling", "control"),
+];
+
+/// Return the reader-facing documentation category slug for a filter.
+///
+/// Explicit overrides win; otherwise the source category decides. Unknown
+/// source categories fall back to `core` so a new filter still gets a page.
+fn doc_category(entry: &FilterEntry) -> &'static str {
+    if let Some((_, category)) = DOC_CATEGORY_OVERRIDES
+        .iter()
+        .find(|(name, _)| *name == entry.filter.name)
+    {
+        return category;
+    }
+    match (entry.crate_kind.as_str(), entry.category.as_str()) {
+        ("apis", "anthropic" | "openai") => "apis",
+        ("apis", "azure" | "vertex") | ("filters", "aws" | "azure" | "gcp") => "providers",
+        ("filters", "inference" | "routing") => "routing",
+        ("filters", "guardrails" | "identity_guard" | "inflight" | "metering" | "token_rate_limit") => "control",
+        ("filters", "agentic") => "agents",
+        ("filters", "time_to_first_token" | "token_usage") => "observability",
+        _ => "core",
+    }
+}
+
+/// Return a filter page path relative to `docs/filters/`.
+fn doc_rel_path(entry: &FilterEntry) -> PathBuf {
+    Path::new(doc_category(entry)).join(format!("{}.md", entry.filter.name))
+}
+
 /// Render the reference index linking to all per-filter docs.
 fn render_reference_index(entries: &[FilterEntry]) -> String {
     let mut out = render_reference_header();
-    let grouped = group_by_crate_category(entries);
 
-    let mut current_crate = "";
-    for ((crate_kind, category), filters) in &grouped {
-        if *crate_kind != current_crate {
-            current_crate = crate_kind;
-            writeln!(out).unwrap();
-            let crate_title = crate_heading(crate_kind);
-            writeln!(out, "## {crate_title}").unwrap();
+    for (slug, title, summary) in DOC_CATEGORIES {
+        let filters: Vec<&FilterEntry> = entries.iter().filter(|e| doc_category(e) == *slug).collect();
+        if filters.is_empty() {
+            continue;
         }
-        render_category_section(&mut out, category, filters);
+        render_category_section(&mut out, slug, title, summary, &filters);
     }
 
     out
@@ -1863,8 +1957,12 @@ fn render_reference_header() -> String {
     writeln!(out).unwrap();
     writeln!(out, "# Filter Reference").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "AI filters provided by Praxis AI. For base proxy").unwrap();
-    writeln!(out, "filters (router, load balancer, headers, CORS, etc.),").unwrap();
+    writeln!(out, "AI filters provided by Praxis AI, grouped by the task they serve.").unwrap();
+    writeln!(
+        out,
+        "For base proxy filters (router, load balancer, headers, CORS, etc.),"
+    )
+    .unwrap();
     writeln!(out, "see the [Praxis core filter reference][core-ref].").unwrap();
     writeln!(out).unwrap();
     writeln!(
@@ -1875,71 +1973,18 @@ fn render_reference_header() -> String {
     out
 }
 
-/// Return the section heading for a crate kind.
-fn crate_heading(crate_kind: &str) -> &str {
-    match crate_kind {
-        "apis" => "Provider APIs (praxis-ai-apis)",
-        "filters" => "Cross-Provider Filters (praxis-ai-filters)",
-        other => other,
-    }
-}
-
-/// Group filter entries by `(crate_kind, category)`.
-fn group_by_crate_category(entries: &[FilterEntry]) -> BTreeMap<(&str, &str), Vec<&FilterEntry>> {
-    let mut grouped: BTreeMap<(&str, &str), Vec<&FilterEntry>> = BTreeMap::new();
-    for entry in entries {
-        grouped
-            .entry((&entry.crate_kind, &entry.category))
-            .or_default()
-            .push(entry);
-    }
-    grouped
-}
-
 /// Render one category section in the reference index.
-fn render_category_section(out: &mut String, category: &str, filters: &[&FilterEntry]) {
-    let title = format_title(category);
+fn render_category_section(out: &mut String, slug: &str, title: &str, summary: &str, filters: &[&FilterEntry]) {
     writeln!(out).unwrap();
-    writeln!(out, "### {title}").unwrap();
+    writeln!(out, "## {title}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "| Filter | Description |").unwrap();
     writeln!(out, "|--------|-------------|").unwrap();
     for f in filters {
-        let link = format!("{}.md", f.filter.name);
+        let link = format!("{slug}/{}.md", f.filter.name);
         writeln!(out, "| [`{}`]({link}) | {} |", f.filter.name, f.filter.description).unwrap();
-    }
-}
-
-/// Format a category slug into a human-readable title.
-fn format_title(category_name: &str) -> String {
-    category_name
-        .split('_')
-        .map(|w| match w {
-            "ai" => "AI".to_owned(),
-            "tcp" => "TCP".to_owned(),
-            "ip" => "IP".to_owned(),
-            "http" => "HTTP".to_owned(),
-            "openai" => "OpenAI".to_owned(),
-            "mcp" => "MCP".to_owned(),
-            "a2a" => "A2A".to_owned(),
-            "aws" => "AWS".to_owned(),
-            "gcp" => "GCP".to_owned(),
-            other => capitalize(other),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Capitalize the first letter of a word.
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => {
-            let mut result = c.to_uppercase().collect::<String>();
-            result.push_str(chars.as_str());
-            result
-        },
     }
 }
 
@@ -1951,11 +1996,7 @@ fn capitalize(s: &str) -> String {
 fn remove_stale_docs(root: &Path, docs_dir: &Path, entries: &[FilterEntry]) {
     let expected = build_expected_paths(docs_dir, entries);
 
-    let Ok(dir_entries) = fs::read_dir(docs_dir) else {
-        return;
-    };
-    for entry in dir_entries.flatten() {
-        let path = entry.path();
+    for path in collect_md_files_recursive(docs_dir) {
         if is_generated_md(&path) && !expected.contains(&path) && fs::remove_file(&path).is_ok() {
             print_relative(root, &path, "removed stale");
         }
@@ -1966,23 +2007,37 @@ fn remove_stale_docs(root: &Path, docs_dir: &Path, entries: &[FilterEntry]) {
 fn check_for_stale_files(root: &Path, docs_dir: &Path, entries: &[FilterEntry], stale: &mut Vec<PathBuf>) {
     let expected = build_expected_paths(docs_dir, entries);
 
-    let Ok(dir_entries) = fs::read_dir(docs_dir) else {
-        return;
-    };
-    for entry in dir_entries.flatten() {
-        let path = entry.path();
+    for path in collect_md_files_recursive(docs_dir) {
         if is_generated_md(&path) && !expected.contains(&path) {
             stale.push(relative_path(root, &path));
         }
     }
 }
 
+/// Collect Markdown files under `dir` and its subdirectories, sorted by path.
+fn collect_md_files_recursive(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(dir_entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in dir_entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Build the set of expected doc file paths.
 fn build_expected_paths(docs_dir: &Path, entries: &[FilterEntry]) -> HashSet<PathBuf> {
-    let mut paths: HashSet<PathBuf> = entries
-        .iter()
-        .map(|e| docs_dir.join(format!("{}.md", e.filter.name)))
-        .collect();
+    let mut paths: HashSet<PathBuf> = entries.iter().map(|e| docs_dir.join(doc_rel_path(e))).collect();
     paths.insert(docs_dir.join("reference.md"));
     paths
 }
@@ -2092,12 +2147,6 @@ mod tests {
     fn to_camel_case_handles_rust_field_names() {
         assert_eq!(to_camel_case("secret_ref"), "secretRef");
         assert_eq!(to_camel_case("SecretRef"), "secretRef");
-    }
-
-    #[test]
-    fn capitalize_basic() {
-        assert_eq!(capitalize("traffic"), "Traffic", "basic word");
-        assert_eq!(capitalize(""), "", "empty string");
     }
 
     #[test]
@@ -2300,14 +2349,15 @@ mod tests {
         let mut entry = sample_filter_entry();
         entry.filter.name = "intelligent_route".to_owned();
         let entries = vec![entry];
-        let path = docs_dir.join("intelligent_route.md");
+        let path = docs_dir.join(doc_rel_path(&entries[0]));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, render_filter_doc(&entries[0])).unwrap();
         fs::write(docs_dir.join("reference.md"), render_reference_index(&entries)).unwrap();
         assert!(collect_stale_doc_paths(root.path(), &docs_dir, &entries).is_empty());
         fs::write(&path, "# Outdated reference\n").unwrap();
         assert_eq!(
             collect_stale_doc_paths(root.path(), &docs_dir, &entries),
-            vec![PathBuf::from("docs/filters/intelligent_route.md")]
+            vec![PathBuf::from("docs/filters/core/intelligent_route.md")]
         );
     }
 
@@ -2731,22 +2781,42 @@ mod tests {
         let result = render_reference_index(&entries);
         assert!(result.contains("# Filter Reference"), "should have title");
         assert!(
-            result.contains("### Traffic Management"),
+            result.contains("## Core building blocks"),
             "should have category heading"
         );
-        assert!(result.contains("[`timeout`](timeout.md)"), "should have filter link");
+        assert!(
+            result.contains("[`timeout`](core/timeout.md)"),
+            "should link into the category folder"
+        );
     }
 
     #[test]
-    fn format_title_category() {
+    fn doc_category_uses_overrides_then_source_category() {
+        let mut entry = sample_filter_entry();
+        entry.crate_kind = "filters".to_owned();
+        entry.category = "token_usage".to_owned();
+        entry.filter.name = "token_count".to_owned();
+        assert_eq!(doc_category(&entry), "observability", "source category mapping");
+        entry.filter.name = "token_ceiling".to_owned();
+        assert_eq!(doc_category(&entry), "control", "explicit override");
+        entry.category = "unknown_category".to_owned();
+        entry.filter.name = "new_filter".to_owned();
+        assert_eq!(doc_category(&entry), "core", "fallback category");
         assert_eq!(
-            format_title("traffic_management"),
-            "Traffic Management",
-            "basic category"
+            doc_rel_path(&entry),
+            PathBuf::from("core/new_filter.md"),
+            "page lives in its category folder"
         );
-        assert_eq!(format_title("openai"), "OpenAI", "special case");
-        assert_eq!(format_title("aws"), "AWS", "special case");
-        assert_eq!(format_title("token_usage"), "Token Usage", "multi-word");
+    }
+
+    #[test]
+    fn doc_category_overrides_name_known_categories() {
+        for (name, category) in DOC_CATEGORY_OVERRIDES {
+            assert!(
+                DOC_CATEGORIES.iter().any(|(slug, ..)| slug == category),
+                "override for {name} names unknown category {category}"
+            );
+        }
     }
 
     #[test]

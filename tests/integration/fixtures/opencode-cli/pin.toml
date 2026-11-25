@@ -27,7 +27,7 @@
 # NOTE: `opencode --version` prints the bare version with NO product prefix
 # (`1.19.3`, not `opencode 1.19.3`). Unlike the Codex pin, an equality check
 # against a prefixed string would never match.
-version = "1.19.3"
+version = "1.19.6"
 # Platform slug the pinned build targets.
 platform = "linux-x64"
 # How CI obtains the executable.

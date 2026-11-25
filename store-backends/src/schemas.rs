@@ -305,7 +305,7 @@ pub(crate) fn ddl_error(statement: &str, error: &sqlx::Error) -> StoreError {
             .as_database_error()
             .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
     {
-        "; see docs/store/legacy-item-position-repair.md for pre-index data repair"
+        "; see docs/operations/store/legacy-item-position-repair.md for pre-index data repair"
     } else {
         ""
     };
@@ -449,7 +449,7 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
          ON {i}(conversation_id, position, item_id)"
     ));
     // Pre-index databases with duplicate positions need the operator-run repair in
-    // docs/store/legacy-item-position-repair.md before this DDL can succeed.
+    // docs/operations/store/legacy-item-position-repair.md before this DDL can succeed.
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
          ON {i}(tenant_id, owner_issuer, owner_subject, conversation_id, position)"
@@ -1268,7 +1268,8 @@ mod tests {
         .err()
         .expect("new unique index must reject duplicate legacy positions");
         assert!(
-            err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+            err.to_string()
+                .contains("docs/operations/store/legacy-item-position-repair.md"),
             "startup must provide the repair path: {err}"
         );
         let pool = sqlx::SqlitePool::connect(&url)
@@ -1306,7 +1307,8 @@ mod tests {
             .expect_err("duplicate positions should prevent index creation");
         let err = ddl_error(index, &cause);
         assert!(
-            err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+            err.to_string()
+                .contains("docs/operations/store/legacy-item-position-repair.md"),
             "startup error should identify the operator-run repair: {err}"
         );
 

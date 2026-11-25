@@ -2,9 +2,9 @@
 
 Praxis AI can forward Anthropic Messages (`/v1/messages`) to a native
 backend, or translate supported requests to a Chat Completions backend.
-Start with the [complete operator recipes](recipes/anthropic.md) for build,
+Start with the [complete operator recipes](guides/anthropic.md) for build,
 credentials, startup, requests, and cleanup. This page owns the detailed
-protocol and qualification notes; the [client/provider table](client-provider-paths.md)
+protocol and qualification notes; the [client/provider table](getting-started/choose-client-and-provider.md)
 also covers the optional Vertex Anthropic path.
 
 Translation is a bounded compatibility layer. Review rejected fields, explicit
@@ -85,6 +85,32 @@ model server, so vLLM cannot honor it. When the selected cluster declares
 `load_balancer` to see the selected cluster. A cluster tagged
 `application_provider: anthropic`, or an untagged cluster, forwards the
 connector unchanged. The Chat Completions translation always refuses it.
+
+To serve the connector on these backends, add the experimental
+[`anthropic_mcp_connector`](filters/agents/anthropic_mcp_connector.md) filter
+(cargo feature `anthropic-mcp-connector-filter`) first in the inference step
+of an `iterative_request_router`. Praxis then runs the connector itself:
+
+- On the first round it lists each declared server's tools, keeps the ones
+  the `mcp_toolset` enables (`default_config` and per-tool `configs`), and
+  sends them to the model as plain tools named `{server}__{tool}`. It drops
+  `mcp_servers` and the `mcp-client-*` beta token, so the refusal above no
+  longer applies.
+- When the model calls one of those tools, Praxis runs it over MCP and
+  re-enters inference. The final response carries Anthropic's
+  `mcp_tool_use` and `mcp_tool_result` blocks for every call, followed by the
+  model's answer. Usage is summed over all rounds.
+- `mcp_tool_use` / `mcp_tool_result` history replayed in a later turn is
+  converted into ordinary `tool_use` / `tool_result` turns for the backend.
+- A client server runs only when its `url` matches an operator connector's
+  `server_url`; any other URL is rejected with a 400 unless the operator sets
+  `allow_client_servers: true`.
+- Both the native Messages route and the Chat Completions translation are
+  supported. Streaming (`stream: true`) requests that use the connector, a
+  toolset's `defer_loading: true`, and pinned tool lists are rejected with a
+  400 for now.
+
+See [`examples/configs/anthropic/mcp-connector.yaml`](../examples/configs/anthropic/mcp-connector.yaml).
 
 Claude Code is unaffected: it runs MCP servers itself and sends their tools
 as ordinary client tools, which every route serves.
@@ -560,11 +586,24 @@ The `anthropic_messages_to_chat_completions` filter:
   chain still installs the backend's own token
 - Hoists `system` to an OpenAI system message
 - Translates text, user image, assistant `tool_use`,
-  and text-only user `tool_result` blocks; rejects
+  and user `tool_result` blocks; top-level
   `document`, `search_result`, and other blocks that
-  Chat Completions cannot represent
-- Rejects `tool_result.is_error: true` because Chat
-  Completions has no equivalent tool-result error flag
+  Chat Completions cannot represent are rejected
+- Translates `tool_result.is_error: true` by
+  prefixing the tool message content with
+  `Anthropic tool_result error:` (a bare marker when
+  the content is empty), because Chat Completions has
+  no equivalent tool-result error flag
+- Splits array-form `tool_result.content`: text
+  parts are joined into the tool message, image
+  parts are promoted to a follow-up user message
+  emitted after every tool message of the same
+  Anthropic message (Chat Completions requires all
+  tool replies to follow the assistant `tool_calls`
+  message directly), and `search_result`/`document`
+  parts are flattened to text; unsupported part
+  types, malformed image sources, and parts that
+  would flatten to nothing are rejected
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
 - Reports a matched stop sequence as `stop_reason:
@@ -581,7 +620,9 @@ The `anthropic_messages_to_chat_completions` filter:
   `output_format`) to a strict `response_format`; any
   other `output_config` key is rejected with a 400
 - Rejects the MCP connector (`mcp_servers` or any
-  `mcp_toolset` tool) with a 400 that names it
+  `mcp_toolset` tool) with a 400 that names it, unless
+  `anthropic_mcp_connector` resolved it earlier in the
+  step (see [MCP connector](#mcp-connector))
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully; the
@@ -689,7 +730,7 @@ forwarded unchanged. No body transformation, version-specific validation,
 or credential handling. See [API version compatibility](#api-version-compatibility).
 Placed after `load_balancer`, it also refuses the
 [MCP connector](#mcp-connector) for a cluster whose `application_provider`
-is not `anthropic`.
+is not `anthropic`, unless `anthropic_mcp_connector` resolved it first.
 
 ```yaml
 filter: anthropic_messages_protocol

@@ -54,13 +54,13 @@ jobs:
       # workspace build artifacts, so caching them just adds restore/save I/O.
       - name: Setup Rust
         if: matrix.language == 'rust'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           cache-suffix: codeql-cargo
           cache-target: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           languages: ${{ matrix.language }}
           # 0 = use all available cores; the default caps analysis at 2 threads.
@@ -71,7 +71,7 @@ jobs:
       # compiled the whole tree (deps + bins) for artifacts CodeQL discards.
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           category: "/language:${{ matrix.language }}"
           # Keep CodeQL a required merge-queue gate, but skip SARIF upload for

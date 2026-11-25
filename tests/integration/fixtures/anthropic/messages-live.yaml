@@ -1,0 +1,24 @@
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [anthropic]
+filter_chains:
+  - name: anthropic
+    filters:
+      - filter: router
+        routes:
+          - path: /v1/messages
+            cluster: anthropic
+      - filter: credential_injection
+        clusters:
+          - name: anthropic
+            header: x-api-key
+            env_var: ANTHROPIC_API_KEY
+      - filter: load_balancer
+        clusters:
+          - name: anthropic
+            endpoints: ["api.anthropic.com:443"]
+            http:
+              authority: api.anthropic.com
+            tls:
+              sni: api.anthropic.com
