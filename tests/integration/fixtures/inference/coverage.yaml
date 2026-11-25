@@ -69,6 +69,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.tool_result_error
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-result-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.tool_result_image_promotion
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-result-image-promotion
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.text
     scopes:
       - messages_to_chat_completions
