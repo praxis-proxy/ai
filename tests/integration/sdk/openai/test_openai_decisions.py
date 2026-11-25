@@ -216,4 +216,6 @@ class TestOpenAIDecisionsPassthrough:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, *sys.argv[1:]])
+    # Propagate the exit code: the decisions-sdk workflow runs this file
+    # directly, and a bare pytest.main() return value would read as success.
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
