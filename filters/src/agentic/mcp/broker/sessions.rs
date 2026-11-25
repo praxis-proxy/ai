@@ -107,6 +107,29 @@ pub(crate) enum Publish {
     Cancelled(BoundSession),
 }
 
+/// Why [`BackendSessionStore::slot`] returned no slot.
+#[derive(Debug)]
+pub(crate) enum SlotUnavailable {
+    /// The gateway session ended.
+    Ended,
+    /// Every slot is busy with an in-flight exchange.
+    Full,
+}
+
+/// Clears a slot's handshake marker when dropped, so a handshake whose
+/// request is dropped mid-flight (a client disconnect) leaves no marker that
+/// a later `DELETE` would mistake for another caller's handshake. Hold it
+/// while holding the handshake permit, and drop it first: the permit makes
+/// the marker it clears this handshake's own. After `publish` or `abort`,
+/// clearing again has no effect.
+pub(crate) struct PendingGuard<'a>(&'a SessionSlot);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A handshake in flight for one slot.
 #[derive(Debug)]
 struct Pending {
@@ -289,31 +312,49 @@ impl BackendSessionStore {
 
     /// Return the slot for `key`, creating a fresh one when absent or idle.
     ///
-    /// Returns `None` when the map is full and every slot is in use.
-    pub(crate) fn slot(&self, key: &BackendSessionKey) -> Option<Arc<SessionSlot>> {
-        self.slot_at(key, Instant::now())
+    /// `live` reports whether the key's gateway session is still live; it
+    /// runs under the map lock, before any entry is created or evicted, so an
+    /// ended session never displaces another gateway's mapping.
+    pub(crate) fn slot(
+        &self,
+        key: &BackendSessionKey,
+        live: impl FnOnce() -> bool,
+    ) -> Result<Arc<SessionSlot>, SlotUnavailable> {
+        let mut inner = self.lock();
+        if !live() {
+            return Err(SlotUnavailable::Ended);
+        }
+        self.slot_locked(&mut inner, key, Instant::now())
+            .ok_or(SlotUnavailable::Full)
     }
 
-    /// [`slot`](Self::slot) with an explicit clock for tests.
+    /// [`slot`](Self::slot) with an explicit clock and no liveness check, for
+    /// tests.
+    #[cfg(test)]
     fn slot_at(&self, key: &BackendSessionKey, now: Instant) -> Option<Arc<SessionSlot>> {
         let mut inner = self.lock();
+        self.slot_locked(&mut inner, key, now)
+    }
+
+    /// [`slot`](Self::slot) under the map lock. Returns `None` when the map
+    /// is full and every slot is in use.
+    fn slot_locked(&self, inner: &mut Inner, key: &BackendSessionKey, now: Instant) -> Option<Arc<SessionSlot>> {
         if now.saturating_duration_since(inner.last_sweep) >= self.idle_timeout {
             inner.last_sweep = now;
-            self.purge_idle(&mut inner, now);
+            self.purge_idle(inner, now);
         }
         if let Some(entry) = inner.entries.get_mut(key) {
             if self.reusable(entry, now) {
                 // Overlapping callers may sample the clock out of order.
                 entry.last_used = entry.last_used.max(now);
                 let slot = Arc::clone(&entry.slot);
-                drop(inner);
                 return Some(slot);
             }
             if let Some(stale) = inner.entries.remove(key) {
                 inner.retire(key.server, &stale);
             }
         }
-        if !self.make_room(&mut inner, now) {
+        if !self.make_room(inner, now) {
             return None;
         }
         let slot = Arc::new(SessionSlot::default());
@@ -324,7 +365,6 @@ impl BackendSessionStore {
                 slot: Arc::clone(&slot),
             },
         );
-        drop(inner);
         Some(slot)
     }
 
@@ -443,12 +483,14 @@ impl BackendSessionStore {
     /// Mappings and handshakes of other credentials are kept: presenting a
     /// gateway session id alone must not tear down sessions another caller
     /// created. [`GatewayRemoval::foreign`] reports whether any remain. When
-    /// none do, `end` runs under the map lock to end the gateway session, so
+    /// `live` reports the session already ended, nothing changes. When none
+    /// remain, `end` runs under the map lock to end the gateway session, so
     /// no handshake can [`begin`](Self::begin) between the check and the end.
     pub(crate) fn remove_gateway(
         &self,
         gateway_session: &str,
         credential: &CredentialFingerprint,
+        live: impl FnOnce() -> bool,
         end: impl FnOnce() -> bool,
     ) -> GatewayRemoval {
         let mut removal = GatewayRemoval {
@@ -457,6 +499,11 @@ impl BackendSessionStore {
             ended: false,
         };
         let mut inner = self.lock();
+        // A concurrent DELETE may have ended the session after the caller's
+        // check; its handshakes still in flight are not foreign.
+        if !live() {
+            return removal;
+        }
         inner.entries.retain(|key, entry| {
             &*key.gateway_session != gateway_session || entry.remove_owned(key.server, credential, &mut removal)
         });
@@ -471,20 +518,21 @@ impl BackendSessionStore {
     /// `live` reports its gateway session ended. Call while holding the
     /// slot's handshake permit. Runs under the map lock, so it is ordered
     /// with [`remove_gateway`](Self::remove_gateway): a handshake either
-    /// starts before a `DELETE` sees it or not at all.
-    pub(crate) fn begin(
+    /// starts before a `DELETE` sees it or not at all. The returned guard
+    /// clears the marker if the handshake is dropped before it settles.
+    pub(crate) fn begin<'a>(
         &self,
-        slot: &SessionSlot,
+        slot: &'a SessionSlot,
         credential: CredentialFingerprint,
         live: impl FnOnce() -> bool,
-    ) -> bool {
+    ) -> Option<PendingGuard<'a>> {
         let inner = self.lock();
         if !live() {
-            return false;
+            return None;
         }
         slot.begin(credential);
         drop(inner);
-        true
+        Some(PendingGuard(slot))
     }
 
     /// Number of retained mappings.
@@ -576,12 +624,12 @@ mod tests {
     #[test]
     fn same_key_returns_same_slot() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
-        let first = store.slot(&key("g", 0)).unwrap();
+        let first = store.slot(&key("g", 0), || true).unwrap();
         set(&first, bound("s"));
-        let second = store.slot(&key("g", 0)).unwrap();
+        let second = store.slot(&key("g", 0), || true).unwrap();
         assert!(Arc::ptr_eq(&first, &second), "same key must reuse the slot");
         assert!(
-            !Arc::ptr_eq(&first, &store.slot(&key("g", 1)).unwrap()),
+            !Arc::ptr_eq(&first, &store.slot(&key("g", 1), || true).unwrap()),
             "another server must get its own slot"
         );
     }
@@ -694,7 +742,7 @@ mod tests {
     #[test]
     fn invalidate_requires_matching_session() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
-        set(&store.slot(&key("g", 0)).unwrap(), bound("current"));
+        set(&store.slot(&key("g", 0), || true).unwrap(), bound("current"));
 
         assert!(
             !store.invalidate(&key("g", 0), &HeaderValue::from_static("stale")),
@@ -711,7 +759,7 @@ mod tests {
     #[test]
     fn invalidate_keeps_held_slot_mapped() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
-        let held = store.slot(&key("g", 0)).unwrap();
+        let held = store.slot(&key("g", 0), || true).unwrap();
         set(&held, bound("s"));
 
         assert!(
@@ -720,7 +768,7 @@ mod tests {
         );
         assert!(current_id(&held).is_none(), "the session must be cleared");
         assert!(
-            Arc::ptr_eq(&held, &store.slot(&key("g", 0)).unwrap()),
+            Arc::ptr_eq(&held, &store.slot(&key("g", 0), || true).unwrap()),
             "a held slot must stay mapped so the next handshake is shared"
         );
     }
@@ -728,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_applies_during_a_handshake() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
-        let slot = store.slot(&key("g", 0)).unwrap();
+        let slot = store.slot(&key("g", 0), || true).unwrap();
         set(&slot, bound_with("old", 0));
         let permit = slot.handshake_permit().await;
         slot.begin([1; SHA256_LEN]);
@@ -764,12 +812,12 @@ mod tests {
     #[test]
     fn remove_gateway_returns_initialized_sessions() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        set(&store.slot(&key("g", 0)).unwrap(), bound("s0"));
-        set(&store.slot(&key("g", 1)).unwrap(), bound("s1"));
-        store.slot(&key("g", 2)).unwrap();
-        set(&store.slot(&key("other", 0)).unwrap(), bound("o"));
+        set(&store.slot(&key("g", 0), || true).unwrap(), bound("s0"));
+        set(&store.slot(&key("g", 1), || true).unwrap(), bound("s1"));
+        store.slot(&key("g", 2), || true).unwrap();
+        set(&store.slot(&key("other", 0), || true).unwrap(), bound("o"));
 
-        let mut removed = store.remove_gateway("g", &[0; SHA256_LEN], || true).retired;
+        let mut removed = store.remove_gateway("g", &[0; SHA256_LEN], || true, || true).retired;
         removed.sort_by_key(|retired| retired.server);
 
         assert_eq!(removed.len(), 2, "only initialized sessions are returned");
@@ -780,9 +828,9 @@ mod tests {
     #[test]
     fn remove_gateway_keeps_sessions_of_other_credentials() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        set(&store.slot(&key("g", 0)).unwrap(), bound("s0"));
+        set(&store.slot(&key("g", 0), || true).unwrap(), bound("s0"));
 
-        let removed = store.remove_gateway("g", &[1; SHA256_LEN], || true);
+        let removed = store.remove_gateway("g", &[1; SHA256_LEN], || true, || true);
 
         assert!(
             removed.retired.is_empty(),
@@ -795,15 +843,17 @@ mod tests {
     #[test]
     fn remove_gateway_reports_no_foreign_sessions_when_the_caller_owns_them_all() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        set(&store.slot(&key("g", 0)).unwrap(), bound("s0"));
-        set(&store.slot(&key("other", 0)).unwrap(), bound_with("o", 1));
+        set(&store.slot(&key("g", 0), || true).unwrap(), bound("s0"));
+        set(&store.slot(&key("other", 0), || true).unwrap(), bound_with("o", 1));
 
-        let removed = store.remove_gateway("g", &[0; SHA256_LEN], || true);
+        let removed = store.remove_gateway("g", &[0; SHA256_LEN], || true, || true);
 
         assert_eq!(removed.retired.len(), 1, "the caller's session is removed");
         assert!(!removed.foreign, "other gateway sessions do not count");
         assert!(
-            !store.remove_gateway("unused", &[0; SHA256_LEN], || true).foreign,
+            !store
+                .remove_gateway("unused", &[0; SHA256_LEN], || true, || true)
+                .foreign,
             "a gateway session without mappings has no foreign sessions"
         );
     }
@@ -811,12 +861,12 @@ mod tests {
     #[tokio::test]
     async fn remove_gateway_reports_another_callers_handshake_as_foreign() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        let slot = store.slot(&key("g", 0)).unwrap();
+        let slot = store.slot(&key("g", 0), || true).unwrap();
         let _permit = slot.handshake_permit().await;
         slot.begin([0; SHA256_LEN]);
 
         assert!(
-            store.remove_gateway("g", &[1; SHA256_LEN], || true).foreign,
+            store.remove_gateway("g", &[1; SHA256_LEN], || true, || true).foreign,
             "a handshake in flight for another caller is foreign"
         );
     }
@@ -824,12 +874,15 @@ mod tests {
     #[tokio::test]
     async fn remove_gateway_cancels_a_handshake_in_flight() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        let slot = store.slot(&key("g", 0)).unwrap();
+        let slot = store.slot(&key("g", 0), || true).unwrap();
         let permit = slot.handshake_permit().await;
         slot.begin([0; SHA256_LEN]);
 
         assert!(
-            store.remove_gateway("g", &[1; SHA256_LEN], || true).retired.is_empty(),
+            store
+                .remove_gateway("g", &[1; SHA256_LEN], || true, || true)
+                .retired
+                .is_empty(),
             "nothing is published yet"
         );
         assert!(
@@ -838,7 +891,7 @@ mod tests {
         );
 
         slot.begin([0; SHA256_LEN]);
-        store.remove_gateway("g", &[0; SHA256_LEN], || true);
+        store.remove_gateway("g", &[0; SHA256_LEN], || true, || true);
         let outcome = slot.publish(bound_with("late", 0));
         drop(permit);
         assert!(
@@ -850,39 +903,100 @@ mod tests {
     #[tokio::test]
     async fn remove_gateway_ends_the_session_only_without_foreign_sessions() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        let slot = store.slot(&key("g", 0)).unwrap();
+        let slot = store.slot(&key("g", 0), || true).unwrap();
         let _permit = slot.handshake_permit().await;
         slot.begin([0; SHA256_LEN]);
 
         let mut end_called = false;
-        let refused = store.remove_gateway("g", &[1; SHA256_LEN], || {
-            end_called = true;
-            true
-        });
+        let refused = store.remove_gateway(
+            "g",
+            &[1; SHA256_LEN],
+            || true,
+            || {
+                end_called = true;
+                true
+            },
+        );
         assert!(
             refused.foreign && !refused.ended && !end_called,
             "a foreign handshake keeps the session"
         );
 
-        let ended = store.remove_gateway("g", &[0; SHA256_LEN], || true);
+        let ended = store.remove_gateway("g", &[0; SHA256_LEN], || true, || true);
         assert!(!ended.foreign && ended.ended, "the owner's DELETE ends the session");
     }
 
     #[tokio::test]
     async fn begin_refuses_an_ended_gateway_session() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        let slot = store.slot(&key("g", 0)).unwrap();
+        let slot = store.slot(&key("g", 0), || true).unwrap();
         let _permit = slot.handshake_permit().await;
 
         assert!(
-            !store.begin(&slot, [0; SHA256_LEN], || false),
+            store.begin(&slot, [0; SHA256_LEN], || false).is_none(),
             "an ended session starts nothing"
         );
         assert!(
-            store.remove_gateway("g", &[1; SHA256_LEN], || true).ended,
+            store.remove_gateway("g", &[1; SHA256_LEN], || true, || true).ended,
             "a refused begin leaves no handshake behind"
         );
-        assert!(store.begin(&slot, [0; SHA256_LEN], || true), "a live session starts");
+        assert!(
+            store.begin(&slot, [0; SHA256_LEN], || true).is_some(),
+            "a live session starts"
+        );
+    }
+
+    #[test]
+    fn slot_for_an_ended_gateway_session_creates_and_evicts_nothing() {
+        let store = BackendSessionStore::new(1, Duration::from_secs(60));
+        set(&store.slot(&key("other", 0), || true).unwrap(), bound("o"));
+
+        assert!(
+            matches!(store.slot(&key("g", 0), || false), Err(SlotUnavailable::Ended)),
+            "an ended gateway session gets no slot"
+        );
+        assert_eq!(store.len(), 1, "no entry is created or evicted");
+        assert!(
+            store
+                .slot(&key("other", 0), || true)
+                .unwrap()
+                .current(&[0; SHA256_LEN])
+                .is_some(),
+            "the other gateway's session survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_gateway_of_an_ended_session_changes_nothing() {
+        let store = BackendSessionStore::new(8, Duration::from_secs(60));
+        let slot = store.slot(&key("g", 0), || true).unwrap();
+        let _permit = slot.handshake_permit().await;
+        slot.begin([0; SHA256_LEN]);
+
+        let removal = store.remove_gateway("g", &[1; SHA256_LEN], || false, || true);
+        assert!(
+            !removal.foreign && !removal.ended && removal.retired.is_empty(),
+            "a stale DELETE sees the session ended, not a foreign handshake"
+        );
+        assert!(
+            matches!(slot.publish(bound("s")), Publish::Published(None)),
+            "the in-flight handshake is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_pending_guard_clears_the_handshake_marker() {
+        let store = BackendSessionStore::new(8, Duration::from_secs(60));
+        let slot = store.slot(&key("g", 0), || true).unwrap();
+        let permit = slot.handshake_permit().await;
+        let guard = store.begin(&slot, [0; SHA256_LEN], || true).unwrap();
+        drop(guard);
+        drop(permit);
+
+        assert!(
+            !store.remove_gateway("g", &[1; SHA256_LEN], || true, || true).foreign,
+            "an abandoned handshake leaves no marker"
+        );
     }
 
     #[test]

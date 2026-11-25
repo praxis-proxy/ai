@@ -73,7 +73,7 @@ use self::{
     config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
     gateway::GatewaySessions,
     sessions::{
-        BackendSessionKey, BackendSessionStore, BoundSession, Publish, RetiredSession, SessionSlot,
+        BackendSessionKey, BackendSessionStore, BoundSession, Publish, RetiredSession, SessionSlot, SlotUnavailable,
         credential_fingerprint,
     },
 };
@@ -202,10 +202,11 @@ struct ForwardedCall {
 /// in top-level `clusters:` so the handshake chain can reference them.
 ///
 /// With `backend_sessions`, `initialize` issues signed gateway session ids,
-/// and a request carrying an id the broker did not issue, or one a `DELETE`
-/// ended, gets HTTP `404` on every method until the client initializes
-/// again. A `DELETE` that would end a session still holding backend sessions
-/// created with other credentials answers `409` and leaves it usable.
+/// and a request carrying a well-formed id the broker did not issue, or one
+/// a `DELETE` ended, gets HTTP `404` on every method; the client sends a new
+/// `initialize` without the header. A malformed header (empty, too long, or
+/// with characters outside visible ASCII) gets `400`. A `DELETE` that would end a session still holding backend
+/// sessions created with other credentials answers `409` and leaves it usable.
 ///
 /// # YAML
 ///
@@ -374,15 +375,6 @@ impl McpBrokerFilter {
         method_str: &str,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
-        if let Some((status, message)) = self.gateway_session_rejection(ctx) {
-            return Ok(json_rpc_error_action_with_status(
-                envelope,
-                status,
-                ERR_INVALID_REQUEST,
-                message,
-            ));
-        }
-
         if method_str.starts_with("notifications/") {
             return Ok(handle_notification(envelope));
         }
@@ -594,6 +586,38 @@ impl McpBrokerFilter {
             .ok_or_else(|| unsupported_version_action(envelope, requested, &self.supported_versions))
     }
 
+    /// Parse a complete POST body into its JSON value and JSON-RPC envelope,
+    /// or return the action answering the request instead.
+    ///
+    /// An unknown or ended session id wins over body errors, so the client
+    /// always learns to reinitialize (MCP Streamable HTTP, session management
+    /// items 3 and 4).
+    fn parse_request_body(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        body: Option<&Bytes>,
+    ) -> Result<(serde_json::Value, JsonRpcEnvelope), FilterAction> {
+        let gateway_rejection = self.gateway_session_rejection(ctx);
+        let body_error =
+            || FilterAction::Reject(Rejection::status(gateway_rejection.map_or(400, |(status, _)| status)));
+        let Some(chunk) = body else {
+            return Err(gateway_rejection.map_or(FilterAction::Continue, |_| body_error()));
+        };
+        let value = serde_json::from_slice::<serde_json::Value>(chunk).map_err(|_invalid| body_error())?;
+        let Ok(Some(envelope)) = parse_json_rpc_value(&value, &self.json_rpc_config) else {
+            return Err(body_error());
+        };
+        if let Some((status, message)) = gateway_rejection {
+            return Err(json_rpc_error_action_with_status(
+                &envelope,
+                status,
+                ERR_INVALID_REQUEST,
+                message,
+            ));
+        }
+        Ok((value, envelope))
+    }
+
     /// The status and message rejecting a request whose gateway
     /// `Mcp-Session-Id` this broker did not issue or that a `DELETE` ended
     /// (HTTP 404, so the client sends a new `initialize`), or whose header is
@@ -637,9 +661,12 @@ impl McpBrokerFilter {
         };
         // Ending the id under the map lock orders it with every handshake
         // start: a later handshake sees the id ended and opens nothing.
-        let removal = backend
-            .store
-            .remove_gateway(gateway, &credential, || backend.gateway.end(gateway));
+        let removal = backend.store.remove_gateway(
+            gateway,
+            &credential,
+            || backend.gateway.is_live(gateway),
+            || backend.gateway.end(gateway),
+        );
         let status = match (removal.foreign, removal.ended) {
             (true, _) => 409,
             // A concurrent DELETE ended it first.
@@ -916,16 +943,9 @@ impl HttpFilter for McpBrokerFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(chunk) = body.as_ref() else {
-            return Ok(FilterAction::Continue);
-        };
-
-        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(chunk) else {
-            return Ok(FilterAction::Reject(Rejection::status(400)));
-        };
-
-        let Ok(Some(envelope)) = parse_json_rpc_value(&value, &self.json_rpc_config) else {
-            return Ok(FilterAction::Reject(Rejection::status(400)));
+        let (mut value, envelope) = match self.parse_request_body(ctx, body.as_ref()) {
+            Ok(parsed) => parsed,
+            Err(action) => return Ok(action),
         };
 
         let Some(method_str) = &envelope.method else {
@@ -1082,7 +1102,7 @@ impl BackendSessions {
         callout: &BackendCallout,
     ) -> Result<(Arc<SessionSlot>, BackendInit), McpBackendError> {
         let credential = credential_fingerprint(&callout.forwarded_headers);
-        let slot = self.store.slot(key).ok_or(McpBackendError::Capacity)?;
+        let slot = self.store.slot(key, || self.gateway.is_live(&key.gateway_session))?;
         if let Some(init) = slot.current(&credential) {
             return Ok((slot, init));
         }
@@ -1121,32 +1141,34 @@ impl BackendSessions {
         protocol_version: &str,
         callout: &BackendCallout,
     ) -> Result<(Option<Publish>, BackendInit), McpBackendError> {
+        let live = || self.gateway.is_live(&key.gateway_session);
+        // A call that waited for the permit while a DELETE ended the gateway
+        // session stops here, before any backend I/O or session reuse.
         let _permit = tokio::time::timeout_at(callout.deadline.into(), slot.handshake_permit())
             .await
-            .map_err(|_elapsed| McpBackendError::Timeout)?
+            .map_err(|_elapsed| {
+                if live() {
+                    McpBackendError::Timeout
+                } else {
+                    McpBackendError::GatewayEnded
+                }
+            })?
             .map_err(|_closed| McpBackendError::SessionClosed)?;
+        if !live() {
+            return Err(McpBackendError::GatewayEnded);
+        }
         let credential = credential_fingerprint(&callout.forwarded_headers);
         if let Some(init) = slot.current(&credential) {
             return Ok((None, init));
         }
-        // A call that waited for the permit while a DELETE ended the gateway
-        // session stops here, before any backend I/O.
-        if !self
-            .store
-            .begin(slot, credential, || self.gateway.is_live(&key.gateway_session))
-        {
+        // Declared after the permit so it drops first: a dropped handshake
+        // clears its marker before the next caller can begin.
+        let Some(_pending) = self.store.begin(slot, credential, live) else {
             return Err(McpBackendError::GatewayEnded);
-        }
-        match self.handshake(target, protocol_version, callout).await {
-            Ok(init) => {
-                let outcome = slot.publish(BoundSession::new(&callout.forwarded_headers, init.clone()));
-                Ok((Some(outcome), init))
-            },
-            Err(error) => {
-                slot.abort();
-                Err(error)
-            },
-        }
+        };
+        let init = self.handshake(target, protocol_version, callout).await?;
+        let outcome = slot.publish(BoundSession::new(&callout.forwarded_headers, init.clone()));
+        Ok((Some(outcome), init))
     }
 
     /// Terminate the sessions the map retired (evicted, expired, or replaced
@@ -1380,6 +1402,15 @@ fn gateway_session_id<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
         return None;
     }
     value.to_str().ok()
+}
+
+impl From<SlotUnavailable> for McpBackendError {
+    fn from(unavailable: SlotUnavailable) -> Self {
+        match unavailable {
+            SlotUnavailable::Ended => Self::GatewayEnded,
+            SlotUnavailable::Full => Self::Capacity,
+        }
+    }
 }
 
 /// The answer to a `tools/call` whose backend session could not be obtained:

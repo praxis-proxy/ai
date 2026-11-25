@@ -173,9 +173,9 @@ impl GatewaySessions {
     /// a MAC failure (fail closed).
     fn verified_sequence(&self, id: &str) -> Option<u64> {
         let (payload, tag) = id.strip_prefix(PREFIX)?.split_once(SEPARATOR)?;
-        let payload: Payload = URL_SAFE_NO_PAD.decode(payload).ok()?.try_into().ok()?;
-        let tag = URL_SAFE_NO_PAD.decode(tag).ok()?;
-        if tag.len() != SHA256_LEN || !HmacSha256::verify(self.key.as_ref(), &payload, &tag).ok()? {
+        let payload: Payload = decode_exact(payload)?;
+        let tag: [u8; SHA256_LEN] = decode_exact(tag)?;
+        if !HmacSha256::verify(self.key.as_ref(), &payload, &tag).ok()? {
             return None;
         }
         let (sequence, _) = payload.split_first_chunk::<SEQUENCE_LEN>()?;
@@ -187,6 +187,19 @@ impl GatewaySessions {
     fn lock(&self) -> MutexGuard<'_, Ended> {
         self.ended.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Decode unpadded base64url into exactly `N` bytes on the stack.
+fn decode_exact<const N: usize>(encoded: &str) -> Option<[u8; N]> {
+    // Unpadded base64 carries 6 bits per character.
+    if encoded.len() != (N * 8).div_ceil(6) {
+        return None;
+    }
+    // The decoder reserves room for whole 3-byte groups.
+    let mut buf = [0; 48];
+    let decoded = buf.get_mut(..N.div_ceil(3) * 3)?;
+    let len = URL_SAFE_NO_PAD.decode_slice(encoded, decoded).ok()?;
+    decoded.get(..len)?.try_into().ok()
 }
 
 impl Ended {
@@ -201,8 +214,7 @@ impl Ended {
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

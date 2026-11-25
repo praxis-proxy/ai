@@ -411,6 +411,16 @@ fn current_profile_ended_gateway_session_is_not_found_until_reinitialized() {
         200,
         "a new initialize must issue a working id: {raw}"
     );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "the fresh id's call must succeed at the backend: {raw}"
+    );
+    assert_eq!(
+        weather.tool_call_count("get_weather"),
+        1,
+        "only the fresh id's call reaches the backend"
+    );
 }
 
 // -----------------------------------------------------------------------------

@@ -1418,6 +1418,83 @@ async fn delete_during_another_credentials_handshake_is_refused() {
     assert_eq!(mock.count("initialize"), 1, "the published session is reused");
 }
 
+#[tokio::test]
+async fn ended_gateway_session_is_not_found_before_body_errors() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+    let live = issue(&filter).await;
+    let ended = issue(&filter).await;
+    let deleted = delete(&filter, &ended, None).await;
+    assert_eq!(status_of(&deleted), Some(204), "DELETE ends the session");
+
+    for body in ["{not json", r#"{"jsonrpc":"2.0","id":1}"#] {
+        let action = post(&filter, Some(&ended), body).await;
+        assert_eq!(
+            status_of(&action),
+            Some(404),
+            "an ended id wins over body errors: {body}"
+        );
+        let action = post(&filter, Some(&live), body).await;
+        assert_eq!(status_of(&action), Some(400), "a live id keeps the body error: {body}");
+    }
+}
+
+#[tokio::test]
+async fn dropped_handshake_does_not_block_another_callers_delete() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mock = Arc::new(MockBackend {
+        initialize_gate: Some((Arc::clone(&started), Arc::new(tokio::sync::Notify::new()))),
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+    let gateway = issue(&filter).await;
+    let alice = call_request(Some(&gateway), Some("Bearer alice"));
+
+    // The client disconnects mid-handshake: the call's future is dropped.
+    tokio::select! {
+        _ = route(&filter, &alice, "weather_get_weather") => panic!("the handshake is gated"),
+        () = started.notified() => {},
+    }
+
+    let deleted = delete(&filter, &gateway, Some("Bearer bob")).await;
+    assert_eq!(
+        status_of(&deleted),
+        Some(204),
+        "an abandoned handshake must not count as another caller's session"
+    );
+}
+
+#[tokio::test]
+async fn permit_wait_that_times_out_after_delete_is_not_found() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let mock = Arc::new(MockBackend {
+        initialize_gate: Some((Arc::clone(&started), Arc::clone(&proceed))),
+        ..MockBackend::default()
+    });
+    let yaml = SESSION_BROKER_YAML.replacen("max_sessions: 16", "max_sessions: 16\n  handshake_timeout_ms: 200", 1);
+    let filter = broker_from_yaml(Arc::clone(&mock), &yaml);
+    let gateway = issue(&filter).await;
+    let req = call_request(Some(&gateway), None);
+
+    let (_, waiting) = tokio::join!(route(&filter, &req, "weather_get_weather"), async {
+        started.notified().await;
+        let waiting = async { route(&filter, &req, "weather_get_weather").await };
+        let (waiting, deleted) = tokio::join!(waiting, async {
+            settle().await;
+            delete(&filter, &gateway, None).await
+        });
+        assert_eq!(status_of(&deleted), Some(204), "DELETE ends the session");
+        proceed.notify_one();
+        waiting
+    });
+
+    assert_eq!(
+        status_of(&waiting.action),
+        Some(404),
+        "a call whose permit wait times out after DELETE must see the session ended"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------

@@ -10,8 +10,10 @@
 # mapping, and the next call initializes a fresh backend
 # session. DELETE on the gateway session terminates its
 # backend sessions. The broker accepts only gateway session
-# ids it issued and that were not deleted; any other id gets
-# 404 on every method, and the client must initialize again.
+# ids it issued and that were not deleted. A well-formed id it
+# did not issue, or one that was deleted, gets 404 on every
+# method: the client must send a new initialize without the
+# old Mcp-Session-Id header. A malformed header gets 400.
 # A DELETE that would end a session other credentials still
 # use answers 409 and leaves it usable.
 #

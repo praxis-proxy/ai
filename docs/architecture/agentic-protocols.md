@@ -239,7 +239,9 @@ before it starts, so a handshake either starts before the
 on a handshake when the id ends gets `404` without
 contacting the backend, and one whose handshake the
 `DELETE` cancelled fails with `session_closed` after the
-new backend session is terminated. A config reload or
+broker attempts to terminate the new backend session
+(best effort: if that termination fails, the session is
+left to the backend's idle expiry). A config reload or
 restart draws a new key, so every outstanding id gets
 `404` and clients reinitialize. Without
 `backend_sessions`, ids are not signed or checked.
