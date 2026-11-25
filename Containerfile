@@ -25,9 +25,9 @@ WORKDIR /src
 # Cache Build
 # ------------------------------------------------------------------------------
 
-# Cache dependency builds: copy only manifests first, then
-# create stub source files so `cargo build` resolves and
-# compiles all dependencies without the real source code.
+# Cache dependency builds: copy manifests and required build inputs first,
+# then create stub source files so `cargo build` resolves and compiles
+# dependencies before the application source is copied.
 
 # Workspace manifests
 COPY Cargo.toml Cargo.lock ./
@@ -35,11 +35,10 @@ COPY store/Cargo.toml ./store/Cargo.toml
 COPY store-lifecycle/Cargo.toml ./store-lifecycle/Cargo.toml
 COPY store-backends/Cargo.toml ./store-backends/Cargo.toml
 COPY apis/Cargo.toml ./apis/Cargo.toml
-# The apis manifest declares the translation_overhead bench, and cargo
-# refuses to parse a manifest whose declared bench target is missing, so
-# the bench sources must exist in the image even though `cargo build -p
-# praxis-ai-proxy` never compiles them.
+# Cargo requires the sources for the explicit bench and test targets in
+# apis/Cargo.toml when loading the workspace, even with S3 disabled.
 COPY apis/benches ./apis/benches
+COPY apis/tests/s3_file_store.rs ./apis/tests/s3_file_store.rs
 COPY filters/Cargo.toml ./filters/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
 COPY server/build_support/Cargo.toml ./server/build_support/Cargo.toml
