@@ -11,9 +11,12 @@ pub use test_utils::load_example_config;
 mod agentic_routing;
 mod anthropic_full_flow_agentic;
 mod anthropic_full_flow_agentic_chat;
+#[cfg(feature = "anthropic-mcp-connector-filter")]
+mod anthropic_mcp_connector;
 #[cfg(feature = "openai-responses")]
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;
+mod anthropic_messages_to_openai;
 mod anthropic_messages_to_openai_vllm;
 mod anthropic_web_search_scoped_credentials;
 mod anthropic_web_search_tavily_scoped_credentials;
@@ -34,6 +37,8 @@ mod credential_injection;
 mod decisions;
 mod external_metering;
 mod external_metering_file_key;
+#[cfg(feature = "policy-engine")]
+mod external_metering_policy_identity;
 #[cfg(target_os = "linux")]
 mod file_descriptor_limits;
 #[cfg(feature = "openai-agentic-loop")]
@@ -42,6 +47,7 @@ mod file_search_chat_completions;
 mod file_search_dispatch;
 #[cfg(feature = "openai-agentic-loop")]
 mod file_search_streaming;
+mod filter_body_processing_limits;
 #[cfg(feature = "openai-responses")]
 mod format_routing;
 #[cfg(all(
@@ -57,9 +63,11 @@ mod full_flow_agentic;
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod guardrails_service_account;
 mod identity_header_guard;
 #[cfg(feature = "openai-responses")]
 mod inference_fallback;
+mod inference_fallback_provider;
 #[cfg(feature = "inflight-tracker-filter")]
 mod inflight_tracking;
 mod intelligent_route_hardening;
@@ -75,7 +83,10 @@ mod lakera_guard;
 mod llmd_ext_proc;
 mod llmisvc_model_provider_resolver;
 mod mcp_broker;
+#[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
+mod mcp_kuadrant_gateway;
 mod model_to_header;
+mod model_to_header_body_limits;
 mod model_to_header_trust_existing;
 mod model_to_provider;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
@@ -87,7 +98,10 @@ mod openai_client_tool_compat;
 #[cfg(feature = "openai-conversations")]
 #[cfg(feature = "store-sqlite")]
 mod openai_conversations;
-#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
+#[cfg(all(
+    any(feature = "store-postgres", feature = "store-postgres-cert-auth"),
+    feature = "openai-conversations"
+))]
 mod openai_conversations_postgres_mtls;
 #[cfg(feature = "openai-file-resolve-filter")]
 mod openai_doc_extract;
@@ -151,6 +165,9 @@ mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
 mod openai_tool_parse;
+#[cfg(feature = "openai-agentic-loop")]
+#[cfg(feature = "store-sqlite")]
+mod openshell_sandboxed_coding_clients;
 mod project_state_owner_headers;
 mod prompt_enrichment;
 mod provider_route;
@@ -174,11 +191,14 @@ mod time_to_first_token;
 mod token_ceiling;
 mod token_count;
 mod token_counting;
+#[cfg(feature = "token-quota-filter")]
+mod token_quota;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit_sentinel;
 mod token_usage_headers;
+mod token_usage_metrics;
 mod vector_stores_routing;
 #[cfg(feature = "vertex-anthropic-filter")]
 mod vertex_anthropic;

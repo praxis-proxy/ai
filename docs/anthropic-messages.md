@@ -1,9 +1,15 @@
 # Anthropic Messages API
 
-Praxis supports the Anthropic Messages API
-(`/v1/messages`) through five composable filters.
-Operators can route, validate JSON envelopes, and transform
-Anthropic requests to reach any backend.
+Praxis AI can forward Anthropic Messages (`/v1/messages`) to a native
+backend, or translate supported requests to a Chat Completions backend.
+Start with the [complete operator recipes](guides/anthropic.md) for build,
+credentials, startup, requests, and cleanup. This page owns the detailed
+protocol and qualification notes; the [client/provider table](getting-started/choose-client-and-provider.md)
+also covers the optional Vertex Anthropic path.
+
+Translation is a bounded compatibility layer. Review rejected fields, explicit
+lossy opt-ins, and [known gaps](conformance/translation-matrix.md#known-gaps)
+before choosing it over a native backend.
 
 ## Filters
 
@@ -12,7 +18,7 @@ Anthropic requests to reach any backend.
 | `anthropic_messages_request` | Process the create-message body once: validate the envelope and promote routing facts |
 | `anthropic_messages_protocol` | Header management for native `/v1/messages` backends |
 | `anthropic_messages_to_chat_completions` | Bidirectional body transformation to the Chat Completions wire shape |
-| `anthropic_messages_to_chat_completions_stream` | SSE event transformation (per-chunk streaming, conformant with Inference Proxy Conformance Guidelines) |
+| `anthropic_messages_to_chat_completions_stream` | Incremental Chat Completions SSE to Messages events; see compatibility limits below |
 
 ## Passthrough to vLLM
 
@@ -23,7 +29,7 @@ Anthropic endpoint enabled).
 ```yaml
 listeners:
   - name: gateway
-    address: "0.0.0.0:8080"
+    address: "127.0.0.1:8080"
     filter_chains: [anthropic]
 
 filter_chains:
@@ -31,9 +37,6 @@ filter_chains:
     filters:
       - filter: anthropic_messages_request
         on_invalid: continue
-
-      - filter: anthropic_messages_protocol
-        default_version: "2023-06-01"
 
       - filter: router
         routes:
@@ -43,8 +46,18 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: vllm
+            http:
+              application_provider: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+      # After load_balancer so it can refuse the MCP connector for the
+      # selected vLLM cluster (see "MCP connector" below).
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
+
+insecure_options:
+  allow_private_endpoints: true # local development backend
 ```
 
 Test:
@@ -60,6 +73,47 @@ curl http://localhost:8080/v1/messages \
     "messages": [{"role": "user", "content": "Hi"}]
   }'
 ```
+
+### MCP connector
+
+Anthropic's server-side MCP connector (`mcp_servers` plus `mcp_toolset`
+tools, beta `mcp-client-2025-11-20`) is executed by Anthropic, not by the
+model server, so vLLM cannot honor it. When the selected cluster declares
+`application_provider` with any value other than `anthropic`,
+`anthropic_messages_protocol` refuses such a request with a 400
+`invalid_request_error` instead of forwarding it. The filter must run after
+`load_balancer` to see the selected cluster. A cluster tagged
+`application_provider: anthropic`, or an untagged cluster, forwards the
+connector unchanged. The Chat Completions translation always refuses it.
+
+To serve the connector on these backends, add the experimental
+[`anthropic_mcp_connector`](filters/agents/anthropic_mcp_connector.md) filter
+(cargo feature `anthropic-mcp-connector-filter`) first in the inference step
+of an `iterative_request_router`. Praxis then runs the connector itself:
+
+- On the first round it lists each declared server's tools, keeps the ones
+  the `mcp_toolset` enables (`default_config` and per-tool `configs`), and
+  sends them to the model as plain tools named `{server}__{tool}`. It drops
+  `mcp_servers` and the `mcp-client-*` beta token, so the refusal above no
+  longer applies.
+- When the model calls one of those tools, Praxis runs it over MCP and
+  re-enters inference. The final response carries Anthropic's
+  `mcp_tool_use` and `mcp_tool_result` blocks for every call, followed by the
+  model's answer. Usage is summed over all rounds.
+- `mcp_tool_use` / `mcp_tool_result` history replayed in a later turn is
+  converted into ordinary `tool_use` / `tool_result` turns for the backend.
+- A client server runs only when its `url` matches an operator connector's
+  `server_url`; any other URL is rejected with a 400 unless the operator sets
+  `allow_client_servers: true`.
+- Both the native Messages route and the Chat Completions translation are
+  supported. Streaming (`stream: true`) requests that use the connector, a
+  toolset's `defer_loading: true`, and pinned tool lists are rejected with a
+  400 for now.
+
+See [`examples/configs/anthropic/mcp-connector.yaml`](../examples/configs/anthropic/mcp-connector.yaml).
+
+Claude Code is unaffected: it runs MCP servers itself and sends their tools
+as ordinary client tools, which every route serves.
 
 ### Committed example with credential isolation
 
@@ -101,24 +155,33 @@ and the response, so vLLM only ever sees OpenAI Chat Completions.
 
 Chat Completions cannot represent the Anthropic-only features an unmodified
 Claude Code client always sends — prompt caching (`cache_control` markers) and
-extended thinking (`thinking`). The example enables **operator-approved
-degradation** on the translation filter so those requests succeed instead of
-failing closed with a 400:
+extended thinking (`thinking`) — and backends whose chat templates reject a
+mid-conversation `system` message (some vLLM-hosted models) additionally
+refuse the one Claude Code sends after its first user turn. The example enables
+**operator-approved degradation** on the translation filter so those requests
+succeed instead of failing closed with a 400:
 
 ```yaml
 - filter: anthropic_messages_to_chat_completions
   allow_lossy_features:
     - prompt_caching
     - extended_thinking
+    - mid_conversation_system
 ```
 
-Each listed feature's wire markers are validated and then stripped, and the
+Each listed feature is validated and then degraded as described below, and the
 degradation is reported to the operator — one `WARN` log per request, a
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
 feature, and an `x-degraded-features` response header. `prompt_caching`
 preserves all prompt and tool content but does not honor explicit cache
 breakpoints, so cost and latency may differ; `extended_thinking` means the
-translated response carries no thinking blocks. Remove an entry to make that
+translated response carries no thinking blocks; `mid_conversation_system`
+folds each eligible text-only `system` message with exactly `role` and
+`content` fields that appears after the first non-system turn into
+the single leading system message (real OpenAI accepts mid-array `system`
+messages; whether a vLLM-hosted backend accepts one depends on the model's
+chat template — some answer "System message must be at the beginning", others
+render it in place). Remove an entry to make that
 feature fail closed again. Malformed markers, other `context_management` edits,
 and every feature not listed are still rejected with a 400. Leaving the
 allowlist empty (the default of [`messages-to-openai.yaml`](../examples/configs/anthropic/messages-to-openai.yaml))
@@ -261,15 +324,157 @@ Anthropic Messages conformance gate: other content blocks, request fields,
 server tools, caching, and model-dependent behaviors require separate contract
 and live-backend coverage before a broader support claim.
 
+The GPU acceptance SDK is pinned to `anthropic==1.9.0` deliberately: that
+client release and its `2023-06-01` API-version header are the qualified
+baseline, and upgrading it is a separate, explicitly validated change rather
+than something a floating dependency may drift into.
+
+### Anthropic SDK v1/v2 compatibility lanes (issue #1825)
+
+Anthropic Python SDK v2 changes the defaults the client puts on the wire:
+
+| | SDK v1 (through 1.17.0) | SDK v2 |
+|---|---|---|
+| `anthropic-version` | `2023-06-01` | `2026-10-21` |
+| credential header | `x-api-key: <key>` | `authorization: Bearer <key>` |
+
+[`tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py`](../tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py)
+exercises both pinned lanes against local recording backends across the two
+routes where the Anthropic SDK is the client — native `/v1/messages`
+passthrough and the Messages -> Chat Completions translation — asserting each
+lane's wire headers, JSON and streaming message round-trips, tool use, and
+the route-owned `2026-10-21` acceptance constraints (sampling parameter
+mapping, empty versus active citations, `document` and `thinking` block
+rejection). It needs no Anthropic credentials and makes no external calls.
+On the translated route, the `anthropic_messages_to_chat_completions`
+filter strips the caller's Anthropic wire credentials — `x-api-key` (SDK v1)
+and `authorization: Bearer` (SDK v2) — along with `anthropic-version`, so
+neither reaches a Chat Completions backend in either lane.
+
+The OpenAI -> Anthropic Messages direction is driven by the OpenAI SDK as the
+client, so it does not vary on the Anthropic SDK axis; its backend wire
+headers (operator-selected `anthropic-version` via `api_version`,
+defaulting to `2023-06-01`, injected `x-api-key`,
+stripped caller `authorization`) are asserted in
+[`tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py`](../tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py).
+
+Run both lanes locally with `make test-anthropic-sdk`, or one lane at a time:
+
+```console
+cargo build -p praxis-ai-proxy
+uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=1.x
+uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=2.x
+```
+
+CI runs both lanes as sequential steps in the `anthropic-sdk` job of
+[`integration.yaml`](../.github/workflows/integration.yaml).
+
+## API version compatibility
+
+Anthropic Messages API version `2026-10-21` rejects requests that
+`2023-06-01` accepts:
+
+- `temperature`, `top_p`, and `top_k`, even when they carry default values
+- `document` content blocks in assistant messages
+- non-empty `citations` on user `text` blocks
+
+Anthropic SDK v2 selects `2026-10-21` by default, so upgrading a client SDK
+can change which version reaches the backend. Praxis does not reject these
+fields based on version. Each route either forwards the version chosen by the
+caller or the operator and lets the backend validate it, or ends the Anthropic
+contract entirely.
+
+| Route | `anthropic-version` sent to the backend | Caller credential | Sampling fields | Assistant `document`, user text citations |
+|---|---|---|---|---|
+| Native passthrough (`anthropic_messages_protocol`) | The caller's version; `default_version` only when the caller sends none | Forwarded unless the chain removes it | Forwarded; a `2026-10-21` backend rejects them | Forwarded; a `2026-10-21` backend rejects them |
+| Messages to Chat Completions (`anthropic_messages_to_chat_completions`) | None; the header is removed | `x-api-key` and `authorization` removed | `temperature` and `top_p` mapped, `top_k` forwarded, under either version | Rejected with a 400 under either version: Chat Completions cannot represent them |
+| Chat Completions to Messages (`openai_chat_completions_to_anthropic`) | The operator's `api_version` (default `2023-06-01`); caller headers ignored | `authorization` and `x-api-key` removed; `credential_inject` adds the provider key | `temperature` and `top_p` forwarded; a `2026-10-21` backend rejects them; `top_k` rejected by the bridge | Never produced: the translator emits only text, image, and tool blocks |
+
+Native passthrough preserves a caller-supplied `anthropic-version` and the
+request body. `anthropic_messages_protocol.default_version` fills in a
+missing version; it does not override the caller or enforce version-specific
+body restrictions. An SDK v1 client therefore reaches the backend with
+`2023-06-01` and an SDK v2 client with `2026-10-21`, even when the chain sets
+`default_version: "2023-06-01"`. A backend that accepts the newer version
+returns its own error for unsupported fields; how a backend treats a version
+it does not recognize is up to that backend.
+
+For Chat Completions clients translated to Anthropic Messages, the operator
+selects `openai_chat_completions_to_anthropic.api_version`. Its default is
+`2023-06-01`. Under either supported version, supported sampling values reach
+the backend unchanged; the backend owns version-specific validation and any
+rejection is returned through the existing error translation. The translator
+setting wins over a co-configured native protocol default in either
+filter order. It applies to the whole translator configuration, not individual
+routing-overlay providers. Compatible Messages-to-Chat Completions and native vLLM
+routes retain their sampling support. See the
+[version and sampling contract](developing/openai-anthropic-compatibility.md#api-version-and-sampling).
+
+### SDK credentials and gateway authentication
+
+SDK v1 sends the API key as `x-api-key`; SDK v2 sends it as
+`authorization: Bearer` (see the
+[compatibility lanes](#anthropic-sdk-v1v2-compatibility-lanes-issue-1825)).
+A chain that removes only `x-api-key` stops the SDK v1 key, but not the
+SDK v2 key. Pick the case that matches your deployment:
+
+- **The caller's key is meant for the upstream.** A pure passthrough
+  forwards either header unchanged. This is correct when every client brings
+  its own Anthropic key.
+- **The gateway owns the upstream credential.** Remove both `x-api-key` and
+  `authorization` with a `headers` `request_remove`, then add the upstream
+  key with `credential_injection`. Pending removals run before injected
+  values, so the filter order doesn't matter. See
+  [Passthrough to Anthropic API](#passthrough-to-anthropic-api).
+- **The gateway authenticates the caller.** The committed vLLM examples run
+  `basic_auth` with `strip_authorization: true`. It accepts only `Basic`, so
+  an SDK v2 Bearer key is rejected with a 401 before routing and never
+  reaches the backend. To use SDK v2 with these gateways, send the gateway
+  credential as the `Authorization` header. SDK v2 then sends it in place of
+  its Bearer key rather than alongside it:
+
+  ```python
+  import base64
+  import os
+
+  from anthropic import Anthropic
+
+  token = base64.b64encode(f"gateway:{os.environ['GATEWAY_AUTH_PASSWORD']}".encode()).decode()
+  client = Anthropic(
+      base_url="http://127.0.0.1:8080",
+      api_key="unused-by-gateway",
+      default_headers={"Authorization": f"Basic {token}"},
+  )
+  ```
+
+  SDK v1 sends that header next to `x-api-key`. The examples' `headers`
+  filter removes `x-api-key`. Claude Code supplies the same header through
+  `ANTHROPIC_CUSTOM_HEADERS`.
+
+The Messages to Chat Completions translator removes both Anthropic
+credential forms on its own: a Chat Completions backend can't tell an
+Anthropic key from its own token.
+
 ## Passthrough to Anthropic API
 
 Route to `api.anthropic.com` with credential
 injection for the `x-api-key` header.
 
+A pure passthrough forwards whichever credential header the caller sent, so an
+SDK v2 client's `Authorization: Bearer` key reaches Anthropic unchanged. That is
+intended when the caller supplies its own key. When the gateway owns the
+upstream credential instead, add `authorization` to a `headers` `request_remove`
+in the same chain. `credential_injection` is configured for `x-api-key`, not
+`authorization`, so a client Bearer would otherwise reach Anthropic too, and the
+request may then authenticate as the caller rather than as the gateway. The
+relative order of header removal and injection does not matter: pending removals
+are applied before injected values in `apply_pending_header_mutations`. The
+`router` must still precede `credential_injection` so a cluster is selected.
+
 ```yaml
 listeners:
   - name: gateway
-    address: "0.0.0.0:8080"
+    address: "127.0.0.1:8080"
     filter_chains: [anthropic]
 
 filter_chains:
@@ -285,6 +490,8 @@ filter_chains:
         request_set:
           - name: Host
             value: "api.anthropic.com"
+        request_remove:
+          - authorization
 
       - filter: router
         routes:
@@ -330,7 +537,7 @@ without Anthropic support).
 ```yaml
 listeners:
   - name: gateway
-    address: "0.0.0.0:8080"
+    address: "127.0.0.1:8080"
     filter_chains: [transform]
 
 filter_chains:
@@ -366,9 +573,17 @@ filter_chains:
           - name: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # local development backend
 ```
 
 The `anthropic_messages_to_chat_completions` filter:
+- Removes both client credential forms (the legacy `x-api-key` header and the
+  `Authorization: Bearer` header SDK v2 sends) because a Chat Completions
+  backend cannot tell an Anthropic key from its own. Pending header removals
+  are applied before injected values, so a `credential_injection` in the same
+  chain still installs the backend's own token
 - Hoists `system` to an OpenAI system message
 - Translates text, user image, assistant `tool_use`,
   and text-only user `tool_result` blocks; rejects
@@ -391,6 +606,10 @@ The `anthropic_messages_to_chat_completions` filter:
   `output_config.format` (or the deprecated
   `output_format`) to a strict `response_format`; any
   other `output_config` key is rejected with a 400
+- Rejects the MCP connector (`mcp_servers` or any
+  `mcp_toolset` tool) with a 400 that names it, unless
+  `anthropic_mcp_connector` resolved it earlier in the
+  step (see [MCP connector](#mcp-connector))
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully; the
@@ -413,6 +632,13 @@ The `anthropic_messages_to_chat_completions` filter:
   unless `prompt_caching` is in `allow_lossy_features`,
   which strips `cache_control` markers (preserving the
   prompt and tool content) and reports the degradation
+- Preserves a text-only `system` message inside the
+  `messages` array in its original position, unless
+  `mid_conversation_system` is in `allow_lossy_features`,
+  which folds every `system` message that follows the
+  first non-system turn into the single leading system
+  message (in encounter order) and reports the
+  degradation; leading `system` messages join the merged prompt in encounter order when a later message moves
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and
@@ -486,7 +712,12 @@ explicitly.
 ### `anthropic_messages_protocol`
 
 Injects `anthropic-version` header if absent.
-No body transformation.
+A caller-supplied version, including the SDK v2 default `2026-10-21`, is
+forwarded unchanged. No body transformation, version-specific validation,
+or credential handling. See [API version compatibility](#api-version-compatibility).
+Placed after `load_balancer`, it also refuses the
+[MCP connector](#mcp-connector) for a cluster whose `application_provider`
+is not `anthropic`, unless `anthropic_mcp_connector` resolved it first.
 
 ```yaml
 filter: anthropic_messages_protocol

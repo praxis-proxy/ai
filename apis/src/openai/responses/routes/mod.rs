@@ -90,7 +90,11 @@ macro_rules! request_binding {
 }
 
 /// Convert a registry contract declaration into optional owned metadata.
-#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-files",
+    feature = "openai-responses-openapi"
+))]
 macro_rules! operation_contract {
     (none {}) => {
         None
@@ -109,6 +113,7 @@ macro_rules! operation_contract {
                 request: request_binding!($request),
                 responses: &[ResponseSpec {
                     status: "200",
+                    headers: &[],
                     description: "OK",
                     content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
                 }],
@@ -174,7 +179,7 @@ macro_rules! responses_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
-                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-files", feature = "openai-responses-openapi"))]
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
@@ -319,6 +324,14 @@ pub(crate) fn operation_for_id(operation_id: &str) -> Option<ResponsesOperation>
         .iter()
         .find(|spec| spec.operation_id() == operation_id)
         .map(|spec| spec.operation)
+}
+
+/// Whether a matched operation head is the Responses create call.
+///
+/// Consumers that act on inference-bearing Responses traffic use this registry
+/// predicate instead of duplicating the protocol and operation ID strings.
+pub(crate) fn is_create_response(protocol: ApplicationProtocol, operation_id: &str) -> bool {
+    protocol == APPLICATION_PROTOCOL && operation_for_id(operation_id) == Some(ResponsesOperation::CreateResponse)
 }
 
 #[cfg(test)]

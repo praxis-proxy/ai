@@ -4,13 +4,17 @@
 //! Token usage extraction and exposure filters.
 //!
 //! This module owns the complete in-process token usage flow: parsing
-//! provider responses, storing normalized counts in filter metadata, and
-//! optionally exposing those counts as downstream response headers.
+//! provider responses, storing normalized counts in filter metadata,
+//! optionally exposing those counts as downstream response headers, and
+//! optionally emitting per-tenant Prometheus counters.
 
 #[cfg(feature = "token-ceiling-filter")]
 mod ceiling;
 mod count;
 mod headers;
+mod metrics;
+#[cfg(any(feature = "token-quota-filter", feature = "token-rate-limit-filter"))]
+pub(crate) mod normalized;
 mod providers;
 mod stream_usage;
 mod streaming;
@@ -19,6 +23,8 @@ mod streaming;
 pub use ceiling::TokenCeilingFilter;
 pub use count::TokenCountFilter;
 pub use headers::TokenUsageHeadersFilter;
+pub use metrics::TokenUsageMetricsFilter;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::HttpFilterContext;
 pub use stream_usage::StreamUsageInjectFilter;
 
@@ -191,15 +197,15 @@ struct StreamingTokens {
 fn set_token_usage(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64, total: Option<u64>) {
     let total = total.unwrap_or_else(|| input.saturating_add(output));
 
-    ctx.set_metadata(META_TOKEN_INPUT, input.to_string());
-    ctx.set_metadata(META_TOKEN_OUTPUT, output.to_string());
-    ctx.set_metadata(META_TOKEN_TOTAL, total.to_string());
+    ctx.record_ai_metadata(META_TOKEN_INPUT, input.to_string());
+    ctx.record_ai_metadata(META_TOKEN_OUTPUT, output.to_string());
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, total.to_string());
 }
 
 /// Marks token usage as unavailable due to exceeding the capture limit,
 /// distinguishable from a genuine zero-usage response.
 fn set_token_status_overflow(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW.to_owned());
+    ctx.record_ai_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW.to_owned());
 }
 
 /// Stores the prompt cache breakdown of the input tokens.
@@ -226,6 +232,6 @@ fn set_reasoning_token_usage(ctx: &mut HttpFilterContext<'_>, reasoning: Option<
 /// Writes one optional count; skips the key when the provider omitted it.
 fn set_optional_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
     if let Some(value) = value {
-        ctx.set_metadata(key, value.to_string());
+        ctx.record_ai_metadata(key, value.to_string());
     }
 }

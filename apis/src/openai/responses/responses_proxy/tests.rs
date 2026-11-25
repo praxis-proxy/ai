@@ -12,8 +12,11 @@ use praxis_filter::{
 };
 use serde_json::json;
 
-use super::super::state::{RequestReasoningPresence, ResponsesState};
-use crate::test_utils::{make_filter_context, make_request};
+use super::super::state::ResponsesState;
+use crate::{
+    RecordAiMetadata as _,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -54,7 +57,7 @@ fn body_rewrite_runs_after_upstream_selection() {
     assert_eq!(filter.request_body_access(), BodyAccess::None);
     assert_eq!(
         filter.selected_upstream_request_body_access(),
-        BodyAccess::ReadWrite,
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "openai_responses_proxy must rewrite only after upstream selection"
     );
 }
@@ -108,7 +111,7 @@ async fn selects_streaming_from_effective_passthrough_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "false");
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
@@ -163,7 +166,7 @@ async fn uses_rebuilt_state_body_not_client_intent_metadata() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -197,7 +200,7 @@ async fn selects_streaming_for_rebuilt_effective_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "false");
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -388,23 +391,21 @@ async fn selected_rebuild_projects_state_owned_tools_and_tool_choice() {
 }
 
 #[tokio::test]
-async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_settings() {
-    for (live_reasoning, expected) in [
-        (None, json!({"effort": "high"})),
-        (
-            Some(json!({"summary": "auto"})),
-            json!({"summary": "auto", "effort": "high"}),
-        ),
-        (
-            Some(json!({"effort": "low", "summary": "detailed"})),
-            json!({"effort": "low", "summary": "detailed"}),
-        ),
-        (Some(json!({"effort": null})), json!({"effort": null})),
-        (Some(json!(null)), json!(null)),
+async fn selected_rebuild_preserves_live_reasoning_without_injecting_state_defaults() {
+    for live_reasoning in [
+        None,
+        Some(json!({"summary": "auto"})),
+        Some(json!({"effort": "low", "summary": "detailed"})),
+        Some(json!({"effort": null})),
+        Some(json!(null)),
     ] {
         let filter = make_filter();
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
+        // State still carries the stored default the rehydrate filter already
+        // published into the live body; the rebuild must not re-apply it over
+        // whatever the live body now carries. The stored default reaches a
+        // request through rehydration, never through the rebuild.
         let mut state = ResponsesState::from_request_body(json!({
             "model": "before-filter",
             "input": "original",
@@ -412,9 +413,6 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
             "reasoning": {"effort": "high", "summary": "old"}
         }));
         state.history_rehydrated = true;
-        // The request itself specified no reasoning; state carries the merged
-        // stored default, so an omitted live effort still inherits it.
-        state.request_reasoning = RequestReasoningPresence::Absent;
         ctx.extensions.insert(state);
         let mut live = json!({
             "model": "after-filter",
@@ -422,8 +420,8 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
             "conversation": "conv_configuration",
             "metadata": {"changed": true}
         });
-        if let Some(reasoning) = live_reasoning {
-            live["reasoning"] = reasoning;
+        if let Some(reasoning) = &live_reasoning {
+            live["reasoning"] = reasoning.clone();
         }
         let mut body = Some(Bytes::from(serde_json::to_vec(&live).unwrap()));
         let action = filter
@@ -432,10 +430,16 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
             .unwrap();
         assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
         let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            rebuilt["reasoning"], expected,
-            "live effort wins; only omitted effort inherits"
-        );
+        match live_reasoning {
+            None => assert!(
+                rebuilt.get("reasoning").is_none(),
+                "absent live reasoning must stay absent; the stored default is published by rehydration, not the rebuild"
+            ),
+            Some(reasoning) => assert_eq!(
+                rebuilt["reasoning"], reasoning,
+                "live reasoning must survive byte-for-byte, including explicit nulls"
+            ),
+        }
         assert_eq!(rebuilt["model"], "after-filter", "later model edits must survive");
         assert_eq!(
             rebuilt["input"][0]["content"], "edited",
@@ -454,38 +458,33 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
 
 #[tokio::test]
 async fn selected_rebuild_preserves_later_reasoning_member_removal() {
-    for request_reasoning in [
-        RequestReasoningPresence::OmittedEffort,
-        RequestReasoningPresence::ExplicitEffort,
-    ] {
-        let filter = make_filter();
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
-        let mut state = ResponsesState::from_request_body(json!({
-            "model": "gpt-4.1",
-            "input": "hello",
-            "conversation": "conv_configuration",
-            "reasoning": {"effort": "high"}
-        }));
-        state.history_rehydrated = true;
-        state.request_reasoning = request_reasoning;
-        ctx.extensions.insert(state);
-        // A later filter removed the reasoning member the request carried.
-        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
-        let action = filter
-            .on_selected_upstream_request_body(&mut ctx, &mut body)
-            .await
-            .unwrap();
-        assert!(
-            matches!(action, SelectedUpstreamBodyOutcome::Continue),
-            "removing the reasoning member must not reject the request"
-        );
-        let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert!(
-            rebuilt.get("reasoning").is_none(),
-            "a later filter's removal of the reasoning member must stand: {request_reasoning:?}"
-        );
-    }
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "conversation": "conv_configuration",
+        "reasoning": {"effort": "high"}
+    }));
+    state.history_rehydrated = true;
+    ctx.extensions.insert(state);
+    // A later filter removed the reasoning member the request carried (the
+    // rehydrate filter had already published the stored default into it).
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "removing the reasoning member must not reject the request"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.get("reasoning").is_none(),
+        "a later filter's removal of the reasoning member must stand"
+    );
 }
 
 #[tokio::test]
@@ -502,7 +501,6 @@ async fn selected_rebuild_preserves_later_reasoning_effort_removal() {
         "reasoning": {"effort": "low", "summary": "detailed"}
     }));
     state.history_rehydrated = true;
-    state.request_reasoning = RequestReasoningPresence::ExplicitEffort;
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","reasoning":{"summary":"detailed"}}"#,
@@ -1535,4 +1533,155 @@ fn make_native_responses_pipeline() -> FilterPipeline {
     );
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(yaml).unwrap();
     FilterPipeline::build(&mut entries, &registry).unwrap()
+}
+
+#[test]
+fn selected_body_caps_complete_raw_splice_and_preserves_exact_bytes() {
+    let body = Bytes::from_static(br#"{"opaque" : { "z":1, "a":2 }, "input": []}"#);
+    let state = ResponsesState::from_request_body(json!({"input": []}));
+    let filter = super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    };
+    let expected = br#"{"opaque" : { "z":1, "a":2 },"input": []}"#;
+    let output = filter
+        .serialize_selected_body(&body, &state, true, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(output, expected);
+    let config = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {}", expected.len())).unwrap();
+    let exact = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_value(config).unwrap()).unwrap(),
+    };
+    assert_eq!(
+        exact
+            .serialize_selected_body(&body, &state, true, None)
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    let config = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {}", expected.len() - 1)).unwrap();
+    let below = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_value(config).unwrap()).unwrap(),
+    };
+    assert!(
+        matches!(below.serialize_selected_body(&body, &state, true, None).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+    );
+    assert!(
+        matches!(exact.serialize_selected_body(&body, &state, true, Some(expected.len() - 1)).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+    );
+}
+
+#[test]
+fn oversized_selected_raw_splice_does_not_allocate_output() {
+    let body = Bytes::from(format!(r#"{{"opaque":"{}","input":[]}}"#, "x".repeat(1_048_576)));
+    let state = ResponsesState::from_request_body(json!({"input": []}));
+    let config = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
+    let filter = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_value(config).unwrap()).unwrap(),
+    };
+    let allocations = allocation_counter::measure(|| {
+        assert!(
+            matches!(filter.serialize_selected_body(&body, &state, true, None).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+        );
+    });
+    assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+}
+
+#[test]
+fn oversized_selected_input_replacement_does_not_allocate_output() {
+    let body = Bytes::from_static(br#"{"input":[]}"#);
+    let mut state = ResponsesState::from_request_body(json!({"input": []}));
+    state
+        .messages
+        .push(json!({"role":"user", "content":"\u{0000}".repeat(1_048_576)}));
+    let filter = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap()).unwrap(),
+    };
+    let allocations = allocation_counter::measure(|| {
+        assert!(
+            matches!(filter.serialize_selected_body(&body, &state, true, None).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+        );
+    });
+    assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+}
+
+/// Records which sink methods a selected-body splice calls.
+#[derive(Default)]
+struct RecordingSink {
+    /// Number of input replacements emitted.
+    inputs: usize,
+    /// Number of generic JSON replacements serialized.
+    json: usize,
+}
+
+impl super::SelectedBodySink for RecordingSink {
+    fn raw(&mut self, _bytes: &[u8]) -> Result<(), praxis_filter::FilterError> {
+        Ok(())
+    }
+
+    fn json<T: serde::Serialize + ?Sized>(&mut self, _value: &T) -> Result<(), praxis_filter::FilterError> {
+        self.json += 1;
+        Ok(())
+    }
+
+    fn input(&mut self, _input: &super::SelectedMessages<'_>) -> Result<(), praxis_filter::FilterError> {
+        self.inputs += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn repeated_input_members_reuse_one_input_measurement() {
+    let body = Bytes::from_static(br#"{"input":[],"model":"m","input":[]}"#);
+    let mut state = ResponsesState::from_request_body(json!({"input": []}));
+    state
+        .messages
+        .push(json!({"role":"user", "content":"é 東京 🦀\n\t\"\\".repeat(4_096)}));
+    let members = super::scan_top_level_object(&body).unwrap();
+    let messages = super::selected_input::reconcile(&body, &members, &state, true).unwrap();
+    let input = super::SelectedMessages {
+        messages: &messages,
+        preserve_native_compaction: true,
+        provider_compaction_ids: &state.provider_compaction_ids,
+    };
+    let splice = super::SelectedBodySplice {
+        body: &body,
+        members: &members,
+        state: &state,
+        input: &input,
+        stream: None,
+    };
+    let mut sink = RecordingSink::default();
+    splice.write_to(&mut sink).unwrap();
+    assert_eq!(
+        (sink.inputs, sink.json),
+        (2, 0),
+        "input must route through the cached length"
+    );
+
+    let filter = super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    };
+    let output = filter
+        .serialize_selected_body(&body, &state, true, None)
+        .unwrap()
+        .unwrap();
+    let replacement = serde_json::to_vec(&input).unwrap();
+    assert_eq!(
+        output.len(),
+        2 * replacement.len() + br#"{"input":,"model":"m","input":}"#.len()
+    );
+
+    let limit = output.len() - 1;
+    let below = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_str(&format!("max_rewritten_body_bytes: {limit}")).unwrap())
+            .unwrap(),
+    };
+    let Err(FilterAction::Reject(rejection)) = below.serialize_selected_body(&body, &state, true, None).unwrap() else {
+        panic!("duplicate input members over the limit must be rejected");
+    };
+    assert_eq!(rejection.status, 413);
+    let message = String::from_utf8(rejection.body.unwrap().to_vec()).unwrap();
+    assert!(message.contains(&output.len().to_string()), "{message}");
+    assert!(message.contains(&limit.to_string()), "{message}");
 }

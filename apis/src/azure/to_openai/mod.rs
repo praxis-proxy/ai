@@ -31,18 +31,38 @@ use crate::{
     openai::sse::{SseFrame, SseFrameParser},
 };
 
-/// Metadata key selecting response transformation mode.
-const RESPONSE_TRANSFORM_KEY: &str = "azureai_translation.response_transform";
-/// Response transform marker for a successful response.
-const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
-/// Response transform marker for an upstream error.
-const RESPONSE_TRANSFORM_ERROR: &str = "error";
-/// Response transform marker for SSE streaming.
-const RESPONSE_TRANSFORM_SSE: &str = "sse";
-/// Metadata key preserving the upstream error status for the body phase.
-const RESPONSE_STATUS_KEY: &str = "azureai_translation.response_status";
 /// OpenAI Chat Completions SSE sentinel that marks logical stream completion.
 const DONE_SENTINEL: &[u8] = b"[DONE]";
+
+/// How this filter translates one response body, chosen from the response
+/// headers and kept in `filter_state` until the body ends.
+enum ResponseTranslation {
+    /// A JSON success body, stripped of Azure content-filter fields.
+    Success,
+    /// An Azure error body, normalized under the upstream status.
+    Error(http::StatusCode),
+    /// An SSE stream, re-framed and stripped frame by frame.
+    Sse(SseFrameParser),
+}
+
+impl ResponseTranslation {
+    /// Select the translation while response headers are available.
+    fn for_response(ctx: &HttpFilterContext<'_>, max_body_bytes: usize) -> Self {
+        let status = ctx.response_header.as_ref().map(|r| r.status);
+        let is_sse = ctx
+            .response_header
+            .as_ref()
+            .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(crate::is_event_stream_content_type);
+
+        match status {
+            Some(status) if status.is_client_error() || status.is_server_error() => Self::Error(status),
+            _ if is_sse => Self::Sse(SseFrameParser::new(max_body_bytes)),
+            _ => Self::Success,
+        }
+    }
+}
 
 /// Transforms requests targeting Azure OpenAI deployments into standard
 /// Chat Completions-compatible form and normalizes responses back.
@@ -96,7 +116,7 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -106,7 +126,7 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -152,25 +172,17 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let transform = response_transform(ctx);
+        let translation = ResponseTranslation::for_response(ctx, self.config.max_body_bytes);
 
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
-        if transform == RESPONSE_TRANSFORM_ERROR {
-            let status = ctx
-                .response_header
-                .as_ref()
-                .map_or(500, |response| response.status.as_u16());
-            ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
+        if matches!(translation, ResponseTranslation::Error(_)) {
             normalize_event_stream_error_content_type(ctx);
         }
-
-        if transform == RESPONSE_TRANSFORM_SSE {
-            ctx.insert_filter_state(SseFrameParser::new(self.config.max_body_bytes));
-        } else {
+        if !matches!(translation, ResponseTranslation::Sse(_)) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(self.config.max_body_bytes),
             });
         }
+        ctx.insert_filter_state(translation);
         remove_stale_content_length(ctx);
 
         Ok(FilterAction::Continue)
@@ -182,14 +194,26 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_SSE) => strip_sse_chunk(ctx, body, end_of_stream)?,
-            Some(RESPONSE_TRANSFORM_ERROR) if end_of_stream => transform_error_body(ctx, body),
-            Some(RESPONSE_TRANSFORM_SUCCESS) if end_of_stream => {
-                transform_success_body(body);
+        let Some(translation) = ctx.get_filter_state_mut::<ResponseTranslation>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let translated = match translation {
+            ResponseTranslation::Sse(parser) => strip_sse_chunk(parser, body, end_of_stream),
+            ResponseTranslation::Error(status) if end_of_stream => {
+                transform_error_body(*status, body);
+                Ok(())
             },
-            _ => {},
+            ResponseTranslation::Success if end_of_stream => {
+                transform_success_body(body);
+                Ok(())
+            },
+            ResponseTranslation::Error(_) | ResponseTranslation::Success => Ok(()),
+        };
+        // A failed stream is not resumed; its later chunks pass through.
+        if end_of_stream || translated.is_err() {
+            ctx.remove_filter_state::<ResponseTranslation>();
         }
+        translated?;
         Ok(FilterAction::Continue)
     }
 }
@@ -265,43 +289,17 @@ fn normalize_event_stream_error_content_type(ctx: &mut HttpFilterContext<'_>) {
     }
 }
 
-/// Select the response transformation mode while headers are available.
-fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
-    let status = ctx.response_header.as_ref().map(|r| r.status);
-    let is_error = status.is_some_and(|s| s.is_client_error() || s.is_server_error());
-    let is_sse = ctx
-        .response_header
-        .as_ref()
-        .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(crate::is_event_stream_content_type);
-
-    if is_error {
-        RESPONSE_TRANSFORM_ERROR
-    } else if is_sse {
-        RESPONSE_TRANSFORM_SSE
-    } else {
-        RESPONSE_TRANSFORM_SUCCESS
-    }
-}
-
 /// Normalize an Azure error response body (fill `type: null`, strip `innererror`).
-fn transform_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
-    if let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) {
-        let status = ctx
-            .get_metadata(RESPONSE_STATUS_KEY)
-            .and_then(|value| value.parse::<u16>().ok())
-            .and_then(|value| http::StatusCode::from_u16(value).ok())
-            .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-
-        if let Some(normalized) = wire::normalize_error_response(bytes, status) {
-            debug!(
-                original_len = bytes.len(),
-                normalized_len = normalized.len(),
-                "normalized Azure error response type field"
-            );
-            *body = Some(Bytes::from(normalized));
-        }
+fn transform_error_body(status: http::StatusCode, body: &mut Option<Bytes>) {
+    if let Some(bytes) = body.as_ref().filter(|b| !b.is_empty())
+        && let Some(normalized) = wire::normalize_error_response(bytes, status)
+    {
+        debug!(
+            original_len = bytes.len(),
+            normalized_len = normalized.len(),
+            "normalized Azure error response type field"
+        );
+        *body = Some(Bytes::from(normalized));
     }
 }
 
@@ -326,14 +324,10 @@ fn transform_success_body(body: &mut Option<Bytes>) {
 /// Process an SSE chunk: parse frames via [`SseFrameParser`], strip
 /// Azure-specific fields from each frame's data, and re-emit as SSE.
 fn strip_sse_chunk(
-    ctx: &mut HttpFilterContext<'_>,
+    parser: &mut SseFrameParser,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
 ) -> Result<(), FilterError> {
-    let Some(mut parser) = ctx.remove_filter_state::<SseFrameParser>() else {
-        return Ok(());
-    };
-
     let frames = match body.as_ref() {
         Some(bytes) => match parser.parse_chunk(bytes) {
             Ok(frames) => frames,
@@ -345,15 +339,11 @@ fn strip_sse_chunk(
         None => Vec::new(),
     };
 
-    if end_of_stream {
-        if parser.has_incomplete_frame() {
-            debug!("incomplete SSE frame at end of stream in azureai_translation");
-            return Err(FilterError::from(
-                "azureai_translation: incomplete SSE frame at end of stream",
-            ));
-        }
-    } else {
-        ctx.insert_filter_state(parser);
+    if end_of_stream && parser.has_incomplete_frame() {
+        debug!("incomplete SSE frame at end of stream in azureai_translation");
+        return Err(FilterError::from(
+            "azureai_translation: incomplete SSE frame at end of stream",
+        ));
     }
 
     if body.is_some() || end_of_stream {
@@ -612,7 +602,10 @@ mod tests {
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_SUCCESS);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx, 64),
+            ResponseTranslation::Success
+        ));
     }
 
     #[test]
@@ -623,7 +616,10 @@ mod tests {
         response.status = StatusCode::BAD_REQUEST;
         ctx.response_header = Some(&mut response);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_ERROR);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx, 64),
+            ResponseTranslation::Error(StatusCode::BAD_REQUEST)
+        ));
     }
 
     #[test]
@@ -637,7 +633,10 @@ mod tests {
         );
         ctx.response_header = Some(&mut response);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_SSE);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx, 64),
+            ResponseTranslation::Sse(_)
+        ));
     }
 
     #[test]
@@ -652,7 +651,10 @@ mod tests {
         );
         ctx.response_header = Some(&mut response);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_ERROR);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx, 64),
+            ResponseTranslation::Error(StatusCode::BAD_REQUEST)
+        ));
     }
 
     #[tokio::test]
@@ -661,7 +663,8 @@ mod tests {
         let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SUCCESS);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(ResponseTranslation::Success);
 
         let azure_response = serde_json::json!({
             "id": "chatcmpl-abc",
@@ -836,15 +839,12 @@ mod tests {
 
     #[test]
     fn strip_sse_chunk_processes_multi_event_chunk() {
-        let request = make_request(Method::POST, "/chat/completions");
-        let mut ctx = make_filter_context(&request);
-        ctx.current_filter_id = Some(0);
-        ctx.insert_filter_state(SseFrameParser::new(65_536));
+        let mut parser = SseFrameParser::new(65_536);
 
         let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"A\"},\"content_filter_results\":{}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"B\"},\"content_filter_results\":{}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
+        strip_sse_chunk(&mut parser, &mut body, false).unwrap();
 
         let bytes = body.unwrap();
         let output = std::str::from_utf8(bytes.as_ref()).unwrap();
@@ -858,17 +858,19 @@ mod tests {
 
     #[test]
     fn strip_sse_chunk_buffers_partial_line() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
         ctx.current_filter_id = Some(0);
-        ctx.insert_filter_state(SseFrameParser::new(65_536));
+        ctx.insert_filter_state(ResponseTranslation::Sse(SseFrameParser::new(65_536)));
 
         let chunk1 = b"data: {\"choices\":[{\"delta\":{\"con";
         let mut body1 = Some(Bytes::from(chunk1.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body1, false).unwrap();
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
 
         assert!(
-            ctx.get_filter_state::<SseFrameParser>().is_some(),
+            ctx.get_filter_state::<ResponseTranslation>().is_some(),
             "parser should be retained in filter state"
         );
         assert!(
@@ -878,7 +880,7 @@ mod tests {
 
         let chunk2 = b"tent\":\"Hi\"},\"content_filter_results\":{}}]}\n\n";
         let mut body2 = Some(Bytes::from(chunk2.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body2, false).unwrap();
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
 
         let bytes2 = body2.unwrap();
         let output = std::str::from_utf8(bytes2.as_ref()).unwrap();
@@ -888,39 +890,38 @@ mod tests {
 
     #[test]
     fn strip_sse_chunk_returns_error_on_parse_error() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
         ctx.current_filter_id = Some(0);
         // Tiny limit so a normal Azure SSE frame overflows the parser.
-        ctx.insert_filter_state(SseFrameParser::new(8));
+        ctx.insert_filter_state(ResponseTranslation::Sse(SseFrameParser::new(8)));
 
         let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.to_vec()));
 
-        let err = strip_sse_chunk(&mut ctx, &mut body, false).unwrap_err();
+        let err = filter.on_response_body(&mut ctx, &mut body, false).unwrap_err();
         assert!(
             err.to_string().contains("SSE parse error"),
             "parse error should be returned as FilterError, got: {err}"
         );
         assert!(
-            ctx.get_filter_state::<SseFrameParser>().is_none(),
+            ctx.get_filter_state::<ResponseTranslation>().is_none(),
             "parser should NOT be retained after a parse error"
         );
     }
 
     #[test]
     fn strip_sse_chunk_returns_error_on_incomplete_frame_at_eof() {
-        let request = make_request(Method::POST, "/chat/completions");
-        let mut ctx = make_filter_context(&request);
-        ctx.current_filter_id = Some(0);
-        ctx.insert_filter_state(SseFrameParser::new(65_536));
+        let mut parser = SseFrameParser::new(65_536);
 
         let chunk = b"data: {\"choices\":[{\"delta\":{\"con";
         let mut body = Some(Bytes::from(chunk.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
+        strip_sse_chunk(&mut parser, &mut body, false).unwrap();
 
         let mut eof_body = None;
-        let err = strip_sse_chunk(&mut ctx, &mut eof_body, true).unwrap_err();
+        let err = strip_sse_chunk(&mut parser, &mut eof_body, true).unwrap_err();
         assert!(
             err.to_string().contains("incomplete SSE frame at end of stream"),
             "incomplete trailing frame at EOF should return FilterError, got: {err}"
@@ -929,20 +930,17 @@ mod tests {
 
     #[test]
     fn strip_sse_chunk_preserves_multibyte_utf8_across_boundary() {
-        let request = make_request(Method::POST, "/chat/completions");
-        let mut ctx = make_filter_context(&request);
-        ctx.current_filter_id = Some(0);
-        ctx.insert_filter_state(SseFrameParser::new(65_536));
+        let mut parser = SseFrameParser::new(65_536);
 
         let full_line = "data: {\"choices\":[{\"delta\":{\"content\":\"שלום\"},\"content_filter_results\":{}}]}\n\n";
         let full_bytes = full_line.as_bytes();
         let split_at = full_bytes.len() / 2;
 
         let mut body1 = Some(Bytes::from(full_bytes[..split_at].to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body1, false).unwrap();
+        strip_sse_chunk(&mut parser, &mut body1, false).unwrap();
 
         let mut body2 = Some(Bytes::from(full_bytes[split_at..].to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body2, false).unwrap();
+        strip_sse_chunk(&mut parser, &mut body2, false).unwrap();
 
         let bytes2 = body2.unwrap();
         let output = std::str::from_utf8(bytes2.as_ref()).unwrap();
@@ -955,10 +953,7 @@ mod tests {
 
     #[test]
     fn strip_sse_chunk_drops_async_filter_only_annotations() {
-        let request = make_request(Method::POST, "/chat/completions");
-        let mut ctx = make_filter_context(&request);
-        ctx.current_filter_id = Some(0);
-        ctx.insert_filter_state(SseFrameParser::new(65_536));
+        let mut parser = SseFrameParser::new(65_536);
 
         // Mix of normal chunk + async filter-only annotation (no delta).
         let chunk = concat!(
@@ -967,7 +962,7 @@ mod tests {
         );
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
+        strip_sse_chunk(&mut parser, &mut body, false).unwrap();
 
         let output_bytes = body.unwrap();
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
@@ -987,15 +982,12 @@ mod tests {
 
     #[test]
     fn strip_sse_chunk_keeps_finish_reason_with_filter_metadata() {
-        let request = make_request(Method::POST, "/chat/completions");
-        let mut ctx = make_filter_context(&request);
-        ctx.current_filter_id = Some(0);
-        ctx.insert_filter_state(SseFrameParser::new(65_536));
+        let mut parser = SseFrameParser::new(65_536);
 
         let chunk = "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
+        strip_sse_chunk(&mut parser, &mut body, false).unwrap();
 
         let output_bytes = body.unwrap();
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
@@ -1007,13 +999,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn on_response_error_status_types_the_normalized_body() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        let mut response = make_response();
+        response.status = StatusCode::NOT_FOUND;
+        ctx.response_header = Some(&mut response);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        let azure_error = br#"{"error":{"message":"deployment not found","type":null,"code":"DeploymentNotFound"}}"#;
+        let mut body = Some(Bytes::from_static(azure_error));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "the 404 seen with the headers types the error body"
+        );
+    }
+
+    #[tokio::test]
     async fn on_response_body_normalizes_error_type() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
         let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_ERROR);
-        ctx.set_metadata(RESPONSE_STATUS_KEY, "404");
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(ResponseTranslation::Error(StatusCode::NOT_FOUND));
 
         let azure_error = br#"{"error":{"message":"deployment not found","type":null,"code":"DeploymentNotFound"}}"#;
         let mut body = Some(Bytes::from(azure_error.to_vec()));

@@ -45,7 +45,7 @@ use area::{ApiArea, CONFORMANCE_AREAS, OPENAI_REFERENCE_MANIFEST, OPENAI_REFEREN
 use coverage::calculate_coverage;
 pub(crate) use item_contracts::{Args as ItemContractsArgs, run as run_item_contracts};
 use item_contracts::{ITEM_CONTRACTS_ARTIFACT, generate_item_contracts, verify_item_contracts};
-use json_report::write_json_report;
+use json_report::{write_json_report, write_state_badges};
 use model::{
     CoverageReport, ReferenceSourceReport, RuntimeVerificationArea, RuntimeVerificationCheck, RuntimeVerificationStatus,
 };
@@ -101,6 +101,10 @@ pub(crate) struct Args {
     /// Write the full conformance report as JSON.
     #[arg(long, value_name = "PATH")]
     output_json: Option<PathBuf>,
+
+    /// Write repository-local SVG badges for Responses state verification.
+    #[arg(long, value_name = "DIRECTORY")]
+    output_badges_dir: Option<PathBuf>,
 
     /// Exit non-zero when covered operation percentage is below this value.
     #[arg(long, value_name = "PERCENT", value_parser = parse_percent)]
@@ -189,6 +193,14 @@ pub(crate) fn run(args: &Args) {
         println!("wrote JSON report: {}", path.display());
     }
 
+    if let Some(directory) = &args.output_badges_dir {
+        write_state_badges(&result, directory).unwrap_or_else(|e| {
+            eprintln!("openai-conformance failed: {e}");
+            std::process::exit(1);
+        });
+        println!("wrote Responses state badges: {}", directory.display());
+    }
+
     if result
         .runtime_verifications
         .iter()
@@ -267,10 +279,10 @@ fn run_inner(args: &Args) -> Result<CoverageReport, String> {
         args.include_beta,
     );
 
-    let owned_operations = report.owned_operations();
+    let contract_operations = report.contract_operations();
     report.oasdiff = Some(run_scoped_oasdiff(
         args.implementation_spec.as_deref(),
-        &owned_operations,
+        &contract_operations,
         &areas,
         &reference_projections,
     )?);

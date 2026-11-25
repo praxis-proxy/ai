@@ -11,11 +11,12 @@
 //! [mcp]: https://spec.modelcontextprotocol.io/
 
 use std::{
+    collections::HashSet,
     io::Write as _,
     net::TcpStream,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -86,6 +87,19 @@ pub struct McpMockConfig {
     /// default 405 makes the transport treat the server as not supporting SSE and
     /// skip it. Enable this to exercise the GET-common-stream path end-to-end.
     pub serve_get_stream: bool,
+
+    /// When `Some`, attach this value as `structuredContent` to successful
+    /// `tools/call` results.
+    pub structured_content: Option<Value>,
+
+    /// Mint a unique `MCP-Session-Id` per `initialize` and enforce it: any
+    /// other POST without a session gets 400, and one with an unknown or
+    /// expired session gets 404, like a real stateful MCP server.
+    pub enforce_sessions: bool,
+
+    /// When `Some(n)`, pad the `initialize` result to at least `n` bytes and
+    /// send it with chunked transfer encoding (oversized handshake scenario).
+    pub oversized_initialize_bytes: Option<usize>,
 }
 
 impl Default for McpMockConfig {
@@ -100,6 +114,9 @@ impl Default for McpMockConfig {
             sse_tool_results: false,
             oversized_sse_bytes: None,
             serve_get_stream: false,
+            structured_content: None,
+            enforce_sessions: false,
+            oversized_initialize_bytes: None,
         }
     }
 }
@@ -230,9 +247,48 @@ pub struct McpMockServerGuard {
 
     /// Captured requests.
     state: Arc<Mutex<Vec<McpRecordedRequest>>>,
+
+    /// Live sessions when `enforce_sessions` is set.
+    sessions: Arc<MockSessions>,
+}
+
+/// Session bookkeeping for `enforce_sessions`.
+#[derive(Default)]
+struct MockSessions {
+    /// Sessions minted so far.
+    minted: AtomicUsize,
+    /// Currently valid session ids.
+    live: Mutex<HashSet<String>>,
 }
 
 impl McpMockServerGuard {
+    /// Expire every live session so the next request carrying one gets 404.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session mutex is poisoned.
+    pub fn expire_sessions(&self) {
+        self.sessions.live.lock().unwrap().clear();
+    }
+
+    /// Number of sessions minted by `initialize`.
+    pub fn sessions_minted(&self) -> usize {
+        self.sessions.minted.load(Ordering::SeqCst)
+    }
+
+    /// `MCP-Session-Id` header values of recorded requests with `method`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state mutex is poisoned.
+    pub fn session_ids_for(&self, method: &str) -> Vec<Option<String>> {
+        let reqs = self.state.lock().unwrap();
+        reqs.iter()
+            .filter(|r| r.json_rpc_method.as_deref() == Some(method))
+            .map(|r| request_header(&r.headers, "mcp-session-id").map(str::to_owned))
+            .collect()
+    }
+
     /// The `host:port` address string.
     pub fn endpoint(&self) -> String {
         format!("127.0.0.1:{}", self.port)
@@ -332,8 +388,10 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
     let shutdown = Arc::new(AtomicBool::new(false));
     let state: Arc<Mutex<Vec<McpRecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let sessions = Arc::new(MockSessions::default());
     let flag = Arc::clone(&shutdown);
     let shared_state = Arc::clone(&state);
+    let shared_sessions = Arc::clone(&sessions);
     let path = config.path.clone();
     let config = Arc::new(config);
 
@@ -344,7 +402,8 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
             }
             let cfg = Arc::clone(&config);
             let st = Arc::clone(&shared_state);
-            std::thread::spawn(move || handle_connection(stream, &cfg, &st));
+            let ss = Arc::clone(&shared_sessions);
+            std::thread::spawn(move || handle_connection(stream, &cfg, &st, &ss));
         }
     });
 
@@ -353,6 +412,7 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
         port,
         shutdown,
         state,
+        sessions,
     }
 }
 
@@ -362,7 +422,12 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
 
 /// Per-connection entry point; DELETE is special-cased
 /// before the POST-only gate.
-fn handle_connection(mut stream: TcpStream, config: &McpMockConfig, state: &Mutex<Vec<McpRecordedRequest>>) {
+fn handle_connection(
+    mut stream: TcpStream,
+    config: &McpMockConfig,
+    state: &Mutex<Vec<McpRecordedRequest>>,
+    sessions: &MockSessions,
+) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let Some(req) = parse_agentic_request(&mut stream) else {
@@ -371,6 +436,13 @@ fn handle_connection(mut stream: TcpStream, config: &McpMockConfig, state: &Mute
 
     if req.method == "DELETE" {
         record_request(state, build_record(&req));
+        // Only a DELETE the handler accepts ends the session.
+        if config.enforce_sessions
+            && path_matches(&req.path, &config.path)
+            && let Some(session) = request_header(&req.headers, "mcp-session-id")
+        {
+            sessions.live.lock().unwrap().remove(session);
+        }
         handle_delete(&mut stream, &req, config);
         return;
     }
@@ -387,7 +459,7 @@ fn handle_connection(mut stream: TcpStream, config: &McpMockConfig, state: &Mute
         return;
     }
 
-    dispatch_json_rpc(&mut stream, config, state, &req);
+    dispatch_json_rpc(&mut stream, config, state, sessions, &req);
 }
 
 /// `Some(status)` when the request is invalid before
@@ -410,6 +482,7 @@ fn dispatch_json_rpc(
     stream: &mut TcpStream,
     config: &McpMockConfig,
     state: &Mutex<Vec<McpRecordedRequest>>,
+    sessions: &MockSessions,
     req: &AgenticHttpRequest,
 ) {
     let Ok(json) = serde_json::from_str::<Value>(&req.body) else {
@@ -431,8 +504,16 @@ fn dispatch_json_rpc(
 
     record_request(state, record);
 
+    if config.enforce_sessions
+        && method.as_deref() != Some("initialize")
+        && let Some(status) = session_rejection(req, sessions)
+    {
+        write_response(stream, status, reason_for(status), &[], "");
+        return;
+    }
+
     match method.as_deref() {
-        Some("initialize") => handle_initialize(stream, config, &id),
+        Some("initialize") => handle_initialize(stream, config, &id, sessions),
         Some("notifications/initialized") => handle_notification(stream),
         Some("tools/list") => handle_tools_list(stream, config, &id),
         Some("tools/call") => handle_tools_call(stream, config, &id, tool_name),
@@ -455,10 +536,26 @@ fn reason_for(status: u16) -> &'static str {
 // Method Handlers
 // -----------------------------------------------------------------------------
 
+/// `Some(400)` without a session header, `Some(404)` for an unknown one.
+fn session_rejection(req: &AgenticHttpRequest, sessions: &MockSessions) -> Option<u16> {
+    let Some(session) = request_header(&req.headers, "mcp-session-id") else {
+        return Some(400);
+    };
+    (!sessions.live.lock().unwrap().contains(session)).then_some(404)
+}
+
+/// Case-insensitive header lookup on recorded `(name, value)` pairs.
+fn request_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
 /// Capabilities envelope; emits `MCP-Session-Id`
 /// when `stateful_sessions` is set.
-fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option<Value>) {
-    let result = json!({
+fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option<Value>, sessions: &MockSessions) {
+    let mut result = json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
@@ -471,14 +568,55 @@ fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
         }
     });
 
+    let session_id = mint_session(config, sessions);
+
+    if let Some(n) = config.oversized_initialize_bytes {
+        result["result"]["serverInfo"]["padding"] = json!("x".repeat(n));
+        write_chunked_json(stream, &result.to_string(), session_id.as_deref());
+        return;
+    }
+
     let body = result.to_string();
     let mut headers: Vec<(&str, String)> = vec![("Content-Type", "application/json".to_owned())];
 
-    if config.stateful_sessions {
-        headers.push(("MCP-Session-Id", MOCK_SESSION_ID.to_owned()));
+    if let Some(session_id) = session_id {
+        headers.push(("MCP-Session-Id", session_id));
     }
 
     write_response(stream, 200, "OK", &headers, &body);
+}
+
+/// Session id for an `initialize` reply: unique and tracked under
+/// `enforce_sessions`, otherwise the fixed id when `stateful_sessions` is set.
+fn mint_session(config: &McpMockConfig, sessions: &MockSessions) -> Option<String> {
+    if !config.enforce_sessions {
+        return config.stateful_sessions.then(|| MOCK_SESSION_ID.to_owned());
+    }
+    let n = sessions.minted.fetch_add(1, Ordering::SeqCst) + 1;
+    let session = format!("mock-mcp-session-{n}");
+    sessions.live.lock().unwrap().insert(session.clone());
+    Some(session)
+}
+
+/// Write a JSON body with chunked transfer encoding in 4 KiB chunks.
+fn write_chunked_json(stream: &mut TcpStream, body: &str, session_id: Option<&str>) {
+    let mut head = String::from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n");
+    if let Some(session_id) = session_id {
+        head.push_str("MCP-Session-Id: ");
+        head.push_str(session_id);
+        head.push_str("\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    for chunk in body.as_bytes().chunks(4096) {
+        let framed = [format!("{:x}\r\n", chunk.len()).as_bytes(), chunk, b"\r\n"].concat();
+        if stream.write_all(&framed).is_err() {
+            return;
+        }
+    }
+    _ = stream.write_all(b"0\r\n\r\n");
 }
 
 /// Notifications have no `id`, so the MCP spec
@@ -535,9 +673,15 @@ fn handle_tools_call(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
     } else if config.failing_tools.iter().any(|t| t == &name) {
         write_failing_tool_result(stream, id, &name);
     } else if config.sse_tool_results {
-        write_known_tool_result_sse(stream, id, &name, config.oversized_sse_bytes);
+        write_known_tool_result_sse(
+            stream,
+            id,
+            &name,
+            config.oversized_sse_bytes,
+            config.structured_content.as_ref(),
+        );
     } else {
-        write_known_tool_result(stream, id, &name);
+        write_known_tool_result(stream, id, &name, config.structured_content.as_ref());
     }
 }
 
@@ -678,8 +822,8 @@ fn record_request(state: &Mutex<Vec<McpRecordedRequest>>, record: McpRecordedReq
 }
 
 /// Successful `tools/call` content result.
-fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &str) {
-    let result = json!({
+fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &str, structured: Option<&Value>) {
+    let mut result = json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
@@ -690,6 +834,9 @@ fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &st
             "isError": false,
         }
     });
+    if let Some(structured) = structured {
+        result["result"]["structuredContent"] = structured.clone();
+    }
 
     let body = result.to_string();
     write_response(
@@ -702,7 +849,13 @@ fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &st
 }
 
 /// Successful `tools/call` content result emitted as SSE.
-fn write_known_tool_result_sse(stream: &mut TcpStream, id: &Option<Value>, name: &str, oversized_bytes: Option<usize>) {
+fn write_known_tool_result_sse(
+    stream: &mut TcpStream,
+    id: &Option<Value>,
+    name: &str,
+    oversized_bytes: Option<usize>,
+    structured: Option<&Value>,
+) {
     let mut result = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -711,6 +864,9 @@ fn write_known_tool_result_sse(stream: &mut TcpStream, id: &Option<Value>, name:
             "isError": false,
         }
     });
+    if let Some(structured) = structured {
+        result["result"]["structuredContent"] = structured.clone();
+    }
 
     // Pad the result if oversized_bytes is set to trigger transport's wire ceiling
     if let Some(n) = oversized_bytes {

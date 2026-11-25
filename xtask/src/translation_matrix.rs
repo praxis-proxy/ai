@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! `cargo xtask translation-matrix` validates the translation support matrix
-//! manifest and regenerates (or verifies) `docs/conformance/translation-matrix.md`.
+//! manifest and regenerates (or verifies) `docs/conformance/translation-matrix.md`
+//! and its machine-readable sidecar `docs/conformance/translation-matrix.json`.
 //!
 //! The manifest is the published contract for what Praxis supports natively,
 //! what it translates, and what it refuses. Validation is the point of this
@@ -11,7 +12,8 @@
 //! - Every surface answers every feature in the shared catalog, so the table is a matrix rather than a pile of
 //!   per-filter notes. A feature added to the catalog fails the check until each surface classifies it.
 //! - A `dropped` cell is a defect, not a support level, and must carry a blocker. Those cells never reach the support
-//!   table; they render into "Known gaps" so the document cannot claim behavior Praxis lacks.
+//!   table; they render into "Known gaps" so the document cannot claim behavior Praxis lacks. A blocker is an issue URL
+//!   in this repository or in Praxis core, never placeholder text, because release notes publish it verbatim.
 //!
 //! Two further checks tie the manifest to the checkout it describes: every
 //! filter it names must be registered in `filters/src/register.rs`, and every
@@ -47,6 +49,12 @@ const MANIFEST_REL: &str = "docs/conformance/translation-matrix.yaml";
 /// Generated document, relative to the workspace root.
 const DOC_REL: &str = "docs/conformance/translation-matrix.md";
 
+/// Generated machine-readable sidecar, relative to the workspace root.
+///
+/// The release support report assembles its translation section from this file
+/// with the Python standard library, so it must not require a YAML parser.
+const JSON_REL: &str = "docs/conformance/translation-matrix.json";
+
 /// Manifest schema version this task understands.
 const SUPPORTED_VERSION: u32 = 1;
 
@@ -55,6 +63,12 @@ const REGISTER_REL: &str = "filters/src/register.rs";
 
 /// Crate the manifest cites for behavior owned by the core protocol layer.
 const PROTOCOL_CRATE: &str = "praxis-proxy-protocol";
+
+/// Issue URL prefixes a gap's blocker may use.
+const BLOCKER_ISSUE_PREFIXES: [&str; 2] = [
+    "https://github.com/praxis-proxy/ai/issues/",
+    "https://github.com/praxis-proxy/praxis/issues/",
+];
 
 // -----------------------------------------------------------------------------
 // Manifest
@@ -87,6 +101,19 @@ enum Status {
 }
 
 impl Status {
+    /// Manifest spelling, used by the machine-readable sidecar.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Passthrough => "passthrough",
+            Self::Translated => "translated",
+            Self::TranslatedLossy => "translated-lossy",
+            Self::Rejected => "rejected",
+            Self::Dropped => "dropped",
+            Self::NotApplicable => "n-a",
+        }
+    }
+
     /// Short label used in the rendered tables.
     const fn label(self) -> &'static str {
         match self {
@@ -265,7 +292,7 @@ pub(crate) fn run(args: &Args) {
         std::process::exit(1);
     }
 
-    emit(args, &checkout.root, &render_doc(&manifest));
+    emit(args, &checkout.root, &render_doc(&manifest), &render_json(&manifest));
 }
 
 /// Read and parse the manifest, reporting a schema mismatch and exiting.
@@ -286,17 +313,23 @@ fn load_manifest(path: &Path) -> Manifest {
     }
 }
 
-/// Write the rendered document, or verify the committed copy still matches.
-fn emit(args: &Args, root: &Path, content: &str) {
-    let doc_path = root.join(DOC_REL);
+/// Write the rendered document and sidecar, or verify both committed copies.
+fn emit(args: &Args, root: &Path, doc: &str, json: &str) {
+    emit_one(args, root, DOC_REL, doc);
+    emit_one(args, root, JSON_REL, json);
+}
+
+/// Write one generated file, or fail when its committed copy drifted.
+fn emit_one(args: &Args, root: &Path, rel: &str, content: &str) {
+    let path = root.join(rel);
 
     if args.fix {
-        fs::write(&doc_path, content).unwrap();
-        println!("wrote {}", doc_path.strip_prefix(root).unwrap_or(&doc_path).display());
-    } else if fs::read_to_string(&doc_path).unwrap_or_default() == content {
-        println!("{DOC_REL} is up to date");
+        fs::write(&path, content).unwrap();
+        println!("wrote {}", path.strip_prefix(root).unwrap_or(&path).display());
+    } else if fs::read_to_string(&path).unwrap_or_default() == content {
+        println!("{rel} is up to date");
     } else {
-        eprintln!("{DOC_REL} is stale");
+        eprintln!("{rel} is stale");
         eprintln!("\nrun: cargo xtask translation-matrix --fix");
         std::process::exit(1);
     }
@@ -324,12 +357,18 @@ impl Checkout {
                 .map(|found| found[1].to_owned())
                 .collect();
 
-        let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("failed to read workspace Cargo.toml");
-        let version = regex::Regex::new(r#"praxis-protocol\s*=\s*\{[^}]*version\s*=\s*"([^"]+)""#)
-            .expect("dependency pattern is valid")
-            .captures(&cargo)
-            .expect("workspace Cargo.toml pins praxis-protocol")[1]
-            .to_owned();
+        let lock = fs::read_to_string(root.join("Cargo.lock")).expect("failed to read workspace Cargo.lock");
+        let lock: toml::Table = toml::from_str(&lock).expect("failed to parse workspace Cargo.lock");
+        let version = lock
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .and_then(|packages| {
+                packages
+                    .iter()
+                    .find(|package| package.get("name").and_then(toml::Value::as_str) == Some(PROTOCOL_CRATE))
+            })
+            .and_then(|package| package.get("version").and_then(toml::Value::as_str))
+            .expect("workspace Cargo.lock pins praxis-proxy-protocol");
 
         Self {
             root,
@@ -445,6 +484,11 @@ fn validate_cross_surface_gaps(m: &Manifest, surface_ids: &BTreeSet<&str>, probl
         }
         if gap.blocker.trim().is_empty() {
             problems.push(format!("cross-surface gap `{}` has no blocker", gap.id));
+        } else if let Err(problem) = check_blocker(&gap.blocker) {
+            problems.push(format!(
+                "cross-surface gap `{}` blocker `{}` {problem}",
+                gap.id, gap.blocker
+            ));
         }
     }
 }
@@ -490,6 +534,11 @@ fn validate_cell(where_: &str, cell: &Cell, checkout: &Checkout, problems: &mut 
         (Some(blocker), true) if blocker.trim().is_empty() => {
             problems.push(format!("{where_} is a gap with an empty blocker"));
         },
+        (Some(blocker), true) => {
+            if let Err(problem) = check_blocker(blocker) {
+                problems.push(format!("{where_} blocker `{blocker}` {problem}"));
+            }
+        },
         (Some(_), false) => problems.push(format!(
             "{where_} has a blocker but status `{}`; only a gap takes a blocker",
             cell.status.label()
@@ -509,6 +558,23 @@ fn validate_cell(where_: &str, cell: &Cell, checkout: &Checkout, problems: &mut 
 
     if cell.status.needs_note() && cell.note.as_ref().is_none_or(|n| n.trim().is_empty()) {
         problems.push(format!("{where_} has status `{}` but no note", cell.status.label()));
+    }
+}
+
+/// Check that a blocker is a tracking issue rather than free text.
+///
+/// The release support report publishes blockers verbatim, so a placeholder
+/// such as `TODO-ISSUE ...` would ship as a known gap with nothing to follow.
+/// Only issues in this repository or in Praxis core are accepted.
+fn check_blocker(blocker: &str) -> Result<(), String> {
+    let number = BLOCKER_ISSUE_PREFIXES
+        .iter()
+        .find_map(|prefix| blocker.strip_prefix(prefix))
+        .ok_or_else(|| format!("is not an issue URL under {}", BLOCKER_ISSUE_PREFIXES.join(" or ")))?;
+    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && !number.starts_with('0') {
+        Ok(())
+    } else {
+        Err("does not end in an issue number".to_owned())
     }
 }
 
@@ -559,6 +625,120 @@ fn check_citation(citation: &str, checkout: &Checkout) -> Result<(), String> {
 /// Collapse a folded-scalar note onto one line so it fits a table cell.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Render the machine-readable sidecar consumed by the release support report.
+///
+/// The shape is deliberately explicit rather than a derive of the internal
+/// manifest structs: the report is assembled from committed files by a Python
+/// script, so this is a stable interface, not an implementation detail.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one explicit JSON object per report section is easier to audit than nested helpers"
+)]
+fn render_json(m: &Manifest) -> String {
+    let surfaces = m
+        .surfaces
+        .iter()
+        .map(|surface| {
+            let cells = m
+                .features
+                .iter()
+                .map(|feature| {
+                    let cell = surface.cell(&feature.id);
+                    serde_json::json!({
+                        "feature": feature.id,
+                        "label": feature.label,
+                        "status": cell.status.as_str(),
+                        "note": cell.note,
+                        "evidence": cell.evidence,
+                        "blocker": cell.blocker,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": surface.id,
+                "short": surface.short,
+                "client_api": surface.client_api,
+                "backend_api": surface.backend_api,
+                "filters": surface.filters,
+                "clean_rejection_requires": surface.clean_rejection_requires,
+                "unknown_field_policy": surface.unknown_field_policy,
+                "doc_gap": surface.doc_gap,
+                "cells": cells,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut totals = std::collections::BTreeMap::new();
+    for surface in &m.surfaces {
+        for feature in &m.features {
+            *totals.entry(surface.cell(&feature.id).status.as_str()).or_insert(0_u32) += 1;
+        }
+    }
+
+    let native_surfaces = m
+        .native_surfaces
+        .iter()
+        .map(|native| {
+            serde_json::json!({
+                "id": native.id,
+                "client_api": native.client_api,
+                "operations": native.operations,
+                "status": native.status.as_str(),
+                "note": native.note,
+                "evidence": native.evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let preconditions = m
+        .preconditions
+        .iter()
+        .map(|precondition| {
+            serde_json::json!({
+                "id": precondition.id,
+                "summary": precondition.summary,
+                "evidence": precondition.evidence,
+                "detail": precondition.detail,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let gaps = m
+        .cross_surface_gaps
+        .iter()
+        .map(|gap| {
+            serde_json::json!({
+                "id": gap.id,
+                "affects": gap.affects,
+                "summary": gap.summary,
+                "blocker": gap.blocker,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let features = m
+        .features
+        .iter()
+        .map(|feature| serde_json::json!({"id": feature.id, "label": feature.label}))
+        .collect::<Vec<_>>();
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": MANIFEST_REL,
+        "conformance_claim_caveat": m.conformance_claim_caveat,
+        "preconditions": preconditions,
+        "features": features,
+        "native_surfaces": native_surfaces,
+        "surfaces": surfaces,
+        "cross_surface_gaps": gaps,
+        "status_totals": totals,
+    });
+
+    let mut rendered = serde_json::to_string_pretty(&document).expect("manifest is serializable");
+    rendered.push('\n');
+    rendered
 }
 
 /// Render the full `translation-matrix.md` document.
@@ -852,4 +1032,56 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask crate always has a parent directory")
         .to_path_buf()
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocker_accepts_ai_and_core_issue_urls() {
+        assert!(check_blocker("https://github.com/praxis-proxy/ai/issues/2044").is_ok());
+        assert!(check_blocker("https://github.com/praxis-proxy/praxis/issues/1564").is_ok());
+    }
+
+    #[test]
+    fn blocker_rejects_placeholder_text() {
+        let problem = check_blocker("TODO-ISSUE emit terminal events at end-of-stream").unwrap_err();
+        assert!(problem.contains("is not an issue URL"), "{problem}");
+    }
+
+    #[test]
+    fn blocker_rejects_other_repositories_and_link_kinds() {
+        for blocker in [
+            "https://github.com/praxis-proxy/conventions/issues/1",
+            "https://github.com/praxis-proxy/ai/pull/1591",
+            "http://github.com/praxis-proxy/ai/issues/2044",
+            "#2044",
+        ] {
+            assert!(check_blocker(blocker).is_err(), "{blocker} should be rejected");
+        }
+    }
+
+    #[test]
+    fn blocker_rejects_missing_or_malformed_issue_numbers() {
+        for blocker in [
+            "https://github.com/praxis-proxy/ai/issues/",
+            "https://github.com/praxis-proxy/ai/issues/abc",
+            "https://github.com/praxis-proxy/ai/issues/12#issuecomment-3",
+            "https://github.com/praxis-proxy/ai/issues/012",
+            "https://github.com/praxis-proxy/ai/issues/12 ",
+        ] {
+            assert_eq!(
+                check_blocker(blocker).unwrap_err(),
+                "does not end in an issue number",
+                "{blocker}"
+            );
+        }
+    }
 }

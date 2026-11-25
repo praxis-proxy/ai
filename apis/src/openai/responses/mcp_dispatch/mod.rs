@@ -30,9 +30,6 @@
 
 mod approval;
 mod config;
-mod validate;
-
-pub(crate) use approval::{OWNER_FINGERPRINT, owner_fingerprint};
 
 #[cfg(test)]
 #[cfg(feature = "store-sqlite")]
@@ -56,11 +53,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt as _, future::join_all};
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, Rejection, parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -68,36 +64,47 @@ use tracing::{debug, warn};
 use self::config::MAX_MCP_CALL_ID_BYTES;
 use self::{
     approval::{
-        ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context, bind_owner_context,
-        build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
-        parse_approval_response, resolve_approval, target_fingerprint,
+        ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message, extract_approval_responses,
+        is_approval_response, parse_approval_response, resolve_approval,
     },
-    config::{
-        MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, MinimumApproval, build_config, require_inline_outbound_chain,
-    },
+    config::{McpDispatchConfig, MinimumApproval, build_config, require_inline_outbound_chain},
 };
+#[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
+use super::state::McpApprovalState;
 use super::{
     DEFAULT_STORE_NAME,
     agentic_loop::budget::input_charge,
     error::responses_error_rejection,
-    mcp_admission::McpAdmissionDecisions,
-    mcp_classify::ApprovalFloor,
     mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
-        discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
+        ResolveError, consume_pending_list_tools_failure, discover_deferred_connectors_with_forwarded_headers,
+        has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpConnectorContextPolicy, McpExecutionBudget, ResponsesState},
 };
 #[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
-use super::{
-    mcp_classify::{McpDisposition, classify_mcp},
-    state::McpApprovalState,
+use crate::mcp_core::{
+    classify::{McpDisposition, classify_mcp},
+    execute::size_limit_fallback,
+    fingerprint::target_fingerprint,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
-    json_body::serialized_len,
+    json_body::{MAX_JSON_BODY_BYTES, serialized_len},
     mcp_client,
+    mcp_core::{
+        admission::McpAdmissionDecisions,
+        classify::ApprovalFloor,
+        execute::{
+            self, MIN_RETAINED_RESULT_BYTES, McpCallIdentity, McpCallOutcome, McpExecutionOptions,
+            McpResultLimitExceeded, McpToolCall, bounded_fallback_call_id,
+        },
+        fingerprint::{
+            bind_credential_context, bind_forwarded_header_context, bind_owner_context, is_connector_tool_entry,
+        },
+        naming::{McpToolIndex, McpToolMatch},
+    },
     state_owner::StateOwner,
     store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},
 };
@@ -105,9 +112,9 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 
-/// A minimal JSON-RPC `initialize` reply needs roughly 150 KiB of lexical
-/// parser headroom under the shared node charge. Reserve a little more before
-/// a single-use approval can be consumed.
+/// A minimal JSON-RPC `initialize` reply needs roughly 13 KiB under
+/// `mcp_result_charge`. Keep a generous floor before a single-use approval
+/// can be consumed.
 const MIN_MCP_INITIALIZE_PARSE_CHARGE: usize = 256 * 1_024;
 
 /// A budget failure must terminate the request even when an MCP server or
@@ -182,7 +189,7 @@ fn reserve_mcp_execution(
     }
     let reserved = slot.checked_mul(count)?;
     let parse_charge_limit = slot / 2;
-    let wire_limit = parse_charge_limit / 64;
+    let wire_limit = parse_charge_limit / 16;
     if parse_charge_limit < MIN_MCP_INITIALIZE_PARSE_CHARGE
         || wire_limit < 512
         || !budget.reserve_additional_input(reserved)
@@ -223,23 +230,19 @@ fn settle_mcp_execution(state: &mut ResponsesState, results: &[McpCallResult]) -
     })
 }
 
-/// Whether this internally resolved tool entry names a configured connector.
-///
-/// Optional fields are serialized into the tool map as JSON `null`, so field
-/// presence alone is not sufficient to distinguish a request-selected URL.
-pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
-    entry
-        .get("connector_id")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|connector_id| !connector_id.is_empty())
-}
-
 // -----------------------------------------------------------------------------
 // McpDispatchFilter
 // -----------------------------------------------------------------------------
 
 /// Executes MCP tool calls against upstream MCP servers within
 /// the Responses API agentic loop.
+///
+/// Results with `structuredContent` use a compact JSON object containing both
+/// `content` and `structuredContent` in the model-facing `function_call_output`
+/// and public `mcp_call.output` strings. This preserves structured-only results
+/// and distinct text or media blocks. Without structured content, text blocks
+/// remain newline-joined and non-text results remain JSON content arrays.
+/// The combined serialized output is subject to the existing result-byte limits.
 ///
 /// # YAML
 ///
@@ -503,10 +506,7 @@ impl McpDispatchFilter {
             return;
         };
         for result in results {
-            let result_start = state.messages.len();
-            state.messages.push(result.message.clone());
-            state.persisted_messages.push(result.message);
-            state.mark_local_tool_results_from(result_start);
+            state.append_local_tool_results([result.message]);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
             // lifecycle.
@@ -780,7 +780,7 @@ impl McpDispatchFilter {
             // re-ran this request and rebuilt the admission verdicts, so a call
             // whose tool is now denied (connector policy changed, or no longer
             // classified read-only) is rejected here without spending its approval. The
-            // dispatch-time check in `execute_single_call` remains as defense in
+            // dispatch-time check in the shared executor remains as defense in
             // depth.
             for decision in &resolved {
                 if decision.approve
@@ -1074,8 +1074,12 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
         let result_start = state.messages.len();
-        state.messages.push(denial.clone());
-        state.persisted_messages.push(denial);
+        if state.captures_persistence_history() {
+            state.messages.push(denial.clone());
+            state.push_persisted_message(denial);
+        } else {
+            state.messages.push(denial);
+        }
         state.mark_local_tool_results_from(result_start);
     }
 }
@@ -1107,7 +1111,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -1119,7 +1123,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -1137,10 +1141,6 @@ impl HttpFilter for McpDispatchFilter {
         clippy::too_many_lines,
         reason = "deferred discovery and MCP execution share one request-body path"
     )]
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "request-body dispatch retains admitted call state across bounded async MCP execution"
-    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -1150,10 +1150,10 @@ impl HttpFilter for McpDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         // Publish the operator approval floor onto typed request state so the
         // owner's response-phase approval partitioning (`prepare_response_round`)
-        // applies it this IRR iteration. Unlike `set_metadata` (bounded entry
+        // applies it this IRR iteration. Unlike `FilterMetadata::insert` (bounded entry
         // count; silently drops a new key once full), a struct field cannot be
         // dropped under metadata saturation, so a configured security floor can
         // never be silently disabled. When there is no `ResponsesState` there is
@@ -1302,7 +1302,9 @@ impl HttpFilter for McpDispatchFilter {
             let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
                 ctx.extensions
                     .get::<ResponsesState>()
-                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
+                    // Serialize the current request explicitly: `request_body` holds
+                    // parameters only, so re-attach the current input in its form (#1618).
+                    .and_then(|state| serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)).ok())
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -1451,7 +1453,8 @@ async fn discover_pending_connectors(
         Err(ResolveError::RetainedBudget) => Ok(McpDispatchFilter::budget_limit_action(ctx)),
         Err(err) => {
             let streaming = ctx
-                .get_metadata("openai_responses_request.stream")
+                .filter_metadata
+                .get("openai_responses_request.stream")
                 .is_some_and(|v| v == "true");
             Ok(resolve_error_action(ctx, &err, streaming, body))
         },
@@ -1461,7 +1464,7 @@ async fn discover_pending_connectors(
 /// Return the response fan-out cap this dispatcher published for the owner.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+    ctx.filter_metadata.get(MAX_CALLS_METADATA)?.parse().ok()
 }
 
 /// Validate and partition one model-produced MCP round for request-side execution.
@@ -1702,17 +1705,11 @@ fn mcp_call_ids_are_unique_and_new(
 /// the minimum per-call reservation after JSON escaping.
 #[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
 fn call_id_fallback_fits(tool_call: &serde_json::Value) -> bool {
-    let (call_id, tool_name) = bounded_fallback_identity(tool_call);
-    build_error_result(
-        call_id,
-        "unknown",
-        tool_name,
-        "",
-        "MCP result exceeds the platform administrator's size limit.",
-        Some(call_id),
-    )
-    .retained_bytes()
-    .is_some_and(|bytes| bytes <= MIN_RETAINED_RESULT_BYTES)
+    let mut call = responses_tool_call(tool_call);
+    call.approval_request_id = Some(call.fallback_call_id);
+    size_limit_fallback::<McpCallResult>(&call)
+        .retained_bytes()
+        .is_some_and(|bytes| bytes <= MIN_RETAINED_RESULT_BYTES)
 }
 
 /// Check whether a tool call is an MCP tool call by matching the
@@ -1790,26 +1787,10 @@ fn extract_call_id(tc: &serde_json::Value) -> String {
         .to_owned()
 }
 
-/// Normalize raw tool call arguments.
-///
-/// Function calls carry arguments either as a JSON string
-/// (e.g., `"{\"city\":\"Paris\"}"`) or directly as a JSON value.
-/// Returns `(parsed_value, canonical_string)` or an error for
-/// malformed JSON strings.
-fn normalize_arguments(raw: &serde_json::Value) -> Result<(serde_json::Value, String), String> {
-    match raw {
-        serde_json::Value::String(s) => {
-            let parsed = serde_json::from_str(s).map_err(|e| format!("malformed tool arguments: {e}"))?;
-            Ok((parsed, s.clone()))
-        },
-        other => Ok((other.clone(), other.to_string())),
-    }
-}
-
 /// Extract serialised arguments from a tool call value.
 ///
 /// Uses the same string-vs-non-string convention as
-/// [`normalize_arguments`] but only produces the canonical string,
+/// [`normalize_arguments`](crate::mcp_core::execute::normalize_arguments) but only produces the canonical string,
 /// avoiding the deep clone that full normalization performs on
 /// non-string values.
 #[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
@@ -1887,11 +1868,6 @@ fn check_single_approval(
 // Execution
 // -----------------------------------------------------------------------------
 
-/// Maximum simultaneous owners of a result payload while a task constructs
-/// the temporary output plus private, public-output, error, and persisted
-/// representations. Four is the worst case for an MCP tool-error result.
-const RESULT_PAYLOAD_OWNER_COUNT: usize = 4;
-
 /// Reserve fixed-size rejection records, then divide the remaining aggregate
 /// allowance only among calls that can perform external work.
 fn admitted_result_limits(
@@ -1910,11 +1886,6 @@ fn admitted_result_limits(
     Ok((per_result_limit, execution_batch_limit))
 }
 
-/// Derive the payload ceiling represented by one retained-result reservation.
-fn result_payload_limit(retained_result_limit: usize) -> usize {
-    retained_result_limit / RESULT_PAYLOAD_OWNER_COUNT
-}
-
 /// Result of executing a single MCP tool call.
 #[derive(Debug)]
 struct McpCallResult {
@@ -1926,7 +1897,35 @@ struct McpCallResult {
     limit_exceeded: bool,
 }
 
-impl McpCallResult {
+impl McpCallOutcome for McpCallResult {
+    /// Maximum simultaneous owners of a result payload while a task constructs
+    /// the temporary output plus private, public-output, error, and persisted
+    /// representations. Four is the worst case for an MCP tool-error result.
+    const PAYLOAD_OWNER_COUNT: usize = 4;
+
+    fn success(call: &McpCallIdentity<'_>, output: &str, is_error: bool) -> Self {
+        build_success_result(
+            call.call_id,
+            call.server_label,
+            call.tool_name,
+            call.arguments,
+            output,
+            is_error,
+            call.approval_request_id,
+        )
+    }
+
+    fn error(call: &McpCallIdentity<'_>, message: &str) -> Self {
+        build_error_result(
+            call.call_id,
+            call.server_label,
+            call.tool_name,
+            call.arguments,
+            message,
+            call.approval_request_id,
+        )
+    }
+
     /// Serialized bytes retained across private replay, persistence, and public output.
     fn retained_bytes(&self) -> Option<usize> {
         serialized_len(&self.message)
@@ -1934,562 +1933,48 @@ impl McpCallResult {
             .checked_mul(2)?
             .checked_add(serialized_len(&self.output_item).ok()?)
     }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn mark_limit_exceeded(&mut self) {
+        self.limit_exceeded = true;
+    }
 }
 
-/// A result batch exceeded its configured retained-byte ceiling.
-#[derive(Debug)]
-struct McpResultLimitExceeded;
-
-/// Replace an oversized completed result with a small truthful tool error, or
-/// fail the batch terminally.
+/// Borrow the shared call view of one Responses `function_call` item.
 ///
-/// The filter reserves at least [`MIN_RETAINED_RESULT_BYTES`] before dispatch,
-/// so this fallback can always be retained after the external side effect has
-/// happened. Keeping one result per executed call prevents retries from being
-/// encouraged by a batch-wide proxy error. The full `approval_request_id` is
-/// preserved — never truncated — because it correlates the result to the
-/// approval that authorized the side effect. If it cannot fit the reservation
-/// (for example a legacy stored approval id that predates the
-/// [`MAX_MCP_CALL_ID_BYTES`] gate), the batch fails terminally instead of
-/// retaining an oversized fallback.
-fn fit_result_or_limit_error(
-    tool_call: &serde_json::Value,
-    result: McpCallResult,
-    retained_limit: usize,
-) -> Result<McpCallResult, McpResultLimitExceeded> {
-    if result.retained_bytes().is_some_and(|bytes| bytes <= retained_limit) {
-        return Ok(result);
+/// The correlation id is `call_id`, falling back to the item `id`; arguments
+/// are the JSON-encoded `arguments` string.
+fn responses_tool_call(tool_call: &serde_json::Value) -> McpToolCall<'_> {
+    let field = |name: &str| tool_call.get(name).and_then(serde_json::Value::as_str);
+    McpToolCall {
+        encoded_name: field("name"),
+        call_id: field("call_id").or_else(|| field("id")).unwrap_or("unknown"),
+        fallback_call_id: bounded_fallback_call_id(field("call_id"), field("id")),
+        arguments: tool_call.get("arguments"),
+        approval_request_id: approval_request_id(tool_call),
     }
-    bounded_result_limit_error(tool_call, retained_limit)
 }
 
-/// Build the fixed limit-error fallback, or fail when it cannot fit its
-/// call's retained reservation.
-fn bounded_result_limit_error(
-    tool_call: &serde_json::Value,
-    retained_limit: usize,
-) -> Result<McpCallResult, McpResultLimitExceeded> {
-    let (call_id, tool_name) = bounded_fallback_identity(tool_call);
-    let mut fallback = build_error_result(
-        call_id,
-        "unknown",
-        tool_name,
-        "",
-        "MCP result exceeds the platform administrator's size limit.",
-        approval_request_id(tool_call),
-    );
-    if fallback.retained_bytes().is_none_or(|bytes| bytes > retained_limit) {
-        warn!(
-            approval_request_bytes = approval_request_id(tool_call).map_or(0, str::len),
-            "MCP result-limit fallback exceeded its retained reservation; failing the batch"
-        );
-        return Err(McpResultLimitExceeded);
-    }
-    // A budgeted batch fails rather than retaining a truncated result; flag the
-    // replacement so the caller can enforce that when a transport budget is set.
-    fallback.limit_exceeded = true;
-    Ok(fallback)
-}
-
-/// Identity fields retained by the fixed result-limit fallback.
-fn bounded_fallback_identity(tool_call: &serde_json::Value) -> (&str, &str) {
-    let bounded_identity = |field: &str| {
-        tool_call
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| value.len() <= 64)
-            .unwrap_or("unknown")
-    };
-    let call_id = tool_call
-        .get("call_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| bounded_identity("id"));
-    (call_id, bounded_identity("name"))
-}
-
-/// Controls execution of one homogeneous MCP call batch.
-#[derive(Clone, Copy)]
-struct McpExecutionOptions<'a> {
-    /// Whether independent calls may execute concurrently.
-    parallel: bool,
-    /// Maximum number of calls concurrently in flight.
-    max_parallel_calls: usize,
-    /// Maximum raw bytes accepted for one MCP result event.
-    max_result_bytes: usize,
-    /// Maximum serialized bytes retained by one result batch.
-    max_total_result_bytes: usize,
-    /// Timeout applied independently to each MCP call.
-    timeout: Duration,
-    /// Names reserved for trusted forwarding, including when values are absent.
-    forwarded_header_names: &'a [http::HeaderName],
-    /// Trusted request headers selected by operator configuration.
-    forwarded_headers: Option<&'a http::HeaderMap>,
-    /// Request-scoped context injected only for configured connector entries.
-    connector_identity: Option<&'a McpCalloutIdentity>,
-    /// Per-execution pool of initialized MCP sessions reused across rounds.
-    session_pool: &'a mcp_client::McpSessionPool,
-    /// Namespace unique to the dispatcher whose transport configuration opened
-    /// the session.
-    pool_namespace: mcp_client::McpPoolNamespace,
-    /// Operator admission decisions, re-enforced at dispatch so a policy-denied
-    /// or ineligible call cannot execute even if it reaches this point (#1724).
-    admission: &'a McpAdmissionDecisions,
-    /// Optional request-wide transport and parse admission for this call.
-    transport_budget: Option<mcp_client::McpBudgetedCallLimits>,
-}
-
-/// Execute MCP tool calls — concurrently when `parallel` is true,
-/// sequentially otherwise.
+/// Execute Responses `function_call` items as MCP tool calls through the
+/// shared executor.
 async fn execute_mcp_calls(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
     callout: &mcp_client::McpCallout,
 ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
-    let minimum_reservation = mcp_calls
-        .len()
-        .checked_mul(MIN_RETAINED_RESULT_BYTES)
-        .ok_or(McpResultLimitExceeded)?;
-    if options.max_result_bytes < MIN_RETAINED_RESULT_BYTES
-        || options.max_total_result_bytes < minimum_reservation
-        || options.max_parallel_calls == 0
-    {
-        return Err(McpResultLimitExceeded);
-    }
-    let per_call_limit = options
-        .max_result_bytes
-        .min(options.max_total_result_bytes / mcp_calls.len().max(1));
-    let bounded_options = McpExecutionOptions {
-        max_result_bytes: per_call_limit,
-        ..options
-    };
-    if options.parallel {
-        execute_parallel(mcp_calls, tool_index, bounded_options, callout).await
-    } else {
-        execute_sequential(mcp_calls, tool_index, bounded_options, callout).await
-    }
-}
-
-/// Execute MCP tool calls concurrently within the owning request future.
-///
-/// Avoid detached tasks: dropping the request must also cancel every pending
-/// external side effect. Panics are converted to per-call errors so one faulty
-/// future does not discard successful siblings.
-#[expect(clippy::too_many_lines, reason = "batch execution and ordered outcome handling")]
-async fn execute_parallel(
-    mcp_calls: &[&serde_json::Value],
-    tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions<'_>,
-    callout: &mcp_client::McpCallout,
-) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
-    let mut results = Vec::with_capacity(mcp_calls.len());
-    let mut remaining_calls = mcp_calls;
-    while !remaining_calls.is_empty() {
-        let chunk_size = remaining_calls.len().min(options.max_parallel_calls);
-        let (chunk, rest) = remaining_calls.split_at(chunk_size);
-        remaining_calls = rest;
-        let futures = chunk.iter().map(|tc| {
-            std::panic::AssertUnwindSafe(execute_single_call(tc, tool_index, &options, callout)).catch_unwind()
-        });
-        for (tc, outcome) in chunk.iter().zip(join_all(futures).await) {
-            let result = match outcome {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    warn!(tool = ?tc.get("name"), "parallel MCP call returned None, emitting error");
-                    error_result_for_dropped_call(tc, "internal error: call produced no result")
-                },
-                Err(_panic) => {
-                    warn!(tool = ?tc.get("name"), "parallel MCP call future panicked, emitting error");
-                    error_result_for_dropped_call(tc, "internal error: call future panicked")
-                },
-            };
-            let result = fit_result_or_limit_error(tc, result, options.max_result_bytes)?;
-            if options.transport_budget.is_some() && result.limit_exceeded {
-                return Err(McpResultLimitExceeded);
-            }
-            results.push(result);
-        }
-    }
-    Ok(results)
-}
-
-/// Execute MCP tool calls sequentially, emitting error results
-/// for any calls that produce no result.
-async fn execute_sequential(
-    mcp_calls: &[&serde_json::Value],
-    tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions<'_>,
-    callout: &mcp_client::McpCallout,
-) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
-    let mut results = Vec::with_capacity(mcp_calls.len());
-    for tc in mcp_calls {
-        let result = if let Some(result) = execute_single_call(tc, tool_index, &options, callout).await {
-            result
-        } else {
-            warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
-            error_result_for_dropped_call(tc, "internal error: call produced no result")
-        };
-        let result = fit_result_or_limit_error(tc, result, options.max_result_bytes)?;
-        if options.transport_budget.is_some() && result.limit_exceeded {
-            return Err(McpResultLimitExceeded);
-        }
-        results.push(result);
-    }
-    Ok(results)
-}
-
-/// Resolve an encoded function name to its unique entry, rejecting
-/// ambiguity.
-#[expect(clippy::type_complexity, reason = "key+value pair needed by callers")]
-fn resolve_tool_entry<'a>(
-    tool_index: &McpToolIndex<'a>,
-    encoded_name: &str,
-    call_id: &str,
-    approval_request_id: Option<&str>,
-) -> Result<(&'a (String, String), &'a serde_json::Value), Option<Box<McpCallResult>>> {
-    match tool_index.get(encoded_name) {
-        Some(McpToolMatch::Unique { key, entry }) => Ok((key, entry)),
-        Some(McpToolMatch::Ambiguous { count }) => {
-            warn!(
-                encoded_name,
-                server_count = count,
-                "ambiguous MCP tool name: multiple entries produce this encoded name"
-            );
-            Err(Some(Box::new(build_error_result(
-                call_id,
-                "unknown",
-                encoded_name,
-                "",
-                &format!("ambiguous tool name: {count} servers expose '{encoded_name}'"),
-                approval_request_id,
-            ))))
-        },
-        None => {
-            warn!(encoded_name, "tool not found in mcp_tool_map, skipping");
-            Err(None)
-        },
-    }
-}
-
-/// Parse tool call arguments, handling JSON-string encoding.
-fn parse_call_arguments(
-    tool_call: &serde_json::Value,
-    call_id: &str,
-    server_label: &str,
-    tool_name: &str,
-    approval_request_id: Option<&str>,
-) -> Result<(serde_json::Value, String), Box<McpCallResult>> {
-    let empty = serde_json::Value::Object(serde_json::Map::new());
-    let raw = tool_call.get("arguments").unwrap_or(&empty);
-    normalize_arguments(raw).map_err(|e| {
-        warn!(tool_name, error = %e, "malformed JSON in tool call arguments");
-        Box::new(build_error_result(
-            call_id,
-            server_label,
-            tool_name,
-            raw.as_str().unwrap_or_default(),
-            &e,
-            approval_request_id,
-        ))
-    })
-}
-
-/// Build result from a completed (successful or failed) MCP call.
-#[expect(clippy::too_many_lines, reason = "match branches with structured logging")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "result identity and configured size policy are independent inputs"
-)]
-fn process_call_result(
-    result: Result<rmcp::model::CallToolResult, mcp_client::McpClientError>,
-    call_id: &str,
-    server_label: &str,
-    tool_name: &str,
-    arguments_string: &str,
-    approval_request_id: Option<&str>,
-    max_result_bytes: usize,
-) -> McpCallResult {
-    match result {
-        Ok(r) => {
-            let is_error = r.is_error.unwrap_or(false);
-            let content_count = r.content.len();
-            let output = content_blocks_to_output(&r.content, max_result_bytes);
-            drop(r);
-            match output {
-                Ok(output_text) => {
-                    debug!(tool_name, call_id, is_error, content_count, "MCP tool call completed");
-                    build_success_result(
-                        call_id,
-                        server_label,
-                        tool_name,
-                        arguments_string,
-                        &output_text,
-                        is_error,
-                        approval_request_id,
-                    )
-                },
-                Err(e) => {
-                    warn!(
-                        tool_name, call_id, error = %e,
-                        "failed to serialize MCP content blocks; returning tool error"
-                    );
-                    let mut result = build_error_result(
-                        call_id,
-                        server_label,
-                        tool_name,
-                        arguments_string,
-                        &e,
-                        approval_request_id,
-                    );
-                    result.limit_exceeded = e == MCP_RESULT_TOO_LARGE;
-                    result
-                },
-            }
-        },
-        Err(e) => {
-            warn!(tool_name, call_id, error = %e, "MCP tool call failed");
-            let exceeded = matches!(e, mcp_client::McpClientError::ResponseTooLarge { .. });
-            let mut result = build_error_result(
-                call_id,
-                server_label,
-                tool_name,
-                arguments_string,
-                &e.to_string(),
-                approval_request_id,
-            );
-            result.limit_exceeded = exceeded;
-            result
-        },
-    }
-}
-
-/// Execute a single MCP tool call.
-#[expect(
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::large_stack_frames,
-    reason = "linear validation, dispatch-time admission re-enforcement, and async call"
-)]
-async fn execute_single_call(
-    tool_call: &serde_json::Value,
-    tool_index: &McpToolIndex<'_>,
-    options: &McpExecutionOptions<'_>,
-    callout: &mcp_client::McpCallout,
-) -> Option<McpCallResult> {
-    let encoded_name = tool_call.get("name").and_then(serde_json::Value::as_str)?;
-    let call_id = tool_call
-        .get("call_id")
-        .or_else(|| tool_call.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let approval_request_id = approval_request_id(tool_call);
-
-    // Dispatch-time admission re-enforcement (#1724): a tool denied at discovery
-    // is not in the map, so reject it explicitly here rather than letting it fall
-    // through as an unresolved client function.
-    if let Some(reason) = options.admission.denied_reason(encoded_name) {
-        warn!(encoded_name, reason = ?reason, "rejecting model-generated call to a policy-denied MCP tool");
-        return Some(build_error_result(
-            call_id,
-            "unknown",
-            encoded_name,
-            "",
-            reason.message(),
-            approval_request_id,
-        ));
-    }
-
-    let (key, entry) = match resolve_tool_entry(tool_index, encoded_name, call_id, approval_request_id) {
-        Ok(r) => r,
-        Err(opt) => return opt.map(|b| *b),
-    };
-    let original_tool_name = &key.1;
-    // Re-verify the resolved entry against its operator-owned verdict. Defense in
-    // depth: an admitted entry with no verdict, or a writable tool under operator
-    // read-only mode, fails closed before any external side effect.
-    if let Some(reason) = options.admission.admitted_denial(&key.0, original_tool_name) {
-        warn!(encoded_name, reason = ?reason, "rejecting MCP call ineligible under operator admission policy");
-        return Some(build_error_result(
-            call_id,
-            &key.0,
-            original_tool_name,
-            "",
-            reason.message(),
-            approval_request_id,
-        ));
-    }
-    let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
-    let server_label = entry
-        .get("server_label")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let headers = entry.get("headers");
-    let authorization = entry.get("authorization").and_then(serde_json::Value::as_str);
-    let forwarded_headers = is_connector_tool_entry(entry)
-        .then_some(options.forwarded_headers)
-        .flatten();
-    let connector_context = is_connector_tool_entry(entry)
-        .then_some(options.connector_identity)
-        .flatten()
-        .map(|identity| mcp_client::McpConnectorContext {
-            owner: identity.owner(),
-            bearer: identity.user_credential(),
-            assertion: identity.authorization(),
-        });
-    let (arguments, arguments_string) = match parse_call_arguments(
-        tool_call,
-        call_id,
-        server_label,
-        original_tool_name,
-        approval_request_id,
-    ) {
-        Ok(r) => r,
-        Err(r) => return Some(*r),
-    };
-
-    // Enforce the tool's advertised `inputSchema` before any outbound side
-    // effect. A schema violation (wrong type, missing required field, or a field
-    // forbidden by `additionalProperties: false`) is returned as a tool error so
-    // the model can correct itself, and no `tools/call` is dialed (issue #1125).
-    // The message is value-free, and the rejected arguments are not echoed back:
-    // a malformed value may carry private content, and echoing it would also risk
-    // overrunning the result-byte budget and discarding the actionable error.
-    if let Err(message) = validate::validate_arguments(entry.get("tool_definition"), &arguments) {
-        warn!(
-            tool_name = original_tool_name,
-            server_label, call_id, %message,
-            "rejecting MCP tool call: arguments failed input-schema validation"
-        );
-        return Some(build_schema_rejection_result(
-            call_id,
-            server_label,
-            original_tool_name,
-            &message,
-            approval_request_id,
-        ));
-    }
-
-    debug!(
-        tool_name = original_tool_name,
-        server_label, call_id, "executing MCP tool call"
-    );
-
-    // The temporary decoded output is copied into private and public result
-    // fields, and an MCP tool-error also retains it in the public error field.
-    // Limiting the wire/result payload to one quarter of the retained allowance
-    // keeps every in-flight task within its aggregate reservation even at that
-    // worst-case ownership point.
-    let payload_limit = result_payload_limit(options.max_result_bytes);
-    if payload_limit == 0 {
-        return Some(build_error_result(
-            call_id,
-            server_label,
-            original_tool_name,
-            &arguments_string,
-            "MCP result allowance is too small to retain a result",
-            approval_request_id,
-        ));
-    }
-
-    // The opaque key binds target identity to this dispatcher's outbound
-    // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
-    // key and therefore remain fail-closed and unpooled.
-    let result = if let Some(limits) = options.transport_budget {
-        mcp_client::call_tool_with_forwarded_headers_budgeted(
-            server_url,
-            headers,
-            authorization,
-            options.forwarded_header_names,
-            forwarded_headers,
-            connector_context.as_ref(),
-            original_tool_name,
-            arguments,
-            options.timeout,
-            payload_limit,
-            callout,
-            limits,
-        )
-        .await
-    } else {
-        let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
-        mcp_client::call_tool_with_forwarded_headers(
-            session_key.as_ref().map(|key| (options.session_pool, key)),
-            server_url,
-            headers,
-            authorization,
-            options.forwarded_header_names,
-            forwarded_headers,
-            connector_context.as_ref(),
-            original_tool_name,
-            arguments,
-            options.timeout,
-            payload_limit,
-            callout,
-        )
-        .await
-    };
-    Some(process_call_result(
-        result,
-        call_id,
-        server_label,
-        original_tool_name,
-        &arguments_string,
-        approval_request_id,
-        payload_limit,
-    ))
+    let calls: Vec<McpToolCall<'_>> = mcp_calls.iter().map(|tc| responses_tool_call(tc)).collect();
+    // Boxed once per round: the generic batch future holds every in-flight call
+    // and would otherwise inflate the dispatch filter's request future.
+    Box::pin(execute::execute_mcp_calls(&calls, tool_index, options, callout)).await
 }
 
 // -----------------------------------------------------------------------------
 // Result Construction
 // -----------------------------------------------------------------------------
-
-/// Stable internal reason for a result that exceeded its admitted content cap.
-const MCP_RESULT_TOO_LARGE: &str = "MCP tool result exceeded the configured per-result byte limit";
-
-/// Serialize rmcp `ContentBlock` values into a lossless string for the
-/// Responses `output` field.
-///
-/// Text-only results keep the simple newline-joined form for readability and
-/// backward compatibility. Any result carrying non-text content (image, audio,
-/// embedded resource, or resource link) is serialized as the compact JSON MCP
-/// content array so that no block is silently dropped.
-///
-/// Returns `Err` when the content cannot be represented, so the caller can
-/// surface an explicit tool error instead of a lossy empty success.
-fn content_blocks_to_output(blocks: &[rmcp::model::ContentBlock], max_result_bytes: usize) -> Result<String, String> {
-    if blocks
-        .iter()
-        .all(|block| matches!(block, rmcp::model::ContentBlock::Text(_)))
-    {
-        let mut output = String::new();
-        for block in blocks {
-            let rmcp::model::ContentBlock::Text(text) = block else {
-                unreachable!("text-only content was checked above")
-            };
-            let separator_bytes = usize::from(!output.is_empty());
-            let next_bytes = output
-                .len()
-                .checked_add(separator_bytes)
-                .and_then(|bytes| bytes.checked_add(text.text.len()))
-                .ok_or_else(|| MCP_RESULT_TOO_LARGE.to_owned())?;
-            if next_bytes > max_result_bytes {
-                return Err(MCP_RESULT_TOO_LARGE.to_owned());
-            }
-            if separator_bytes != 0 {
-                output.push('\n');
-            }
-            output.push_str(&text.text);
-        }
-        return Ok(output);
-    }
-
-    let output_bytes = serialized_len(blocks).map_err(|e| format!("failed to size MCP content blocks: {e}"))?;
-    if output_bytes > max_result_bytes {
-        return Err(MCP_RESULT_TOO_LARGE.to_owned());
-    }
-    serde_json::to_string(blocks).map_err(|e| format!("failed to serialize MCP content blocks: {e}"))
-}
 
 /// Build result structs for a successful MCP call.
 #[expect(clippy::too_many_arguments, reason = "all args needed for result construction")]
@@ -2546,67 +2031,9 @@ fn build_success_result(
     }
 }
 
-/// Build an error result for a tool call that was dropped
-/// (task panic, cancellation, or missing fields).
-fn error_result_for_dropped_call(tool_call: &serde_json::Value, reason: &str) -> McpCallResult {
-    let call_id = tool_call
-        .get("call_id")
-        .or_else(|| tool_call.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let tool_name = tool_call
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    build_error_result(
-        call_id,
-        "unknown",
-        tool_name,
-        "",
-        reason,
-        approval_request_id(tool_call),
-    )
-}
-
 /// Extract the approval correlation id threaded through an approved tool call.
 fn approval_request_id(tool_call: &serde_json::Value) -> Option<&str> {
     tool_call.get("approval_request_id").and_then(serde_json::Value::as_str)
-}
-
-/// Build a schema-rejection result that fits the per-call retained-byte
-/// reservation.
-///
-/// The diagnostic is repeated across the replayed message and the public output
-/// item, and the identity fields (`call_id`, `server_label`, tool name, approval
-/// id) consume part of the fixed `MIN_RETAINED_RESULT_BYTES` budget. A fixed
-/// message cap therefore cannot guarantee the fit, so the message is trimmed
-/// until the whole result fits; otherwise the generic size fallback would discard
-/// the actionable explanation (issue #1125 review).
-fn build_schema_rejection_result(
-    call_id: &str,
-    server_label: &str,
-    tool_name: &str,
-    message: &str,
-    approval_request_id: Option<&str>,
-) -> McpCallResult {
-    let mut fitted = message.to_owned();
-    loop {
-        let result = build_error_result(call_id, server_label, tool_name, "", &fitted, approval_request_id);
-        if fitted.is_empty()
-            || result
-                .retained_bytes()
-                .is_none_or(|bytes| bytes <= MIN_RETAINED_RESULT_BYTES)
-        {
-            return result;
-        }
-        // Trim roughly a quarter (at least one byte) on a char boundary and retry.
-        let target = (fitted.len() * 3 / 4).min(fitted.len().saturating_sub(1));
-        let mut end = target;
-        while end > 0 && !fitted.is_char_boundary(end) {
-            end -= 1;
-        }
-        fitted.truncate(end);
-    }
 }
 
 /// Build result structs for a failed MCP call.

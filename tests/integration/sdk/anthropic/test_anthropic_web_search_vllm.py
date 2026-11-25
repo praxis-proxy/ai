@@ -8,6 +8,11 @@
 # ///
 """Official Anthropic SDK -> Praxis -> real vLLM hosted web-search acceptance.
 
+The SDK is pinned to ``anthropic==1.9.0`` deliberately: this GPU acceptance
+baseline was qualified against that client release and its ``2023-06-01``
+API-version header, and upgrading it is a separate, explicitly validated
+change — not something a floating dependency may drift into.
+
 Drives the Chat Completions backend path of the shipped
 ``anthropic/full-flow-agentic.yaml`` example — the server-owned Anthropic
 ``WebSearch`` loop translated onto a Chat-Completions-only vLLM backend — against a

@@ -7,6 +7,8 @@ use praxis_ai_apis::credential_source::CredentialSource;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use crate::identity::{DEFAULT_IDENTITY_HEADER_PREFIX, DEFAULT_IDENTITY_METADATA_NAMESPACE};
+
 /// Default HTTP timeout for metering service calls (5 seconds).
 const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 
@@ -15,13 +17,6 @@ const DEFAULT_FEATURE_KEY: &str = "inference-tokens";
 
 /// Default `CloudEvents` `source` field.
 const DEFAULT_SOURCE: &str = "ai-gateway";
-
-/// Default header prefix for tenant identity headers.
-const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
-
-/// Default metadata namespace the `identity_header_guard` filter writes
-/// captured identity headers under.
-const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 
 /// Deserialized YAML config for the `external_metering` filter.
 ///
@@ -85,6 +80,19 @@ pub(super) struct ExternalMeteringConfig {
     /// `metadata_namespace` setting when both run in one pipeline.
     #[serde(default = "default_identity_metadata_namespace")]
     pub identity_metadata_namespace: String,
+
+    /// Custom claim on a policy/auth filter's verified identity (tier 0) to
+    /// meter as the tenant username. When unset, the verified subject id is
+    /// used. Only consulted when an upstream filter (e.g. the `policy` engine)
+    /// published an `AuthenticatedIdentity` for the request.
+    #[serde(default)]
+    pub identity_username_claim: Option<String>,
+
+    /// Custom claim on a policy/auth filter's verified identity (tier 0) to
+    /// meter as the tenant group. When unset, no group is taken from the
+    /// verified identity.
+    #[serde(default)]
+    pub identity_group_claim: Option<String>,
 
     /// Fallback username when no identity header is present.
     /// If set, requests without `{prefix}username` are still metered

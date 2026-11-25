@@ -1,0 +1,38 @@
+server:
+  grpc_address: "0.0.0.0:9004"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: request_id
+      - filter: ai_guardrails
+        provider:
+          type: nemo
+          endpoint: "https://nemo.nemo-infra.svc/v1/checks"
+          model: "check-model"
+          timeout_ms: 5000
+          token_file: "/var/run/secrets/tokens/nemo/token"
+          tls:
+            ca_file: "/var/run/secrets/nemo-ca/service-ca.crt"
+          guardrails:
+            config_ids: ["pii-v1"]
+        phase:
+          request: true
+          response: false
+      - filter: ai_guardrails
+        provider:
+          type: nemo
+          endpoint: "https://nemo.nemo-infra.svc/v1/checks"
+          model: "check-model"
+          timeout_ms: 5000
+          token_file: "/var/run/secrets/tokens/nemo/token"
+          tls:
+            ca_file: "/var/run/secrets/nemo-ca/service-ca.crt"
+          guardrails:
+            config_ids: ["pii-v1"]
+        phase:
+          request: false
+          response: true
+
+insecure_options:
+  allow_unbounded_body: true
+  allow_private_upstreams: true

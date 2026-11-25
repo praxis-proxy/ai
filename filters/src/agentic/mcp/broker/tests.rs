@@ -11,7 +11,6 @@ use super::{
     *,
 };
 use crate::agentic::mcp::{
-    build_json_rpc_config,
     config::DEFAULT_MAX_BODY_BYTES,
     protocol::{
         PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_STATELESS_2026_07_28, ProtocolProfile, SUPPORTED_VERSIONS_CURRENT,
@@ -692,7 +691,7 @@ async fn initialize_extracts_protocol_version() {
     let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         Some("2025-03-26"),
         "should extract protocol version from initialize params"
     );
@@ -1072,7 +1071,7 @@ fn body_access_is_read_write() {
     let filter = make_broker_filter();
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::ReadWrite,
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "Praxis should declare ReadWrite body access"
     );
 }
@@ -1153,7 +1152,7 @@ async fn control_char_method_not_written_to_metadata() {
     let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(
-        ctx.get_metadata("mcp.method").is_none(),
+        ctx.filter_metadata.get("mcp.method").is_none(),
         "method with control chars should not be written to metadata"
     );
 }
@@ -1169,7 +1168,7 @@ async fn control_char_protocol_version_not_written() {
     let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(
-        ctx.get_metadata("mcp.protocol_version").is_none(),
+        ctx.filter_metadata.get("mcp.protocol_version").is_none(),
         "protocol version with control chars should not be written to metadata"
     );
 }
@@ -2935,20 +2934,9 @@ fn make_stateless_broker_filter() -> McpBrokerFilter {
 
 fn build_broker_filter_from_yaml(yaml: &str) -> McpBrokerFilter {
     let cfg: McpBrokerConfig = serde_yaml::from_str(yaml).unwrap();
+    let servers = cfg.servers.clone();
     let (validated, catalog) = build_config(cfg).unwrap();
-    let json_rpc_config = build_json_rpc_config(validated.max_body_bytes);
-
-    McpBrokerFilter {
-        cache_scope: validated.cache_scope,
-        cache_ttl_ms: validated.cache_ttl_ms,
-        catalog,
-        default_version: validated.default_version.clone(),
-        json_rpc_config,
-        max_body_bytes: validated.max_body_bytes,
-        protocol_profile: validated.protocol_profile,
-        public_path: validated.path.clone(),
-        supported_versions: validated.supported_versions.clone(),
-    }
+    McpBrokerFilter::build(&validated, catalog, &servers, None)
 }
 
 fn make_mcp_request() -> praxis_filter::Request {

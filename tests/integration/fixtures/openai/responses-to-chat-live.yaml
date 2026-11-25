@@ -1,0 +1,45 @@
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-to-chat]
+
+filter_chains:
+  - name: responses-to-chat
+    filters:
+      - filter: ai_operation
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        timeout_ms: 120000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+              - filter: openai_responses_to_chat_completions
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses$"
+                  replacement: "/v1/chat/completions"
+              - filter: router
+                routes:
+                  - path: "/v1/chat/completions"
+                    cluster: openai
+              - filter: credential_injection
+                clusters:
+                  - name: openai
+                    header: Authorization
+                    env_var: OPENAI_API_KEY
+                    header_prefix: "Bearer "
+              - filter: load_balancer
+                clusters:
+                  - name: openai
+                    endpoints: ["api.openai.com:443"]
+                    http:
+                      authority: api.openai.com
+                    tls:
+                      sni: api.openai.com
+            on_result:
+              - default: true
+                done: true

@@ -21,13 +21,57 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
-    start_proxy,
+    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_body_aware_backend,
+    start_mcp_mock_server_with_config, start_proxy, start_proxy_with_registry, test_subrequest_client,
 };
 
 // -----------------------------------------------------------------------------
 // Pipeline Build
 // -----------------------------------------------------------------------------
+
+/// Make the final model message observable to response screening in this
+/// fixture: the agentic loop otherwise adds MCP output items, which the
+/// text-only guardrail extractor rejects before evaluating the final message.
+struct FinalMessageOnly;
+
+#[async_trait::async_trait]
+impl praxis_filter::HttpFilter for FinalMessageOnly {
+    fn name(&self) -> &'static str {
+        "test_final_message_only"
+    }
+
+    async fn on_request(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+    ) -> Result<praxis_filter::FilterAction, praxis_filter::FilterError> {
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+
+    fn response_body_access(&self) -> praxis_filter::BodyAccess {
+        praxis_filter::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    }
+
+    fn on_response_body(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+    ) -> Result<praxis_filter::FilterAction, praxis_filter::FilterError> {
+        if !end_of_stream {
+            return Ok(praxis_filter::FilterAction::Continue);
+        }
+        if let Some(bytes) = body {
+            let mut json: serde_json::Value = serde_json::from_slice(bytes)?;
+            if let Some(output) = json.get_mut("output").and_then(serde_json::Value::as_array_mut)
+                && output.iter().any(|item| item["type"] == "message")
+            {
+                output.retain(|item| item["type"] == "message");
+                *bytes = bytes::Bytes::from(serde_json::to_vec(&json)?);
+            }
+        }
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+}
 
 #[test]
 fn example_config_builds_pipeline() {
@@ -1355,6 +1399,152 @@ fn agentic_guardrail_blocks_mcp_result_before_second_inference() {
             .is_some_and(|content| content.contains("mock result for get_weather")),
         "NeMo must receive the MCP result rather than the stale IRR request body: {check:#}"
     );
+}
+
+#[test]
+fn agentic_guardrail_rejects_modified_structured_output_after_local_tool_result() {
+    assert_agentic_redaction_after_local_tool_result(false);
+    assert_agentic_redaction_after_local_tool_result(true);
+}
+
+/// Keep pipeline construction separate from the request and response fixtures.
+#[inline(never)]
+fn combined_agentic_guardrail_config(model_port: u16, nemo_port: u16) -> Box<praxis_core::config::Config> {
+    let path = example_config_path("openai/responses/agentic-loop-guardrails.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read guarded agentic-loop example");
+    let original_phase = "                  response: false\n                  tool_results: true";
+    assert_eq!(
+        yaml.matches(original_phase).count(),
+        1,
+        "the example must expose the tool-result phase"
+    );
+    let yaml = yaml.replacen(
+        original_phase,
+        "                  response: true\n                  tool_results: true",
+        1,
+    );
+    let owner = "              # Sole continuation and terminal-response owner.";
+    assert_eq!(yaml.matches(owner).count(), 1, "the example must expose the loop owner");
+    let yaml = yaml.replacen(
+        owner,
+        &format!("              - filter: test_final_message_only\n\n{owner}"),
+        1,
+    );
+    let yaml = patch_yaml(
+        &yaml,
+        free_port(),
+        &HashMap::from([("127.0.0.1:3001", model_port), ("127.0.0.1:3002", nemo_port)]),
+    );
+    Box::new(praxis_core::config::Config::from_yaml(&yaml).expect("parse combined guardrail phases"))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises the local tool-result and structured response phases in one agentic loop"
+)]
+fn assert_agentic_redaction_after_local_tool_result(structured: bool) {
+    let first_response = serde_json::json!({
+        "id":"resp_structured_tool_1", "object":"response", "status":"completed",
+        "output":[{"type":"function_call", "id":"fc_structured_tool_1", "call_id":"call_structured_tool_1",
+            "name":"weather__get_weather", "arguments":r#"{"location":"SF"}"#, "status":"completed"}]
+    });
+    let final_response = serde_json::json!({
+        "id":"resp_structured_tool_2", "object":"response", "status":"completed",
+        "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"secret"}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, final_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let nemo = start_body_aware_backend(|body| {
+        let payload: serde_json::Value = serde_json::from_str(body).expect("NeMo call must contain JSON");
+        let is_modified_output = payload["guardrails"]["rail_types"] == serde_json::json!(["output"])
+            && payload["messages"][0]["content"] == "secret";
+        let verdict = if is_modified_output {
+            serde_json::json!({"status":"modified", "content":"masked"})
+        } else {
+            serde_json::json!({"status":"passed", "content":"safe"})
+        };
+        (200, verdict.to_string())
+    });
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let config = combined_agentic_guardrail_config(model.port(), nemo.port());
+    let mut registry = praxis_ai::build_full_registry(&test_subrequest_client());
+    registry
+        .register(
+            "test_final_message_only",
+            praxis_filter::FilterFactory::Http(Arc::new(|_| Ok(Box::new(FinalMessageOnly)))),
+        )
+        .expect("register test response fixture");
+    let proxy = start_proxy_with_registry(&config, &registry);
+    let mut request = serde_json::json!({
+        "model":"gpt-4.1", "input":"What is the weather in SF?",
+        "text":{"format":{"type":"json_schema", "name":"answer", "schema":{"type":"object"}}},
+        "tools":[{"type":"mcp", "server_label":"weather", "server_url":format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools":["get_weather"], "require_approval":"never"}]
+    });
+    if !structured {
+        assert!(
+            request.as_object_mut().unwrap().remove("text").is_some(),
+            "the comparison case must request an ordinary text response"
+        );
+    }
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passed local tool result must permit the second inference"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the local tool must execute before the final response"
+    );
+    let checks: Vec<serde_json::Value> = nemo
+        .requests()
+        .iter()
+        .map(|request| serde_json::from_str(&request.body).expect("captured NeMo check must be JSON"))
+        .collect();
+    assert!(
+        checks.iter().any(
+            |check| check["guardrails"]["rail_types"] == serde_json::json!(["input"])
+                && check["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("mock result for get_weather"))
+        ),
+        "the early-return path must actually screen the local tool result: {checks:#?}"
+    );
+    assert!(
+        checks.iter().any(
+            |check| check["guardrails"]["rail_types"] == serde_json::json!(["output"])
+                && check["messages"][0]["content"] == "secret"
+        ),
+        "the final output must reach NeMo before deciding the rewrite: {checks:#?}; client response: {raw}"
+    );
+    let body = parse_body(&raw);
+    if structured {
+        assert!(
+            body.contains("evaluation_failed"),
+            "the changed structured output must fail closed: {raw}"
+        );
+        assert!(
+            !body.contains("secret") && !body.contains("masked"),
+            "neither original nor partial rewrite may reach the client: {raw}"
+        );
+    } else {
+        let json: serde_json::Value = serde_json::from_str(&body).expect("the unstructured response must be JSON");
+        assert_eq!(
+            json.pointer("/output/0/content/0/text")
+                .and_then(serde_json::Value::as_str),
+            Some("masked"),
+            "the same local tool-result flow must allow a safe unstructured rewrite: {raw}"
+        );
+    }
 }
 
 #[test]
@@ -3485,6 +3675,98 @@ fn retained_budget_reuses_released_round_body_headroom() {
 }
 
 #[test]
+fn retained_budget_admits_structured_mcp_result() {
+    // A ~5 KiB `structuredContent` result with ~550 JSON nodes, shaped like a
+    // Kubernetes object. Under a 10 MiB limit the per-call parse allowance is
+    // ~1.5 MB: enough for the MCP result charge (~0.4 MB) but not for the
+    // provider-output charge (~4.9 MB) applied to MCP replies previously.
+    let containers: Vec<serde_json::Value> = (0..60)
+        .map(|i| {
+            serde_json::json!({
+                "name": format!("container-{i}"),
+                "image": "quay.io/example/app:v1",
+                "ready": true,
+                "restarts": 0
+            })
+        })
+        .collect();
+    let tool_round = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "k8s__resources_get",
+            "arguments": r#"{"name":"shop"}"#,
+            "status": "completed"
+        }]
+    })
+    .to_string();
+    let final_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        }]
+    })
+    .to_string();
+    let model = StatefulCapturingBackend::new(vec![(200, tool_round), (200, final_response)]).start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("resources_get").with_input_schema(object_schema("name"))],
+        sse_tool_results: true,
+        structured_content: Some(serde_json::json!({"kind": "Deployment", "containers": containers})),
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_with_budget(proxy_port, model.port(), 10_485_760);
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the shop deployment",
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "k8s",
+            "server_url": mcp_url,
+            "allowed_tools": ["resources_get"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "structured MCP result must fit the budget: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+    let mcp_call = response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "mcp_call"))
+        .expect("response must include the mcp_call");
+    assert!(
+        mcp_call["error"].is_null()
+            && mcp_call["output"]
+                .as_str()
+                .is_some_and(|out| out.contains("mock result for resources_get")),
+        "structured MCP result must succeed: {mcp_call:#?}"
+    );
+    assert_eq!(model.requests().len(), 2, "both inference rounds ran");
+}
+
+#[test]
 fn two_tool_rounds_accumulate_output_and_usage() {
     // Round 1: the model asks to call the weather tool.
     let first_response = serde_json::json!({
@@ -4983,6 +5265,310 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Round-Trip: File-Search Context Across Stored Continuations (#2036)
+// -----------------------------------------------------------------------------
+//
+// A gateway-executed file search feeds the next inference round a private
+// `function_call`/`function_call_output` bridge. The answer need not repeat the
+// retrieved passage, so a `previous_response_id` continuation and a later
+// reactive compaction must replay that bridge from the store.
+// https://github.com/praxis-proxy/ai/issues/2036
+
+/// Unique passage marker the follow-up answers deliberately never repeat.
+const FILE_SEARCH_MARKER: &str = "FILE-SEARCH-PASSAGE-MARKER-2036";
+
+/// Model round that reasons, then asks the gateway for a hosted file search.
+fn file_search_reasoning_round(response_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 1_760_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "id": "rs_fs_2036", "summary": [{"type": "summary_text", "text": "Search the policy."}]},
+            {"type": "file_search_call", "id": "fs_2036", "status": "searching", "queries": ["policy details"]}
+        ]
+    })
+}
+
+/// Assistant answer that intentionally omits [`FILE_SEARCH_MARKER`].
+fn file_search_answer(response_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 1_760_000_001,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": format!("msg_{response_id}"),
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text}]
+        }]
+    })
+}
+
+/// Return the `[reasoning, function_call, function_call_output]` file-search
+/// prefix a model request received, asserting order and correlation.
+fn file_search_prefix(input: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let start = input
+        .iter()
+        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_fs_2036")
+        .unwrap_or_else(|| panic!("request must carry the search round's reasoning: {input:#?}"));
+    let prefix = input
+        .get(start..start + 3)
+        .expect("reasoning, call, and result")
+        .to_vec();
+    assert_eq!(
+        prefix.iter().map(output_item_type).collect::<Vec<_>>(),
+        ["reasoning", "function_call", "function_call_output"],
+        "file-search context must keep reasoning/call/result order: {input:#?}"
+    );
+    assert_eq!(
+        prefix[1]["call_id"], prefix[2]["call_id"],
+        "correlation id must survive"
+    );
+    assert!(
+        prefix[2]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains(FILE_SEARCH_MARKER)),
+        "the private result must carry the retrieved passage: {prefix:#?}"
+    );
+    assert!(
+        input.iter().all(|item| item["type"] != "file_search_call"),
+        "a hosted file_search_call is never valid inference input: {input:#?}"
+    );
+    prefix
+}
+
+/// Answer text that cites the earlier passage without a fresh search.
+const CITING_FOLLOW_UP: &str = "Still documented <|file-42|>.";
+
+/// Private stored-response key the gateway uses for restored citations.
+const STORED_CITATION_KEY: &str = "_praxis_file_search_citation_files";
+
+/// Assert a continuation answer resolved its restored citation marker into a
+/// public `file_citation` annotation with cleaned text.
+fn assert_restored_citation(response: &serde_json::Value) {
+    let message = response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "message"))
+        .unwrap_or_else(|| panic!("continuation must return an assistant message: {response}"));
+    let part = &message["content"][0];
+    let text = part["text"].as_str().expect("output text");
+    assert!(
+        !text.contains("<|file-") && text.starts_with("Still documented"),
+        "the restored citation marker must be removed from the answer: {text:?}"
+    );
+    let annotations = part["annotations"].as_array().expect("annotations array");
+    assert!(
+        annotations
+            .iter()
+            .any(|annotation| annotation["type"] == "file_citation"
+                && annotation["file_id"] == "file-42"
+                && annotation["filename"] == "handbook.txt"),
+        "a continuation citing an earlier passage must carry its file_citation: {annotations:#?}"
+    );
+    assert!(
+        response.get(STORED_CITATION_KEY).is_none(),
+        "the private citation map must never reach the client: {response}"
+    );
+}
+
+#[test]
+fn file_search_context_survives_stored_continuation_and_compaction() {
+    // Pad the passage past the minimum compaction threshold so the follow-up
+    // turn's reactive compaction is driven by the retrieved context itself.
+    let passage = format!("{FILE_SEARCH_MARKER} {}", "Retained policy clause. ".repeat(600));
+    let summary = r#"{"id":"chatcmpl-fs","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":5,"total_tokens":55}}"#;
+    let model = StatefulCapturingBackend::new(vec![
+        (200, file_search_reasoning_round("resp_fs_round_1").to_string()),
+        (
+            200,
+            file_search_answer("resp_fs_turn_1", "The policy is documented.").to_string(),
+        ),
+        (200, file_search_answer("resp_fs_turn_2", CITING_FOLLOW_UP).to_string()),
+        (200, summary.to_owned()),
+        (
+            200,
+            file_search_answer("resp_fs_turn_3", "Compacted answer.").to_string(),
+        ),
+    ])
+    .start_with_shutdown();
+    let vector_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let vector_port = vector_listener.local_addr().unwrap().port();
+    let vector_calls = spawn_vector_store_mock_with_text(vector_listener, &passage);
+    let db = TempSqlite::new("file_search_continuation");
+    let config = load_file_search_store_config(free_port(), model.port(), vector_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What does the policy say?",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let first_raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&first_raw), 200, "searched turn: {first_raw}");
+    let first_body: serde_json::Value = serde_json::from_str(&parse_body(&first_raw)).unwrap();
+    assert_eq!(vector_calls.load(Ordering::SeqCst), 1, "one vector-store callout");
+    assert!(
+        first_body["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "file_search_call")
+            .all(|item| item.get("results").is_none_or(serde_json::Value::is_null)),
+        "public results stay opt-in: {first_body}"
+    );
+    assert!(
+        !first_body.to_string().contains(FILE_SEARCH_MARKER),
+        "marker is private"
+    );
+
+    let continuation = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "And what else?",
+        "previous_response_id": first_body["id"],
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let continuation_raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(parse_status(&continuation_raw), 200, "continuation: {continuation_raw}");
+    let continuation_body: serde_json::Value = serde_json::from_str(&parse_body(&continuation_raw)).unwrap();
+    assert_restored_citation(&continuation_body);
+    for id in [&first_body["id"], &continuation_body["id"]] {
+        let (status, stored) = http_get(proxy.addr(), &format!("/v1/responses/{}", id.as_str().unwrap()), None);
+        assert_eq!(status, 200, "stored response must be retrievable: {stored}");
+        assert!(
+            !stored.contains(STORED_CITATION_KEY),
+            "retrieval must strip the private citation map: {stored}"
+        );
+    }
+
+    // Branch compaction from the searched turn: compaction fails closed on the
+    // continuation's non-empty citation annotations, which its text-only
+    // summary cannot represent; the search turn's stored bridge is the source
+    // under test here.
+    let compacting = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Summarize everything.",
+        "previous_response_id": first_body["id"],
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    });
+    let compacting_raw = http_send(proxy.addr(), &json_post("/v1/responses", &compacting.to_string()));
+    assert_eq!(parse_status(&compacting_raw), 200, "compacting turn: {compacting_raw}");
+
+    let requests = model.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "two search rounds, one continuation, one summarizer, one compacted inference"
+    );
+    let live_input = request_input(&requests[1].body);
+    let continuation_input = request_input(&requests[2].body);
+    assert_eq!(
+        file_search_prefix(&continuation_input),
+        file_search_prefix(&live_input),
+        "continuation must replay the exact file-search prefix the live round received"
+    );
+    assert_eq!(
+        vector_calls.load(Ordering::SeqCst),
+        1,
+        "continuation must not search again"
+    );
+    assert!(
+        requests[3].uri.ends_with("/chat/completions") && requests[3].body.contains(FILE_SEARCH_MARKER),
+        "the compaction summarizer must see the retrieved passage: {}",
+        requests[3].uri
+    );
+}
+
+#[test]
+fn streaming_file_search_context_survives_stored_continuation() {
+    let round = file_search_reasoning_round("resp_fs_stream_1");
+    let answer = file_search_answer("resp_fs_stream_2", "The policy is documented.");
+    let follow_up = file_search_answer("resp_fs_stream_3", CITING_FOLLOW_UP);
+    let as_stream = |response: &serde_json::Value| {
+        let id = response["id"].as_str().unwrap();
+        let mut events = vec![sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": id, "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        )];
+        let output = response["output"].as_array().unwrap();
+        for (index, item) in output.iter().enumerate() {
+            events.push(sse_event(
+                "response.output_item.added",
+                serde_json::json!({"response_id": id, "output_index": index, "item": item, "sequence_number": events.len()}),
+            ));
+            events.push(sse_event(
+                "response.output_item.done",
+                serde_json::json!({"response_id": id, "output_index": index, "item": item, "sequence_number": events.len()}),
+            ));
+        }
+        let mut completed = response.clone();
+        completed["usage"] = usage_json((8, 2, 10));
+        events.push(sse_event(
+            "response.completed",
+            serde_json::json!({"response": completed, "sequence_number": events.len()}),
+        ));
+        events
+    };
+    let (model_port, model_requests, model_thread) =
+        start_streaming_model(vec![as_stream(&round), as_stream(&answer), as_stream(&follow_up)]);
+    let vector_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let vector_port = vector_listener.local_addr().unwrap().port();
+    let vector_calls = spawn_vector_store_mock_with_text(vector_listener, FILE_SEARCH_MARKER);
+    let db = TempSqlite::new("file_search_stream_continuation");
+    let config = load_file_search_store_config(free_port(), model_port, vector_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What does the policy say?",
+        "stream": true,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let first_raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&first_raw), 200, "streamed search turn: {first_raw}");
+    let first_id = completed_response_id(&parse_body(&first_raw));
+    assert_eq!(vector_calls.load(Ordering::SeqCst), 1, "one vector-store callout");
+
+    let continuation = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "And what else?",
+        "stream": true,
+        "previous_response_id": first_id,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let continuation_raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(
+        parse_status(&continuation_raw),
+        200,
+        "streamed continuation: {continuation_raw}"
+    );
+    assert_restored_citation(&extract_completed_response(&parse_body(&continuation_raw)));
+    drop(proxy);
+    model_thread.join().expect("streaming model should finish");
+
+    let requests = model_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3, "two search rounds and one continuation");
+    assert_eq!(
+        file_search_prefix(&request_input(&requests[2])),
+        file_search_prefix(&request_input(&requests[1])),
+        "streamed continuation must replay the exact live file-search prefix"
+    );
+    assert_eq!(
+        vector_calls.load(Ordering::SeqCst),
+        1,
+        "continuation must not search again"
+    );
+}
+
 #[test]
 fn web_search_batch_respects_response_wide_max_tool_calls() {
     let first_response = serde_json::json!({
@@ -5215,26 +5801,26 @@ fn web_search_provider_failure_continues_loop_with_failed_result() {
     );
 }
 
-#[test]
-fn streaming_web_search_round_trip_resumes_one_logical_response() {
+/// Script a search round that omits `output_item.done` so Praxis synthesizes the lifecycle.
+fn web_search_stream_round(response_id: &str, item_id: &str, query: &str) -> Vec<String> {
     let search_call = serde_json::json!({
         "type": "web_search_call",
-        "id": "ws_stream_1",
+        "id": item_id,
         "status": "completed",
-        "action": {"type": "search", "query": "Rust 2025 edition"}
+        "action": {"type": "search", "query": query}
     });
-    let first_response = vec![
+    vec![
         sse_event(
             "response.created",
             serde_json::json!({
-                "response": {"id": "resp_ws_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "response": {"id": response_id, "object": "response", "status": "in_progress", "output": []},
                 "sequence_number": 0
             }),
         ),
         sse_event(
             "response.output_item.added",
             serde_json::json!({
-                "response_id": "resp_ws_stream_1",
+                "response_id": response_id,
                 "output_index": 0,
                 "item": search_call,
                 "sequence_number": 1
@@ -5244,7 +5830,7 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
             "response.completed",
             serde_json::json!({
                 "response": {
-                    "id": "resp_ws_stream_1",
+                    "id": response_id,
                     "object": "response",
                     "status": "completed",
                     "output": [search_call],
@@ -5253,7 +5839,12 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
                 "sequence_number": 2
             }),
         ),
-    ];
+    ]
+}
+
+#[test]
+fn streaming_web_search_round_trip_resumes_one_logical_response() {
+    let first_response = web_search_stream_round("resp_ws_stream_1", "ws_stream_1", "Rust 2025 edition");
     let final_message = serde_json::json!({
         "type": "message",
         "id": "msg_ws_stream_2",
@@ -5499,6 +6090,72 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
         Some(bridge_call_id),
         "bridge function_call_output must reuse the bridge function_call call_id: {input:?}"
     );
+}
+
+#[test]
+fn streaming_web_search_emits_one_progress_lifecycle_per_round() {
+    let (model_port, _, model_thread) = start_streaming_model(vec![
+        web_search_stream_round("resp_first", "ws_first", "Rust release"),
+        web_search_stream_round("resp_second", "ws_second", "Rust release notes"),
+        vec![sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_final",
+                    "object": "response",
+                    "status": "completed",
+                    "output": []
+                },
+                "sequence_number": 0
+            }),
+        )],
+    ]);
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_calls = spawn_search_mock(search_listener);
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model_port, search_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Find the Rust release and release notes",
+        "stream": true,
+        "store": false,
+        "tools": [{"type": "web_search"}]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+
+    let body = parse_body(&raw);
+    let frames = assert_logical_stream_conformance(&body, "resp_first");
+    let progress: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.event_type.starts_with("response.web_search_call."))
+        .map(|frame| {
+            (
+                frame.event_type.as_str(),
+                frame.data["item_id"].as_str(),
+                frame.data["output_index"].as_u64(),
+            )
+        })
+        .collect();
+    let lifecycle = [
+        "response.web_search_call.in_progress",
+        "response.web_search_call.searching",
+        "response.web_search_call.completed",
+    ];
+    let expected: Vec<_> = [(0, "ws_first"), (1, "ws_second")]
+        .into_iter()
+        .flat_map(|(index, id)| lifecycle.map(|event| (event, Some(id), Some(index))))
+        .collect();
+    assert_eq!(progress, expected, "{body}");
+
+    let output = terminal_output(&frames);
+    assert_eq!(output.len(), 2, "{body}");
+    assert_eq!(output[0]["id"], "ws_first", "{body}");
+    assert_eq!(output[1]["id"], "ws_second", "{body}");
+    assert_eq!(search_calls.load(Ordering::SeqCst), 2);
+    model_thread.join().expect("streaming model thread should finish");
 }
 
 #[test]
@@ -6339,13 +6996,18 @@ fn spawn_capturing_search_mock(listener: TcpListener) -> Arc<Mutex<Vec<String>>>
 /// can assert exactly how many vector-store callouts the file-search dispatcher
 /// issued across an agentic-loop continuation.
 fn spawn_vector_store_mock(listener: TcpListener) -> Arc<AtomicUsize> {
+    spawn_vector_store_mock_with_text(listener, "The answer is 42.")
+}
+
+/// [`spawn_vector_store_mock`] returning one chunk with caller-chosen text.
+fn spawn_vector_store_mock_with_text(listener: TcpListener, text: &str) -> Arc<AtomicUsize> {
     use std::io::{Read as _, Write as _};
     let body = serde_json::json!({
         "data": [{
             "file_id": "file-42",
             "filename": "handbook.txt",
             "score": 0.98,
-            "content": [{"type": "text", "text": "The answer is 42."}],
+            "content": [{"type": "text", "text": text}],
             "attributes": null
         }]
     })
@@ -9691,6 +10353,28 @@ fn load_agentic_config_with_budget_and_store(
     );
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config with Store")
+}
+
+/// Agentic-loop example with a temporary Store and the model and vector-store
+/// endpoints retargeted at loopback mocks; the compaction summarizer shares
+/// the model endpoint.
+fn load_file_search_store_config(
+    proxy_port: u16,
+    model_port: u16,
+    vector_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let with_store = original.replace("sqlite://responses.db?mode=rwc", db_url);
+    assert_ne!(with_store, original, "expected the example's SQLite URL");
+    let yaml = patch_yaml(
+        &with_store,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port), ("127.0.0.1:8001", vector_port)]),
+    );
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse file-search agentic-loop config with Store")
 }
 
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {

@@ -44,14 +44,14 @@ pub(super) mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, io, time::Duration};
+use std::{borrow::Cow, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -69,7 +69,9 @@ use super::{
     state::{ResponsesState, mark_local_compaction_item},
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_policy::OnFailure,
+    json_body::MAX_JSON_BODY_BYTES,
     state_owner::{StateOwner, require_state_owner},
     store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry, StoreError},
     subrequest::{self, SubRequest, SubRequestClient},
@@ -566,26 +568,7 @@ fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, Filt
 
 /// Count already parsed JSON without building another serialized payload.
 fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
-    let mut counter = JsonByteCounter(0);
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.0)
-}
-
-/// Counts encoded JSON bytes without retaining the serialized payload.
-struct JsonByteCounter(usize);
-
-impl io::Write for JsonByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(buf.len())
-            .ok_or_else(|| io::Error::other("compaction JSON size overflow"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    praxis_filter::json_size::serialized_len(value).ok()
 }
 
 /// Budget failures always terminate the request, including fail-open callouts.
@@ -604,7 +587,7 @@ impl HttpFilter for CompactFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Also offer the bound-upstream phase so a chain may defer compaction until
@@ -619,7 +602,7 @@ impl HttpFilter for CompactFilter {
     /// minted once the body is bound. A standalone chain with no such condition
     /// still runs the pre-read hook.
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -675,7 +658,7 @@ impl HttpFilter for CompactFilter {
             Err(action) => return Ok(action),
         };
         self.apply_compaction(ctx, &summary);
-        ctx.set_metadata("responses.compacted", "true");
+        ctx.record_ai_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
 
@@ -828,7 +811,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+    ctx.filter_metadata.get("openai_responses_request.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------
@@ -1911,19 +1894,29 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     let input_len = state.input.len();
     let mut message_tail = split_current_turn(&mut state.messages, input_len);
-    let mut persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let persisted_tail = state
+        .persisted_messages_mut()
+        .map(|persisted_messages| split_current_turn(persisted_messages, input_len));
     // The replay view carries the unmarked compaction item while the persisted
     // copy is marked, so the two views genuinely differ and cannot share one
     // payload. Rehydration strips the marker from the replay projection.
-    let persisted_compaction_item = mark_local_compaction_item(compaction_item);
+    let persisted_compaction_item = state
+        .captures_persistence_history()
+        .then(|| mark_local_compaction_item(compaction_item));
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
     state.messages.append(&mut message_tail);
 
-    state.persisted_messages.clear();
-    state.persisted_messages.push(persisted_compaction_item);
-    state.persisted_messages.append(&mut persisted_tail);
+    if let (Some(persisted_messages), Some(mut persisted_tail), Some(persisted_compaction_item)) = (
+        state.persisted_messages_mut(),
+        persisted_tail,
+        persisted_compaction_item,
+    ) {
+        persisted_messages.clear();
+        persisted_messages.push(persisted_compaction_item);
+        persisted_messages.append(&mut persisted_tail);
+    }
 }
 
 /// Move the current-turn tail off `items`, leaving history behind to drop.

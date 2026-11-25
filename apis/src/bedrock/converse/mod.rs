@@ -59,33 +59,6 @@ use crate::bedrock::{
 };
 
 // -----------------------------------------------------------------------------
-// Metadata keys (scoped to avoid collisions with other filters)
-// -----------------------------------------------------------------------------
-
-/// Model extracted from the Chat Completions request body.
-const MODEL_KEY: &str = "bedrock_converse.model";
-
-/// Synthetic response ID generated at request time and shared across all
-/// streaming chunks so each SSE frame carries the same `id` field.
-const RESPONSE_ID_KEY: &str = "bedrock_converse.response_id";
-
-/// Whether the caller requested streaming usage metadata.
-const INCLUDE_USAGE_KEY: &str = "bedrock_converse.include_usage";
-
-/// Discriminates which `on_response_body` branch to execute.
-const RESPONSE_PATH_KEY: &str = "bedrock_converse.response_path";
-/// Response-path variant for upstream error responses.
-const RESPONSE_PATH_ERROR: &str = "error";
-/// Response-path variant for non-streaming success responses.
-const RESPONSE_PATH_SUCCESS: &str = "success";
-/// Response-path variant for binary `EventStream` streaming responses.
-const RESPONSE_PATH_STREAM: &str = "stream";
-
-/// HTTP status code saved from `on_response` for use in error body
-/// normalization.
-const RESPONSE_STATUS_KEY: &str = "bedrock_converse.response_status";
-
-// -----------------------------------------------------------------------------
 // SSE framing
 // -----------------------------------------------------------------------------
 
@@ -93,19 +66,56 @@ const RESPONSE_STATUS_KEY: &str = "bedrock_converse.response_status";
 const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
 
 // -----------------------------------------------------------------------------
-// Per-request streaming state
+// Per-exchange state
 // -----------------------------------------------------------------------------
 
-/// State persisted across `on_response_body` calls for a single streaming
-/// response.  Stored via [`HttpFilterContext::insert_filter_state`] so it
-/// survives multiple chunk deliveries.
-struct BedrockStreamingState {
-    /// Model returned on every translated SSE chunk.
+/// This filter's state for one exchange, kept in `filter_state` from the
+/// translated request until the response body ends.
+struct Exchange {
+    /// What the response side needs from the request.
+    request: TranslatedRequest,
+    /// How the response body is translated, once its headers arrive.
+    response: Option<ResponseTranslation>,
+}
+
+/// The parts of a translated Chat Completions request that shape its
+/// response.
+struct TranslatedRequest {
+    /// Model returned on every translated response and SSE chunk.
     model: String,
-    /// Response ID returned on every translated SSE chunk.
+    /// Synthetic response ID generated at request time and shared across all
+    /// streaming chunks so each SSE frame carries the same `id` field.
     response_id: String,
     /// Whether the caller opted into the final usage chunk.
     include_usage: bool,
+}
+
+impl Default for TranslatedRequest {
+    /// A request this filter did not translate: its response reports an
+    /// `unknown` model under the fallback ID, with no usage chunk.
+    fn default() -> Self {
+        Self {
+            model: "unknown".to_owned(),
+            response_id: response::FALLBACK_ID.to_owned(),
+            include_usage: false,
+        }
+    }
+}
+
+/// How a response body is translated, chosen from its headers.
+enum ResponseTranslation {
+    /// A Bedrock error, normalized to the OpenAI envelope with this status.
+    Error(http::StatusCode),
+    /// A non-streaming success body.
+    Success,
+    /// A binary `EventStream`, translated to SSE. Its state starts with the
+    /// first body chunk.
+    Stream(Option<BedrockStreamingState>),
+}
+
+/// State persisted across `on_response_body` calls for a single streaming
+/// response.
+struct BedrockStreamingState {
     /// Incremental binary frame decoder.  Holds any partial frame bytes
     /// that spanned a chunk boundary.
     decoder: EventStreamDecoder,
@@ -154,20 +164,52 @@ impl OpenaiChatCompletionsToBedrockConverseFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
+
+    /// Prepare a successful response's headers and body mode, and select
+    /// its translation by content type.
+    fn prepare_success_response(&self, ctx: &mut HttpFilterContext<'_>) -> ResponseTranslation {
+        // Check content-type with a short-lived immutable borrow.
+        let is_stream = ctx
+            .response_header
+            .as_ref()
+            .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("application/vnd.amazon.eventstream"));
+
+        if is_stream {
+            // Streaming: rewrite Content-Type to the OpenAI SSE format.
+            if let Some(resp) = ctx.response_header.as_mut() {
+                resp.headers.remove(http::header::CONTENT_LENGTH);
+                resp.headers.remove(http::header::CONTENT_ENCODING);
+                resp.headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/event-stream"),
+                );
+            }
+            ctx.response_headers_modified = true;
+            ResponseTranslation::Stream(None)
+        } else {
+            // Non-streaming success: buffer full body.
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(self.config.max_body_bytes),
+            });
+            if let Some(resp) = ctx.response_header.as_mut() {
+                resp.headers.remove(http::header::CONTENT_LENGTH);
+            }
+            ctx.response_headers_modified = true;
+            ResponseTranslation::Success
+        }
+    }
 }
 
 #[async_trait]
-#[expect(
-    clippy::too_many_lines,
-    reason = "implements all four HttpFilter phases; splitting the trait impl would scatter the pipeline logic"
-)]
 impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
     fn name(&self) -> &'static str {
         FILTER_NAME
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -177,7 +219,7 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -221,14 +263,6 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
             Err(error) => return Ok(invalid_request_action(&error)),
         };
 
-        // Persist model name for the response phase.
-        ctx.set_metadata(MODEL_KEY, result.model.clone());
-        ctx.set_metadata(INCLUDE_USAGE_KEY, result.include_usage.to_string());
-
-        // Generate a stable response ID used by all streaming SSE frames.
-        let response_id = format!("chatcmpl-{:x}", response_id_seed());
-        ctx.set_metadata(RESPONSE_ID_KEY, response_id);
-
         // Set the Bedrock Converse endpoint path.
         // `aws_sigv4_sign` reads `ctx.rewritten_path` to sign the
         // correct canonical URI.
@@ -242,6 +276,17 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
             "Bedrock Converse request translated"
         );
 
+        // Keep the model and a stable response ID, used by all streaming SSE
+        // frames, for the response phase.
+        ctx.insert_filter_state(Exchange {
+            request: TranslatedRequest {
+                model: result.model,
+                response_id: format!("chatcmpl-{:x}", response_id_seed()),
+                include_usage: result.include_usage,
+            },
+            response: None,
+        });
+
         *body = Some(Bytes::from(result.body));
         Ok(FilterAction::Continue)
     }
@@ -250,50 +295,17 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // Read status with a short-lived immutable borrow so subsequent
-        // ctx method calls (set_metadata, set_response_body_mode) can
-        // take ownership of the mutable reference without a conflict.
+        // ctx method calls (set_response_body_mode) can take ownership of
+        // the mutable reference without a conflict.
         let status = match ctx.response_header.as_ref() {
             Some(r) => r.status,
             None => return Ok(FilterAction::Continue),
         };
 
-        if !status.is_success() {
-            // Bedrock error: buffer full body and normalize in the body phase.
-            ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_ERROR);
-            ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(self.config.max_body_bytes),
-            });
-            if let Some(resp) = ctx.response_header.as_mut() {
-                resp.headers.remove(http::header::CONTENT_LENGTH);
-            }
-            ctx.response_headers_modified = true;
-            return Ok(FilterAction::Continue);
-        }
-
-        // Check content-type with another short-lived immutable borrow.
-        let is_stream = ctx
-            .response_header
-            .as_ref()
-            .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("application/vnd.amazon.eventstream"));
-
-        if is_stream {
-            // Streaming: rewrite Content-Type to the OpenAI SSE format.
-            ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
-            if let Some(resp) = ctx.response_header.as_mut() {
-                resp.headers.remove(http::header::CONTENT_LENGTH);
-                resp.headers.remove(http::header::CONTENT_ENCODING);
-                resp.headers.insert(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("text/event-stream"),
-                );
-            }
-            ctx.response_headers_modified = true;
+        let translation = if status.is_success() {
+            self.prepare_success_response(ctx)
         } else {
-            // Non-streaming success: buffer full body.
-            ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_SUCCESS);
+            // Bedrock error: buffer full body and normalize in the body phase.
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(self.config.max_body_bytes),
             });
@@ -301,6 +313,15 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
                 resp.headers.remove(http::header::CONTENT_LENGTH);
             }
             ctx.response_headers_modified = true;
+            ResponseTranslation::Error(status)
+        };
+
+        match ctx.get_filter_state_mut::<Exchange>() {
+            Some(exchange) => exchange.response = Some(translation),
+            None => ctx.insert_filter_state(Exchange {
+                request: TranslatedRequest::default(),
+                response: Some(translation),
+            }),
         }
 
         Ok(FilterAction::Continue)
@@ -312,35 +333,39 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        match ctx.get_metadata(RESPONSE_PATH_KEY) {
-            Some(RESPONSE_PATH_ERROR) => Ok(translate_error_body(ctx, body, end_of_stream)),
-            Some(RESPONSE_PATH_SUCCESS) => translate_success_body(ctx, body, end_of_stream),
-            Some(RESPONSE_PATH_STREAM) => Ok(translate_stream_chunk(
-                ctx,
+        let Some(Exchange { request, response }) = ctx.get_filter_state_mut::<Exchange>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let action = match response {
+            Some(ResponseTranslation::Error(status)) => Ok(translate_error_body(*status, body, end_of_stream)),
+            Some(ResponseTranslation::Success) => translate_success_body(request, body, end_of_stream),
+            Some(ResponseTranslation::Stream(stream)) => Ok(translate_stream_chunk(
+                stream,
+                request,
                 body,
                 end_of_stream,
                 self.config.max_body_bytes,
             )),
-            _ => Ok(FilterAction::Continue),
+            None => Ok(FilterAction::Continue),
+        };
+        if end_of_stream {
+            // The response is complete; release this exchange's state.
+            ctx.remove_filter_state::<Exchange>();
         }
+        action
     }
 }
+
 
 // -----------------------------------------------------------------------------
 // Response body helpers
 // -----------------------------------------------------------------------------
 
 /// Buffer-and-replace the body with an OpenAI-shaped error envelope.
-fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) -> FilterAction {
+fn translate_error_body(status: http::StatusCode, body: &mut Option<Bytes>, end_of_stream: bool) -> FilterAction {
     if !end_of_stream {
         return FilterAction::Continue;
     }
-
-    let status = ctx
-        .get_metadata(RESPONSE_STATUS_KEY)
-        .and_then(|s| s.parse::<u16>().ok())
-        .and_then(|c| http::StatusCode::from_u16(c).ok())
-        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
 
     let bytes = body.as_deref().unwrap_or(&[]);
     let normalized = normalize_error_response(bytes, status);
@@ -350,7 +375,7 @@ fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>, e
 
 /// Buffer-and-replace the body with an OpenAI Chat Completions response.
 fn translate_success_body(
-    ctx: &HttpFilterContext<'_>,
+    request: &TranslatedRequest,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
 ) -> Result<FilterAction, FilterError> {
@@ -359,12 +384,7 @@ fn translate_success_body(
     }
 
     let bytes = body.as_deref().unwrap_or(&[]);
-    let translated = transform_response(
-        bytes,
-        ctx.get_metadata(MODEL_KEY).unwrap_or("unknown"),
-        ctx.get_metadata(RESPONSE_ID_KEY).unwrap_or(response::FALLBACK_ID),
-    )
-    .map_err(|error| {
+    let translated = transform_response(bytes, &request.model, &request.response_id).map_err(|error| {
         warn!(error = %error, "Bedrock Converse: non-streaming response translation failed");
         FilterError::from(format!("Bedrock Converse response translation failed: {error}"))
     })?;
@@ -379,7 +399,8 @@ fn translate_success_body(
     reason = "handles full streaming lifecycle: decode, translate, SSE-frame, state management"
 )]
 fn translate_stream_chunk(
-    ctx: &mut HttpFilterContext<'_>,
+    stream: &mut Option<BedrockStreamingState>,
+    request: &TranslatedRequest,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
     max_frame_bytes: usize,
@@ -387,55 +408,38 @@ fn translate_stream_chunk(
     let chunk = body.take().unwrap_or_default();
 
     // Lazy-init the streaming state on the first body chunk.
-    if ctx.get_filter_state::<BedrockStreamingState>().is_none() {
-        let model = ctx.get_metadata(MODEL_KEY).unwrap_or("unknown").to_owned();
-        let response_id = ctx
-            .get_metadata(RESPONSE_ID_KEY)
-            .unwrap_or(response::FALLBACK_ID)
-            .to_owned();
-        let include_usage = ctx.get_metadata(INCLUDE_USAGE_KEY) == Some("true");
-        ctx.insert_filter_state(BedrockStreamingState {
-            model,
-            response_id,
-            include_usage,
-            decoder: EventStreamDecoder::with_max_frame_len(max_frame_bytes),
-            stream_state: StreamState::default(),
-            failed: false,
-        });
-    }
+    let state = stream.get_or_insert_with(|| BedrockStreamingState {
+        decoder: EventStreamDecoder::with_max_frame_len(max_frame_bytes),
+        stream_state: StreamState::default(),
+        failed: false,
+    });
 
     let mut sse_output: Vec<u8> = Vec::new();
 
-    if let Some(state) = ctx.get_filter_state_mut::<BedrockStreamingState>() {
-        state.decoder.push(&chunk);
+    state.decoder.push(&chunk);
 
-        decode_stream_events(state, &mut sse_output);
+    decode_stream_events(state, request, &mut sse_output);
 
-        if end_of_stream && !state.failed && !state.decoder.is_empty() {
-            append_sse_error(
-                &mut sse_output,
-                "Bedrock event stream ended with an incomplete frame",
-                "incomplete_stream",
-            );
-            state.failed = true;
-        }
-
-        if end_of_stream && !state.failed && state.stream_state.finish_reason.is_none() {
-            append_sse_error(
-                &mut sse_output,
-                "Bedrock event stream ended before a messageStop event",
-                "incomplete_stream",
-            );
-            state.failed = true;
-        }
-
-        if end_of_stream && !state.failed {
-            sse_output.extend_from_slice(SSE_DONE);
-        }
+    if end_of_stream && !state.failed && !state.decoder.is_empty() {
+        append_sse_error(
+            &mut sse_output,
+            "Bedrock event stream ended with an incomplete frame",
+            "incomplete_stream",
+        );
+        state.failed = true;
     }
-    if end_of_stream {
-        // Release streaming state; the response is complete.
-        ctx.remove_filter_state::<BedrockStreamingState>();
+
+    if end_of_stream && !state.failed && state.stream_state.finish_reason.is_none() {
+        append_sse_error(
+            &mut sse_output,
+            "Bedrock event stream ended before a messageStop event",
+            "incomplete_stream",
+        );
+        state.failed = true;
+    }
+
+    if end_of_stream && !state.failed {
+        sse_output.extend_from_slice(SSE_DONE);
     }
 
     // Always set the body — even to an empty Bytes — so the framework
@@ -450,11 +454,11 @@ fn translate_stream_chunk(
 }
 
 /// Decode every complete frame currently buffered and translate its events.
-fn decode_stream_events(state: &mut BedrockStreamingState, output: &mut Vec<u8>) {
+fn decode_stream_events(state: &mut BedrockStreamingState, request: &TranslatedRequest, output: &mut Vec<u8>) {
     // `decode_all` drains every complete frame from the buffer, leaving any
     // partial final frame for the next `on_response_body` call.
     match state.decoder.decode_all() {
-        Ok(messages) => append_translated_stream_events(state, &messages, output),
+        Ok(messages) => append_translated_stream_events(state, request, &messages, output),
         Err(error) => {
             warn!(error = %error, "Bedrock EventStream decode error");
             append_sse_error(
@@ -470,6 +474,7 @@ fn decode_stream_events(state: &mut BedrockStreamingState, output: &mut Vec<u8>)
 /// Translate decoded Bedrock events into OpenAI SSE frames in wire order.
 fn append_translated_stream_events(
     state: &mut BedrockStreamingState,
+    request: &TranslatedRequest,
     messages: &[EventStreamMessage],
     output: &mut Vec<u8>,
 ) {
@@ -477,10 +482,10 @@ fn append_translated_stream_events(
         if message.is_exception() {
             state.failed = true;
         }
-        if message.event_type() == Some("metadata") && !state.include_usage {
+        if message.event_type() == Some("metadata") && !request.include_usage {
             continue;
         }
-        match transform_stream_event(message, &state.model, &state.response_id, &mut state.stream_state) {
+        match transform_stream_event(message, &request.model, &request.response_id, &mut state.stream_state) {
             Ok(Some(json_bytes)) => {
                 output.extend_from_slice(b"data: ");
                 output.extend_from_slice(&json_bytes);
@@ -547,12 +552,13 @@ fn response_id_seed() -> u128 {
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     unused_must_use,
     reason = "tests"
 )]
 mod tests {
-    use http::Method;
-    use praxis_filter::parse_filter_config;
+    use http::{Method, StatusCode};
+    use praxis_filter::{Request, parse_filter_config};
     use serde_json::Value;
 
     use super::*;
@@ -585,6 +591,36 @@ mod tests {
         build_frame(&[(":message-type", "event"), (":event-type", event_type)], payload)
     }
 
+    /// A filter context with a filter ID, as in a pipeline.
+    fn filter_context(req: &Request) -> HttpFilterContext<'_> {
+        let mut ctx = make_filter_context(req);
+        ctx.current_filter_id = Some(0);
+        ctx
+    }
+
+    /// The exchange state this filter keeps in `ctx`.
+    fn exchange<'a>(ctx: &'a HttpFilterContext<'_>) -> &'a Exchange {
+        ctx.get_filter_state::<Exchange>().unwrap()
+    }
+
+    /// Leave `ctx` as this filter does once it translated `request` and
+    /// selected the response `translation`.
+    fn responding(ctx: &mut HttpFilterContext<'_>, request: TranslatedRequest, translation: ResponseTranslation) {
+        ctx.insert_filter_state(Exchange {
+            request,
+            response: Some(translation),
+        });
+    }
+
+    /// A translated request for the Nova model, answered as `chatcmpl-test`.
+    fn nova_request(include_usage: bool) -> TranslatedRequest {
+        TranslatedRequest {
+            model: "amazon.nova-lite-v1:0".to_owned(),
+            response_id: "chatcmpl-test".to_owned(),
+            include_usage,
+        }
+    }
+
     // ── Lifecycle smoke test ──────────────────────────────────────────────
 
     #[test]
@@ -606,7 +642,7 @@ mod tests {
     async fn on_request_removes_accept_encoding_and_authorization() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
 
         filter.on_request(&mut ctx).await.unwrap();
 
@@ -626,8 +662,7 @@ mod tests {
     async fn on_request_body_translates_and_sets_path_non_streaming() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
 
         let mut body = Some(chat_body("amazon.nova-lite-v1:0", false));
         filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -638,8 +673,8 @@ mod tests {
             "non-streaming path must end in /converse"
         );
         assert_eq!(
-            ctx.get_metadata(MODEL_KEY),
-            Some("amazon.nova-lite-v1:0"),
+            exchange(&ctx).request.model,
+            "amazon.nova-lite-v1:0",
             "model must be stored for the response phase"
         );
 
@@ -655,8 +690,7 @@ mod tests {
     async fn on_request_body_sets_converse_stream_path_for_streaming() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
 
         let mut body = Some(Bytes::from_static(
             br#"{"model":"anthropic.claude-3-sonnet-20240229-v1:0","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#,
@@ -668,14 +702,14 @@ mod tests {
             Some("/model/anthropic.claude-3-sonnet-20240229-v1:0/converse-stream"),
             "streaming path must end in /converse-stream"
         );
-        assert_eq!(ctx.get_metadata(INCLUDE_USAGE_KEY), Some("true"));
+        assert!(exchange(&ctx).request.include_usage);
     }
 
     #[tokio::test]
     async fn on_request_body_skips_non_final_chunk() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
 
         let mut body: Option<Bytes> = None;
         // Should not error and should not rewrite the path on an interim chunk.
@@ -688,7 +722,7 @@ mod tests {
     async fn malformed_request_returns_openai_400() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = Some(Bytes::from_static(b"not-json"));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -705,7 +739,7 @@ mod tests {
     async fn unsafe_model_does_not_rewrite_upstream_path() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = Some(chat_body("../../../other-endpoint", false));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -716,7 +750,7 @@ mod tests {
             "invalid model must not set an upstream path"
         );
         assert!(
-            ctx.get_metadata(MODEL_KEY).is_none(),
+            ctx.get_filter_state::<Exchange>().is_none(),
             "invalid model must not be persisted"
         );
     }
@@ -725,7 +759,7 @@ mod tests {
     async fn unsupported_request_field_returns_openai_400() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = Some(Bytes::from_static(br#"{"model":"m","messages":[],"n":2}"#));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -743,7 +777,7 @@ mod tests {
     async fn empty_request_body_returns_openai_400() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -756,17 +790,25 @@ mod tests {
     async fn on_response_error_sets_error_path_and_buffers_body() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
 
         let mut upstream = make_response();
-        upstream.status = http::StatusCode::TOO_MANY_REQUESTS;
+        upstream.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut upstream);
-        ctx.set_metadata(MODEL_KEY, "some-model");
+        ctx.insert_filter_state(Exchange {
+            request: TranslatedRequest {
+                model: "some-model".to_owned(),
+                ..TranslatedRequest::default()
+            },
+            response: None,
+        });
 
         filter.on_response(&mut ctx).await.unwrap();
 
-        assert_eq!(ctx.get_metadata(RESPONSE_PATH_KEY), Some(RESPONSE_PATH_ERROR));
-        assert_eq!(ctx.get_metadata(RESPONSE_STATUS_KEY), Some("429"));
+        assert!(matches!(
+            exchange(&ctx).response,
+            Some(ResponseTranslation::Error(StatusCode::TOO_MANY_REQUESTS))
+        ));
     }
 
     // ── on_response_body — error ──────────────────────────────────────────
@@ -775,9 +817,12 @@ mod tests {
     fn on_response_body_error_normalizes_bedrock_error() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_ERROR);
-        ctx.set_metadata(RESPONSE_STATUS_KEY, "400");
+        let mut ctx = filter_context(&req);
+        responding(
+            &mut ctx,
+            TranslatedRequest::default(),
+            ResponseTranslation::Error(StatusCode::BAD_REQUEST),
+        );
 
         let bedrock_err = br#"{"message":"Invalid model identifier"}"#;
         let mut body: Option<Bytes> = Some(Bytes::copy_from_slice(bedrock_err));
@@ -797,9 +842,12 @@ mod tests {
     fn on_response_body_error_waits_for_end_of_stream() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_ERROR);
-        ctx.set_metadata(RESPONSE_STATUS_KEY, "500");
+        let mut ctx = filter_context(&req);
+        responding(
+            &mut ctx,
+            TranslatedRequest::default(),
+            ResponseTranslation::Error(StatusCode::INTERNAL_SERVER_ERROR),
+        );
 
         let mut body: Option<Bytes> = Some(Bytes::from_static(b"partial"));
         filter.on_response_body(&mut ctx, &mut body, false).unwrap();
@@ -814,10 +862,8 @@ mod tests {
     fn on_response_body_success_translates_full_response() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_SUCCESS);
-        ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
-        ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
+        let mut ctx = filter_context(&req);
+        responding(&mut ctx, nova_request(false), ResponseTranslation::Success);
 
         let bedrock_resp = serde_json::json!({
             "output": {
@@ -843,9 +889,15 @@ mod tests {
     fn malformed_success_response_aborts_body_translation() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_SUCCESS);
-        ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
+        let mut ctx = filter_context(&req);
+        responding(
+            &mut ctx,
+            TranslatedRequest {
+                model: "amazon.nova-lite-v1:0".to_owned(),
+                ..TranslatedRequest::default()
+            },
+            ResponseTranslation::Success,
+        );
 
         let mut body = Some(Bytes::from_static(b"{}"));
         let error = filter.on_response_body(&mut ctx, &mut body, true).unwrap_err();
@@ -859,12 +911,8 @@ mod tests {
     fn on_response_body_stream_emits_sse_events_and_done_sentinel() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
-        ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
-        ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
-        ctx.set_metadata(INCLUDE_USAGE_KEY, "true");
+        let mut ctx = filter_context(&req);
+        responding(&mut ctx, nova_request(true), ResponseTranslation::Stream(None));
 
         // Frame 1: messageStart
         let start_frame = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
@@ -902,46 +950,90 @@ mod tests {
         assert!(text.contains("\"total_tokens\":15"), "requested usage must appear");
     }
 
+    #[tokio::test]
+    async fn stream_carries_the_translated_request_model_id_and_usage_opt_in() {
+        let filter = make_filter("{}");
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = filter_context(&req);
+        let mut body = Some(Bytes::from_static(
+            br#"{"model":"amazon.nova-lite-v1:0","messages":[{"role":"user","content":"Hi"}],"stream":true,"stream_options":{"include_usage":true}}"#,
+        ));
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        let mut upstream = make_response();
+        upstream.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/vnd.amazon.eventstream"),
+        );
+        ctx.response_header = Some(&mut upstream);
+        filter.on_response(&mut ctx).await.unwrap();
+        ctx.response_header = None;
+
+        let mut frames = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
+        frames.extend_from_slice(&event_stream_frame(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"Hi!"}}"#,
+        ));
+        frames.extend_from_slice(&event_stream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+        frames.extend_from_slice(&event_stream_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}"#,
+        ));
+        let mut body = Some(Bytes::from(frames));
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+        let text = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
+        let chunks: Vec<Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert!(
+            chunks.iter().all(|chunk| chunk["model"] == "amazon.nova-lite-v1:0"),
+            "every chunk names the requested model: {text}"
+        );
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert_ne!(id, response::FALLBACK_ID, "the request minted the response id");
+        assert!(
+            chunks.iter().all(|chunk| chunk["id"] == id),
+            "one response id across the stream: {text}"
+        );
+        assert!(
+            text.contains("\"total_tokens\":15"),
+            "the usage opt-in reaches the stream"
+        );
+    }
+
     #[test]
     fn on_response_body_stream_suppresses_usage_without_opt_in() {
-        for include_usage in [None, Some("false")] {
-            let filter = make_filter("{}");
-            let req = make_request(Method::POST, "/v1/chat/completions");
-            let mut ctx = make_filter_context(&req);
-            ctx.current_filter_id = Some(0);
-            ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
-            ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
-            ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
-            if let Some(value) = include_usage {
-                ctx.set_metadata(INCLUDE_USAGE_KEY, value);
-            }
+        let filter = make_filter("{}");
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = filter_context(&req);
+        responding(&mut ctx, nova_request(false), ResponseTranslation::Stream(None));
 
-            let mut combined = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
-            combined.extend_from_slice(&event_stream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
-            combined.extend_from_slice(&event_stream_frame(
-                "metadata",
-                br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}"#,
-            ));
+        let mut combined = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
+        combined.extend_from_slice(&event_stream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+        combined.extend_from_slice(&event_stream_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}"#,
+        ));
 
-            let mut body = Some(Bytes::from(combined));
-            filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let mut body = Some(Bytes::from(combined));
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
-            let output = body.unwrap();
-            let text = std::str::from_utf8(&output).unwrap();
-            assert!(!text.contains("\"usage\""));
-            assert!(text.ends_with("data: [DONE]\n\n"));
-        }
+        let output = body.unwrap();
+        let text = std::str::from_utf8(&output).unwrap();
+        assert!(!text.contains("\"usage\""));
+        assert!(text.ends_with("data: [DONE]\n\n"));
     }
 
     #[test]
     fn on_response_body_stream_partial_frame_emits_nothing_until_complete() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
-        ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
-        ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
+        let mut ctx = filter_context(&req);
+        responding(&mut ctx, nova_request(false), ResponseTranslation::Stream(None));
 
         let full_frame = event_stream_frame(
             "contentBlockDelta",
@@ -972,9 +1064,12 @@ mod tests {
     fn truncated_stream_emits_error_without_done() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
+        let mut ctx = filter_context(&req);
+        responding(
+            &mut ctx,
+            TranslatedRequest::default(),
+            ResponseTranslation::Stream(None),
+        );
 
         let frame = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
         let mut body = Some(Bytes::copy_from_slice(&frame[..frame.len() / 2]));
@@ -989,9 +1084,12 @@ mod tests {
     fn corrupt_stream_emits_error_without_done() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
+        let mut ctx = filter_context(&req);
+        responding(
+            &mut ctx,
+            TranslatedRequest::default(),
+            ResponseTranslation::Stream(None),
+        );
 
         let mut frame = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
         let last = frame.len() - 1;
@@ -1008,9 +1106,12 @@ mod tests {
     fn malformed_stream_event_emits_error_without_done() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
-        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
+        let mut ctx = filter_context(&req);
+        responding(
+            &mut ctx,
+            TranslatedRequest::default(),
+            ResponseTranslation::Stream(None),
+        );
 
         let mut body = Some(Bytes::from(event_stream_frame("messageStop", b"not-json")));
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();

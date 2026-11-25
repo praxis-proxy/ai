@@ -116,6 +116,13 @@
                 "message": {
                   "content": [
                     {
+                      "reasoningContent": {
+                        "reasoningText": {
+                          "text": "Thinking"
+                        }
+                      }
+                    },
+                    {
                       "text": "Paris is the capital of France."
                     }
                   ],

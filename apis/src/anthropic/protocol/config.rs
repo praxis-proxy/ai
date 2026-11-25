@@ -11,7 +11,7 @@ use serde::Deserialize;
 // -----------------------------------------------------------------------------
 
 /// Default Anthropic API version header value.
-const DEFAULT_VERSION: &str = "2023-06-01";
+const DEFAULT_VERSION: &str = crate::anthropic::API_VERSION_2023_06_01;
 
 // -----------------------------------------------------------------------------
 // AnthropicMessagesProtocolConfig

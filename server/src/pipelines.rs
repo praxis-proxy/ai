@@ -11,7 +11,7 @@ use std::{
 #[cfg(feature = "openai-responses")]
 use praxis_ai_apis::openai::AgenticBudgetPolicy;
 use praxis_core::config::{
-    ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry, InsecureOptions, Listener,
+    BodyLimitsConfig, ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry, InsecureOptions, Listener,
 };
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
@@ -222,8 +222,15 @@ fn build_listener_pipelines(
         let request_body_limit = agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
         #[cfg(not(feature = "openai-responses"))]
         let request_body_limit = config.body_limits.max_request_bytes;
-        let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
+        #[cfg(feature = "token-rate-limit-filter")]
+        validate_shared_token_quota_pipeline(&entries, &chains, &listener.name)?;
+        let mut pipeline = FilterPipeline::build_with_chains(
+            &mut entries,
+            &registry,
+            &chains,
+            &config.insecure_options,
+            &config.clusters,
+        )?;
         configure_pipeline(
             &mut pipeline,
             config,
@@ -246,6 +253,141 @@ fn build_listener_pipelines(
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Validate the single-source response chain used by shared quota enforcement.
+///
+/// Request filters are declared in `token_rate_limit -> policy ->
+/// token_count` order so their response-body hooks run in the inverse order.
+/// Requiring unconditional, unique producers prevents a missing branch or
+/// response condition from silently settling a reservation at its estimate.
+#[cfg(feature = "token-rate-limit-filter")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps uniqueness, conditions, and ordering in one startup invariant audit"
+)]
+fn validate_shared_token_quota_pipeline(
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+    listener_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if branch_contains(entries, chains, &mut HashSet::new(), &is_shared_quota_limiter) {
+        return Err(format!(
+            "listener '{listener_name}': token_rate_limit with use_token_quota must be top-level, not branch-conditional"
+        )
+        .into());
+    }
+    let shared_limiters = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.filter_type == "token_rate_limit" && config_bool(entry, "use_token_quota"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if shared_limiters.is_empty() {
+        return Ok(());
+    }
+
+    let policy_filters = filter_indices(entries, "policy");
+    let token_counters = filter_indices(entries, "token_count");
+    let ([policy_index], [count_index]) = (policy_filters.as_slice(), token_counters.as_slice()) else {
+        return Err(format!(
+            "listener '{listener_name}': token_rate_limit with use_token_quota requires exactly one policy and one token_count filter"
+        )
+        .into());
+    };
+    let (Some(policy), Some(counter)) = (entries.get(*policy_index), entries.get(*count_index)) else {
+        return Err(format!("listener '{listener_name}': internal shared quota filter index is invalid").into());
+    };
+    if config_str(policy, "body_access").is_some_and(|mode| mode != "read_only") {
+        return Err(format!(
+            "listener '{listener_name}': policy must use body_access: read_only when token_rate_limit uses shared quota"
+        )
+        .into());
+    }
+    if policy.failure_mode != FailureMode::Closed
+        || counter.failure_mode != FailureMode::Closed
+        || !policy.conditions.is_empty()
+        || !policy.response_conditions.is_empty()
+        || !counter.conditions.is_empty()
+        || !counter.response_conditions.is_empty()
+    {
+        return Err(format!(
+            "listener '{listener_name}': policy and token_count must be unconditional and fail-closed when token_rate_limit uses shared quota"
+        )
+        .into());
+    }
+    if shared_limiters.iter().any(|index| index >= policy_index) || policy_index >= count_index {
+        return Err(format!(
+            "listener '{listener_name}': shared quota filters must be ordered token_rate_limit -> policy -> token_count"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Whether an entry is a shared-quota limiter.
+#[cfg(feature = "token-rate-limit-filter")]
+fn is_shared_quota_limiter(entry: &FilterEntry) -> bool {
+    entry.filter_type == "token_rate_limit" && config_bool(entry, "use_token_quota")
+}
+
+/// Detect a matching entry nested in any reachable inline or named branch.
+fn branch_contains(
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+    visited: &mut HashSet<String>,
+    matches: &impl Fn(&FilterEntry) -> bool,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.branch_chains.as_ref().is_some_and(|branches| {
+            branches.iter().any(|branch| {
+                branch.chains.iter().any(|chain| {
+                    let nested = match chain {
+                        ChainRef::Inline { filters, .. } => filters.as_slice(),
+                        ChainRef::Named(name) => {
+                            if visited.insert(name.clone()) {
+                                chains.get(name.as_str()).copied().unwrap_or_default()
+                            } else {
+                                &[]
+                            }
+                        },
+                    };
+                    nested.iter().any(matches) || branch_contains(nested, chains, visited, matches)
+                })
+            })
+        })
+    })
+}
+
+/// Return every index for one filter type in an expanded listener chain.
+#[cfg(feature = "token-rate-limit-filter")]
+fn filter_indices(entries: &[FilterEntry], filter_type: &str) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.filter_type == filter_type).then_some(index))
+        .collect()
+}
+
+/// Read one boolean from a filter's flattened configuration mapping.
+#[cfg(feature = "token-rate-limit-filter")]
+fn config_bool(entry: &FilterEntry, field: &str) -> bool {
+    entry
+        .config
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String(field.to_owned())))
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Read one string from a filter's flattened configuration mapping.
+#[cfg(feature = "token-rate-limit-filter")]
+fn config_str<'a>(entry: &'a FilterEntry, field: &str) -> Option<&'a str> {
+    entry
+        .config
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String(field.to_owned())))
+        .and_then(serde_yaml::Value::as_str)
 }
 
 /// Clone `registry` and hand it the proxy's shared sub-request `connector` as
@@ -572,11 +714,12 @@ fn configure_pipeline(
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     request_body_limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    pipeline.apply_body_limits(
-        request_body_limit,
-        config.body_limits.max_response_bytes,
-        config.insecure_options.allow_unbounded_body,
-    )?;
+    let limits = BodyLimitsConfig {
+        max_buffer_bytes: config.body_limits.max_buffer_bytes,
+        max_request_bytes: request_body_limit,
+        max_response_bytes: config.body_limits.max_response_bytes,
+    };
+    pipeline.configure_body_limits(&limits, config.insecure_options.allow_unbounded_body)?;
     if !health_registry.is_empty() {
         pipeline.set_health_registry(Arc::clone(health_registry));
     }
@@ -612,7 +755,9 @@ fn validate_provider_boundary(
     entries: &[FilterEntry],
     chains: &HashMap<&str, &[FilterEntry]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if provider_consumer_exists_in_branch(entries, chains, &mut HashSet::new()) {
+    if branch_contains(entries, chains, &mut HashSet::new(), &|entry| {
+        entry.filter_type == "provider_route"
+    }) {
         return Err(format!(
             "listener '{}': provider_route must be top-level, not branch-conditional",
             listener.name
@@ -694,34 +839,6 @@ fn required_peer_identity_trust<'a>(
     Ok(peer)
 }
 
-/// Detect provider consumers nested in any reachable inline or named branch.
-fn provider_consumer_exists_in_branch(
-    entries: &[FilterEntry],
-    chains: &HashMap<&str, &[FilterEntry]>,
-    visited: &mut HashSet<String>,
-) -> bool {
-    entries.iter().any(|entry| {
-        entry.branch_chains.as_ref().is_some_and(|branches| {
-            branches.iter().any(|branch| {
-                branch.chains.iter().any(|chain| {
-                    let nested = match chain {
-                        ChainRef::Inline { filters, .. } => filters.as_slice(),
-                        ChainRef::Named(name) => {
-                            if visited.insert(name.clone()) {
-                                chains.get(name.as_str()).copied().unwrap_or_default()
-                            } else {
-                                &[]
-                            }
-                        },
-                    };
-                    nested.iter().any(|filter| filter.filter_type == "provider_route")
-                        || provider_consumer_exists_in_branch(nested, chains, visited)
-                })
-            })
-        })
-    })
-}
-
 /// Require a security-boundary filter to execute unconditionally and fail closed.
 fn validate_unconditional_closed(
     listener_name: &str,
@@ -799,6 +916,130 @@ mod tests {
     use praxis_filter::FilterRegistry;
 
     use super::*;
+
+    #[cfg(feature = "token-rate-limit-filter")]
+    #[test]
+    fn shared_token_quota_pipeline_requires_unique_unconditional_ordered_producers() {
+        let valid: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+  body_access: read_only
+- filter: token_count
+",
+        )
+        .unwrap();
+        validate_shared_token_quota_pipeline(&valid, &HashMap::new(), "inference").unwrap();
+
+        for (yaml, expected) in [
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_count
+",
+                "exactly one policy and one token_count",
+            ),
+            (
+                "
+- filter: policy
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_count
+",
+                "token_rate_limit -> policy -> token_count",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+  body_access: read_write
+- filter: token_count
+",
+                "policy must use body_access: read_only",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+  failure_mode: open
+- filter: token_count
+",
+                "unconditional and fail-closed",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+  response_conditions:
+    - when:
+        status: [200]
+- filter: token_count
+",
+                "must be unconditional",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+- filter: policy
+- filter: token_count
+",
+                "exactly one policy and one token_count",
+            ),
+        ] {
+            let entries: Vec<FilterEntry> = serde_yaml::from_str(yaml).unwrap();
+            let error = validate_shared_token_quota_pipeline(&entries, &HashMap::new(), "inference").unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(feature = "token-rate-limit-filter")]
+    #[test]
+    fn shared_token_quota_limiter_must_not_be_branch_conditional() {
+        let entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: request_id
+  branch_chains:
+    - name: quota
+      rejoin: terminal
+      chains:
+        - name: quota-inline
+          filters:
+            - filter: token_rate_limit
+              use_token_quota: true
+",
+        )
+        .unwrap();
+        let error = validate_shared_token_quota_pipeline(&entries, &HashMap::new(), "inference").unwrap_err();
+        assert!(error.to_string().contains("must be top-level"), "{error}");
+
+        let named: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: token_rate_limit
+  use_token_quota: true
+",
+        )
+        .unwrap();
+        let named_entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: request_id
+  branch_chains:
+    - name: quota
+      rejoin: terminal
+      chains: [quota-chain]
+",
+        )
+        .unwrap();
+        let chains = HashMap::from([("quota-chain", named.as_slice())]);
+        let error = validate_shared_token_quota_pipeline(&named_entries, &chains, "inference").unwrap_err();
+        assert!(error.to_string().contains("must be top-level"), "{error}");
+    }
 
     #[test]
     fn filter_duration_flag_enables_per_filter_histograms() {
@@ -921,6 +1162,30 @@ mod tests {
         assert_eq!(agentic_request_body_cap(None, Some(policy)), Some(128));
         assert_eq!(agentic_request_body_cap(Some(64), Some(policy)), Some(64));
         assert_eq!(agentic_request_body_cap(Some(10_485_760), None), Some(10_485_760));
+
+        let mut config = valid_config();
+        config.body_limits.max_buffer_bytes = 4096.try_into().unwrap();
+        let mut pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        configure_pipeline(
+            &mut pipeline,
+            &config,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &test_client(),
+            agentic_request_body_cap(config.body_limits.max_request_bytes, Some(policy)),
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline.request_body_ceiling(),
+            Some(128),
+            "the agentic request cap must survive wiring"
+        );
+        assert_eq!(
+            pipeline.buffer_cap(),
+            4096,
+            "the independent buffering cap must also survive wiring"
+        );
     }
 
     #[test]
@@ -1214,6 +1479,121 @@ insecure_options:
             praxis_filter::BodyMode::SizeLimit { max_bytes: 2048 },
             "default Stream should become SizeLimit for enforcement"
         );
+    }
+
+    #[test]
+    fn model_inspection_inherits_configured_body_limits() {
+        for (limits, insecure, expected, buffer_cap) in [
+            ("", "", Some(10_485_760), 67_108_864),
+            ("max_request_bytes: 33554432", "", Some(33_554_432), 67_108_864),
+            ("max_buffer_bytes: 134217728", "", Some(10_485_760), 134_217_728),
+            ("max_request_bytes: 134217728", "", None, 67_108_864),
+            (
+                "max_request_bytes: 134217728, max_buffer_bytes: 134217728",
+                "",
+                Some(134_217_728),
+                134_217_728,
+            ),
+            ("max_request_bytes: 2048, max_buffer_bytes: 1024", "", None, 1024),
+            ("max_request_bytes: 1024, max_buffer_bytes: 2048", "", Some(1024), 2048),
+            (
+                "max_request_bytes: null, max_buffer_bytes: 2048",
+                "allow_unbounded_body: true",
+                Some(2048),
+                2048,
+            ),
+        ] {
+            let config = Config::from_yaml(&format!(
+                r#"
+body_limits: {{ {limits} }}
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints: ["127.0.0.1:8001"]
+insecure_options:
+  allow_private_endpoints: true
+  {insecure}
+"#
+            ))
+            .unwrap();
+            let client = test_client();
+            let registry = crate::build_full_registry(&client);
+            let pipelines = resolve_pipelines(
+                &config,
+                &registry,
+                &empty_health_registry(),
+                &empty_kv_stores(),
+                &empty_inflight_registry(),
+                &client,
+            );
+            let Some(expected) = expected else {
+                let error = pipelines
+                    .err()
+                    .expect("the buffered pipeline must reject incompatible limits");
+                assert!(
+                    error.to_string().contains("exceeds body_limits.max_buffer_bytes"),
+                    "{limits}: {error}"
+                );
+                continue;
+            };
+            let pipelines = pipelines.unwrap();
+            let pipeline = pipelines.get("web").unwrap().load();
+            assert_eq!(pipeline.buffer_cap(), buffer_cap, "buffer cap for {limits}");
+            assert_eq!(
+                pipeline.body_capabilities().request_body_mode,
+                praxis_filter::BodyMode::StreamBuffer {
+                    max_bytes: Some(expected)
+                },
+                "effective inspection limit for {limits}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_pipelines_applies_max_buffer_bytes() {
+        for cap in [4096, 134_217_728] {
+            let mut config = valid_config();
+            config.body_limits.max_buffer_bytes = cap.try_into().unwrap();
+            config.body_limits.max_request_bytes = Some(cap);
+            config.body_limits.max_response_bytes = Some(268_435_456);
+            config.filter_chains[0].filters.insert(
+                0,
+                serde_yaml::from_str(
+                    "filter: json_body\nmax_body_bytes: 268435456\nrequest_remove: [/secret]\nresponse_remove: [/secret]",
+                )
+                .unwrap(),
+            );
+            let pipelines = resolve_pipelines(
+                &config,
+                &FilterRegistry::with_builtins(),
+                &empty_health_registry(),
+                &empty_kv_stores(),
+                &empty_inflight_registry(),
+                &test_client(),
+            )
+            .unwrap();
+            let pipeline = pipelines.get("web").unwrap().load();
+            assert_eq!(
+                pipeline.buffer_cap(),
+                cap,
+                "configured buffering cap must reach the pipeline"
+            );
+            let expected = praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(cap) };
+            assert_eq!(pipeline.body_capabilities().request_body_mode, expected);
+            assert_eq!(pipeline.body_capabilities().response_body_mode, expected);
+        }
     }
 
     #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
@@ -1700,7 +2080,7 @@ filter_chains:
     /// KV store registry with one test store.
     fn make_kv_registry() -> praxis_core::kv::KvStoreRegistry {
         let registry = praxis_core::kv::KvStoreRegistry::new();
-        registry.get_or_create("test");
+        registry.get_or_create_memory("test");
         registry
     }
 

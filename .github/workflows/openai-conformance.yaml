@@ -85,7 +85,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           cache-suffix: openai-conformance
 
@@ -105,11 +105,13 @@ jobs:
         run: >-
           cargo xtask openai-conformance
           --output-json docs/conformance/openai-conformance-report.json
+          --output-badges-dir docs/conformance/badges
 
       - name: Check generated artifacts
         run: >-
           git diff --exit-code --
           docs/conformance/openai-conformance-report.json
+          docs/conformance/badges/
           docs/conformance/specs/openai-openapi.yaml
           docs/conformance/specs/openai-openapi-source.json
 

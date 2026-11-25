@@ -140,6 +140,24 @@ fn vertex_gemini_non_streaming_without_usage_is_schema_valid() {
 }
 
 #[test]
+fn vertex_gemini_non_streaming_maps_cached_content_tokens() {
+    let parsed = translate_non_streaming(
+        r#"{"candidates":[{"content":{"parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":2,"totalTokenCount":102}}"#,
+    );
+
+    assert_chat_completion_response_schema(&parsed);
+    assert_eq!(
+        parsed["usage"]["prompt_tokens"], 100,
+        "cached tokens stay inside prompt_tokens"
+    );
+    assert_eq!(parsed["usage"]["total_tokens"], 102);
+    assert_eq!(
+        parsed["usage"]["prompt_tokens_details"]["cached_tokens"], 80,
+        "cachedContentTokenCount should become prompt_tokens_details.cached_tokens"
+    );
+}
+
+#[test]
 fn vertex_gemini_non_streaming_logprobs_are_schema_valid() {
     let parsed = translate_non_streaming(
         r#"{

@@ -16,9 +16,23 @@ name = "praxis_ai_filters"
 default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter", "policy-engine"]
-# The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds
-# can omit the policy engine and its pure-Rust cryptography.
-policy-engine = ["praxis-filter/policy-engine"]
+# The `policy` filter from Praxis core: the RustCrypto backend and every stable
+# builtin, named one by one because the `policy-builtins` bundle also carries
+# the experimental Limitador rate limiter and its tonic/prost graph. Kept
+# explicit so no-default FIPS builds can omit the engine and that cryptography.
+policy-engine = [
+    "praxis-filter/policy-crypto-default",
+    "praxis-filter/policy-api-key",
+    "praxis-filter/policy-jwt",
+    "praxis-filter/policy-oauth",
+    "praxis-filter/policy-cedar",
+    "praxis-filter/policy-cel",
+    "praxis-filter/policy-opa",
+    "praxis-filter/policy-valkey",
+    "praxis-filter/policy-delegator-vault",
+    "praxis-filter/policy-elicitation-ciba",
+    "praxis-filter/policy-secrets-vault",
+]
 # aws_sigv4_sign: AWS Signature V4 request signing. The signature is computed
 # over the system OpenSSL (praxis-ai-apis' hash seam); aws-sigv4 itself is a
 # dev-dependency, the oracle the signer is tested against.
@@ -57,6 +71,9 @@ gcp-adc-filter = ["experimental", "dep:openssl"]
 # Experimental: Anthropic Messages to Vertex AI rawPredict translation. Work
 # in progress; the config surface may change. Activates the experimental marker.
 vertex-anthropic-filter = ["experimental", "praxis-ai-apis/vertex-anthropic"]
+# Experimental: anthropic_mcp_connector executes the Anthropic Messages MCP
+# connector in Praxis. Work in progress; the config surface may change.
+anthropic-mcp-connector-filter = ["experimental", "praxis-ai-apis/anthropic-mcp-connector"]
 # Experimental: the token_rate_limit filter. Its parent proposal
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,
@@ -67,6 +84,9 @@ vertex-anthropic-filter = ["experimental", "praxis-ai-apis/vertex-anthropic"]
 # optional so the rest of the crate (and its consumers) don't compile the
 # Valkey client and its transitive deps unless this feature is on.
 token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
+# Experimental: lets PPE select and evaluate weighted quota plugins over the
+# final normalized per-request token usage snapshot.
+token-quota-filter = ["experimental", "policy-engine", "dep:ppe"]
 # Experimental pre-forward input/output token ceiling guard.  Kept separate
 # from token-rate-limit-filter because static request admission must fail
 # closed independently of quota-backend health.
@@ -93,6 +113,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
@@ -103,6 +124,7 @@ praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.7.0 (no extra dependencies).
 praxis-filter = { workspace = true, features = ["chain-binding"] }
+ppe = { workspace = true, optional = true }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }

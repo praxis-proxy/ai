@@ -8,32 +8,12 @@ ignore = [
     # rustls-pemfile 2.2.0: unmaintained (via pingora-rustls)
     "RUSTSEC-2025-0134",
 
-    # zstd 0.13.3 and zstd-safe 7.3.0, reached only through
-    # quixotic-plecostomus-header-serde -> ...-cache -> ...-proxy ->
-    # praxis-proxy-protocol. Fixed upstream in zstd 0.14.3 and
-    # zstd-safe 8.2.0, each a semver-incompatible jump from what the
-    # vendored Pingora fork pins, so no resolution of this lockfile can
-    # take them. The copies this workspace owns are already patched.
-    #
-    # This list is longer than the one in .cargo/audit.toml because
-    # cargo-deny errors on the informational "unsound" advisories that
-    # cargo-audit only reports as warnings. Every entry below is the
-    # same root cause.
-    #
-    # Remove all of these once the fork moves to zstd 0.14.3 or later.
-    "RUSTSEC-2026-0391",
-    "RUSTSEC-2026-0395",
-    "RUSTSEC-2026-0396",
-    "RUSTSEC-2026-0397",
-    "RUSTSEC-2026-0398",
-    "RUSTSEC-2026-0399",
-    "RUSTSEC-2026-0400",
-    "RUSTSEC-2026-0401",
-    "RUSTSEC-2026-0402",
-    "RUSTSEC-2026-0403",
-    "RUSTSEC-2026-0404",
-    "RUSTSEC-2026-0405",
-    "RUSTSEC-2026-0406",
+    # RustSec marked these crates unmaintained; no safe upgrade is available
+    # for chrono-tz or humantime, and chrono is pulled in across the workspace.
+    # Track dependency migration in issue #2011.
+    "RUSTSEC-2026-0542", # humantime (via humantime-serde)
+    "RUSTSEC-2026-0543", # chrono (transitive)
+    "RUSTSEC-2026-0555", # chrono-tz (via cel / praxis-policy)
 ]
 
 [licenses]
@@ -70,10 +50,9 @@ highlight = "all"
 # fails if any is enabled; cargo-deny prints the full feature-activation path.
 #
 # This is the feature-level half of the guard. The complementary "no non-OpenSSL
-# crypto backend crate in the FIPS image" check lives in `cargo xtask fips`
-# (xtask/src/fips/graph.rs::DENIED — ring, aws-lc-rs, aws-lc-sys, boring, …),
+# crypto backend crate in the FIPS image" check lives in `cargo fips-check report`,
 # run per-PR via `make lint` (fips-deps) and the FIPS workflow. Together they
-# cover both profiles: cargo-deny the full/superset graph, cargo xtask fips the
+# cover both profiles: cargo-deny the full/superset graph, cargo-fips-check the
 # reduced FIPS graph. The human-readable operation/provider inventory is
 # docs/architecture/cryptographic-inventory.md.
 [[bans.features]]
@@ -99,7 +78,7 @@ reason = "aws-lc-rs runs only JWT signature verification in the full profile; it
 [[bans.features]]
 crate = "quixotic-plecostomus-rustls-openssl"
 deny = ["fips"]
-reason = "FIPS is host-activated (docs/fips.md), not a build feature; this crate's `fips` feature is a no-op and must stay unset so the compliance posture is not asserted by the build."
+reason = "FIPS is host-activated (docs/operations/fips.md), not a build feature; this crate's `fips` feature is a no-op and must stay unset so the compliance posture is not asserted by the build."
 
 [sources]
 unknown-registry = "deny"

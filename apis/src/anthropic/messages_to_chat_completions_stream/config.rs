@@ -3,11 +3,10 @@
 
 //! Configuration for the Anthropic-to-Chat-Completions streaming transformation filter.
 
-use praxis_filter::{
-    FilterError,
-    body::{DEFAULT_JSON_BODY_MAX_BYTES, MAX_JSON_BODY_BYTES},
-};
+use praxis_filter::{FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES};
 use serde::Deserialize;
+
+use crate::json_body::MAX_JSON_BODY_BYTES;
 
 // -----------------------------------------------------------------------------
 // AnthropicMessagesToChatCompletionsStreamConfig

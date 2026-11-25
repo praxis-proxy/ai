@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "anthropic>=0.40",
+#     "anthropic==1.17.0",
 #     "pytest>=8.0",
 # ]
 # ///
@@ -80,11 +80,16 @@ class RecordingBackend(BaseHTTPRequestHandler):
     response_content_type = "application/json"
     send_tool_reply_once = False
     tool_call_arguments = "{}"
+    many_tool_calls_stream_once = False
+    matched_stop_stream_once: str | None = None
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
+    fragmented_stream_once = False
     error_response_once = False
+    named_tool_finish_gate = threading.Event()
 
     def do_POST(self):
+        """Record a request and return the configured Chat Completions response."""
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
@@ -105,11 +110,37 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(reply)
             return
+        if body.get("stream") and RecordingBackend.fragmented_stream_once:
+            RecordingBackend.fragmented_stream_once = False
+            text = "é🌍" * 2048
+            event = {"id": "chatcmpl-stub", "model": MODEL,
+                     "choices": [{"index": 0, "delta": {"content": text},
+                                  "finish_reason": "stop"}]}
+            payload = ("data: " + json.dumps(event, ensure_ascii=False)
+                       + "\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            for offset in range(0, len(payload), 127):
+                self.wfile.write(payload[offset:offset + 127])
+                self.wfile.flush()
+            return
         if body.get("stream"):
-            if RecordingBackend.untranslatable_stream_once:
+            if RecordingBackend.matched_stop_stream_once is not None:
+                stop_sequence = RecordingBackend.matched_stop_stream_once
+                RecordingBackend.matched_stop_stream_once = None
+                self._send_matched_stop_stream(stop_sequence)
+            elif RecordingBackend.untranslatable_stream_once:
                 kind = RecordingBackend.untranslatable_stream_once
                 RecordingBackend.untranslatable_stream_once = None
-                self._send_untranslatable_stream(kind)
+                if kind == "tool_use_stop":
+                    self._send_named_tool_stop_stream()
+                else:
+                    self._send_untranslatable_stream(kind)
+            elif RecordingBackend.many_tool_calls_stream_once:
+                RecordingBackend.many_tool_calls_stream_once = False
+                self._send_many_tool_calls_stream()
             else:
                 self._send_invalid_tool_id_stream()
             return
@@ -248,6 +279,103 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.wfile.write(wire)
         self.wfile.flush()
 
+    def _send_named_tool_stop_stream(self):
+        """Return a named tool call followed by a stop finish reason."""
+        chunks = [
+            {
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }]
+                },
+                "finish_reason": None,
+            },
+            {"delta": {}, "finish_reason": "stop"},
+        ]
+        wire_chunks = []
+        for chunk in chunks:
+            payload = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, **chunk}],
+            }
+            wire_chunks.append(f"data: {json.dumps(payload)}\n\n")
+        terminal = (wire_chunks[1] + "data: [DONE]\n\n").encode()
+        tool_call = wire_chunks[0].encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(len(tool_call) + len(terminal)))
+        self.end_headers()
+        self.wfile.write(tool_call)
+        self.wfile.flush()
+        if not RecordingBackend.named_tool_finish_gate.wait(timeout=10):
+            return
+        self.wfile.write(terminal)
+        self.wfile.flush()
+
+    def _send_many_tool_calls_stream(self):
+        tool_calls = [
+            {
+                "index": index,
+                "id": f"call_{index}",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+            for index in range(64)
+        ]
+        chunks = [
+            {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            },
+        ]
+        wire = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        wire += "data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire.encode())))
+        self.end_headers()
+        self.wfile.write(wire.encode())
+        self.wfile.flush()
+
+    def _send_matched_stop_stream(self, stop_sequence: str):
+        """Send a terminal stream chunk reporting the supplied matched sequence."""
+        chunk = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "partial"},
+                "finish_reason": "stop",
+                "stop_reason": stop_sequence,
+            }],
+        }
+        wire = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
+
     def log_message(self, format, *args):
         pass
 
@@ -271,6 +399,7 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
             + "        allow_lossy_features:\n"
             + "          - prompt_caching\n"
             + "          - extended_thinking\n"
+            + "          - mid_conversation_system\n"
         )
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
@@ -438,6 +567,86 @@ class TestRequestFieldHandling:
         assert "thinking" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
+    def test_cache_control_rejection_names_the_offending_field(self, anthropic_client):
+        """The 400 must name `cache_control`, not the block's overall shape."""
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                system=[{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "cache_control" in str(excinfo.value)
+        assert "not supported by this endpoint" in str(excinfo.value)
+        assert "Remove the caching markers" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
+    def test_deferred_tool_placeholder_is_accepted(self, anthropic_client):
+        """Claude Code's first session request carries `defer_loading: true`.
+
+        Rejecting it costs the client two failed round-trips per session
+        while it falls back to the flattened tool list.
+        """
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+            extra_body={
+                "tools": [
+                    {
+                        "name": "DeferredToolPlaceholder",
+                        "description": "placeholder",
+                        "input_schema": {"type": "object"},
+                        "defer_loading": True,
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "input_schema": {"type": "object"},
+                    },
+                ]
+            },
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tools = upstream["tools"]
+        assert len(tools) == 2, "both tools must be forwarded"
+        assert tools[0]["function"]["name"] == "DeferredToolPlaceholder"
+        for tool in tools:
+            assert "defer_loading" not in tool["function"], (
+                f"the deferred-loading marker is dropped: {tool}"
+            )
+
+    def test_unsupported_tool_field_rejection_names_the_field(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call lookup"}],
+                extra_body={
+                    "tools": [
+                        {
+                            "name": "lookup",
+                            "input_schema": {"type": "object"},
+                            "signed": "no",
+                        }
+                    ]
+                },
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "signed" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
     def test_default_valued_rejected_field_is_dropped(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -553,6 +762,22 @@ class TestRequestFieldHandling:
         assert response.stop_reason == "stop_sequence"
         assert response.stop_sequence == ","
 
+    def test_long_stop_sequence_is_retained_end_to_end(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        stop_sequence = "s" * 253
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            stop_sequences=[stop_sequence],
+            messages=[{"role": "user", "content": "Stop after the marker"}],
+        )
+
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stop"] == [stop_sequence]
+        assert response.stop_reason == "stop_sequence"
+        assert response.stop_sequence == stop_sequence
+
     def test_stop_without_matched_sequence_is_end_turn(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -654,6 +879,163 @@ class TestResponseValidation:
 
 
 class TestStreamingResponseValidation:
+    def test_fragmented_utf8_crlf_stream(self, anthropic_client):
+        RecordingBackend.fragmented_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=8192,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                text = "".join(stream.text_stream)
+                message = stream.get_final_message()
+            assert text == "é🌍" * 2048
+            assert message.stop_reason == "end_turn"
+        finally:
+            RecordingBackend.fragmented_stream_once = False
+
+    def test_long_matched_stop_sequence_is_reported(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        stop_sequence = "s" * 300
+        RecordingBackend.matched_stop_stream_once = stop_sequence
+
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                stop_sequences=[stop_sequence],
+                messages=[{"role": "user", "content": "Stop after the marker"}],
+            ) as stream:
+                message = stream.get_final_message()
+        finally:
+            RecordingBackend.matched_stop_stream_once = None
+
+        assert message.stop_reason == "stop_sequence"
+        assert message.stop_sequence == stop_sequence
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stop"] == [stop_sequence], (
+            "the streaming request must forward the client stop sequence upstream"
+        )
+
+    def test_named_tool_with_stop_finish_reason_reports_tool_use(
+        self, anthropic_client
+    ):
+        """Preserve named-tool semantics when the upstream terminates with stop."""
+        RecordingBackend.bodies.clear()
+        RecordingBackend.named_tool_finish_gate.clear()
+        RecordingBackend.untranslatable_stream_once = "tool_use_stop"
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Use the weather tool"}],
+                tools=[{
+                    "name": "get_weather",
+                    "description": "Get the weather for a city.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }],
+                tool_choice={"type": "tool", "name": "get_weather"},
+            ) as stream:
+                events = []
+                tool_received = threading.Event()
+
+                def collect_stream() -> None:
+                    """Collect SDK events and signal when the tool block arrives."""
+                    for event in stream:
+                        events.append(event)
+                        if (
+                            event.type == "content_block_start"
+                            and event.content_block.type == "tool_use"
+                        ):
+                            tool_received.set()
+
+                consumer = threading.Thread(target=collect_stream, daemon=True)
+                consumer.start()
+                delivered_before_finish = tool_received.wait(timeout=5)
+                RecordingBackend.named_tool_finish_gate.set()
+                consumer.join(timeout=5)
+
+                assert delivered_before_finish, (
+                    "the SDK must receive the tool block before upstream completion"
+                )
+                assert not consumer.is_alive(), (
+                    "the SDK stream must complete after the terminal events are released"
+                )
+        finally:
+            RecordingBackend.named_tool_finish_gate.set()
+            RecordingBackend.untranslatable_stream_once = None
+
+        tool_use = next(
+            event.content_block
+            for event in events
+            if event.type == "content_block_start"
+            and event.content_block.type == "tool_use"
+        )
+        assert tool_use.name == "get_weather", "the named tool must be preserved in the response"
+        [upstream] = RecordingBackend.bodies
+        assert upstream["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }, "the named Anthropic tool choice must be translated to Chat Completions"
+        message_delta = next(event for event in events if event.type == "message_delta")
+        assert message_delta.delta.stop_reason == "tool_use", (
+            "a tool call with an upstream stop finish reason must report tool_use"
+        )
+        assert any(event.type == "message_stop" for event in events), (
+            "a completed streaming response must emit message_stop"
+        )
+
+    def test_many_tool_calls_preserve_all_content_block_stops(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.many_tool_calls_stream_once = True
+
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call the tools"}],
+            ) as stream:
+                events = list(stream)
+        finally:
+            RecordingBackend.many_tool_calls_stream_once = False
+
+        start_events = [
+            event for event in events if event.type == "content_block_start"
+        ]
+        start_indices = [event.index for event in start_events]
+        stop_indices = [
+            event.index for event in events if event.type == "content_block_stop"
+        ]
+        expected_indices = list(range(64))
+        assert start_indices == expected_indices, (
+            "all 64 tool blocks must start once in block-index order"
+        )
+        assert all(event.content_block.type == "tool_use" for event in start_events), (
+            "all 64 started content blocks must be tool_use blocks"
+        )
+        assert stop_indices == expected_indices, (
+            "all 64 tool blocks must stop once in block-index order"
+        )
+        block_stop_positions = [
+            index for index, event in enumerate(events)
+            if event.type == "content_block_stop"
+        ]
+        message_stop_positions = [
+            index for index, event in enumerate(events) if event.type == "message_stop"
+        ]
+        message_delta_positions = [
+            index for index, event in enumerate(events) if event.type == "message_delta"
+        ]
+        assert len(message_stop_positions) == 1, (
+            "a completed stream must emit exactly one message_stop"
+        )
+        assert message_delta_positions, "a completed stream must emit message_delta"
+        assert max(block_stop_positions) < message_delta_positions[0], (
+            "every content_block_stop must precede the first message_delta"
+        )
+        assert message_delta_positions[-1] < message_stop_positions[0], (
+            "message_stop must follow the last message_delta"
+        )
+
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
         events = []
@@ -776,6 +1158,43 @@ class TestOperatorApprovedDegradation:
         assert raw.http_response.status_code == 200
         reported = raw.http_response.headers.get(DEGRADED_HEADER, "")
         assert "prompt_caching" in reported and "extended_thinking" in reported, reported
+
+    @pytest.mark.parametrize("leading", [False, True])
+    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client, leading):
+        RecordingBackend.bodies.clear()
+
+        # Claude Code sends a text-only `system` message after the first user
+        # turn; vLLM chat templates reject it ("System message must be at the
+        # beginning"), so the allowlisted fold moves it into the single
+        # leading system message.
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            system="Be brief",
+            messages=[
+                *([{"role": "system", "content": "Keep instruction order."}] if leading else []),
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "system", "content": "Answer tersely."},
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "mid_conversation_system" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        system_messages = [m for m in upstream["messages"] if m["role"] == "system"]
+        assert system_messages == [
+            {
+                "role": "system",
+                "content": (
+                    "Be brief\n\n"
+                    + ("Keep instruction order.\n\n" if leading else "")
+                    + "Answer tersely."
+                ),
+            }
+        ], f"the fold must merge into one leading system message: {upstream['messages']}"
 
     def test_streaming_request_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()

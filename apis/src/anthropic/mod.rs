@@ -3,7 +3,14 @@
 
 //! Anthropic protocol filters and the Messages operation registry.
 
+/// Default Anthropic Messages API version.
+pub(crate) const API_VERSION_2023_06_01: &str = "2023-06-01";
+/// Anthropic Messages API version 2026-10-21.
+pub(crate) const API_VERSION_2026_10_21: &str = "2026-10-21";
+
 pub(crate) mod error_response_formatter;
+#[cfg(feature = "anthropic-mcp-connector")]
+mod mcp_connector;
 mod messages_request;
 pub(crate) mod messages_to_chat_completions;
 mod messages_to_chat_completions_stream;
@@ -14,6 +21,8 @@ pub mod routes;
 mod web_search;
 mod wire;
 
+#[cfg(feature = "anthropic-mcp-connector")]
+pub use mcp_connector::AnthropicMcpConnectorFilter;
 pub use messages_request::{AnthropicMessagesRequestFilter, AnthropicMessagesState};
 pub use messages_to_chat_completions::AnthropicMessagesToChatCompletionsFilter;
 pub use messages_to_chat_completions_stream::AnthropicMessagesToChatCompletionsStreamFilter;

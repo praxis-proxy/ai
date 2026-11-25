@@ -6,13 +6,14 @@
 use std::time::Duration;
 
 use praxis_core::config::ChainRef;
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 use url::Url;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{
-    callout_identity::credential_authority, callout_policy::OnFailure, openai::api_client, subrequest::SubRequestClient,
+    callout_identity::credential_authority, callout_policy::OnFailure, json_body::MAX_JSON_BODY_BYTES,
+    openai::api_client, subrequest::SubRequestClient,
 };
 
 // -----------------------------------------------------------------------------

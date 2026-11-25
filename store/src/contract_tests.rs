@@ -13,8 +13,8 @@ use crate::{
     retained_payload::{json_values_charge, retained_charge},
     traits::{ConversationItemStore, PersistedStateBackend, ResponseStore},
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseCasOutcome,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -102,6 +102,8 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     pending_approval_size_measures_payload_only(backend).await;
     budgeted_response_reads_measure_and_limit(backend).await;
     persist_pairs_response_and_approvals(backend).await;
+    response_object_cas_arbitrates_transitions(backend).await;
+    response_object_cas_is_owner_scoped(backend).await;
     insert_if_absent_preserves_prior_response(backend).await;
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
@@ -675,6 +677,116 @@ async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBacken
             .expect("get after delete")
             .is_empty(),
         "approval orphaned after its response was deleted"
+    );
+}
+/// A conditional response-object write is the lifecycle arbiter: it applies
+/// only while the stored object still matches, so exactly one of two racing
+/// claimants wins and a terminal write cannot clobber a state that moved on.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn response_object_cas_arbitrates_transitions(backend: &dyn PersistedStateBackend) {
+    let o = owner("response-cas");
+    let queued = serde_json::json!({"id": "resp_cas", "status": "queued"});
+    let running = serde_json::json!({"id": "resp_cas", "status": "in_progress"});
+    let completed = serde_json::json!({"id": "resp_cas", "status": "completed"});
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_cas".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: queued.clone(),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert response");
+
+    assert_eq!(
+        backend
+            .compare_and_swap_response_object(&o, "resp_cas", &queued, &running)
+            .await
+            .expect("first claim"),
+        ResponseCasOutcome::Applied,
+        "a claim against the current object must apply"
+    );
+    assert_eq!(
+        backend
+            .compare_and_swap_response_object(&o, "resp_cas", &queued, &running)
+            .await
+            .expect("second claim"),
+        ResponseCasOutcome::Mismatch,
+        "a second claimant comparing the same stale object must lose the race"
+    );
+    assert_eq!(
+        backend
+            .compare_and_swap_response_object(&o, "resp_cas", &running, &completed)
+            .await
+            .expect("terminal write"),
+        ResponseCasOutcome::Applied,
+        "a terminal write from the claimed state must apply"
+    );
+    assert_eq!(
+        backend
+            .compare_and_swap_response_object(&o, "resp_cas", &running, &completed)
+            .await
+            .expect("post-terminal write"),
+        ResponseCasOutcome::Mismatch,
+        "a write against a superseded object must not apply"
+    );
+
+    let stored = backend
+        .get_response(&o, "resp_cas")
+        .await
+        .expect("read back")
+        .expect("response present");
+    assert_eq!(stored.response_object, completed, "last applied write must be visible");
+}
+
+/// A conditional write never reaches another owner's record, and an absent
+/// record is reported as such rather than as a lost race.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn response_object_cas_is_owner_scoped(backend: &dyn PersistedStateBackend) {
+    let (a, b) = (owner("response-cas-a"), owner("response-cas-b"));
+    let queued = serde_json::json!({"id": "resp_cas_scope", "status": "queued"});
+    let cancelled = serde_json::json!({"id": "resp_cas_scope", "status": "cancelled"});
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_cas_scope".to_owned(),
+            owner: a.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: queued.clone(),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert response");
+
+    assert_eq!(
+        backend
+            .compare_and_swap_response_object(&b, "resp_cas_scope", &queued, &cancelled)
+            .await
+            .expect("cross-owner swap"),
+        ResponseCasOutcome::NotFound,
+        "another owner's record must be indistinguishable from a missing one"
+    );
+    assert_eq!(
+        backend
+            .compare_and_swap_response_object(&a, "resp_missing", &queued, &cancelled)
+            .await
+            .expect("missing swap"),
+        ResponseCasOutcome::NotFound,
+        "an absent record must report not-found, not a lost race"
+    );
+
+    let stored = backend
+        .get_response(&a, "resp_cas_scope")
+        .await
+        .expect("read back")
+        .expect("response present");
+    assert_eq!(
+        stored.response_object, queued,
+        "a refused cross-owner swap must leave the record untouched"
     );
 }
 

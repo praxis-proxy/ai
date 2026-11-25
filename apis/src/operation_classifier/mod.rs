@@ -58,7 +58,10 @@ use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
+    RecordAiMetadata as _,
     anthropic::routes as anthropic_messages_routes,
+    bedrock::routes as bedrock_routes,
+    gemini::routes as gemini_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
         decisions::routes as decisions_routes, files::routes as files_routes, responses::routes as responses_routes,
@@ -254,8 +257,8 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> 
     let application_protocol = matched.application_protocol.as_str();
 
     ctx.extensions.insert(matched);
-    ctx.set_metadata("ai_operation.application_protocol", application_protocol);
-    ctx.set_metadata("ai_operation.operation_id", matched.operation_id);
+    ctx.record_ai_metadata("ai_operation.application_protocol", application_protocol);
+    ctx.record_ai_metadata("ai_operation.operation_id", matched.operation_id);
 
     let results = ctx.filter_results.entry(FILTER_NAME).or_default();
     results.set("application_protocol", application_protocol)?;
@@ -277,9 +280,10 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> 
 ///
 /// Registered path spaces do not overlap — OpenAI serves `/v1/responses`,
 /// `/v1/conversations`, `/v1/chat/completions`, `/v1/files`, and
-/// `/v1/vector_stores` while Anthropic serves `/v1/messages` — so at most one
-/// registry can match one head, and the order below does not decide between
-/// protocols.
+/// `/v1/vector_stores`, Anthropic serves `/v1/messages`, Gemini serves
+/// `/v1{,beta}/models/{model}:{action}`, and Bedrock serves
+/// `/model/{model_id}/{action}` — so at most one registry can match one head,
+/// and the order below does not decide between protocols.
 pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<AiOperationMatch> {
     let http_match = (transport == Transport::Http).then(|| {
         classify_conversation(method, path)
@@ -288,6 +292,8 @@ pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option
             .or_else(|| classify_files(method, path))
             .or_else(|| classify_vector_stores(method, path))
             .or_else(|| classify_anthropic_messages(method, path))
+            .or_else(|| classify_gemini(method, path))
+            .or_else(|| classify_bedrock(method, path))
     });
     http_match
         .flatten()
@@ -312,6 +318,16 @@ fn classify_decisions(method: &str, path: &str) -> Option<AiOperationMatch> {
 /// Match one Anthropic Messages operation.
 fn classify_anthropic_messages(method: &str, path: &str) -> Option<AiOperationMatch> {
     anthropic_messages_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Gemini operation.
+fn classify_gemini(method: &str, path: &str) -> Option<AiOperationMatch> {
+    gemini_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Bedrock operation.
+fn classify_bedrock(method: &str, path: &str) -> Option<AiOperationMatch> {
+    bedrock_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Files operation.

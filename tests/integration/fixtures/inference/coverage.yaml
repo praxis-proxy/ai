@@ -30,6 +30,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: bedrock.converse.response.reasoning
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.minimal
     scopes:
       - messages_to_chat_completions
@@ -96,6 +105,15 @@ features:
     status: synthetic_only
     scenarios:
       - messages/invalid-tool-id
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.response.streaming_tool_use_stop
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/named-tool-stop-stream
     providers:
       synthetic:
         status: synthetic_only
@@ -223,6 +241,7 @@ features:
       synthetic:
         status: synthetic_only
   - id: responses.native.request
+    reason: Native request ordering also has controlled local Files API and SDK evidence; independent file callouts are outside the one-exchange replay model.
     scopes:
       - responses_native_passthrough
     status: live_covered
@@ -517,6 +536,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.apply_patch_grammar
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-apply-patch-grammar
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.client_tool_compat.mcp_namespace_lower_restore
     scopes:
       - responses_client_tool_compat
@@ -629,6 +657,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: azure.chat.request.preservation
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/request-preservation
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: azure.chat.response.annotation_stream
     scopes:
       - openai_chat_completions_to_azureai_chat_completions
@@ -716,6 +753,15 @@ features:
     status: synthetic_only
     scenarios:
       - vertex/fallback-response-id
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.response.cached_usage
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/cached-usage
     providers:
       synthetic:
         status: synthetic_only
@@ -854,3 +900,69 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: external_model.anthropic.request.legacy_sampling
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  # Covers sampling preservation, backend errors, and a conflicting native default.
+  - id: external_model.anthropic.request.version_sampling
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-version-sampling
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.access_programs
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+      - responses/chat-unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.request.object_document_input
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/object-document-input
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.mcp_rewrite_preservation
+    scopes:
+    - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+    - responses/mcp-request-preservation
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.degrade_mid_conversation_system
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/degrade-features
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.native.mcp_structured_result_projection
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/mcp-structured-result-projection
+    providers:
+      synthetic:
+        status: synthetic_only
+    reason: Native-boundary projection evidence only. MCP execution and both output paths are covered through the real proxy by the OpenAI SDK tests; independent MCP callouts are outside the one-exchange replay model.

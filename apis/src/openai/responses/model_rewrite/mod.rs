@@ -52,8 +52,7 @@ use std::{borrow::Cow, collections::HashMap};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -65,8 +64,9 @@ use super::agentic_loop::{
 };
 use super::error::responses_error_rejection;
 use crate::{
+    RecordAiMetadata as _,
     classifier::{is_chat_completions_create, is_responses_create},
-    json_body::replace_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     promotion::is_promotable_value,
 };
 
@@ -271,7 +271,7 @@ impl HttpFilter for ModelRewriteFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -507,19 +507,19 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
     if let Some(orig) = &result.original_model
         && is_promotable_value(orig)
     {
-        ctx.set_metadata("openai_responses_model_rewrite.original_model", orig.clone());
+        ctx.record_ai_metadata("openai_responses_model_rewrite.original_model", orig.clone());
     }
     if !result.effective_model.is_empty() && is_promotable_value(&result.effective_model) {
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             "openai_responses_model_rewrite.effective_model",
             result.effective_model.clone(),
         );
     }
     if result.rewritten {
-        ctx.set_metadata("openai_responses_model_rewrite.rewritten", "true");
+        ctx.record_ai_metadata("openai_responses_model_rewrite.rewritten", "true");
     }
     if result.default_injected {
-        ctx.set_metadata("openai_responses_model_rewrite.default_injected", "true");
+        ctx.record_ai_metadata("openai_responses_model_rewrite.default_injected", "true");
     }
 }
 
@@ -566,10 +566,14 @@ fn set_filter_results_from_result(ctx: &mut HttpFilterContext<'_>, result: &Rewr
 /// body pre-read so branches on this filter work correctly.
 fn repopulate_filter_results(ctx: &mut HttpFilterContext<'_>) {
     let effective = ctx
-        .get_metadata("openai_responses_model_rewrite.effective_model")
+        .filter_metadata
+        .get("openai_responses_model_rewrite.effective_model")
         .map(str::to_owned);
-    let rewritten = ctx.get_metadata("openai_responses_model_rewrite.rewritten") == Some("true");
-    let default_injected = ctx.get_metadata("openai_responses_model_rewrite.default_injected") == Some("true");
+    let rewritten = ctx.filter_metadata.get("openai_responses_model_rewrite.rewritten") == Some("true");
+    let default_injected = ctx
+        .filter_metadata
+        .get("openai_responses_model_rewrite.default_injected")
+        == Some("true");
 
     if effective.is_none() && !rewritten && !default_injected {
         return;

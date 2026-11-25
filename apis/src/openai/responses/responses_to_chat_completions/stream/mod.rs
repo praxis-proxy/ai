@@ -41,13 +41,16 @@ use self::{
     framing::{Framing, FramingError},
     reasoning::ReasoningState,
 };
-use crate::openai::translation::{
-    chat_completions::{
-        ResponseContext, chat_response_to_response_resource, context_has_web_search,
-        function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_output_item,
-        output_text_item, refusal_item, web_search_call_output_item_from_parts,
+use crate::openai::{
+    responses::state::ResponsesState,
+    translation::{
+        chat_completions::{
+            ResponseContext, chat_response_to_response_resource, context_has_web_search,
+            function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_item_id,
+            message_output_item, output_text_item, refusal_item, web_search_call_output_item_from_parts,
+        },
+        reasoning::{ReasoningOptions, reasoning_item_id},
     },
-    reasoning::{ReasoningOptions, reasoning_item_id},
 };
 
 /// Resource limits governing one streaming translation.
@@ -115,6 +118,8 @@ struct EmitState {
     sequence_number: u64,
     /// Count of events emitted so far.
     events_emitted: usize,
+    /// Add padding to generated delta events.
+    include_obfuscation: bool,
 }
 
 /// Errors produced while translating a stream.
@@ -122,6 +127,8 @@ struct EmitState {
 enum ConvertError {
     /// Serializing a Responses event failed; surfaces as a [`FilterError`].
     Serialize(serde_json::Error),
+    /// The random source failed while generating stream padding.
+    ObfuscationRandomness,
     /// A Chat chunk was not valid JSON.
     MalformedJson,
     /// Accumulated stream state could not form a valid terminal response.
@@ -216,7 +223,11 @@ impl From<FramingError> for ConvertError {
 struct MessageState {
     /// Responses output index for this message item.
     output_index: usize,
-    /// Stable message item id (`msg_{response_id}`).
+    /// Stable message item id.
+    ///
+    /// Prefer `msg_{response_id}_{chat_completion_id}` so IRR rounds stay
+    /// distinct; fall back to `msg_{response_id}` when the Chat completion
+    /// omits an id.
     item_id: String,
     /// Whether `response.output_item.added` was emitted.
     item_added: bool,
@@ -325,6 +336,15 @@ impl ToolCallState {
     }
 }
 
+/// Client input echo for lifecycle resources, reconstructed at most once per
+/// stream (`input` was moved out of `request_body` at init, #1618).
+enum EchoedInput {
+    /// Not reconstructed yet.
+    Pending,
+    /// Reconstructed; `None` when the request carried no `input`.
+    Ready(Option<Value>),
+}
+
 /// Incremental Chat Completions to Responses SSE converter.
 pub(super) struct StreamConverter {
     /// Stable Responses resource id.
@@ -378,10 +398,20 @@ pub(super) struct StreamConverter {
     /// Late reasoning position from a successful terminal, consumed once by the
     /// filter to preserve this completion's association in stored replay.
     replay_reasoning_index: Option<usize>,
+    /// Client input echoed onto lifecycle resources, reconstructed once from the
+    /// state snapshot (`input` was moved out of `request_body` at init, #1618) and
+    /// reused across callbacks so heartbeats never rebuild it.
+    echoed_input: EchoedInput,
 }
 
 impl StreamConverter {
+    /// Set the effective client preference before emitting any events.
+    pub(super) fn set_include_obfuscation(&mut self, enabled: bool) {
+        self.emit.include_obfuscation = enabled;
+    }
+
     /// Create a converter for a streaming response.
+    #[expect(clippy::too_many_lines, reason = "initializes every converter field")]
     pub(super) fn new(
         response_id: String,
         created_at: u64,
@@ -397,6 +427,7 @@ impl StreamConverter {
             emit: EmitState {
                 sequence_number: 0,
                 events_emitted: 0,
+                include_obfuscation: true,
             },
             lifecycle_started: false,
             initial_metadata_checked: false,
@@ -417,6 +448,17 @@ impl StreamConverter {
             budget_output_allowance: 0,
             frames_processed: 0,
             replay_reasoning_index: None,
+            echoed_input: EchoedInput::Pending,
+        }
+    }
+
+    /// Reconstruct the client input echo once per stream from the state snapshot.
+    ///
+    /// `input` was moved out of `request_body` at init (#1618); lifecycle resources
+    /// echo it back. Caching here keeps heartbeat callbacks from rebuilding it.
+    pub(super) fn ensure_echoed_input(&mut self, state: &ResponsesState) {
+        if matches!(self.echoed_input, EchoedInput::Pending) {
+            self.echoed_input = EchoedInput::Ready(crate::openai::responses::request_input::input_echo_value(state));
         }
     }
 
@@ -967,11 +1009,12 @@ impl StreamConverter {
             return Ok(());
         }
         let output_index = self.alloc_output_index();
-        // Matches the finite translation `msg_{response_id}` item-id convention.
-        let item_id = format!("msg_{}", self.response_id);
+        // Matches the finite translation: include the Chat completion id so each
+        // agentic/IRR round under one logical response_id gets a distinct message item.
+        let item_id = message_item_id(&self.response_id, self.chat_id.as_deref());
         self.message = Some(MessageState::new(output_index, item_id));
         let context = self.response_context(inputs, None);
-        let item = message_output_item(&context, "in_progress", Vec::new());
+        let item = message_output_item(&context, "in_progress", Vec::new(), self.chat_id.as_deref());
         emit_event(
             &mut self.emit,
             &self.limits,
@@ -1379,13 +1422,18 @@ impl StreamConverter {
             )?;
         }
         let content_items = self.build_message_content_items();
-        let context = self.response_context(inputs, None);
         let output_index = self.message.as_ref().expect("present").output_index;
+        // Build the item (which borrows the echoed input via the context) before
+        // mutating `self.emit`, so the context's `&self` borrow is released first.
+        let item = {
+            let context = self.response_context(inputs, None);
+            message_output_item(&context, status, content_items, self.chat_id.as_deref())
+        };
         emit_event(
             &mut self.emit,
             &self.limits,
             true,
-            events::output_item_done(output_index, &message_output_item(&context, status, content_items)),
+            events::output_item_done(output_index, &item),
             out,
         )?;
         self.message.as_mut().expect("present").closed = true;
@@ -1481,9 +1529,11 @@ impl StreamConverter {
     /// Emit the terminal `response.completed` or `response.incomplete` event.
     fn emit_terminal(&mut self, inputs: &SnapshotInputs<'_>, out: &mut Vec<u8>) -> Result<(), ConvertError> {
         let finish = self.finish_reason.clone().unwrap_or_default();
-        let context = self.response_context(inputs, Some(inputs.now));
         let mut synthetic = self.synthetic_completion(&finish);
+        // Finish mutating `self` (reasoning move) before taking the context's `&self`
+        // borrow, which the echoed input now ties to `self` (#1618).
         self.move_reasoning_to_completion(&mut synthetic)?;
+        let context = self.response_context(inputs, Some(inputs.now));
         let mut resource = chat_response_to_response_resource(&synthetic, &context).map_err(|error| {
             tracing::trace!(%error, "accumulated stream state could not form a valid terminal response");
             ConvertError::InvalidTerminalResource
@@ -1595,14 +1645,20 @@ impl StreamConverter {
             Err(other) => return Err(other),
         }
         // A failed response has no completion moment, so no completed_at timestamp.
-        let context = self.response_context(inputs, None);
         // The synthetic completion only supplies the request-echoed envelope
         // (id, model, usage); mark_failed drops its output because the failed
         // terminal never streamed completion events for the accumulated items.
         let synthetic = self.synthetic_completion("stop");
-        let mut resource = chat_response_to_response_resource(&synthetic, &context)
-            .or_else(|_| in_progress_response_resource_with_service_tier(&context, self.service_tier.as_ref()))
-            .unwrap_or_else(|_| minimal_failed_resource(&context, message));
+        // Build every resource that borrows the context — which now ties the echoed
+        // input to `&self` (#1618) — before mutating `self.emit` below.
+        let (mut resource, minimal) = {
+            let context = self.response_context(inputs, None);
+            let resource = chat_response_to_response_resource(&synthetic, &context)
+                .or_else(|_| in_progress_response_resource_with_service_tier(&context, self.service_tier.as_ref()))
+                .unwrap_or_else(|_| minimal_failed_resource(&context, message));
+            let minimal = minimal_failed_resource(&context, message);
+            (resource, minimal)
+        };
         mark_failed(&mut resource, message);
         // The partial snapshot can be arbitrarily large — this failure may itself
         // be the byte-limit trip, and the snapshot echoes request-controlled
@@ -1611,7 +1667,7 @@ impl StreamConverter {
         // constant-bounded failed resource that echoes no request data, so the
         // terminal never re-serializes the oversized content the ceiling bounds.
         if serialized_json_len(&resource)? > self.limits.max_body_bytes {
-            resource = minimal_failed_resource(&context, message);
+            resource = minimal.clone();
         }
         // Emit the failed terminal. Even after the byte-ceiling fallback the frame
         // can exceed the (tighter) per-frame ceiling — the response-size ceiling
@@ -1628,7 +1684,6 @@ impl StreamConverter {
         ) {
             Ok(()) => {},
             Err(ConvertError::FrameSizeLimit) => {
-                let minimal = minimal_failed_resource(&context, message);
                 emit_event(
                     &mut self.emit,
                     &self.limits,
@@ -1828,7 +1883,7 @@ impl StreamConverter {
     }
 
     /// Build a response context borrowing the request body.
-    fn response_context<'a>(&self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
+    fn response_context<'a>(&'a self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
         let mut context =
             ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at)
                 .with_reasoning_options(self.reasoning_options);
@@ -1838,6 +1893,12 @@ impl StreamConverter {
         context.tools = inputs.tools;
         if let Some(original_tool_choice) = inputs.original_tool_choice {
             context.tool_choice = Some(original_tool_choice);
+        }
+        // `input` was moved out of `request_body` at init (#1618); echo the copy the
+        // converter reconstructed once (falls back to the request body in tests that
+        // do not strip it).
+        if let EchoedInput::Ready(Some(input)) = &self.echoed_input {
+            context.input = Some(input);
         }
         match completed_at {
             Some(timestamp) => context.with_completed_at(timestamp),
@@ -1914,11 +1975,11 @@ fn emit_event(
         return Err(ConvertError::EventLimit);
     }
     let start = out.len();
-    if let Err(error) = events::encode(event, emit.sequence_number, out) {
+    if let Err(error) = events::encode(event, emit.sequence_number, emit.include_obfuscation, out) {
         // Drop any partially written frame so a failed encode leaves `out`
         // byte-for-byte as it was before this call.
         out.truncate(start);
-        return Err(ConvertError::Serialize(error));
+        return Err(error);
     }
     if out.len().saturating_sub(start) > limits.max_emitted_sse_frame_bytes {
         // The complete encoded frame exceeds the emitted-frame ceiling. Roll it
@@ -1944,7 +2005,7 @@ fn is_done_sentinel(frame: &framing::Frame) -> bool {
 /// cost nothing.
 fn logprobs_byte_cost(logprobs: &Value) -> usize {
     match logprobs {
-        Value::Array(items) if !items.is_empty() => serde_json::to_vec(logprobs).map_or(0, |bytes| bytes.len()),
+        Value::Array(items) if !items.is_empty() => crate::json_body::serialized_len(logprobs).unwrap_or(0),
         _ => 0,
     }
 }
@@ -1973,6 +2034,7 @@ fn minimal_failed_resource(context: &ResponseContext<'_>, message: &str) -> Valu
     json!({
         "id": context.response_id,
         "object": "response",
+        "access_programs": Value::Null,
         "created_at": context.created_at,
         "completed_at": Value::Null,
         "status": "failed",
@@ -2031,20 +2093,7 @@ fn mark_failed(resource: &mut Value, message: &str) {
 /// ceiling; counting into a sink avoids buffering a second full copy alongside
 /// the one `emit_event` serializes.
 fn serialized_json_len(value: &Value) -> Result<usize, ConvertError> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buf.len());
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value).map_err(ConvertError::Serialize)?;
-    Ok(counter.0)
+    crate::json_body::serialized_len(value).map_err(ConvertError::Serialize)
 }
 
 /// Return whether `reason` is a finish reason the converter can translate.
@@ -2096,6 +2145,7 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::MissingFinishReason => "upstream stream ended without a finish reason",
         ConvertError::UnknownFinishReason => "upstream stream used an unrecognized finish reason",
         ConvertError::IncompleteFrame => "upstream stream ended with an incomplete frame",
+        ConvertError::ObfuscationRandomness => "could not generate stream padding",
         ConvertError::Serialize(_) => "internal serialization error",
     }
 }

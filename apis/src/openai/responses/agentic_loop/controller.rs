@@ -10,17 +10,15 @@ use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    IterationState, Rejection, SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    IterationState, Rejection, SubRequestResponseMode, TrustedHeaderMutation, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
 
 #[cfg(feature = "openai-mcp-tools")]
 use super::super::{
-    mcp_classify::{ApprovalFloor, McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    mcp_tool_resolve::has_pending_deferred_discovery,
 };
 use super::{
     super::{
@@ -41,9 +39,16 @@ use super::{
     AgenticBudgetPolicy,
     config::{AgenticLoopConfig, build_config},
 };
+#[cfg(feature = "openai-mcp-tools")]
+use crate::mcp_core::{
+    classify::{ApprovalFloor, McpDisposition, classify_mcp},
+    naming::McpToolIndex,
+};
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     http_hop::{connection_nominates_header, is_hop_by_hop},
+    json_body::MAX_JSON_BODY_BYTES,
 };
 // -----------------------------------------------------------------------------
 // Constants
@@ -133,7 +138,7 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -145,7 +150,7 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -215,10 +220,14 @@ impl HttpFilter for AgenticLoopFilter {
             && let Some(iteration) = ctx.extensions.get::<IterationState>().map(IterationState::iteration)
         {
             let marker = iteration.to_string();
-            if ctx.get_metadata("responses.agentic_response_processed_iteration") == Some(marker.as_str()) {
+            if ctx
+                .filter_metadata
+                .get("responses.agentic_response_processed_iteration")
+                == Some(marker.as_str())
+            {
                 return Ok(FilterAction::Continue);
             }
-            ctx.set_metadata("responses.agentic_response_processed_iteration", marker);
+            ctx.record_ai_metadata("responses.agentic_response_processed_iteration", marker);
         }
 
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
@@ -229,7 +238,7 @@ impl HttpFilter for AgenticLoopFilter {
             && let Some(budget) = state.simple_budget.as_mut()
             && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes))
         {
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             set_action(ctx, ACTION_DONE)?;
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
@@ -520,7 +529,7 @@ fn convert_dispatch_failure(
     // The loop terminates here; drop this round's dispatch bookkeeping.
     clear_round_dispatch_state(&mut state);
     let streaming = request_is_streaming(&state) && ctx.extensions.get::<ClientResponseHeadersCommitted>().is_some();
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     ctx.extensions.insert(state);
     set_action(ctx, ACTION_DONE)?;
 
@@ -552,7 +561,7 @@ fn finish_incomplete_round(
     mut state: ResponsesState,
     body: &mut Option<Bytes>,
 ) -> Result<FilterAction, FilterError> {
-    ctx.set_metadata(META_STATUS, "incomplete");
+    ctx.record_ai_metadata(META_STATUS, "incomplete");
     // A streamed `incomplete` terminal (status == "incomplete", e.g. truncated at
     // max_output_tokens) is finalized by `openai_stream_events` from
     // `accumulated_output`; the draining finalizer must not run on that path (see
@@ -627,9 +636,9 @@ fn end_stream_with_error(
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
-    ctx.set_metadata("responses.stream_error_code", code.to_owned());
-    ctx.set_metadata("responses.stream_error_message", message.to_owned());
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.stream_error_code", code.to_owned());
+    ctx.record_ai_metadata("responses.stream_error_message", message.to_owned());
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     set_action(ctx, ACTION_DONE)
 }
 
@@ -900,7 +909,7 @@ fn release_completed_round(
         )?;
         return Ok(Some(FilterAction::Continue));
     }
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     set_action(ctx, ACTION_DONE)?;
     Ok(Some(FilterAction::Reject(responses_error_rejection(
         502,
@@ -916,7 +925,9 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
         return;
     }
     let round_start = state.current_round_output_start.unwrap_or(0);
-    let mut pending = std::collections::HashMap::<String, usize>::new();
+    let mut pending = state
+        .captures_persistence_history()
+        .then(std::collections::HashMap::<String, usize>::new);
     for assignment in &state.tool_search_calls {
         if assignment
             .resolve(&state.accumulated_output, round_start, "tool_search_call")
@@ -928,10 +939,14 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
             && let Some(obj) = item.as_object_mut()
         {
             obj.insert("status".to_owned(), json!("incomplete"));
-            *pending.entry(assignment.item_id.clone()).or_default() += 1;
+            if let Some(pending) = pending.as_mut() {
+                *pending.entry(assignment.item_id.clone()).or_default() += 1;
+            }
         }
     }
-    mark_persisted_tool_searches_incomplete(&mut state.persisted_messages, &mut pending);
+    if let (Some(persisted_messages), Some(pending)) = (state.persisted_messages_mut(), pending.as_mut()) {
+        mark_persisted_tool_searches_incomplete(persisted_messages, pending);
+    }
     state.tool_search_calls.clear();
 }
 
@@ -1134,7 +1149,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 // the opaque provider state back instead of translating it
                 // into an assistant summary.
                 state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -1150,7 +1165,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.web_search_calls.push(assignment);
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
                 // Only a completed hosted search may trigger deferred
@@ -1159,10 +1174,10 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.tool_search_calls.push(assignment);
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("file_search_call") => {
                 // Like a hosted web_search_call, a file_search_call is not valid
@@ -1171,7 +1186,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 // `FileSearchAssignment`; openai_file_search_dispatch drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 if is_pending_file_search_call(&item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
                         SynthesisKind::Private
@@ -1308,7 +1323,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // in both state projections before moving the item into the
                 // public streamed output accumulator.
                 state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -1325,7 +1340,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.web_search_calls.push(assignment);
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state.accumulated_output.push(item);
             },
             Some("file_search_call") => {
@@ -1349,7 +1364,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if is_pending_file_search_call(&item) {
                     pending_file_search.push((absolute_index, synthesis));
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state.accumulated_output.push(item);
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
@@ -1360,14 +1375,14 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.tool_search_calls.push(assignment);
                 }
-                state.accumulated_output.push(item.clone());
-                state.persist_collected_output(absolute_index, item);
+                state.persist_collected_output(absolute_index, &item);
+                state.accumulated_output.push(item);
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
                 // Client-executed searches stay client-visible and stored, but
                 // must not queue server-side connector discovery.
-                state.accumulated_output.push(item.clone());
-                state.persist_collected_output(absolute_index, item);
+                state.persist_collected_output(absolute_index, &item);
+                state.accumulated_output.push(item);
             },
             _ => {
                 state.accumulated_output.push(item);

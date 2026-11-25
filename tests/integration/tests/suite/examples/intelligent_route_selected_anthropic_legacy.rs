@@ -219,6 +219,77 @@ fn selected_anthropic_sse_is_converted_incrementally_to_openai_sse() {
     );
 }
 
+#[test]
+fn selected_anthropic_version_example_preserves_sampling_and_backend_errors() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, ANTHROPIC_JSON.to_owned()),
+        (400, r#"{"type":"error","error":{"type":"invalid_request_error","message":"fixture backend rejected sampling"}}"#.to_owned()),
+    ]).start_with_shutdown();
+    let example = example_config_path("openai-selected-provider-version-fixture.yaml");
+    let overlay = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/inference/routing/openai-to-anthropic.json");
+    let yaml = std::fs::read_to_string(&example)
+        .expect("read version-aware example")
+        .replace("0.0.0.0:8080", &format!("127.0.0.1:{}", free_port()))
+        .replace("127.0.0.1:8001", &format!("127.0.0.1:{}", backend.port()))
+        .replace(
+            "tests/integration/fixtures/inference/routing/openai-to-anthropic.json",
+            overlay.to_str().expect("UTF-8 overlay path"),
+        );
+    let config = Config::from_yaml(&yaml).expect("version-aware example must parse");
+    let proxy = start_proxy(&config);
+    for (status, temperature, top_p) in [(200, 1.0, 1.0), (400, 0.5, 0.9)] {
+        let body = json!({
+            "model":"fixture-openai-model", "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":16, "temperature":temperature, "top_p":top_p, "stream":false
+        });
+        let encoded = serde_json::to_string(&body).expect("serialize sampling request");
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAnthropic-Version: 2023-06-01\r\nConnection: close\r\n\r\n{encoded}",
+            encoded.len()
+        );
+        let response = http_send(proxy.addr(), &request);
+        assert_eq!(
+            parse_status(&response),
+            status,
+            "backend status must reach client: {response}"
+        );
+        let requests = backend.requests();
+        let upstream = requests
+            .iter()
+            .rev()
+            .find(|request| request.method == "POST")
+            .expect("sampling reaches upstream");
+        let upstream_body: Value = serde_json::from_str(&upstream.body).expect("upstream Messages JSON");
+        assert_eq!(
+            upstream_body["temperature"], temperature,
+            "temperature must be preserved"
+        );
+        assert_eq!(upstream_body["top_p"], top_p, "top_p must be preserved");
+        assert!(
+            upstream
+                .headers
+                .to_ascii_lowercase()
+                .contains("anthropic-version: 2026-10-21"),
+            "configured version must override caller and native default"
+        );
+        if status == 400 {
+            let error: Value = serde_json::from_str(&parse_body(&response)).expect("OpenAI error JSON");
+            assert_eq!(error["error"]["message"], "fixture backend rejected sampling");
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["code"], 400);
+        }
+    }
+    assert_eq!(
+        backend
+            .requests()
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        2,
+        "both sampling requests must reach upstream"
+    );
+}
+
 /// Render the checked-in example with isolated test listener and credential paths.
 fn example_yaml(
     listener_port: u16,

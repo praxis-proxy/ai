@@ -18,6 +18,7 @@ pub mod callout;
 #[cfg(feature = "gcp-adc-filter")]
 pub mod gcp;
 pub mod guardrails;
+mod identity;
 mod identity_guard;
 pub mod inference;
 pub mod inflight;
@@ -31,6 +32,8 @@ pub mod routing;
 #[cfg(feature = "store")]
 mod store_readiness;
 mod time_to_first_token;
+#[cfg(feature = "token-quota-filter")]
+mod token_quota;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
 mod token_usage;
@@ -61,7 +64,7 @@ pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_rate_limit::TokenRateLimitFilter;
 #[cfg(feature = "token-ceiling-filter")]
 pub use token_usage::TokenCeilingFilter;
-pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
+pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter, TokenUsageMetricsFilter};
 
 /// Build an isolated client after installing the process-wide crypto provider.
 ///
@@ -130,7 +133,8 @@ pub(crate) mod test_utils {
             extra_request_headers: Vec::new(),
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
-            filter_metadata: std::collections::HashMap::new(),
+            request_header_mutations: Vec::new(),
+            filter_metadata: praxis_filter::FilterMetadata::default(),
             pre_read_mutations: Vec::new(),
             prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
@@ -155,8 +159,7 @@ pub(crate) mod test_utils {
             attempted_endpoints: Vec::new(),
             retry_policy: None,
             route_retry_policy: None,
-            cluster_retry_state: None,
-            cluster_retry_state_released: false,
+            cluster_admission: None,
             endpoint_reselector: None,
             pinned_endpoint_address: None,
             rewritten_path: None,

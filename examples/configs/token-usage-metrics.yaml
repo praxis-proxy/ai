@@ -1,0 +1,75 @@
+# Token Usage Prometheus Metrics
+#
+# Opt-in, cardinality-bounded per-tenant token counters.
+#
+# Emits praxis_ai_tokens_total{tenant, model, kind} after token_count
+# extracts usage. A production authentication filter must populate the exact
+# unnamespaced x-tenant-username metadata key from verified credentials.
+# identity_header_guard only strips/captures client headers; its namespaced
+# metadata is deliberately not trusted by token_usage_metrics.
+#
+# Both tenant and model labels use explicit allowlists. Authenticated values
+# outside an allowlist map to the fixed `other` buckets.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-usage-metrics.yaml
+#   curl http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-tenant-username: alice" \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+#
+# The raw header above is intentionally insufficient to create a tenant
+# series. Add the deployment's authentication filter before
+# token_usage_metrics to populate trusted metadata.
+#
+# Grafana: import examples/dashboards/token-usage-metrics.json
+# Prometheus scrape endpoint: http://127.0.0.1:9901/metrics
+#
+# Pipeline ordering: token_usage_metrics is declared before token_count
+# so response hooks (reverse order) extract counts first.
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      # Defense in depth: strip raw identity headers before proxying. The
+      # resulting namespaced metadata is unverified and is not used by metrics.
+      - filter: identity_header_guard
+        prefix: "x-tenant-"
+        metadata_namespace: "identity"
+
+      - filter: model_to_header
+
+      - filter: token_usage_metrics
+        tenant_metadata_key: "x-tenant-username"
+        allowed_tenants:
+          - token-metrics-example-alice
+        allowed_models:
+          - gpt-4o
+        overflow_tenant: other
+        overflow_model: other
+
+      - filter: token_count
+        provider: openai
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+admin:
+  metrics_address: "127.0.0.1:9901"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

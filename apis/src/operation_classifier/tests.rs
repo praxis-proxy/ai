@@ -80,13 +80,11 @@ async fn classifies_a_conversations_operation() {
     assert_eq!(matched.request_body, RequestBody::None);
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("ai_operation.application_protocol")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.application_protocol"),
         Some("openai_conversations")
     );
     assert_eq!(
-        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.operation_id"),
         Some("getConversation")
     );
 }
@@ -303,7 +301,14 @@ async fn classifies_vector_stores_operations() {
 /// enter a route keyed on the classifier's output.
 #[tokio::test]
 async fn unsupported_family_methods_publish_no_match() {
-    for (method, path) in [("PUT", "/v1/files"), ("DELETE", "/v1/vector_stores")] {
+    for (method, path) in [
+        ("PUT", "/v1/files"),
+        ("DELETE", "/v1/vector_stores"),
+        // A Gemini model path without an action verb, and a Bedrock model
+        // path without an action, are outside both registries.
+        ("POST", "/v1/models/gemini-2.0-flash"),
+        ("POST", "/model/us.anthropic.claude-3-7-sonnet"),
+    ] {
         let filter = default_filter();
         let request = req(method, path);
         let mut ctx = make_filter_context(&request);
@@ -522,9 +527,7 @@ async fn headers_can_be_disabled_while_metadata_still_publishes() {
 
     assert!(ctx.request_headers_to_set.is_empty());
     assert_eq!(
-        ctx.filter_metadata
-            .get("ai_operation.application_protocol")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.application_protocol"),
         Some("openai_responses")
     );
 }
@@ -863,13 +866,11 @@ async fn publishes_anthropic_metadata_and_filter_results() {
     drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("ai_operation.application_protocol")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.application_protocol"),
         Some("anthropic_messages")
     );
     assert_eq!(
-        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.operation_id"),
         Some("messages_post")
     );
 
@@ -921,6 +922,90 @@ async fn anthropic_paths_shared_with_openai_classify_as_openai() {
         .copied()
         .expect("the OpenAI Files registry declares this path");
     assert_eq!(matched.application_protocol.as_str(), "openai_files");
+}
+
+/// Gemini heads classify with the model captured from the action segment.
+///
+/// Google's path convention puts the action verb in the model segment after a
+/// colon, and the query string clients add for streaming (`?alt=sse`) never
+/// changes the operation.
+#[tokio::test]
+async fn classifies_gemini_operations() {
+    for (method, path, operation_id) in [
+        ("POST", "/v1/models/gemini-2.0-flash:generateContent", "generateContent"),
+        (
+            "POST",
+            "/v1/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
+            "streamGenerateContent",
+        ),
+        ("POST", "/v1/models/gemini-2.0-flash:countTokens", "countTokens"),
+        (
+            "POST",
+            "/v1beta/models/gemini-2.0-flash:generateContent",
+            "generateContent",
+        ),
+    ] {
+        assert_family(method, path, "google_gemini", operation_id).await;
+    }
+}
+
+/// The Gemini model parameter is captured with the action suffix removed, so
+/// downstream consumers route on the model alone.
+#[tokio::test]
+async fn gemini_model_parameter_excludes_the_action_suffix() {
+    let filter = default_filter();
+    let path = "/v1/models/gemini-2.0-flash:generateContent";
+    let request = req("POST", path);
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
+
+    let matched = ctx
+        .extensions
+        .get::<AiOperationMatch>()
+        .copied()
+        .expect("the head should classify");
+    assert_eq!(matched.path_parameters.get(path, "model"), Some("gemini-2.0-flash"));
+}
+
+/// Bedrock runtime heads classify with the model captured from its own segment.
+#[tokio::test]
+async fn classifies_bedrock_operations() {
+    for (method, path, operation_id) in [
+        ("POST", "/model/us.anthropic.claude-3-7-sonnet/invoke", "InvokeModel"),
+        (
+            "POST",
+            "/model/us.anthropic.claude-3-7-sonnet/invoke-with-response-stream",
+            "InvokeModelWithResponseStream",
+        ),
+        ("POST", "/model/us.anthropic.claude-3-7-sonnet/converse", "Converse"),
+        (
+            "POST",
+            "/model/us.anthropic.claude-3-7-sonnet/converse-stream",
+            "ConverseStream",
+        ),
+    ] {
+        assert_family(method, path, "amazon_bedrock", operation_id).await;
+    }
+}
+
+/// The Bedrock model parameter is captured from its own path segment.
+#[tokio::test]
+async fn bedrock_model_parameter_is_its_own_segment() {
+    let filter = default_filter();
+    let path = "/model/us.anthropic.claude-3-7-sonnet/converse";
+    let request = req("POST", path);
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request_head(&mut ctx).await.unwrap());
+
+    let matched = ctx
+        .extensions
+        .get::<AiOperationMatch>()
+        .copied()
+        .expect("the head should classify");
+    assert_eq!(
+        matched.path_parameters.get(path, "model_id"),
+        Some("us.anthropic.claude-3-7-sonnet")
+    );
 }
 
 /// The request head alone decides the operation.

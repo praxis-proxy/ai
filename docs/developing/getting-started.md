@@ -12,9 +12,13 @@
 Install the development-only Cargo tools used by the Make targets:
 
 ```console
-cargo install cargo-audit cargo-deny cargo-machete
+cargo install cargo-audit cargo-deny
+cargo install cargo-machete --version 0.9.2 --locked
 rustup toolchain install nightly --component rustfmt
 ```
+
+`cargo-machete` is pinned to match CI: version 0.10.1 uses
+`Path::is_empty`, which is unstable on Rust 1.96.
 
 ## Conventions
 
@@ -86,6 +90,28 @@ VLLM_MODEL=praxis-test-model VLLM_TEST_BACKEND=simulator uv run --with "openai>=
 
 You can also pass `--sdk-version=2.x` or `--sdk-version=3.x` to enforce version verification during pytest startup.
 
+### Anthropic SDK Integration Tests (Dual 1.x / 2.x Lanes)
+
+Praxis AI likewise maintains compatibility with both Anthropic Python SDK 1.x
+and 2.x releases. SDK v2 changes the client's wire defaults (`anthropic-version:
+2026-10-21` and `authorization: Bearer` instead of `2023-06-01` and `x-api-key`),
+so each lane is pinned and verified independently:
+
+```console
+cargo build -p praxis-ai-proxy
+uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --anthropic-sdk-version=1.x
+uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --anthropic-sdk-version=2.x
+```
+
+The pinned versions match the `make test-anthropic-sdk-v1` and
+`test-anthropic-sdk-v2` lane targets and CI. `make test-anthropic-sdk` runs
+both lanes locally; CI runs them as sequential steps in the `anthropic-sdk`
+job of `integration.yaml` after a single binary build. You can also pass
+`--anthropic-sdk-version=1.x` or `--anthropic-sdk-version=2.x` to enforce
+version verification during pytest startup. The suites scrub ambient
+`ANTHROPIC_*` environment variables so wire-header assertions stay
+deterministic.
+
 ### OpenAI Agents SDK Responses Compatibility
 
 The OpenAI Agents SDK function-calling loop is verified through the Responses
@@ -132,7 +158,7 @@ make test-fips-host  # the suites as the FIPS build, inside the UBI 9 toolchain 
 ```
 
 On a RHEL 9 host in FIPS mode, two more targets give the runtime proof the
-hosted checks cannot ([FIPS 140-3](../fips.md#verifying-a-deployment)):
+hosted checks cannot ([FIPS 140-3](../operations/fips.md#verifying-a-deployment)):
 
 ```console
 make fips-host-check     # attest the host and the image's module build (target/fips/host-attestation.*)
@@ -152,12 +178,11 @@ make fips-oc       # download the OpenShift CLI the scanner insists on, checksum
 make fips-scan     # run that scanner on the FIPS image, warnings fatal: the gate
 ```
 
-The report and the image verification are `cargo xtask fips` commands; the
-Makefile targets wrap them. `make container-fips`, `make fips-check`,
+The Makefile targets install and use the pinned `cargo-fips-check` tool.
+`make container-fips`, `make fips-check`,
 `make fips-smoke` and `make fips-scan` need a Linux podman (rootless or
 root): the UBI 9 base images are pinned by digest and their Red Hat
-signatures are verified before every build (`cargo xtask fips
-verify-image`), and the scanner reads podman's image store. On Debian
+signatures are verified before every build (`cargo fips-check verify-image`), and the scanner reads podman's image store. On Debian
 and Ubuntu, whose podman packaging ships no `registries.d` entry for Red
 Hat's registry, run `make fips-signature-store` once first. The FIPS
 image is built with Red Hat's `rust-toolset` and links the system
@@ -165,7 +190,7 @@ OpenSSL; nothing is installed into the runtime image beyond the binary
 and the legal files. The report's exit status is non-zero while findings
 remain. See [FIPS Tooling](fips.md) for what is checked, the provenance
 of the pinned images and signing key, and why the build uses cargo's SBOM
-precursor; [FIPS 140-3](../fips.md) is the operator's view.
+precursor; [FIPS 140-3](../operations/fips.md) is the operator's view.
 
 ### Supply Chain Safety
 
@@ -229,6 +254,10 @@ insecure_options:
 | `allow_unbounded_body` | Allow unbounded body processing. This covers two checks: (1) `body_limits.max_request_bytes` or `max_response_bytes` set to `null`, and (2) `StreamBuffer` body mode without a `max_bytes` limit. Without this flag, both are rejected at startup. |
 | `csrf_log_only` | Run the CSRF filter in log-only mode: evaluate all rules but log violations as warnings instead of rejecting requests. Useful for initial rollout monitoring. |
 | `skip_pipeline_validation` | Demote pipeline ordering errors (e.g. filter placement issues) to warnings instead of failing startup. |
+
+For listeners that buffer requests, a finite `body_limits.max_request_bytes`
+must be at or below `body_limits.max_buffer_bytes`. Startup and reload reject
+a configuration where the transfer limit exceeds the buffer cap.
 
 Example overriding two flags for local development:
 

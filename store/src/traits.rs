@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use crate::{
     owner::StateOwner,
     types::{
-        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, ConversationSnapshot, EventLogStatus,
+        PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
     },
 };
 
@@ -43,6 +43,44 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// Returns [`StoreError`] if the database operation fails.
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError>;
+
+    /// Replace a response's stored object only while it still matches
+    /// `expected_response_object`.
+    ///
+    /// The conditional write is what makes storage, rather than a read then
+    /// write in the caller, the authority for a response's lifecycle. Two
+    /// workers racing to claim the same queued response both compare against
+    /// the queued object, so exactly one observes [`ResponseCasOutcome::Applied`];
+    /// and a worker finishing a response that was cancelled underneath it
+    /// compares against an object that no longer exists, so it cannot overwrite
+    /// the cancellation.
+    ///
+    /// Comparison is on the whole object, decoded, so it is unaffected by the
+    /// payload codec in force when the record was written. A backend that
+    /// stores an encoded payload must therefore read, compare and update
+    /// inside one transaction rather than predicating on stored bytes: rows
+    /// written before a `compression.algorithm` change still decode (the codec
+    /// is detected per row), so a byte comparison against a freshly encoded
+    /// value would never match again and would strand the record. Callers that
+    /// care only about a status field still pass the full object they last
+    /// read.
+    ///
+    /// Scoped to the exact owner: a record owned by another principal reports
+    /// [`ResponseCasOutcome::NotFound`], indistinguishable from a missing one.
+    ///
+    /// [`compare_and_swap_conversation_messages`]: ConversationItemStore::compare_and_swap_conversation_messages
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if serialization or the database operation fails.
+    /// On error nothing is written.
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError>;
 
     /// Retrieve a response by ID, scoped to an exact owner.
     ///
@@ -435,6 +473,23 @@ pub trait ConversationItemStore: Send + Sync {
     /// would replace a preserved legacy prefix.
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError>;
 
+    /// Insert a new conversation and its initial items in one commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without writing rows on collision or persistence failure.
+    /// Backends must opt in rather than falling back to partially committed writes.
+    async fn create_conversation_with_items(
+        &self,
+        _record: &ConversationRecord,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic conversation creation".to_owned(),
+        ))
+    }
+
+
     /// Update only the legacy message cache for a conversation.
     ///
     /// Returns `true` if a record was updated, `false` if no matching
@@ -701,6 +756,28 @@ pub trait ConversationItemStore: Send + Sync {
         ))
     }
 
+    /// Delete an item and return public conversation fields from the same lock.
+    ///
+    /// The snapshot is captured after acquiring the parent lock and before
+    /// committing the deletion and cache invalidation. No fallible read follows
+    /// commit. Returns `None` when the item is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for a missing or foreign-owned parent.
+    /// Any failure preserves the item. Backends without this atomic boundary
+    /// fail closed with [`StoreError::Unavailable`].
+    async fn delete_item_and_get_conversation(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic item deletion snapshots".to_owned(),
+        ))
+    }
+
     /// Atomically delete an item and invalidate the retired message cache.
     ///
     /// The parent-row check and cache invalidation share the item transaction.
@@ -757,6 +834,18 @@ mod tests {
 
         async fn get_response(&self, _owner: &StateOwner, _id: &str) -> Result<Option<ResponseRecord>, StoreError> {
             Ok(None)
+        }
+
+        async fn compare_and_swap_response_object(
+            &self,
+            _owner: &StateOwner,
+            _id: &str,
+            _expected_response_object: &serde_json::Value,
+            _response_object: &serde_json::Value,
+        ) -> Result<crate::types::ResponseCasOutcome, StoreError> {
+            // This double exercises the bounded-read defaults only; reporting
+            // "no such record" keeps an unexpected call visible.
+            Ok(crate::types::ResponseCasOutcome::NotFound)
         }
 
         async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {

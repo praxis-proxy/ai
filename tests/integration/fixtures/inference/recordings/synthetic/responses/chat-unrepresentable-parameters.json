@@ -199,6 +199,128 @@
           }
         }
       }
+    },
+    {
+      "name": "access-programs",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-unrepresentable-parameters-model",
+              "input": "Hello",
+              "store": false,
+              "stream": false,
+              "access_programs": {}
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "Responses `access_programs` has no Chat Completions representation: got object, this adapter supports only omitting `access_programs`",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "access-programs-cyber",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-unrepresentable-parameters-model",
+              "input": "Hello",
+              "store": false,
+              "stream": false,
+              "access_programs": {
+                "cyber": "daybreak_blue"
+              }
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "Responses `access_programs` has no Chat Completions representation: got object, this adapter supports only omitting `access_programs`",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
     }
   ]
 }

@@ -5,11 +5,12 @@
 
 use std::collections::HashSet;
 
-use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
 use crate::{
+    RecordAiMetadata as _,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::responses::agentic_loop::budget::SimpleBudget,
     test_utils::{make_filter_context, make_request},
 };
@@ -23,6 +24,7 @@ fn filter() -> ClientToolCompatFilter {
     ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 512,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     }
 }
 
@@ -577,6 +579,7 @@ fn exceeding_max_client_tools_is_rejected() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -1874,6 +1877,7 @@ fn oversized_restored_body_is_rejected() {
     let tiny = ClientToolCompatFilter {
         max_rewritten_body_bytes: 32,
         max_client_tools: 512,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let state = state_with_custom_lowered();
     let response = json!({
@@ -1977,6 +1981,7 @@ fn restores_namespace_custom_member_call() {
             original_name: "freeform".to_owned(),
             namespace: Some("git".to_owned()),
             restore: ClientToolRestore::NamespaceCustom,
+            format: CustomInputFormat::Text,
         },
     )]);
     let mut item = json!({
@@ -2253,6 +2258,7 @@ fn oversized_lowered_request_is_rejected_and_rolled_back() {
     let tiny = ClientToolCompatFilter {
         max_rewritten_body_bytes: 16,
         max_client_tools: 512,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "model": "m",
@@ -2383,6 +2389,7 @@ fn history_only_rewrite_over_cap_fails_closed() {
     let tiny = ClientToolCompatFilter {
         max_rewritten_body_bytes: 64,
         max_client_tools: 512,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "model": "m",
@@ -2490,9 +2497,9 @@ fn namespace_description_is_folded_into_flattened_members() {
 
 #[test]
 fn namespace_without_description_is_rejected() {
-    // `NamespaceToolParam.description` is required (`minLength: 1`). A flattened
-    // member cannot recover the namespace grouping without it, so a namespace that
-    // omits its model-visible description fails closed rather than dropping it.
+    // `NamespaceToolParam.description` is required (no default). A flattened
+    // member cannot recover the namespace grouping without the field, so a
+    // namespace that omits it fails closed rather than dropping it.
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{
             "type": "namespace",
@@ -2516,21 +2523,47 @@ fn namespace_without_description_is_rejected() {
 }
 
 #[test]
-fn namespace_with_blank_description_is_rejected() {
-    // A whitespace-only description is not model-visible content and is treated the
-    // same as an omitted one.
-    let mut state = ResponsesState::from_request_body(json!({
-        "tools": [{
-            "type": "namespace",
-            "name": "git",
-            "description": "   ",
-            "tools": [{"type": "function", "name": "commit"}]
-        }],
-    }));
-    let action = filter()
-        .lower_request(&mut state, false, false)
-        .expect_err("a blank namespace description must fail closed");
-    assert_eq!(reject_parts(&action).0, 400);
+fn namespace_with_blank_description_lowers() {
+    // The pinned schema requires `description` as a string with no `minLength`,
+    // so empty and whitespace-only values are schema-valid. Lowering trims them
+    // and still folds the namespace grouping into each member.
+    for description in ["", "   "] {
+        let mut state = ResponsesState::from_request_body(json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "git",
+                "description": description,
+                "tools": [{
+                    "type": "function",
+                    "name": "commit",
+                    "description": "Record changes.",
+                    "parameters": {"type": "object"}
+                }]
+            }],
+        }));
+        filter()
+            .lower_request(&mut state, false, false)
+            .unwrap_or_else(|_| panic!("blank description {description:?} must lower"));
+        let member = state.request_body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "agentic_ns__git__commit")
+            .expect("function member");
+        let folded = member["description"].as_str().expect("description");
+        assert!(
+            folded.contains("Belongs to the `git` tool namespace."),
+            "blank namespace description still records the grouping: {folded}"
+        );
+        assert!(
+            folded.contains("Record changes."),
+            "the member's own description is retained: {folded}"
+        );
+        assert!(
+            !folded.contains("namespace: "),
+            "a blank namespace blurb must not leave an empty `: ` suffix: {folded}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -3376,6 +3409,7 @@ fn discovered_tools_over_cap_fail_closed() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = state_with_discovered_tools(
         &json!([
@@ -3408,6 +3442,7 @@ fn passthrough_functions_are_not_counted_toward_max_client_tools() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3440,6 +3475,7 @@ fn withheld_deferred_tools_count_toward_max_client_tools() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3469,6 +3505,7 @@ fn withheld_namespace_members_count_toward_max_client_tools() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{
@@ -3499,6 +3536,7 @@ fn lowered_plus_withheld_tools_count_toward_max_client_tools() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3520,6 +3558,7 @@ fn withheld_tools_at_the_cap_are_allowed() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 2,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3549,6 +3588,7 @@ fn deferred_custom_reloaded_by_discovery_counts_once_toward_max_client_tools() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "custom", "name": "apply_patch", "defer_loading": true}],
@@ -3582,6 +3622,7 @@ fn deferred_namespace_member_reloaded_by_discovery_counts_once_toward_max_client
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{
@@ -3638,6 +3679,7 @@ fn deferred_custom_named_shell_and_local_shell_both_count_toward_cap() {
         let capped = ClientToolCompatFilter {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_client_tools: 1,
+            custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
         };
         let mut state = ResponsesState::from_request_body(json!({ "tools": tools }));
         let action = capped
@@ -3660,6 +3702,7 @@ fn deferred_custom_named_tool_search_and_client_tool_search_both_count_toward_ca
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 1,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3694,6 +3737,7 @@ fn top_level_tool_using_reserved_namespace_prefix_fails_closed() {
         let filter = ClientToolCompatFilter {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_client_tools: 512,
+            custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
         };
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool, {"type": "tool_search"}] }));
         let action = filter
@@ -3730,6 +3774,7 @@ fn deferred_top_level_tool_colliding_with_discovered_namespace_member_fails_clos
         let capped = ClientToolCompatFilter {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_client_tools: 1,
+            custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
         };
         let mut state = ResponsesState::from_request_body(json!({
             "tools": [top_level, {"type": "tool_search"}],
@@ -3763,6 +3808,7 @@ fn discovered_top_level_tool_using_reserved_namespace_prefix_fails_closed() {
     let filter = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 512,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{"type": "tool_search"}],
@@ -3793,6 +3839,7 @@ fn legitimate_namespace_member_is_not_rejected_by_the_reserved_prefix() {
     let filter = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 512,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{
@@ -3835,6 +3882,7 @@ fn top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
             let filter = ClientToolCompatFilter {
                 max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
                 max_client_tools: 512,
+                custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
             };
             let mut state = ResponsesState::from_request_body(json!({ "tools": [tool, {"type": "tool_search"}] }));
             let action = filter
@@ -3859,6 +3907,7 @@ fn discovered_top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
         let filter = ClientToolCompatFilter {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_client_tools: 512,
+            custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
         };
         let mut state = ResponsesState::from_request_body(json!({
             "tools": [{"type": "tool_search"}],
@@ -3894,6 +3943,7 @@ fn client_tool_named_a_near_miss_of_a_hosted_tool_is_not_rejected() {
         let filter = ClientToolCompatFilter {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_client_tools: 512,
+            custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
         };
         let mut state = ResponsesState::from_request_body(json!({ "tools": [{"type": "custom", "name": name}] }));
         filter
@@ -4025,6 +4075,7 @@ fn deferred_and_discovered_members_sharing_a_verbatim_split_both_count_against_t
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 2,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -4098,6 +4149,7 @@ fn namespace_boundary_underscore_pair_both_count_against_the_cap() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 2,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -4202,6 +4254,7 @@ fn hash_colliding_deferred_and_discovered_members_both_count_against_the_cap() {
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_client_tools: 2,
+        custom_input_pattern_encoding: CustomInputPatternEncoding::JsonString,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -5814,7 +5867,7 @@ fn discovered_custom_equivalent_descriptions_are_hoisted_once() {
 fn discovered_namespace_description_equivalent_is_hoisted_once() {
     // Fix B (namespace top-level): `namespace_header` trims the required description
     // before folding it into each member, so listings differing only by trailing
-    // whitespace on the namespace description lower identically and hoist once.
+    // whitespace — or by empty vs whitespace-only — lower identically and hoist once.
     assert_discovery_hoisted_once(
         json!({"type": "namespace", "name": "git", "description": "Git tools. ",
                "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
@@ -5822,6 +5875,24 @@ fn discovered_namespace_description_equivalent_is_hoisted_once() {
                "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
         "agentic_ns__git__commit",
         "namespace-description-trailing-space",
+    );
+    assert_discovery_hoisted_once(
+        json!({"type": "namespace", "name": "git", "description": "",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        json!({"type": "namespace", "name": "git", "description": "   ",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        "agentic_ns__git__commit",
+        "namespace-description-blank-equivalent",
+    );
+    // A schema-valid blank string must not share identity with a missing description:
+    // the missing twin rejects on lower, so silent dedup would depend on listing order.
+    assert_discovery_conflicts_both_orders(
+        json!({"type": "namespace", "name": "git", "description": "",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        json!({"type": "namespace", "name": "git",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        "git",
+        "namespace-blank-vs-missing-description",
     );
 }
 
@@ -6100,7 +6171,7 @@ fn budgeted_client_tool_restoration_rejects_before_parsing_response() {
     assert_eq!(status, 502);
     assert!(message.contains("limit set by the platform administrator"));
     assert!(body.is_none());
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -6170,7 +6241,7 @@ async fn streaming_rich_request_rejects_without_arming() {
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.extensions.insert(ResponsesState::from_request_body(json!({
         "stream": true,
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],
@@ -6405,6 +6476,7 @@ fn namespace_custom_call_without_call_id_fails_closed() {
             original_name: "freeform".to_owned(),
             namespace: Some("git".to_owned()),
             restore: ClientToolRestore::NamespaceCustom,
+            format: CustomInputFormat::Text,
         },
     )]);
     let mut item = json!({
@@ -6483,6 +6555,7 @@ fn restore_snapshot_restores_output_items_and_reports_lossy_type() {
             original_name: "run_python".to_owned(),
             namespace: None,
             restore: ClientToolRestore::Custom,
+            format: CustomInputFormat::Text,
         },
     );
     // Well-formed custom call restores in place.
@@ -6535,4 +6608,207 @@ fn streaming_fails_closed_when_stream_owner_absent() {
     let (status, body) = reject_parts(&action);
     assert_eq!(status, 500);
     assert!(body.contains("openai_stream_events"), "names the missing owner: {body}");
+}
+
+// -----------------------------------------------------------------------------
+// apply_patch grammar lowering, constraint, and validation (#1834)
+// -----------------------------------------------------------------------------
+
+/// A syntactically valid patch under the base grammar.
+const VALID_PATCH: &str = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n";
+
+/// A top-level `apply_patch` custom tool declaring `definition` as its Lark grammar.
+fn apply_patch_tool(definition: &str) -> Value {
+    json!({
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Use the `apply_patch` tool to edit files.",
+        "format": {"type": "grammar", "syntax": "lark", "definition": definition},
+    })
+}
+
+#[test]
+fn lowers_apply_patch_grammar_to_pattern_constrained_function() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [apply_patch_tool(custom_input::APPLY_PATCH_LARK_BASE)],
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
+
+    let tool = &state.request_body["tools"][0];
+    assert_eq!(tool["type"], "function");
+    assert_eq!(tool["strict"], true);
+    assert_eq!(
+        tool["parameters"]["properties"]["input"]["pattern"],
+        custom_input::APPLY_PATCH_BACKEND_PATTERN_BASE,
+        "the lowered input is constrained to the pinned grammar pattern",
+    );
+    let lowered = state.client_tool_lowering.get("apply_patch").expect("reverse entry");
+    assert_eq!(lowered.format, CustomInputFormat::ApplyPatch);
+    assert_eq!(lowered.restore, ClientToolRestore::Custom);
+}
+
+#[test]
+fn lowers_apply_patch_envid_grammar_variant() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [apply_patch_tool(custom_input::APPLY_PATCH_LARK_ENVID.as_str())],
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
+    assert_eq!(
+        state.request_body["tools"][0]["parameters"]["properties"]["input"]["pattern"],
+        custom_input::APPLY_PATCH_BACKEND_PATTERN_ENVID,
+    );
+    assert_eq!(
+        state.client_tool_lowering.get("apply_patch").expect("reverse").format,
+        CustomInputFormat::ApplyPatchEnvId,
+    );
+}
+
+#[test]
+fn rejects_unknown_grammar_before_upstream() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [apply_patch_tool("start: something_else")],
+    }));
+    let action = filter()
+        .lower_request(&mut state, false, false)
+        .expect_err("an unknown grammar is rejected");
+    let (status, message) = reject_parts(&action);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("unsupported custom format"),
+        "names the problem: {message}"
+    );
+}
+
+#[test]
+fn text_custom_tool_lowers_without_a_pattern() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "custom", "name": "freeform", "format": {"type": "text"}}],
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("lowering succeeds");
+    assert!(
+        state.request_body["tools"][0]["parameters"]["properties"]["input"]
+            .get("pattern")
+            .is_none(),
+        "a text custom tool is unconstrained",
+    );
+    assert_eq!(
+        state.client_tool_lowering.get("freeform").expect("reverse").format,
+        CustomInputFormat::Text,
+    );
+}
+
+#[test]
+fn grammar_format_is_retained_in_conflict_identity() {
+    // A text format drops out of the identity (it lowers identically), but a grammar
+    // format is materially different and must be retained so base vs env-id (or
+    // grammar vs text) can never dedup behind one another.
+    let mut text = json!({"type": "custom", "name": "x", "format": {"type": "text"}})
+        .as_object()
+        .unwrap()
+        .clone();
+    normalize_conflict_identity_fields(&mut text);
+    assert!(
+        text.get("format").is_none(),
+        "a text format is dropped from the identity"
+    );
+
+    let mut grammar = apply_patch_tool(custom_input::APPLY_PATCH_LARK_BASE)
+        .as_object()
+        .unwrap()
+        .clone();
+    normalize_conflict_identity_fields(&mut grammar);
+    assert!(
+        grammar.get("format").is_some(),
+        "a grammar format is retained so materially different grammars stay distinct",
+    );
+}
+
+#[test]
+fn restores_valid_apply_patch_to_custom_tool_call() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [apply_patch_tool(custom_input::APPLY_PATCH_LARK_BASE)],
+    }));
+    filter().lower_request(&mut state, false, false).expect("lowering");
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "apply_patch",
+            "arguments": json!({"input": VALID_PATCH}).to_string(),
+            "status": "completed"
+        }],
+    });
+    let restored = restore(&state, &response);
+    let item = &restored["output"][0];
+    assert_eq!(item["type"], "custom_tool_call");
+    assert_eq!(item["name"], "apply_patch");
+    assert_eq!(item["input"], VALID_PATCH, "the exact patch bytes are preserved");
+}
+
+#[test]
+fn rejects_malformed_apply_patch_buffered_with_502() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [apply_patch_tool(custom_input::APPLY_PATCH_LARK_BASE)],
+    }));
+    filter().lower_request(&mut state, false, false).expect("lowering");
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "apply_patch",
+            "arguments": json!({"input": "not a patch at all"}).to_string(),
+            "status": "completed"
+        }],
+    });
+    let action = filter()
+        .restore_response(&state, response.to_string().as_bytes())
+        .expect_err("a malformed patch fails closed");
+    assert_eq!(
+        reject_parts(&action).0,
+        502,
+        "malformed backend output that cannot be restored losslessly is a 502",
+    );
+}
+
+#[test]
+fn apply_patch_history_item_preserves_multiline_patch_bytes() {
+    // A stored apply_patch custom_tool_call carries the raw multi-line patch; history
+    // lowering must re-wrap it into the `{"input":...}` envelope byte-for-byte
+    // (newlines preserved) so a continuation turn replays the exact patch.
+    let mut item = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_1",
+        "name": "apply_patch",
+        "input": VALID_PATCH,
+        "id": "ctc_1",
+        "status": "completed",
+    });
+    assert!(lower_history_item(&mut item, &HashSet::new()));
+    assert_eq!(item["type"], "function_call");
+    assert_eq!(item["name"], "apply_patch");
+    assert_eq!(
+        item["arguments"],
+        json!({"input": VALID_PATCH}).to_string(),
+        "the exact patch bytes (including newlines) survive history lowering",
+    );
+}
+
+#[cfg(feature = "store")]
+#[test]
+fn stored_apply_patch_call_replays_through_existing_canonical_types() {
+    // #1834 rides the existing custom_tool_call path, so a stored apply_patch call and
+    // its output already replay to a function-only backend with no new replay type.
+    use crate::openai::responses::is_canonical_openresponses_replay_type;
+    assert!(is_canonical_openresponses_replay_type(
+        &json!({"type": "custom_tool_call"})
+    ));
+    assert!(is_canonical_openresponses_replay_type(
+        &json!({"type": "custom_tool_call_output"})
+    ));
 }

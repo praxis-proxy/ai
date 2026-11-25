@@ -1242,6 +1242,7 @@ filter_chains:
           task_id: x-praxis-a2a-task-id
         task_routing:
           enabled: true
+          store: local
           route_cluster_header: x-praxis-a2a-route-cluster
       - filter: router
         routes:
@@ -1291,6 +1292,7 @@ filter_chains:
           streaming: x-praxis-a2a-streaming
         task_routing:
           enabled: true
+          store: local
       - filter: router
         routes:
           - path_prefix: "/a2a/"
@@ -1332,6 +1334,7 @@ filter_chains:
           streaming: x-praxis-a2a-streaming
         task_routing:
           enabled: true
+          store: local
           route_cluster_header: x-praxis-a2a-route-cluster
       - filter: router
         routes:
@@ -1419,6 +1422,7 @@ filter_chains:
           streaming: x-praxis-a2a-streaming
         task_routing:
           enabled: true
+          store: local
           route_cluster_header: x-praxis-a2a-route-cluster
           ttl_seconds: 3600
           terminal_ttl_seconds: 300
@@ -1477,6 +1481,7 @@ filter_chains:
           task_id: x-praxis-a2a-task-id
         task_routing:
           enabled: true
+          store: local
           route_cluster_header: x-praxis-a2a-route-cluster
           ttl_seconds: 3600
           terminal_ttl_seconds: 0

@@ -107,15 +107,29 @@ impl CalloutIdentity {
 }
 
 /// Compute the exact `host:port` authority used by Praxis Core's deferred-credential
-/// matcher from an operator-configured HTTP(S) URL.
+/// matcher from a configured URL.
 ///
 /// Callers invoke this during configuration and retain the result, preventing a malformed
-/// authority from degrading at request time into a silently unauthenticated callout.
-#[cfg(any(test, feature = "openai-responses"))]
-pub(crate) fn credential_authority(filter_name: &str, raw_url: &str) -> Result<String, FilterError> {
-    let url = url::Url::parse(raw_url).map_err(|error| -> FilterError {
+/// URL from degrading at request time into a silently unauthenticated callout. The scheme
+/// is not part of the result. It only selects the default port when the URL omits one.
+///
+/// # Errors
+///
+/// Returns an error when `raw_url` is not a URL, has no host, uses a scheme with no known
+/// default port and no explicit port, or does not form an HTTP authority.
+pub fn credential_authority(filter_name: &str, raw_url: &str) -> Result<String, FilterError> {
+    authority_from_url(filter_name, &parse_credential_url(filter_name, raw_url)?)
+}
+
+/// Parse `raw_url` once for credential binding.
+fn parse_credential_url(filter_name: &str, raw_url: &str) -> Result<url::Url, FilterError> {
+    url::Url::parse(raw_url).map_err(|error| -> FilterError {
         format!("{filter_name}: target URL is not a valid URL for credential binding: {error}").into()
-    })?;
+    })
+}
+
+/// Host and port of an already-parsed credential URL.
+fn authority_from_url(filter_name: &str, url: &url::Url) -> Result<String, FilterError> {
     let host = url.host_str().ok_or_else(|| -> FilterError {
         format!("{filter_name}: target URL has no host for credential binding").into()
     })?;
@@ -150,7 +164,7 @@ pub(crate) enum CalloutContextMissing {
 
 /// Required configured-connector context missing before MCP dispatch.
 #[derive(Debug)]
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) enum McpCalloutContextMissing {
     /// Trusted owner attribution is absent.
     Owner,
@@ -166,7 +180,7 @@ pub(crate) enum McpCalloutContextMissing {
 /// constructs destination-bound headers. This value is never serialized into
 /// the MCP tool map or deferred connector state.
 #[derive(Clone)]
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) struct McpCalloutIdentity {
     /// Trusted owner projected into the filtered child request.
     owner: StateOwner,
@@ -176,7 +190,7 @@ pub(crate) struct McpCalloutIdentity {
     authorization: Option<SecretString>,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl McpCalloutIdentity {
     /// Borrow the trusted connector owner.
     pub(crate) fn owner(&self) -> &StateOwner {
@@ -208,7 +222,7 @@ impl McpCalloutIdentity {
     }
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl std::fmt::Debug for McpCalloutIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpCalloutIdentity")
@@ -226,7 +240,7 @@ impl std::fmt::Debug for McpCalloutIdentity {
 /// connector subrequest; when no owner is available, the prior context-free
 /// behavior is preserved. Configuring either request-scoped slot makes trusted
 /// owner attribution mandatory and makes that slot fail closed.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[expect(
     clippy::too_many_lines,
     reason = "owner plus two optional fail-closed slots are staged together"
@@ -466,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_without_slots_projects_available_owner() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
@@ -485,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_without_slots_or_owner_preserves_context_free_behavior() {
         let req = make_request(Method::POST, "/v1/responses");
         let ctx = make_filter_context(&req);
@@ -498,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_configured_slot_requires_owner() {
         let req = make_request(Method::POST, "/v1/responses");
         let ctx = make_filter_context(&req);
@@ -510,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_configured_credential_must_be_populated() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
@@ -524,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_configured_assertion_must_be_populated() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
@@ -538,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "openai-mcp-tools")]
+    #[cfg(feature = "mcp")]
     fn mcp_reads_credential_and_assertion_from_one_typed_context() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);

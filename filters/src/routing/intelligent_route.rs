@@ -33,6 +33,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use http::{HeaderName, HeaderValue};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
@@ -213,11 +214,12 @@ impl Default for ReloadConfig {
 /// Subsequent requests with the same key reuse the bound candidate
 /// as long as it remains eligible and the binding has not expired.
 ///
-/// **Scope:** bindings are stored in-memory (single-process).
+/// **Scope:** bindings are stored in the selected store. The only currently
+/// supported store is in-memory (single-process).
 /// They are not shared across gateway instances and are lost on
 /// restart.  This is sufficient for the POC/demo scope.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "RawSessionAffinityConfig")]
 struct SessionAffinityConfig {
     /// Name of a cookie to extract the session key from.
     cookie: Option<String>,
@@ -229,9 +231,62 @@ struct SessionAffinityConfig {
     /// Header name to extract the session key from.
     header: Option<String>,
 
+    /// Storage backend for session bindings. Required when affinity is enabled.
+    store: Option<SessionAffinityStore>,
+
     /// Binding TTL in seconds (default: 3600, max: 86400).
     #[serde(default = "default_ttl_secs")]
     ttl_secs: u64,
+}
+
+/// Storage backend selected for session-affinity bindings.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionAffinityStore {
+    /// Process-local storage backed by a concurrent map.
+    Local,
+}
+
+/// Raw session-affinity YAML shape converted after checking the store invariant.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSessionAffinityConfig {
+    /// Name of a cookie to extract the session key from.
+    cookie: Option<String>,
+
+    /// Whether session affinity is enabled (default: `false`).
+    #[serde(default)]
+    enabled: bool,
+
+    /// Header name to extract the session key from.
+    header: Option<String>,
+
+    /// Storage backend for session bindings. Required when affinity is enabled.
+    store: Option<SessionAffinityStore>,
+
+    /// Binding TTL in seconds (default: 3600, max: 86400).
+    #[serde(default = "default_ttl_secs")]
+    ttl_secs: u64,
+}
+
+impl TryFrom<RawSessionAffinityConfig> for SessionAffinityConfig {
+    type Error = String;
+
+    fn try_from(raw: RawSessionAffinityConfig) -> Result<Self, Self::Error> {
+        if raw.enabled && raw.store.is_none() {
+            return Err(
+                "intelligent_route: session_affinity.store is required when session affinity is enabled".into(),
+            );
+        }
+
+        Ok(Self {
+            cookie: raw.cookie,
+            enabled: raw.enabled,
+            header: raw.header,
+            store: raw.store,
+            ttl_secs: raw.ttl_secs,
+        })
+    }
 }
 
 /// Default session affinity TTL (1 hour).
@@ -631,7 +686,7 @@ impl IntelligentRouteFilter {
         kind: CapabilityKind,
         name: &str,
     ) -> Result<FilterAction, FilterError> {
-        ctx.set_metadata(ROUTE_CANDIDATE_COUNT, candidate_count(snap, kind, name).to_string());
+        ctx.record_ai_metadata(ROUTE_CANDIDATE_COUNT, candidate_count(snap, kind, name).to_string());
         let session_key = self.session_affinity.as_ref().and_then(|a| extract_session_key(a, ctx));
         let outcome = resolve_affinity(
             self.session_affinity.as_ref(),
@@ -836,6 +891,9 @@ fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Optio
     if !cfg.enabled {
         return Ok(None);
     }
+    if !matches!(cfg.store, Some(SessionAffinityStore::Local)) {
+        return Err("intelligent_route: session_affinity.store is required when session affinity is enabled".into());
+    }
     validate_session_affinity_config(&cfg)?;
     let header = cfg
         .header
@@ -1038,9 +1096,9 @@ fn apply_reused(
     #[cfg(feature = "opentelemetry")]
     crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
     record_selection_metadata(ctx, candidate.selection_group, mode);
-    ctx.set_metadata("intelligent_route.session.bound", "true");
-    ctx.set_metadata("intelligent_route.session.reused", "true");
-    ctx.set_metadata("intelligent_route.session.failover", "false");
+    ctx.record_ai_metadata("intelligent_route.session.bound", "true");
+    ctx.record_ai_metadata("intelligent_route.session.reused", "true");
+    ctx.record_ai_metadata("intelligent_route.session.failover", "false");
     Ok(FilterAction::Continue)
 }
 
@@ -1083,9 +1141,9 @@ fn record_session(
             SessionEvent::Bound
         });
     }
-    ctx.set_metadata("intelligent_route.session.bound", if bound { "true" } else { "false" });
-    ctx.set_metadata("intelligent_route.session.reused", "false");
-    ctx.set_metadata(
+    ctx.record_ai_metadata("intelligent_route.session.bound", if bound { "true" } else { "false" });
+    ctx.record_ai_metadata("intelligent_route.session.reused", "false");
+    ctx.record_ai_metadata(
         "intelligent_route.session.failover",
         if failover { "true" } else { "false" },
     );
@@ -1117,7 +1175,7 @@ enum Lookup {
 /// filter dispatches to MCP tool lookup.  Otherwise it falls back to the
 /// configured model header.
 fn extract_lookup(ctx: &HttpFilterContext<'_>, model_header: &HeaderName) -> Lookup {
-    if let Some(mcp_method) = ctx.get_metadata("mcp.method") {
+    if let Some(mcp_method) = ctx.filter_metadata.get("mcp.method") {
         return extract_mcp_lookup(ctx, mcp_method);
     }
     extract_model_lookup(ctx, model_header)
@@ -1136,7 +1194,7 @@ fn extract_mcp_lookup(ctx: &HttpFilterContext<'_>, method: &str) -> Lookup {
         );
         return Lookup::Skip;
     }
-    let Some(name) = ctx.get_metadata("mcp.name") else {
+    let Some(name) = ctx.filter_metadata.get("mcp.name") else {
         tracing::debug!("intelligent_route: tools/call without mcp.name; rejecting");
         return Lookup::Invalid;
     };
@@ -1314,7 +1372,7 @@ fn evict_expired(affinity: &SessionAffinity) {
 /// Written on every path, including rejections, so access logs and
 /// dashboards see the same vocabulary.
 fn record_outcome(ctx: &mut HttpFilterContext<'_>, outcome: DecisionOutcome, kind: Option<CapabilityKind>) {
-    ctx.set_metadata(ROUTE_OUTCOME, outcome.as_str());
+    ctx.record_ai_metadata(ROUTE_OUTCOME, outcome.as_str());
     metrics::record_decision(outcome, kind);
 }
 
@@ -1344,8 +1402,8 @@ fn candidate_count(snap: &RouteSnapshot, kind: CapabilityKind, name: &str) -> us
 /// Record bounded request metadata without changing forwarding headers.
 fn record_selection_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>, mode: PickerPolicy) {
     if let Some(group) = group {
-        ctx.set_metadata(ROUTE_SELECTION_GROUP, group.to_string());
-        ctx.set_metadata(ROUTE_SELECTION_MODE, mode.as_str());
+        ctx.record_ai_metadata(ROUTE_SELECTION_GROUP, group.to_string());
+        ctx.record_ai_metadata(ROUTE_SELECTION_MODE, mode.as_str());
     }
 }
 
@@ -1356,7 +1414,7 @@ fn record_selection_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>
 /// Write bounded route-decision metadata on successful selection.
 ///
 /// Keys use `intelligent_route.` namespace. All values are bounded by the
-/// existing `set_metadata` limits.  No HTTP forwarding headers are
+/// existing `FilterMetadata::insert` limits.  No HTTP forwarding headers are
 /// written by this function.
 fn record_route_decision(
     ctx: &mut HttpFilterContext<'_>,
@@ -1364,26 +1422,26 @@ fn record_route_decision(
     candidate: &RouteCandidate,
     semantic_revision: Option<&Arc<str>>,
 ) {
-    ctx.set_metadata(ROUTE_ADMISSION_STATE, candidate.admission_state.as_str());
-    ctx.set_metadata(ROUTE_CLUSTER, &*candidate.cluster);
-    ctx.set_metadata(ROUTE_KIND, candidate.kind.as_str());
-    ctx.set_metadata(ROUTE_LOCAL_SITE, &**local_site);
-    ctx.set_metadata(ROUTE_NAME, &*candidate.name);
-    ctx.set_metadata(ROUTE_SITE, &*candidate.site);
-    ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
+    ctx.record_ai_metadata(ROUTE_ADMISSION_STATE, candidate.admission_state.as_str());
+    ctx.record_ai_metadata(ROUTE_CLUSTER, &*candidate.cluster);
+    ctx.record_ai_metadata(ROUTE_KIND, candidate.kind.as_str());
+    ctx.record_ai_metadata(ROUTE_LOCAL_SITE, &**local_site);
+    ctx.record_ai_metadata(ROUTE_NAME, &*candidate.name);
+    ctx.record_ai_metadata(ROUTE_SITE, &*candidate.site);
+    ctx.record_ai_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
     if let Some(profile) = &candidate.provider_profile {
-        ctx.set_metadata(ROUTE_API_FORMAT, profile.api_format.as_str());
-        ctx.set_metadata(ROUTE_PATH, profile.path.as_ref());
-        ctx.set_metadata(ROUTE_TARGET_MODEL, profile.target_model.as_ref());
+        ctx.record_ai_metadata(ROUTE_API_FORMAT, profile.api_format.as_str());
+        ctx.record_ai_metadata(ROUTE_PATH, profile.path.as_ref());
+        ctx.record_ai_metadata(ROUTE_TARGET_MODEL, profile.target_model.as_ref());
     }
     if let Some(revision) = semantic_revision {
-        ctx.set_metadata(ROUTE_OVERLAY_REVISION, revision.as_ref());
+        ctx.record_ai_metadata(ROUTE_OVERLAY_REVISION, revision.as_ref());
     }
     if let Some(rank) = candidate.rank {
-        ctx.set_metadata(ROUTE_RANK, rank.to_string());
+        ctx.record_ai_metadata(ROUTE_RANK, rank.to_string());
     }
     if let Some(tier) = &candidate.selection_tier {
-        ctx.set_metadata(ROUTE_SELECTION_TIER, &**tier);
+        ctx.record_ai_metadata(ROUTE_SELECTION_TIER, &**tier);
     }
     set_credential_metadata(ctx, candidate.credential.as_ref());
 }
@@ -1437,7 +1495,7 @@ fn write_provider_context(
         ctx.request_headers_to_set
             .push((HeaderName::from_static(OVERLAY_REVISION_HEADER), rev_value));
     }
-    ctx.set_metadata(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id);
+    ctx.record_ai_metadata(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id);
     Ok(())
 }
 
@@ -1602,7 +1660,7 @@ mod tests {
         let config = serde_json::json!({
             "overlay_file": path.to_string_lossy(),
             "reload": { "enabled": true, "debounce_ms": 10 },
-            "session_affinity": { "enabled": true, "header": "x-session-id" },
+            "session_affinity": { "enabled": true, "store": "local", "header": "x-session-id" },
         });
         let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
 
@@ -2076,8 +2134,8 @@ mod tests {
         ]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
-        ctx.set_metadata("mcp.name", "weather");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "weather");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "valid MCP tool should route");
@@ -2086,8 +2144,8 @@ mod tests {
             Some("grid-site-c"),
             "cluster should be mcp_tool cluster"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.kind"), Some("mcp_tool"));
-        assert_eq!(ctx.get_metadata("intelligent_route.name"), Some("weather"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.kind"), Some("mcp_tool"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.name"), Some("weather"));
     }
 
     #[tokio::test]
@@ -2099,8 +2157,8 @@ mod tests {
         let mut req = crate::test_utils::make_request(Method::POST, "/mcp");
         req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
-        ctx.set_metadata("mcp.name", "weather");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "weather");
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -2116,7 +2174,7 @@ mod tests {
         let mut req = crate::test_utils::make_request(Method::POST, "/mcp");
         req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "initialize");
+        ctx.record_ai_metadata("mcp.method", "initialize");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2132,7 +2190,7 @@ mod tests {
         let f = make_filter(&[("mcp_tool", "weather", "site-c", "c")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
         // mcp.name not set
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -2148,8 +2206,8 @@ mod tests {
         let f = make_filter(&[("mcp_tool", "weather", "site-c", "c")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
-        ctx.set_metadata("mcp.name", "");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2164,8 +2222,8 @@ mod tests {
         let f = make_filter(&[("mcp_tool", "weather", "site-c", "c")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
-        ctx.set_metadata("mcp.name", "unknown-tool");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "unknown-tool");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2181,8 +2239,8 @@ mod tests {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
-        ctx.set_metadata("mcp.name", "llama");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "llama");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2199,8 +2257,8 @@ mod tests {
         ]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata("mcp.method", "tools/call");
-        ctx.set_metadata("mcp.name", "weather");
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "weather");
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -2335,11 +2393,14 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("intelligent_route.cluster"), Some("remote-inf"));
-        assert_eq!(ctx.get_metadata("intelligent_route.kind"), Some("inference_model"));
-        assert_eq!(ctx.get_metadata("intelligent_route.name"), Some("llama"));
-        assert_eq!(ctx.get_metadata("intelligent_route.site"), Some("site-b"));
-        assert_eq!(ctx.get_metadata("intelligent_route.local_site"), Some("site-a"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.cluster"), Some("remote-inf"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.kind"),
+            Some("inference_model")
+        );
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.name"), Some("llama"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.site"), Some("site-b"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.local_site"), Some("site-a"));
     }
 
     #[tokio::test]
@@ -2350,8 +2411,8 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("intelligent_route.cluster"), Some("local-inf"));
-        assert_eq!(ctx.get_metadata("intelligent_route.local_site"), Some("site-a"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.cluster"), Some("local-inf"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.local_site"), Some("site-a"));
     }
 
     #[tokio::test]
@@ -2362,8 +2423,8 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("intelligent_route.cluster"), Some("remote-gw"));
-        assert_eq!(ctx.get_metadata("intelligent_route.site"), Some("site-b"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.cluster"), Some("remote-gw"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.site"), Some("site-b"));
     }
 
     #[tokio::test]
@@ -2408,7 +2469,7 @@ mod tests {
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
         assert!(
-            ctx.get_metadata("intelligent_route.kind").is_none(),
+            ctx.filter_metadata.get("intelligent_route.kind").is_none(),
             "preserved cluster path should not write route metadata"
         );
     }
@@ -2738,7 +2799,10 @@ mod tests {
             Some("c-b"),
             "affinity-enabled request without a key must skip existing_only"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("false"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.bound"),
+            Some("false")
+        );
     }
 
     #[tokio::test]
@@ -2767,9 +2831,15 @@ mod tests {
             Some("c-drain"),
             "existing session reuses bound candidate"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.reused"), Some("true"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.failover"), Some("false"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.reused"),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.failover"),
+            Some("false")
+        );
     }
 
     #[tokio::test]
@@ -2801,9 +2871,15 @@ mod tests {
             Some("c-new"),
             "failover must choose a new_and_existing candidate, not another existing_only candidate"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.reused"), Some("false"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.failover"), Some("true"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.reused"),
+            Some("false")
+        );
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.failover"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -2836,8 +2912,11 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.reused"), Some("false"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.reused"),
+            Some("false")
+        );
         assert!(
             filter
                 .session_affinity
@@ -2870,7 +2949,10 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.reused"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.reused"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -2914,8 +2996,11 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.reused"), Some("false"));
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.reused"),
+            Some("false")
+        );
     }
 
     #[tokio::test]
@@ -2941,7 +3026,10 @@ mod tests {
         let mut ctx2 = crate::test_utils::make_filter_context(&req2);
         let _unused = filter.on_request(&mut ctx2).await.unwrap();
         assert_eq!(ctx2.cluster.as_deref(), Some("c-a"));
-        assert_eq!(ctx2.get_metadata("intelligent_route.session.reused"), Some("true"));
+        assert_eq!(
+            ctx2.filter_metadata.get("intelligent_route.session.reused"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -2973,8 +3061,14 @@ mod tests {
             Some("c-b"),
             "should fail over to remaining candidate"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.session.reused"), Some("false"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.failover"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.reused"),
+            Some("false")
+        );
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.failover"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -2992,7 +3086,10 @@ mod tests {
             filter.session_affinity.as_ref().unwrap().bindings.is_empty(),
             "no session key means no binding stored"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("false"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.bound"),
+            Some("false")
+        );
     }
 
     #[tokio::test]
@@ -3036,7 +3133,7 @@ mod tests {
 
     #[test]
     fn session_affinity_enabled_requires_source() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n";
         let err = parse_err(yaml);
         assert!(
             err.to_string().contains("requires at least one"),
@@ -3045,8 +3142,29 @@ mod tests {
     }
 
     #[test]
+    fn session_affinity_enabled_requires_store() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("session_affinity.store is required"),
+            "enabled affinity without a store should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn session_affinity_rejects_unsupported_store() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: redis\n  header: x-session-id\n";
+        let err = parse_err(yaml);
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown variant `redis`") && message.contains("expected `local`"),
+            "unsupported affinity store should be rejected: {err}"
+        );
+    }
+
+    #[test]
     fn session_affinity_blank_header_rejected() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: \"   \"\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: \"   \"\n";
         let err = parse_err(yaml);
         assert!(
             err.to_string().contains("requires at least one"),
@@ -3056,14 +3174,14 @@ mod tests {
 
     #[test]
     fn session_affinity_ttl_bounds() {
-        let yaml_zero = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n  ttl_secs: 0\n";
+        let yaml_zero = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\n  ttl_secs: 0\n";
         let err = parse_err(yaml_zero);
         assert!(
             err.to_string().contains("ttl_secs must be"),
             "zero ttl should be rejected: {err}"
         );
 
-        let yaml_high = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n  ttl_secs: 100000\n";
+        let yaml_high = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\n  ttl_secs: 100000\n";
         let err2 = parse_err(yaml_high);
         assert!(
             err2.to_string().contains("ttl_secs must be"),
@@ -3073,13 +3191,13 @@ mod tests {
 
     #[test]
     fn session_affinity_valid_with_header() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\n";
         assert!(parse(yaml).is_ok(), "valid session_affinity with header should parse");
     }
 
     #[test]
     fn session_affinity_valid_with_cookie() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  cookie: session_id\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  cookie: session_id\n";
         assert!(parse(yaml).is_ok(), "valid session_affinity with cookie should parse");
     }
 
@@ -3092,9 +3210,9 @@ mod tests {
         req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert!(ctx.get_metadata("intelligent_route.stable_id").is_some());
+        assert!(ctx.filter_metadata.get("intelligent_route.stable_id").is_some());
         assert_eq!(
-            ctx.get_metadata("intelligent_route.admission_state"),
+            ctx.filter_metadata.get("intelligent_route.admission_state"),
             Some("new_and_existing")
         );
     }
@@ -3123,13 +3241,13 @@ mod tests {
 
             assert!(matches!(action, FilterAction::Continue));
             assert_eq!(ctx.cluster.as_deref(), Some("a"));
-            assert_eq!(ctx.get_metadata("intelligent_route.selection_group"), Some("0"));
+            assert_eq!(ctx.filter_metadata.get("intelligent_route.selection_group"), Some("0"));
             assert_eq!(
-                ctx.get_metadata("intelligent_route.selection_mode"),
+                ctx.filter_metadata.get("intelligent_route.selection_mode"),
                 Some("round_robin")
             );
             assert_eq!(
-                ctx.get_metadata("intelligent_route.session.reused"),
+                ctx.filter_metadata.get("intelligent_route.session.reused"),
                 Some(expected_reused)
             );
         }
@@ -3189,7 +3307,10 @@ mod tests {
             filter.session_affinity.as_ref().unwrap().bindings.is_empty(),
             "oversized cookie value must not be stored as a session key"
         );
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("false"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.bound"),
+            Some("false")
+        );
     }
 
     // ---- Provider-hop context ----
@@ -3390,7 +3511,7 @@ mod tests {
             pending_header(&second_ctx, PROVIDER_HOP_REQUEST_ID_HEADER)
         );
         assert_eq!(
-            second_ctx.get_metadata("intelligent_route.session.reused"),
+            second_ctx.filter_metadata.get("intelligent_route.session.reused"),
             Some("true")
         );
     }
@@ -3423,7 +3544,7 @@ mod tests {
             "affinity must preserve the selected cluster when overlay weights change"
         );
         assert_eq!(
-            second_ctx.get_metadata("intelligent_route.session.reused"),
+            second_ctx.filter_metadata.get("intelligent_route.session.reused"),
             Some("true"),
             "the existing affinity binding must be reused"
         );
@@ -3445,12 +3566,12 @@ mod tests {
         );
         assert!(first_ctx.cluster.is_some(), "initial route selects a provider");
         assert_eq!(
-            first_ctx.get_metadata("intelligent_route.session.bound"),
+            first_ctx.filter_metadata.get("intelligent_route.session.bound"),
             Some("true"),
             "the initial route must create an affinity binding"
         );
         assert_eq!(
-            first_ctx.get_metadata("intelligent_route.session.reused"),
+            first_ctx.filter_metadata.get("intelligent_route.session.reused"),
             Some("false"),
             "the initial route must not report a reused binding"
         );
@@ -3675,9 +3796,9 @@ mod tests {
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
-        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("routed"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("routed"));
         assert_eq!(
-            ctx.get_metadata(ROUTE_CANDIDATE_COUNT),
+            ctx.filter_metadata.get(ROUTE_CANDIDATE_COUNT),
             Some("2"),
             "candidate_count counts every candidate for the looked-up capability"
         );
@@ -3692,8 +3813,8 @@ mod tests {
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Reject(r) if r.status == 404));
-        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("no_candidate"));
-        assert_eq!(ctx.get_metadata(ROUTE_CANDIDATE_COUNT), Some("0"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("no_candidate"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_CANDIDATE_COUNT), Some("0"));
         assert_no_route_metadata(&ctx);
     }
 
@@ -3706,9 +3827,9 @@ mod tests {
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Reject(r) if r.status == 400));
-        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("invalid"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("invalid"));
         assert!(
-            ctx.get_metadata(ROUTE_CANDIDATE_COUNT).is_none(),
+            ctx.filter_metadata.get(ROUTE_CANDIDATE_COUNT).is_none(),
             "no lookup happened, so no candidate count is defined"
         );
     }
@@ -3720,7 +3841,7 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("skipped"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("skipped"));
     }
 
     #[tokio::test]
@@ -3730,7 +3851,7 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("management"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("management"));
     }
 
     #[tokio::test]
@@ -3743,13 +3864,13 @@ mod tests {
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("earlier"));
-        assert_eq!(ctx.get_metadata(ROUTE_OUTCOME), Some("preserved"));
+        assert_eq!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("preserved"));
     }
 
     #[tokio::test]
     async fn reused_session_records_reused_outcome() {
         let f = parse(
-            "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+            "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
         )
         .unwrap();
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
@@ -3759,11 +3880,11 @@ mod tests {
 
         let mut first = crate::test_utils::make_filter_context(&req);
         let _unused = f.on_request(&mut first).await.unwrap();
-        assert_eq!(first.get_metadata(ROUTE_OUTCOME), Some("routed"));
+        assert_eq!(first.filter_metadata.get(ROUTE_OUTCOME), Some("routed"));
 
         let mut second = crate::test_utils::make_filter_context(&req);
         let _unused = f.on_request(&mut second).await.unwrap();
-        assert_eq!(second.get_metadata(ROUTE_OUTCOME), Some("reused"));
+        assert_eq!(second.filter_metadata.get(ROUTE_OUTCOME), Some("reused"));
     }
 
     // ---- Metrics ----
@@ -3772,7 +3893,7 @@ mod tests {
     fn decision_metrics_count_outcomes_selections_and_sessions() {
         let (_filter_kept_alive, snapshot) = metrics_emitted_by(async {
             let f = parse(
-                "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+                "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
             )
             .unwrap();
             let _first = route_path_model_with_session(f.as_ref(), "llama", "session-1").await;
@@ -3874,7 +3995,7 @@ mod tests {
     #[tokio::test]
     async fn switching_capability_starts_a_new_binding_rather_than_a_failover() {
         let f = parse(
-            "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+            "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
         )
         .unwrap();
         let _first = route_path_model_with_session(f.as_ref(), "llama", "sess-1").await;
@@ -3886,14 +4007,17 @@ mod tests {
         let _unused = f.on_request(&mut ctx).await.unwrap();
 
         assert_eq!(ctx.cluster.as_deref(), Some("inf-b"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.failover"), Some("false"));
-        assert_eq!(ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            ctx.filter_metadata.get("intelligent_route.session.failover"),
+            Some("false")
+        );
+        assert_eq!(ctx.filter_metadata.get("intelligent_route.session.bound"), Some("true"));
     }
 
     #[test]
     fn session_table_gauge_adds_up_across_instances_and_shrinks_on_drop() {
         let (_first_kept_alive, snapshot) = metrics_emitted_by(async {
-            let yaml = "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n";
+            let yaml = "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n";
             let first = parse(yaml).unwrap();
             let second = parse(yaml).unwrap();
             let _unused = route_path_model_with_session(first.as_ref(), "llama", "sess-1").await;
@@ -4041,7 +4165,9 @@ mod tests {
             let mut ctx = crate::test_utils::make_filter_context(&req);
             let _unused = filter.on_request(&mut ctx).await.unwrap();
             (
-                ctx.get_metadata("intelligent_route.session.bound").map(str::to_owned),
+                ctx.filter_metadata
+                    .get("intelligent_route.session.bound")
+                    .map(str::to_owned),
                 ctx.cluster.as_deref().map(str::to_owned),
             )
         });
@@ -4268,7 +4394,7 @@ mod tests {
             "intelligent_route.site",
             "intelligent_route.stable_id",
         ] {
-            assert!(ctx.get_metadata(key).is_none(), "{key} should be absent");
+            assert!(ctx.filter_metadata.get(key).is_none(), "{key} should be absent");
         }
     }
 

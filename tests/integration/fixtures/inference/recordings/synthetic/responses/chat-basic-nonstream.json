@@ -79,6 +79,7 @@
           "body": {
             "kind": "json",
             "value": {
+              "access_programs": null,
               "background": false,
               "completed_at": 0,
               "created_at": 0,
@@ -265,6 +266,7 @@
           "body": {
             "kind": "json",
             "value": {
+              "access_programs": null,
               "background": false,
               "completed_at": 0,
               "created_at": 0,

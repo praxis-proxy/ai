@@ -17,6 +17,8 @@ on:
       - "store-backends/**"
       - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/mcp_core/**"
+      - "apis/src/mcp_client/**"
       - "apis/src/openai/translation/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
@@ -80,8 +82,8 @@ on:
       run_codex_acceptance:
         description: >-
           Run pinned Codex through native Responses and translated Chat paths
-          against real Qwen3-8B. When run_live_vllm is false, this skips the
-          complete Responses SDK suite.
+          against Qwen3-8B by default. For a candidate checkpoint, set
+          codex_model and leave all other run_* inputs false.
         required: false
         default: false
         type: boolean
@@ -114,10 +116,61 @@ on:
       gpu_instance_type:
         description: >-
           Optional EC2 GPU instance-type override for transient capacity
-          shortages (for example, g5.2xlarge).
+          shortages or larger candidate models (for example, g5.2xlarge,
+          g6e.12xlarge, or p5.4xlarge).
         required: false
         default: g5.xlarge
         type: string
+      codex_model:
+        description: >-
+          Optional Hugging Face model ID override for vllm-gpu-codex-acceptance
+          (empty uses VLLM_GPU_MODEL, Qwen/Qwen3-8B; for example,
+          openai/gpt-oss-120b).
+        required: false
+        default: ""
+        type: string
+      codex_served_model_name:
+        description: >-
+          Slash-free served alias, required when codex_model is set
+          (for example, gpt-oss-120b). Otherwise defaults to qwen3-8b.
+        required: false
+        default: ""
+        type: string
+      codex_tool_call_parser:
+        description: >-
+          vLLM --tool-call-parser for vllm-gpu-codex-acceptance (use "openai"
+          for gpt-oss-120b, "none" to omit).
+        required: false
+        default: hermes
+        type: string
+      codex_reasoning_parser:
+        description: >-
+          vLLM --reasoning-parser for vllm-gpu-codex-acceptance (use
+          "openai_gptoss" for gpt-oss-120b, "none" to omit).
+        required: false
+        default: deepseek_r1
+        type: string
+      codex_tensor_parallel_size:
+        description: >-
+          vLLM --tensor-parallel-size for vllm-gpu-codex-acceptance (for
+          example, 1 on p5.4xlarge or 4 on g6e.12xlarge).
+        required: false
+        default: "1"
+        type: string
+      codex_max_model_len:
+        description: >-
+          vLLM --max-model-len for vllm-gpu-codex-acceptance (must exceed the
+          16000-token compaction window in codex_http.rs).
+        required: false
+        default: "16384"
+        type: string
+      codex_skip_translated:
+        description: >-
+          Skip the translated Chat Completions Codex step (runs native
+          apply_patch and compaction only).
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -193,6 +246,8 @@ jobs:
             'store-backends/' \
             'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/mcp_core/' \
+            'apis/src/mcp_client/' \
             'apis/src/openai/translation/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
@@ -247,7 +302,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           # vllm-responses and vllm-live-cpu build the identical
           # standard,openai-all,store-sqlite proxy, but had no cache-suffix, so
@@ -259,7 +314,7 @@ jobs:
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -454,14 +509,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           # Shares the store-sqlite rust-cache with vllm-responses (identical
           # standard,openai-all,store-sqlite proxy). See that job for rationale.
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -553,7 +608,7 @@ jobs:
        github.event.action == 'labeled' &&
        github.event.label.name == 'vllm-full-suite')
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
@@ -580,279 +635,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Parse pin manifest
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
+        with:
+          cache-suffix: pins-cargo
+
+      # The manifests are the source of truth; check-pins validates every
+      # cross-file invariant (see xtask/src/pins.rs) and exports the pins the
+      # GPU lanes read, so no lane hardcodes a version. The light `pins`
+      # feature builds it without compiling the proxy.
+      - name: Check and export pins
         id: load
-        run: |
-          python3 - "$GITHUB_OUTPUT" <<'PY'
-          import json, pathlib, sys, tomllib
-
-          manifest = pathlib.Path("tests/integration/fixtures/claude-code-cli/pin.toml")
-          data = tomllib.loads(manifest.read_text())
-          claude, vllm = data["claude_code"], data["vllm"]
-          launch = claude["launch"]
-          flags = vllm["launch"]["flags"]
-          max_len_index = flags.index("--max-model-len") + 1
-          flag_context = int(flags[max_len_index])
-          context = int(vllm["context_length"])
-          auto_minimum = int(launch["auto_minimum_backend_context_tokens"])
-          client_context = int(launch["max_context_tokens"])
-          if flag_context != context:
-              raise SystemExit(
-                  "vllm.context_length must match --max-model-len in vllm.launch.flags"
-              )
-          if context < auto_minimum:
-              raise SystemExit(
-                  f"vLLM context {context} is below Claude auto-mode minimum {auto_minimum}"
-              )
-          if context < client_context:
-              raise SystemExit(
-                  f"vLLM context {context} is below Claude client context {client_context}"
-              )
-          # The compaction scenario deliberately runs the client with a LOWERED
-          # window so it auto-compacts mid-task. That window must stay positive
-          # and strictly below the real backend window; otherwise the client
-          # never crosses its threshold and the scenario proves nothing.
-          compaction_context = int(launch["compaction"]["max_context_tokens"])
-          if not 0 < compaction_context < context:
-              raise SystemExit(
-                  f"compaction window {compaction_context} must be in (0, {context})"
-              )
-          # Pinned Claude Code 2.1.267 reserves 2,048 output + 13,000 compaction
-          # tokens, so its effective auto-compaction threshold is
-          # `compaction_context - 15048`. A single ballast read must fit well
-          # under that headroom, or one post-compaction read immediately
-          # re-crosses the threshold and the client's rapid-refill breaker aborts
-          # the run. Total ballast must still exceed the threshold so compaction
-          # fires mid-task. Use ~4 bytes/token to approximate from the pinned
-          # byte sizes.
-          reserved = 15048
-          headroom = compaction_context - reserved
-          if headroom <= 0:
-              raise SystemExit(
-                  f"compaction window {compaction_context} must exceed the "
-                  f"{reserved}-token Claude Code reserve so the client has usable headroom"
-              )
-          ballast_bytes = int(launch["compaction"]["ballast_bytes"])
-          ballast_chapters = int(launch["compaction"]["ballast_chapters"])
-          per_chapter_tokens = ballast_bytes / 4
-          total_ballast_tokens = per_chapter_tokens * ballast_chapters
-          if per_chapter_tokens * 2 >= headroom:
-              raise SystemExit(
-                  f"a single ballast chapter (~{per_chapter_tokens:.0f} tokens) must be well "
-                  f"under the ~{headroom}-token post-compaction headroom to avoid the rapid-refill breaker"
-              )
-          if total_ballast_tokens <= headroom:
-              raise SystemExit(
-                  f"total ballast (~{total_ballast_tokens:.0f} tokens) must exceed the "
-                  f"~{headroom}-token threshold so compaction fires mid-task"
-              )
-          exported = {
-              "claude_url": claude["url"],
-              "claude_sha256": claude["sha256"],
-              "claude_version": claude["version"],
-              "claude_platform": claude["platform"],
-              "vllm_image": vllm["image"],
-              "vllm_served_model": vllm["served_model_name"],
-              "vllm_flags": " ".join(flags),
-          }
-
-          # ---- OpenCode -------------------------------------------------
-          # Exported so the acceptance job carries no hardcoded version
-          # strings. Scattering them is exactly how the Codex pins drifted.
-          # Each OpenCode major has its own manifest and its own credential
-          # recipe (1.x: provider options.headers; 2.x: a plugin). Every
-          # manifest is validated against the major it declares AND the major
-          # its path is reserved for, so a 2.x version dropped into the 1.x
-          # manifest (or the reverse) still fails here: crossing the boundary
-          # needs a rewritten client configuration and a re-validated
-          # manifest, not a bump.
-          oc_manifests = {
-              1: pathlib.Path("tests/integration/fixtures/opencode-cli/pin.toml"),
-              2: pathlib.Path("tests/integration/fixtures/opencode-cli-v2/pin.toml"),
-          }
-          oc_by_major = {}
-          for lane_major, path in oc_manifests.items():
-              manifest_data = tomllib.loads(path.read_text())
-              client = manifest_data["opencode"]
-              declared_major = int(client["major_series"])
-              actual_major = int(client["version"].split(".")[0])
-              if declared_major != actual_major:
-                  raise SystemExit(
-                      f"{path}: opencode.major_series {declared_major} disagrees with version "
-                      f"{client['version']}"
-                  )
-              if actual_major != lane_major:
-                  raise SystemExit(
-                      f"{path}: the OpenCode acceptance lane is pinned to the {lane_major}.x client "
-                      f"configuration; version {client['version']} needs its own manifest and a "
-                      "rewritten client configuration"
-                  )
-              # The prompt is positional on both majors; the flag that would
-              # swallow it differs (-p was the 1.x server password).
-              if client["launch"]["prompt_is_positional"] is not True:
-                  raise SystemExit(f"{path}: opencode.launch.prompt_is_positional must stay true")
-              oc_by_major[lane_major] = manifest_data
-
-          oc = oc_by_major[1]
-          opencode, oc_provider, oc_vllm = oc["opencode"], oc["opencode"]["provider"], oc["vllm"]
-          oc_flags = oc_vllm["launch"]["flags"]
-
-          # The client window, the manifest, and the server flag must agree, or
-          # the client advertises a context the backend will not honor.
-          oc_context = int(oc_provider["context"])
-          oc_vllm_context = int(oc_vllm["context_length"])
-          oc_flag_context = int(oc_flags[oc_flags.index("--max-model-len") + 1])
-          if not oc_context == oc_vllm_context == oc_flag_context:
-              raise SystemExit(
-                  f"OpenCode context {oc_context}, vllm.context_length {oc_vllm_context}, and "
-                  f"--max-model-len {oc_flag_context} must all agree"
-              )
-          if int(oc_provider["output"]) >= oc_context:
-              raise SystemExit("opencode.provider.output must be below the context window")
-
-          # Tool-calling must be served, or the tool-call scenario silently
-          # degrades to a plain text turn and proves nothing.
-          if not oc_vllm["tool_call_parser"] or "--enable-auto-tool-choice" not in oc_flags:
-              raise SystemExit(
-                  "the OpenCode backend must serve tool calls: set vllm.tool_call_parser "
-                  "and pass --enable-auto-tool-choice"
-              )
-
-          # A github-release install is only reproducible with both pins.
-          if opencode["install"] == "github-release":
-              for key in ("url", "sha256"):
-                  if not opencode[key] or "TBD" in opencode[key]:
-                      raise SystemExit(f"install=github-release requires a concrete opencode.{key}")
-
-          # Bind the manifest to the example config: every prefix the client is
-          # allowed to reach must have an explicit route, so the OpenCode path
-          # can never silently regress onto the catch-all that exists for
-          # health checks and startup probes.
-          for manifest_data in oc_by_major.values():
-              example = pathlib.Path("examples/configs") / manifest_data["gateway"]["example_config"]
-              example_text = example.read_text()
-              for prefix in manifest_data["startup_matrix"]["allowed_prefixes"]:
-                  if f'- path: "{prefix}"' not in example_text:
-                      raise SystemExit(
-                          f"{example} must declare an explicit route for {prefix}; "
-                          "relying on the catch-all is not a supported client path"
-                      )
-
-          # ---- OpenCode 2.x ---------------------------------------------
-          # The 2.x scenarios run in the same job against the SAME vLLM
-          # container, so the backend pins live once, in the 1.x manifest. The
-          # 2.x client must address the model that container serves and must
-          # not advertise a window it will not honor.
-          oc2 = oc_by_major[2]
-          opencode2, oc2_provider = oc2["opencode"], oc2["opencode"]["provider"]
-          if "vllm" in oc2:
-              raise SystemExit(
-                  f"{oc_manifests[2]} must not declare [vllm]: the 2.x scenarios share the 1.x "
-                  "lane's vLLM container, whose pins live in the 1.x manifest"
-              )
-          if oc2_provider["model_id"] != oc_provider["model_id"]:
-              raise SystemExit(
-                  f"OpenCode 2.x model {oc2_provider['model_id']} must match the served model "
-                  f"{oc_provider['model_id']}"
-              )
-          if int(oc2_provider["context"]) != oc_vllm_context:
-              raise SystemExit(
-                  f"OpenCode 2.x context {oc2_provider['context']} must equal vllm.context_length "
-                  f"{oc_vllm_context}"
-              )
-          if int(oc2_provider["output"]) >= oc_vllm_context:
-              raise SystemExit("OpenCode 2.x provider.output must be below the context window")
-          # Both 2.x lanes stage the registry tarball verified against the
-          # committed checksum; that is what makes them byte-identical.
-          if opencode2["install"] != "registry-tarball":
-              raise SystemExit("OpenCode 2.x must install from the verified registry tarball")
-          oc2_checksum = (
-              oc_manifests[2].parent / f"{opencode2['version']}-{opencode2['platform']}.sha256"
-          )
-          if not oc2_checksum.is_file():
-              raise SystemExit(f"OpenCode 2.x needs a checksum fixture at {oc2_checksum}")
-
-          exported.update({
-              "opencode_v2_version": opencode2["version"],
-              "opencode_v2_platform": opencode2["platform"],
-          })
-
-          # ---- pi -------------------------------------------------------
-          # pi runs in its own job but against the same Chat Completions
-          # backend as OpenCode, so its backend pins live once, in the 1.x
-          # OpenCode manifest. The client must address the model that backend
-          # serves and must not advertise a window it will not honor.
-          pi_manifest = pathlib.Path("tests/integration/fixtures/pi-cli/pin.toml")
-          pi_data = tomllib.loads(pi_manifest.read_text())
-          pi, pi_provider = pi_data["pi"], pi_data["pi"]["provider"]
-          if "vllm" in pi_data or pi_data["gateway"]["backend_pins"] != "opencode-cli/pin.toml":
-              raise SystemExit(
-                  f"{pi_manifest} must not declare [vllm]: pi shares the backend pins in "
-                  "opencode-cli/pin.toml, and gateway.backend_pins must say so"
-              )
-          if int(pi["version"].split(".")[0]) != int(pi["major_series"]):
-              raise SystemExit(
-                  f"{pi_manifest}: pi.major_series {pi['major_series']} disagrees with version "
-                  f"{pi['version']}; crossing a major must re-validate the manifest"
-              )
-          if pi_provider["api"] != "openai-completions":
-              raise SystemExit("pi is supported over openai-completions only")
-          if pi_provider["model_id"] != oc_provider["model_id"]:
-              raise SystemExit(
-                  f"pi model {pi_provider['model_id']} must match the served model "
-                  f"{oc_provider['model_id']}"
-              )
-          if int(pi_provider["context_window"]) != oc_vllm_context:
-              raise SystemExit(
-                  f"pi context_window {pi_provider['context_window']} must equal "
-                  f"vllm.context_length {oc_vllm_context}"
-              )
-          if int(pi_provider["max_tokens"]) >= oc_vllm_context:
-              raise SystemExit("pi.provider.max_tokens must be below the context window")
-          # Both lanes stage the release archive verified against the
-          # committed checksum; that is what makes them byte-identical.
-          pi_url = (
-              f"https://github.com/earendil-works/pi/releases/download/"
-              f"v{pi['version']}/pi-{pi['platform']}.tar.gz"
-          )
-          if pi["install"] != "github-release" or pi["url"] != pi_url:
-              raise SystemExit(f"pi must install from the verified release archive {pi_url}")
-          pi_checksum = pi_manifest.parent / f"{pi['version']}-{pi['platform']}.sha256"
-          if not pi_checksum.is_file():
-              raise SystemExit(f"pi needs a checksum fixture at {pi_checksum}")
-          # The documented models.json is what both lanes run; it must agree.
-          pi_models = json.loads((pi_manifest.parent / pi["auth"]["fixture"]).read_text())
-          pi_model = pi_models["providers"][pi_provider["id"]]["models"][0]
-          if (pi_model["id"], pi_model["contextWindow"], pi_model["maxTokens"]) != (
-              pi_provider["model_id"], int(pi_provider["context_window"]), int(pi_provider["max_tokens"])
-          ):
-              raise SystemExit(f"{pi['auth']['fixture']} disagrees with {pi_manifest}")
-          pi_example = pathlib.Path("examples/configs") / pi_data["gateway"]["example_config"]
-          for prefix in pi_data["startup_matrix"]["allowed_prefixes"]:
-              if f'- path: "{prefix}"' not in pi_example.read_text():
-                  raise SystemExit(f"{pi_example} must declare an explicit route for {prefix}")
-
-          exported.update({
-              "pi_version": pi["version"],
-              "pi_platform": pi["platform"],
-              "pi_model": pi_provider["model_id"],
-          })
-
-          exported.update({
-              "opencode_version": opencode["version"],
-              "opencode_install": opencode["install"],
-              "opencode_npm_package": opencode["npm_package"],
-              "opencode_url": opencode["url"],
-              "opencode_sha256": opencode["sha256"],
-              "opencode_model": oc_provider["model_id"],
-              "opencode_vllm_image": oc_vllm["image"],
-              "opencode_vllm_flags": " ".join(oc_flags),
-          })
-
-          with open(sys.argv[1], "a", encoding="utf-8") as out:
-              for key, value in exported.items():
-                  out.write(f"{key}={value}\n")
-          PY
+        run: cargo run -q -p xtask --no-default-features --features pins -- check-pins --github-output "$GITHUB_OUTPUT"
 
   # ----------------------------------------------------------------------------
   # Pinned Claude Code drives Anthropic Messages to real vLLM, native + transformed
@@ -963,17 +757,18 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: |
             tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
             tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py
+            tests/integration/sdk/anthropic/test_anthropic_mcp_connector_vllm.py
 
       - name: Verify pins are resolvable
         run: |
@@ -1093,7 +888,7 @@ jobs:
 
       - name: Build Praxis and acceptance test
         run: |
-          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres,anthropic-mcp-connector-filter
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted network namespace
@@ -1390,6 +1185,22 @@ jobs:
           uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
             -p qualification_plugin -k "not live_tavily"
 
+      - name: Run Anthropic SDK MCP connector against real vLLM
+        id: anthropic_mcp_connector
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-mcp-connector-cases.json
+        run: |
+          # The live model is forced to call the one allowlisted tool on a local
+          # MCP stub, so this lane is deterministic and needs no external secret.
+          uv run tests/integration/sdk/anthropic/test_anthropic_mcp_connector_vllm.py -s \
+            -p qualification_plugin
+
       - name: Run credentialed live Tavily web search against real vLLM
         id: anthropic_credentialed_web_search
         if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
@@ -1489,6 +1300,7 @@ jobs:
           CLAUDE_COMPACTION: ${{ steps.claude_compaction.outcome }}
           ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
           ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
+          ANTHROPIC_MCP_CONNECTOR: ${{ steps.anthropic_mcp_connector.outcome }}
           ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
           SELECTED_ANTHROPIC_OPENAI_CHAT: ${{ steps.selected_anthropic_openai_chat.outcome }}
         run: |
@@ -1498,12 +1310,14 @@ jobs:
                    "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
                    "CLAUDE_COMPACTION",
                    "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
+                   "ANTHROPIC_MCP_CONNECTOR",
                    "ANTHROPIC_CREDENTIALED_WEB_SEARCH",
                    "SELECTED_ANTHROPIC_OPENAI_CHAT")
           cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
           for case, filename in (
               ("anthropic_messages", "anthropic-messages-cases.json"),
               ("anthropic_stubbed_web_search", "anthropic-stubbed-web-search-cases.json"),
+              ("anthropic_mcp_connector", "anthropic-mcp-connector-cases.json"),
               ("anthropic_credentialed_web_search", "anthropic-credentialed-web-search-cases.json"),
               ("selected_anthropic_openai_chat", "selected-anthropic-openai-chat-cases.json"),
           ):
@@ -1564,8 +1378,9 @@ jobs:
   #
   # This complements the required deterministic #1223 scripted-backend test:
   # that test remains the provider-wire oracle, while this job proves the real
-  # pinned client can select and execute a coding tool through Praxis against
-  # Qwen3-8B. The child runs in a namespace whose only route reaches Praxis, and
+  # pinned client can select and execute its grammar-constrained apply_patch
+  # tool through Praxis against Qwen3-8B on both paths. The child runs in a
+  # namespace whose only route reaches Praxis, and
   # vLLM requires a provider credential Codex never receives, proving Praxis
   # replaced the gateway credential. It reuses the full suite's on-disk model
   # cache when available and starts its own keyed container sequentially.
@@ -1596,8 +1411,14 @@ jobs:
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
-      CODEX_VERSION: 0.144.1
-      CODEX_VLLM_MODEL: qwen3-8b
+      CODEX_VERSION: "0.170.0"
+      CODEX_CANDIDATE: >-
+        ${{ github.event_name == 'workflow_dispatch' && inputs.codex_model != '' }}
+      CODEX_VLLM_MODEL: ${{ inputs.codex_served_model_name || 'qwen3-8b' }}
+      CODEX_TOOL_CALL_PARSER: ${{ inputs.codex_tool_call_parser || 'hermes' }}
+      CODEX_REASONING_PARSER: ${{ inputs.codex_reasoning_parser || 'deepseek_r1' }}
+      CODEX_TENSOR_PARALLEL_SIZE: ${{ inputs.codex_tensor_parallel_size || '1' }}
+      CODEX_MAX_MODEL_LEN: ${{ inputs.codex_max_model_len || '16384' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1618,7 +1439,7 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           cache-suffix: codex-gpu-acceptance-cargo
 
@@ -1678,8 +1499,29 @@ jobs:
           echo "::add-mask::$token"
           echo "CODEX_BACKEND_TOKEN=$token" >> "$GITHUB_ENV"
 
+      - name: Resolve Codex candidate snapshot
+        if: env.CODEX_CANDIDATE == 'true'
+        env:
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth=()
+          if [ -n "$HUGGING_FACE_HUB_TOKEN" ]; then
+            auth=(-H "Authorization: Bearer $HUGGING_FACE_HUB_TOKEN")
+          fi
+          revision=$(curl --fail --silent --show-error --retry 3 --max-time 30 \
+            "${auth[@]}" "https://huggingface.co/api/models/$CODEX_MODEL" | \
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')
+          if ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Hugging Face did not return a model commit SHA'
+            exit 1
+          fi
+          echo "CODEX_MODEL_REVISION=$revision" >> "$GITHUB_ENV"
+
       - name: Start keyed vLLM for Codex
         env:
+          CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -1689,9 +1531,33 @@ jobs:
           else
             gpu_args=(--gpus all)
           fi
+          if [ "$CODEX_TENSOR_PARALLEL_SIZE" -gt 1 ]; then
+            # Multi-GPU NCCL all-reduce needs more than the default 64 MiB /dev/shm.
+            gpu_args+=(--ipc=host)
+          fi
           cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             cache_mount="${cache_mount}:Z"
+          fi
+          vllm_args=(
+            --model "$CODEX_MODEL"
+            --served-model-name "$CODEX_VLLM_MODEL"
+            --max-model-len "$CODEX_MAX_MODEL_LEN"
+            --gpu-memory-utilization 0.9
+            --seed 0
+            --api-key "$CODEX_BACKEND_TOKEN"
+          )
+          if [ -n "${CODEX_MODEL_REVISION:-}" ]; then
+            vllm_args+=(--revision "$CODEX_MODEL_REVISION" --tokenizer-revision "$CODEX_MODEL_REVISION")
+          fi
+          if [ "$CODEX_TENSOR_PARALLEL_SIZE" -gt 1 ]; then
+            vllm_args+=(--tensor-parallel-size "$CODEX_TENSOR_PARALLEL_SIZE")
+          fi
+          if [ -n "$CODEX_TOOL_CALL_PARSER" ] && [ "$CODEX_TOOL_CALL_PARSER" != "none" ]; then
+            vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$CODEX_TOOL_CALL_PARSER")
+          fi
+          if [ -n "$CODEX_REASONING_PARSER" ] && [ "$CODEX_REASONING_PARSER" != "none" ]; then
+            vllm_args+=(--reasoning-parser "$CODEX_REASONING_PARSER")
           fi
           mkdir -p "$GPU_HF_CACHE_DIR"
           "$CONTAINER_RUNTIME" pull "$VLLM_GPU_IMAGE"
@@ -1701,18 +1567,12 @@ jobs:
             -e HUGGING_FACE_HUB_TOKEN \
             -v "$cache_mount" \
             "$VLLM_GPU_IMAGE" \
-            --model "$VLLM_GPU_MODEL" \
-            --served-model-name "$CODEX_VLLM_MODEL" \
-            --max-model-len 16384 \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.9 \
-            --seed 0 \
-            --api-key "$CODEX_BACKEND_TOKEN"
+            "${vllm_args[@]}"
 
       - name: Preflight vLLM Responses and Chat Completions
         id: codex_vllm_preflight
+        env:
+          CODEX_SKIP_TRANSLATED: ${{ inputs.codex_skip_translated }}
         run: |
           set -euo pipefail
           deadline=$((SECONDS + 1200))
@@ -1734,9 +1594,15 @@ jobs:
           curl -sf -H "$auth" -H 'content-type: application/json' \
             -d "{\"model\":\"${CODEX_VLLM_MODEL}\",\"input\":\"reply ready /no_think\",\"max_output_tokens\":64}" \
             http://127.0.0.1:8000/v1/responses >/dev/null
-          curl -sf -H "$auth" -H 'content-type: application/json' \
-            -d "{\"model\":\"${CODEX_VLLM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"reply ready\"}],\"max_tokens\":1}" \
-            http://127.0.0.1:8000/v1/chat/completions >/dev/null
+          if [ "${CODEX_SKIP_TRANSLATED:-false}" != "true" ]; then
+            chat_probe_tokens=1
+            if [ "$CODEX_CANDIDATE" = "true" ]; then
+              chat_probe_tokens=16
+            fi
+            curl -sf -H "$auth" -H 'content-type: application/json' \
+              -d "{\"model\":\"${CODEX_VLLM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"reply ready\"}],\"max_tokens\":${chat_probe_tokens}}" \
+              http://127.0.0.1:8000/v1/chat/completions >/dev/null
+          fi
 
       - name: Build Praxis and Codex acceptance test
         run: |
@@ -1809,8 +1675,8 @@ jobs:
           fi
           # An exact libtest selector otherwise succeeds when no test is compiled.
           for test_name in \
-            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
-            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http; do
             if ! "$TEST_BIN" "$test_name" --list --exact | grep -Fx "$test_name: test"; then
               echo "::error::missing Codex acceptance test: $test_name"
@@ -1830,11 +1696,15 @@ jobs:
           PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
           PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+          PRAXIS_TEST_CODEX_CANDIDATE: ${{ env.CODEX_CANDIDATE }}
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp -d "$RUNNER_TEMP/codex-native-evidence.XXXXXX")/evidence.json"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_NATIVE_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
             "$TEST_BIN" \
-            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
           test_status=${PIPESTATUS[0]}
           if [ "$test_status" -ne 0 ]; then
@@ -1845,7 +1715,7 @@ jobs:
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
-        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && !inputs.codex_skip_translated && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1856,9 +1726,12 @@ jobs:
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp -d "$RUNNER_TEMP/codex-translated-evidence.XXXXXX")/evidence.json"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_TRANSLATED_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
-            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
           test_status=${PIPESTATUS[0]}
           if [ "$test_status" -ne 0 ]; then
@@ -1878,6 +1751,7 @@ jobs:
           PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
           PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+          PRAXIS_TEST_CODEX_CANDIDATE: ${{ env.CODEX_CANDIDATE }}
         run: |
           set -uo pipefail
           # Grow accepted context over many turns until Codex crosses its own
@@ -1886,7 +1760,10 @@ jobs:
           # test-local HTTP observer between Codex and Praxis captures the
           # compaction request on the wire; the egress namespace guarantees the
           # client's only route is Praxis.
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp -d "$RUNNER_TEMP/codex-compaction-evidence.XXXXXX")/evidence.json"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_COMPACTION_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
             "$TEST_BIN" \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
@@ -1932,17 +1809,50 @@ jobs:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
+          CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
+          CODEX_GPU_INSTANCE_TYPE: >-
+            ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
         run: |
+          python3 .github/scripts/vllm_qualification.py capture-codex --output "$RUNNER_TEMP/codex-acceptance.json"
           python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
-          import json, os, pathlib, subprocess, sys
-          names = ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION")
-          data = {
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
+          import json, os, pathlib, sys
+          data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          statuses = {case["id"]: case["status"] for case in data["cases"]}
+          filter_chains = {}
+          missing_chains = []
+          prefix = "Codex acceptance filter chain: "
+          for path in ("native", "translated", "compaction"):
+              name = f"codex_{path}"
+              status = statuses[name]
+              log = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"codex-acceptance-{path}.log"
+              if log.is_file():
+                  with log.open(errors="replace") as lines:
+                      for line in lines:
+                          if line.startswith(prefix):
+                              filter_chains[name] = json.loads(line.removeprefix(prefix))
+                              break
+              if status == "success" and not filter_chains.get(name):
+                  missing_chains.append(name)
+          data["provenance"] = {
+              "candidate": os.environ["CODEX_CANDIDATE"] == "true",
+              "codex_version": os.environ["CODEX_VERSION"],
+              "backend": {
+                  "model": os.environ["CODEX_MODEL"],
+                  "resolved_revision": os.environ.get("CODEX_MODEL_REVISION"),
+                  "served_model_name": os.environ["CODEX_VLLM_MODEL"],
+                  "vllm_image": os.environ["VLLM_GPU_IMAGE"],
+                  "tensor_parallel_size": int(os.environ["CODEX_TENSOR_PARALLEL_SIZE"]),
+                  "max_model_len": int(os.environ["CODEX_MAX_MODEL_LEN"]),
+                  "tool_call_parser": os.environ["CODEX_TOOL_CALL_PARSER"],
+                  "reasoning_parser": os.environ["CODEX_REASONING_PARSER"],
+              },
+              "runner": {"instance_type": os.environ["CODEX_GPU_INSTANCE_TYPE"],
+                         "name": os.environ.get("RUNNER_NAME")},
+              "filter_chains": filter_chains,
           }
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          if missing_chains:
+              sys.exit("Missing filter-chain evidence for: " + ", ".join(missing_chains))
           PY
 
       - name: Upload Codex acceptance results
@@ -2092,7 +2002,7 @@ jobs:
           done
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           cache-suffix: opencode-gpu-acceptance
 
@@ -2557,7 +2467,7 @@ jobs:
           done
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           cache-suffix: pi-gpu-acceptance
 
@@ -2866,7 +2776,7 @@ jobs:
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_opencode_acceptance || inputs.run_pi_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_opencode_acceptance || inputs.run_pi_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only || inputs.codex_model != '')
       ) ||
       (
         github.event_name == 'pull_request' &&
@@ -2885,6 +2795,45 @@ jobs:
       ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Codex dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUN_CODEX: ${{ inputs.run_codex_acceptance }}
+          RUN_LIVE: ${{ inputs.run_live_vllm }}
+          RUN_CLAUDE: ${{ inputs.run_claude_acceptance }}
+          RUN_OPENCODE: ${{ inputs.run_opencode_acceptance }}
+          RUN_PI: ${{ inputs.run_pi_acceptance }}
+          RUN_DEGRADATION: ${{ inputs.run_degradation_acceptance }}
+          RUN_COMPACTION_ONLY: ${{ inputs.run_compaction_only }}
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          CODEX_VLLM_MODEL: ${{ inputs.codex_served_model_name }}
+          CODEX_TENSOR_PARALLEL_SIZE: ${{ inputs.codex_tensor_parallel_size || '1' }}
+          CODEX_MAX_MODEL_LEN: ${{ inputs.codex_max_model_len || '16384' }}
+        run: |
+          set -euo pipefail
+          alias_pattern='^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
+          if [ -n "$CODEX_MODEL" ]; then
+            if [ "$RUN_CODEX" != true ] || [[ " $RUN_LIVE $RUN_CLAUDE $RUN_OPENCODE $RUN_PI $RUN_DEGRADATION $RUN_COMPACTION_ONLY " == *' true '* ]]; then
+              echo '::error::codex_model requires run_codex_acceptance=true and all other run_* inputs false' >&2
+              exit 1
+            fi
+            if ! [[ "$CODEX_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*$ && "$CODEX_VLLM_MODEL" =~ $alias_pattern ]]; then
+              echo '::error::Set codex_model to an org/checkpoint ID and codex_served_model_name to a slash-free alias' >&2
+              exit 1
+            fi
+          elif [ -n "$CODEX_VLLM_MODEL" ]; then
+            echo '::error::codex_served_model_name requires codex_model' >&2
+            exit 1
+          fi
+          if ! [[ "$CODEX_TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]{0,8}$ ]]; then
+            echo '::error::codex_tensor_parallel_size must be a positive integer' >&2
+            exit 1
+          fi
+          if ! [[ "$CODEX_MAX_MODEL_LEN" =~ ^[1-9][0-9]{0,8}$ ]] || [ "$CODEX_MAX_MODEL_LEN" -le 16000 ]; then
+            echo '::error::codex_max_model_len must be an integer greater than the 16000-token Codex window' >&2
+            exit 1
+          fi
 
       - name: Start EC2 GPU runner
         id: start
@@ -2967,7 +2916,7 @@ jobs:
 
       - name: Log in to GHCR (docker)
         if: env.CONTAINER_RUNTIME == 'docker'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -3007,7 +2956,7 @@ jobs:
           hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       - name: Start PostgreSQL response store
         run: |
@@ -3035,7 +2984,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -3203,6 +3152,8 @@ jobs:
         env:
           QUALIFICATION_SETUP: ${{ steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' && steps.qualification_ogx_ready.outcome == 'success' && 'passed' || 'failed' }}
           GPU_INSTANCE_TYPE: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+          # Empty when resolve rejected the published image and it was built here.
+          VLLM_GPU_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           python3 .github/scripts/vllm_qualification.py capture \
             --responses "$RUNNER_TEMP/qualification-responses-cases.json" \
@@ -3350,9 +3301,13 @@ jobs:
       - vllm-gpu-codex-acceptance
       - vllm-gpu-opencode-acceptance
       - vllm-gpu-pi-acceptance
-    # Always tear down the instance, even on failure/cancel, but skip when the
-    # runner was never started (non-GPU triggers).
-    if: always() && needs.gpu-start-runner.result != 'skipped'
+    # A failed launch with no runner identifiers has nothing to stop.
+    # Keep partial outputs visible as cleanup errors.
+    if: >-
+      always() &&
+      (needs.gpu-start-runner.result == 'success' ||
+       needs.gpu-start-runner.outputs.ec2-instance-id != '' ||
+       needs.gpu-start-runner.outputs.label != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -3409,10 +3364,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every

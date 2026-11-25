@@ -9,6 +9,7 @@ on:
       - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
+      - "tests/integration/sdk/openai/*responses_acceptance*.py"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/openresponses-conformance.yaml"
@@ -24,6 +25,7 @@ on:
       - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
+      - "tests/integration/sdk/openai/*responses_acceptance*.py"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/openresponses-conformance.yaml"
@@ -68,6 +70,7 @@ jobs:
             'examples/configs/openai/responses/responses-to-chat-completions.yaml' \
             'tests/conformance/openresponses/' \
             'tests/integration/sdk/openai/test_responses_conformance.py' \
+            'tests/integration/sdk/openai/*responses_acceptance*.py' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
             '.github/workflows/openresponses-conformance.yaml' \
@@ -84,7 +87,9 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # A cold build took 18 minutes; CPU acceptance then passed in 3m39s,
+    # but the old 25-minute job cap cancelled post-job cache cleanup.
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -96,16 +101,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
       - name: Install bun (pinned)
-        run: |
-          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-            https://bun.sh/install | bash -s "bun-v1.3.12"
-          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+        uses: ./.github/actions/setup-openresponses-bun
 
       - name: Start vLLM
         uses: ./.github/actions/start-vllm
@@ -115,6 +117,13 @@ jobs:
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+
+      - name: Check full-suite runner and controlled HTTP acceptance
+        env:
+          PRAXIS_AI_BIN: target/debug/praxis-ai
+        run: |
+          uv run tests/integration/sdk/openai/test_responses_acceptance_runner.py
+          uv run tests/integration/sdk/openai/test_responses_acceptance_gateway.py -k 'not live_image'
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm

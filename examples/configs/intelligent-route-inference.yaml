@@ -19,6 +19,12 @@
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/intelligent-route-inference.yaml
 
+# Model inspection inherits both bounds. Raising only the buffer cap leaves
+# the default 10 MiB request transfer limit in place.
+body_limits:
+  max_request_bytes: 33554432 # 32 MiB
+  max_buffer_bytes: 33554432 # 32 MiB
+
 listeners:
   - name: proxy
     address: "0.0.0.0:8080"

@@ -7,14 +7,14 @@ use bytes::Bytes;
 use http::StatusCode;
 use praxis_core::time::FixedTimeSource;
 use praxis_filter::{
-    BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, SelectedUpstreamBodyOutcome,
-    SubRequestResponseMode,
+    BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, HttpFilterContext, Request,
+    SelectedUpstreamBodyOutcome, SubRequestResponseMode,
 };
 use serde_json::json;
 
 use super::{
-    ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM,
-    ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
+    Exchange, FiniteResponse, ResponseTranslation, ResponsesToChatCompletionsFilter, error::normalize_provider_error,
+    recorded_created_at, reject_incompatible_reasoning,
 };
 use crate::openai::{
     responses::{
@@ -24,12 +24,45 @@ use crate::openai::{
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
 
+/// A filter context with a filter ID, as in a pipeline.
+fn filter_context(request: &Request) -> HttpFilterContext<'_> {
+    let mut context = crate::test_utils::make_filter_context(request);
+    context.current_filter_id = Some(0);
+    context
+}
+
+/// The exchange state this filter keeps in `context`.
+fn exchange<'a>(context: &'a HttpFilterContext<'_>) -> &'a Exchange {
+    context.get_filter_state::<Exchange>().unwrap()
+}
+
+/// Record a translated request, as the selected-upstream hook does.
+fn arm(context: &mut HttpFilterContext<'_>) {
+    context.insert_filter_state(Exchange {
+        created_at: None,
+        response: None,
+    });
+}
+
+/// Record the Responses resource creation timestamp for an armed exchange.
+fn record_created_at(context: &mut HttpFilterContext<'_>, created_at: u64) {
+    context.get_filter_state_mut::<Exchange>().unwrap().created_at = Some(created_at);
+}
+
+/// Select a finite response translation for an armed exchange.
+fn respond_finite(context: &mut HttpFilterContext<'_>, finite: FiniteResponse) {
+    context.get_filter_state_mut::<Exchange>().unwrap().response = Some(ResponseTranslation::Finite(finite));
+}
+
 #[tokio::test]
 async fn budgeted_buffered_text_translates_with_shared_request_reservation() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
     state.messages = vec![json!({"role":"user","content":"hello"})].into();
     state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
@@ -51,8 +84,11 @@ async fn budgeted_buffered_text_translates_with_shared_request_reservation() {
 async fn budgeted_chat_preserves_high_cardinality_forwarded_parameters() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let extra = (0..100)
         .map(|index| (format!("key_{index}"), json!({})))
         .collect::<serde_json::Map<_, _>>();
@@ -79,8 +115,11 @@ async fn budgeted_chat_preserves_high_cardinality_forwarded_parameters() {
 async fn budgeted_chat_request_overflow_rejects_before_dispatch() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
     state.messages = vec![json!({"role":"user","content":"hello"})].into();
     state.simple_budget = SimpleBudget::new_with_store(4_096, 100, false);
@@ -98,16 +137,16 @@ async fn budgeted_chat_request_overflow_rejects_before_dispatch() {
     };
     assert_eq!(rejection.status, 413);
     assert_eq!(body.as_deref(), Some(original.as_ref()));
-    assert!(context.get_metadata(ARMED_KEY).is_none());
+    assert!(context.get_filter_state::<Exchange>().is_none());
 }
 
 #[test]
 fn budgeted_chat_response_overflow_rejects_before_json_parse() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata(RESPONSE_TRANSFORM_KEY, "success");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    respond_finite(&mut context, FiniteResponse::Success);
     let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
     state.simple_budget = SimpleBudget::new_with_store(65_536, 2_000, false);
     context.extensions.insert(state);
@@ -120,7 +159,45 @@ fn budgeted_chat_response_overflow_rejects_before_json_parse() {
     };
     assert_eq!(rejection.status, 502);
     assert!(body.is_none());
-    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(context.filter_metadata.get("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budgeted_finite_echo_reservation_counts_moved_out_input() {
+    // #1618 moved `input` out of `request_body`; the finite echo reservation must
+    // still count it, or a large input echo slips through unreserved. A tiny-param
+    // request with a large input and headroom that fits the params echo but not the
+    // input echo must reject.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    respond_finite(&mut context, FiniteResponse::Success);
+    let big_input: Vec<_> = (0..400)
+        .map(|i| json!({"role": "user", "content": format!("message {i} with some filler text to add bytes")}))
+        .collect();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": big_input, "store": false}));
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    // Headroom (limit - input_charge - response_reserve = 1M - 605K - 375K = 20K)
+    // comfortably covers the params echo + small response, but not the
+    // (params + input) * 4 echo projection the ~28 KB input adds (~112 KB).
+    state.simple_budget = SimpleBudget::new_with_store(1_000_000, 605_000, false);
+    assert!(state.simple_budget.is_some(), "budget params must be admissible");
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+    ));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the finite echo reservation must count the moved-out input and reject");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(body.is_none());
 }
 
 #[tokio::test]
@@ -128,12 +205,17 @@ async fn budgeted_chat_stream_rejects_partial_frame_before_retaining_it() {
     for headers_committed in [false, true] {
         let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-        let mut context = crate::test_utils::make_filter_context(&request);
-        context.current_filter_id = Some(0);
-        context.set_metadata(ARMED_KEY, "true");
-        context.set_metadata("openai_responses_format.stream", "true");
-        context.set_metadata("responses.response_id", "resp_stream_budget");
-        context.set_metadata(CREATED_AT_KEY, "1700000000");
+        let mut context = filter_context(&request);
+        arm(&mut context);
+        context
+            .filter_metadata
+            .insert("openai_responses_format.stream", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        context
+            .filter_metadata
+            .insert("responses.response_id", "resp_stream_budget")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        record_created_at(&mut context, 1_700_000_000);
         let mut state = ResponsesState::from_request_body(json!({
             "model": "m",
             "input": "hello",
@@ -195,14 +277,14 @@ async fn budgeted_chat_stream_rejects_partial_frame_before_retaining_it() {
         assert!(body.is_none(), "the provider frame must not reach the client");
         assert!(matches!(action, FilterAction::Continue));
         assert_eq!(
-            context.get_metadata("responses.stream_error_code"),
+            context.filter_metadata.get("responses.stream_error_code"),
             Some("server_error")
         );
         assert_eq!(
-            context.get_metadata("responses.stream_error_message"),
+            context.filter_metadata.get("responses.stream_error_message"),
             Some(super::CHAT_RESPONSE_OVERFLOW)
         );
-        assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+        assert_eq!(context.filter_metadata.get("responses.skip_persist"), Some("true"));
         assert_eq!(
             context.filter_results["openai_agentic_loop"].get("action"),
             Some("done")
@@ -220,12 +302,17 @@ async fn budgeted_chat_stream_rejects_partial_frame_before_retaining_it() {
 async fn budgeted_chat_stream_closes_after_many_small_deltas() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.current_filter_id = Some(0);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_format.stream", "true");
-    context.set_metadata("responses.response_id", "resp_many_deltas");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    context
+        .filter_metadata
+        .insert("openai_responses_format.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_many_deltas")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    record_created_at(&mut context, 1_700_000_000);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "m", "input": "hello", "stream": true, "store": false
     }));
@@ -255,7 +342,7 @@ async fn budgeted_chat_stream_closes_after_many_small_deltas() {
         filter.on_response_body(&mut context, &mut keepalive, false).unwrap(),
         FilterAction::Continue
     ));
-    assert_eq!(context.get_metadata("responses.stream_error_code"), None);
+    assert_eq!(context.filter_metadata.get("responses.stream_error_code"), None);
 
     let frame = format!(
         "data: {{\"id\":\"chatcmpl_many\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
@@ -267,7 +354,7 @@ async fn budgeted_chat_stream_closes_after_many_small_deltas() {
             filter.on_response_body(&mut context, &mut body, false).unwrap(),
             FilterAction::Continue
         ));
-        assert_ne!(context.get_metadata("responses.skip_persist"), Some("true"));
+        assert_ne!(context.filter_metadata.get("responses.skip_persist"), Some("true"));
     }
     let mut finish = Some(Bytes::from_static(
         b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -283,15 +370,15 @@ async fn budgeted_chat_stream_closes_after_many_small_deltas() {
     ));
     let translated = String::from_utf8(done.unwrap().to_vec()).unwrap();
     assert!(translated.contains("event: response.completed\n"), "{translated}");
-    assert_eq!(context.get_metadata("responses.stream_error_code"), None);
+    assert_eq!(context.filter_metadata.get("responses.stream_error_code"), None);
 }
 
 #[tokio::test]
 async fn budgeted_finite_chat_buffer_uses_listener_cap() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     context.extensions.insert(
         AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 1048576").unwrap()).unwrap(),
     );
@@ -315,7 +402,10 @@ fn default_config_parses() {
 
     assert_eq!(filter.name(), "openai_responses_to_chat_completions");
     assert_eq!(filter.request_body_access(), BodyAccess::None);
-    assert_eq!(filter.selected_upstream_request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(
+        filter.selected_upstream_request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
     assert!(
         matches!(
             filter.request_body_mode(),
@@ -335,7 +425,7 @@ fn default_config_parses() {
 async fn request_headers_wait_for_successful_classification() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
 
     let action = filter.on_request(&mut context).await.unwrap();
 
@@ -353,7 +443,7 @@ async fn request_headers_wait_for_successful_classification() {
 async fn non_create_request_continues_without_rewriting_or_arming() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::GET, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     let original = Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#);
     let mut body = Some(original.clone());
 
@@ -368,11 +458,11 @@ async fn non_create_request_continues_without_rewriting_or_arming() {
     );
     assert_eq!(body.as_deref(), Some(original.as_ref()));
     assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
+        context.get_filter_state::<Exchange>().is_none(),
         "non-create request must not arm response processing"
     );
     assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
+        recorded_created_at(&context).is_none(),
         "non-create request must not set created_at"
     );
 }
@@ -531,15 +621,21 @@ fn response_body_access_is_read_write() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
 
-    assert_eq!(filter.response_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[tokio::test]
 async fn classified_non_responses_request_continues_without_rewriting() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_chat_completions");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_chat_completions")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut body = Some(Bytes::from_static(br#"{"messages":[]}"#));
 
     let action = filter
@@ -557,7 +653,7 @@ async fn classified_non_responses_request_continues_without_rewriting() {
 async fn responses_create_without_classifier_metadata_fails_closed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello"}"#));
 
     let action = filter
@@ -572,8 +668,11 @@ async fn responses_create_without_classifier_metadata_fails_closed() {
 async fn classified_responses_create_without_state_fails_closed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello"}"#));
 
     let action = filter
@@ -588,7 +687,7 @@ async fn classified_responses_create_without_state_fails_closed() {
 async fn canonical_state_translates_across_iterative_metadata_boundary() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -609,14 +708,14 @@ async fn canonical_state_translates_across_iterative_metadata_boundary() {
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(translated["messages"][0]["content"], "hello");
     assert_eq!(translated["stream"], false);
-    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+    assert!(context.get_filter_state::<Exchange>().is_some());
 }
 
 #[tokio::test]
 async fn canonical_state_installs_stream_converter_across_iterative_metadata_boundary() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -649,17 +748,17 @@ async fn canonical_state_installs_stream_converter_across_iterative_metadata_bou
         matches!(response_action, FilterAction::Continue),
         "preserved canonical state must seed streaming translation across the metadata boundary"
     );
-    assert_eq!(
-        context.get_metadata(RESPONSE_TRANSFORM_KEY),
-        Some(RESPONSE_TRANSFORM_STREAM)
-    );
+    assert!(matches!(
+        exchange(&context).response,
+        Some(ResponseTranslation::Stream(Some(_)))
+    ));
 }
 
 #[tokio::test]
 async fn unvalidated_state_does_not_bypass_missing_classifier_metadata() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello"
@@ -672,16 +771,22 @@ async fn unvalidated_state_does_not_bypass_missing_classifier_metadata() {
         .unwrap();
 
     assert_server_error(action);
-    assert!(context.get_metadata(ARMED_KEY).is_none());
+    assert!(context.get_filter_state::<Exchange>().is_none());
 }
 
 #[tokio::test]
 async fn unresolved_previous_response_id_fails_closed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "false");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -706,11 +811,11 @@ async fn unresolved_previous_response_id_fails_closed() {
     assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
     assert_eq!(body.as_deref(), Some(original.as_ref()));
     assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
+        context.get_filter_state::<Exchange>().is_none(),
         "unresolved previous_response_id must not arm response processing"
     );
     assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
+        recorded_created_at(&context).is_none(),
         "unresolved previous_response_id must not set created_at"
     );
 }
@@ -719,9 +824,15 @@ async fn unresolved_previous_response_id_fails_closed() {
 async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "true");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -752,11 +863,11 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error(
     assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
     assert_eq!(body.as_deref(), Some(original.as_ref()));
     assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
+        context.get_filter_state::<Exchange>().is_none(),
         "unresolved streaming request must not arm response processing"
     );
     assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
+        recorded_created_at(&context).is_none(),
         "unresolved streaming request must not set created_at"
     );
 }
@@ -765,9 +876,15 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error(
 async fn streaming_responses_create_without_state_uses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "true");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello","stream":true}"#));
 
     let action = filter
@@ -803,10 +920,16 @@ async fn canonical_state_is_translated_and_arms_response() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "false");
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -843,8 +966,8 @@ async fn canonical_state_is_translated_and_arms_response() {
             .contains(&http::header::ACCEPT_ENCODING),
         "translation must strip accept-encoding to prevent opaque responses"
     );
-    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
-    assert_eq!(context.get_metadata(CREATED_AT_KEY), Some("1700000000"));
+    assert!(context.get_filter_state::<Exchange>().is_some());
+    assert_eq!(recorded_created_at(&context), Some(1_700_000_000));
     assert_eq!(
         context
             .extensions
@@ -873,8 +996,11 @@ async fn selected_subrequest_mode(config_yaml: &str, request_body: serde_json::V
     let config = serde_yaml::from_str(config_yaml).unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context
         .extensions
         .insert(ResponsesState::from_request_body(request_body.clone()));
@@ -888,7 +1014,10 @@ async fn selected_subrequest_mode(config_yaml: &str, request_body: serde_json::V
         matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "translation should continue"
     );
-    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"), "translation should arm");
+    assert!(
+        context.get_filter_state::<Exchange>().is_some(),
+        "translation should arm"
+    );
     context.subrequest_response_mode()
 }
 
@@ -953,8 +1082,11 @@ async fn malformed_responses_input_is_rejected_before_request_translation() {
     for (case, request_body, expected_message) in cases {
         let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-        let mut context = crate::test_utils::make_filter_context(&request);
-        context.set_metadata("openai_responses_request.format", "openai_responses");
+        let mut context = filter_context(&request);
+        context
+            .filter_metadata
+            .insert("openai_responses_request.format", "openai_responses")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         context
             .extensions
             .insert(ResponsesState::from_request_body(request_body.clone()));
@@ -979,7 +1111,7 @@ async fn malformed_responses_input_is_rejected_before_request_translation() {
             "{case} should not rewrite the body"
         );
         assert!(
-            context.get_metadata(ARMED_KEY).is_none(),
+            context.get_filter_state::<Exchange>().is_none(),
             "{case} must not arm response processing"
         );
     }
@@ -989,9 +1121,15 @@ async fn malformed_responses_input_is_rejected_before_request_translation() {
 async fn rehydrated_previous_response_id_translates_full_history() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "false");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "current input",
@@ -1037,7 +1175,7 @@ async fn rehydrated_previous_response_id_translates_full_history() {
         translated.get("previous_response_id").is_none(),
         "Responses-only field `previous_response_id` must be stripped from translated body"
     );
-    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+    assert!(context.get_filter_state::<Exchange>().is_some());
 }
 
 #[tokio::test]
@@ -1045,8 +1183,11 @@ async fn translated_request_over_configured_limit_is_rejected() {
     let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "x".repeat(1024),
@@ -1069,11 +1210,11 @@ async fn translated_request_over_configured_limit_is_rejected() {
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
     assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
+        context.get_filter_state::<Exchange>().is_none(),
         "oversized request must not arm response processing"
     );
     assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
+        recorded_created_at(&context).is_none(),
         "oversized request must not set created_at"
     );
 }
@@ -1082,8 +1223,11 @@ async fn translated_request_over_configured_limit_is_rejected() {
 async fn web_search_translation_preserves_canonical_hosted_tool_state() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1116,7 +1260,7 @@ async fn web_search_translation_preserves_canonical_hosted_tool_state() {
     let state = context.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.tools.as_slice(), request_body["tools"].as_array().unwrap());
     assert_eq!(state.tool_choice, request_body["tool_choice"]);
-    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+    assert!(context.get_filter_state::<Exchange>().is_some());
 }
 
 #[tokio::test]
@@ -1128,8 +1272,11 @@ async fn lowered_request_body_tools_translate_over_canonical_rich_tools() {
     // valid `function` tool instead of being rejected with `UnsupportedToolType`.
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1172,8 +1319,11 @@ async fn lowered_request_body_tool_choice_translates_over_canonical() {
     // must win over the canonical value so a lowered choice reaches the backend.
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1211,8 +1361,11 @@ async fn non_compat_state_translation_is_golden_unchanged() {
     // Chat request as reading canonical `state.tools`/`state.tool_choice` did before.
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1255,8 +1408,11 @@ async fn non_compat_state_translation_is_golden_unchanged() {
 async fn null_tool_choice_translates_as_absent() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1295,9 +1451,15 @@ async fn null_tool_choice_translates_as_absent() {
 async fn streaming_translation_error_uses_responses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "true");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1318,11 +1480,11 @@ async fn streaming_translation_error_uses_responses_json_error() {
     };
     assert_responses_json_translation_error(&rejection);
     assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
+        context.get_filter_state::<Exchange>().is_none(),
         "streaming translation error must not arm response processing"
     );
     assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
+        recorded_created_at(&context).is_none(),
         "streaming translation error must not set created_at"
     );
 }
@@ -1352,10 +1514,19 @@ async fn successful_sse_response_installs_stream_converter() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "true");
-    context.set_metadata("responses.response_id", "resp_stream");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_stream")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1407,10 +1578,13 @@ async fn streaming_success_without_response_id_fails_closed() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_request.stream", "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    record_created_at(&mut context, 1_700_000_000);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
@@ -1431,9 +1605,12 @@ async fn non_sse_success_for_streaming_request_is_rejected() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_request.stream", "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
@@ -1462,11 +1639,17 @@ async fn streaming_content_encoded_response_is_rejected() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_request.stream", "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
-    context.set_metadata("responses.response_id", "resp_stream");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    record_created_at(&mut context, 1_700_000_000);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_stream")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
@@ -1490,8 +1673,8 @@ async fn non_streaming_success_upgrades_to_bounded_buffer() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
@@ -1548,8 +1731,8 @@ async fn non_streaming_success_upgrades_to_bounded_buffer() {
 async fn encoded_success_is_rejected_before_response_headers_are_committed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response
         .headers
@@ -1574,8 +1757,8 @@ async fn encoded_success_is_rejected_before_response_headers_are_committed() {
 async fn partial_content_success_is_rejected_before_response_headers_are_committed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::PARTIAL_CONTENT;
     context.response_header = Some(response);
@@ -1597,8 +1780,8 @@ async fn non_ok_sse_response_fails_closed_instead_of_leaking_chat_framing() {
     // Responses client, so it must fail closed with a normalized error instead.
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::INTERNAL_SERVER_ERROR;
     response.headers.insert(
@@ -1626,8 +1809,8 @@ async fn sse_response_for_non_streaming_request_is_rejected() {
     // for.
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
@@ -1654,8 +1837,8 @@ async fn sse_response_for_non_streaming_request_is_rejected() {
 async fn redirect_response_is_not_treated_as_provider_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::TEMPORARY_REDIRECT;
     context.response_header = Some(response);
@@ -1671,7 +1854,7 @@ async fn redirect_response_is_not_treated_as_provider_error() {
         "a redirect response must not be buffered"
     );
     assert!(
-        context.get_metadata(RESPONSE_STATUS_KEY).is_none(),
+        exchange(&context).response.is_none(),
         "a redirect must not capture a response status for translation"
     );
     assert!(
@@ -1685,8 +1868,8 @@ async fn response_cleanup_without_headers_does_not_arm_body_processing() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
 
     let action = filter.on_response(&mut context).await.unwrap();
 
@@ -1699,7 +1882,7 @@ async fn response_cleanup_without_headers_does_not_arm_body_processing() {
         "cleanup without headers must leave the body in Stream mode"
     );
     assert!(
-        context.get_metadata(RESPONSE_STATUS_KEY).is_none(),
+        exchange(&context).response.is_none(),
         "cleanup without headers must not capture a response status"
     );
 }
@@ -1709,9 +1892,12 @@ async fn finite_json_error_for_streaming_request_upgrades_to_buffer() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata("openai_responses_request.stream", "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::BAD_REQUEST;
     response.headers.insert(
@@ -1740,8 +1926,8 @@ async fn sse_error_response_fails_closed() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::BAD_REQUEST;
     response.headers.insert(
@@ -1766,11 +1952,20 @@ async fn non_streaming_chat_response_becomes_response_resource() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "false");
-    context.set_metadata("responses.response_id", "resp_test_123");
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_test_123")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let request_value = json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -1840,11 +2035,76 @@ async fn non_streaming_chat_response_becomes_response_resource() {
 }
 
 #[tokio::test]
+async fn non_streaming_response_echoes_array_input_moved_out_of_request_body() {
+    // #1618 moves `input` out of `request_body` at state init, so the synthesized
+    // Responses resource must echo it from the shared history instead. Regression
+    // guard for the inference-fixture replay that caught an empty `input` echo.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = filter_context(&request);
+    context.time_source = &fixed_time;
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_echo_input")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    let input = json!([{"role": "user", "content": [{"type": "input_text", "text": "What is 2+2?"}]}]);
+    let request_value = json!({"model": "gpt-4.1-mini", "input": input, "stream": false});
+    let state = ResponsesState::from_request_body(request_value);
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1-mini", "input": input, "stream": false})).unwrap(),
+    ));
+    assert!(matches!(
+        filter
+            .on_selected_upstream_request_body(&mut context, &mut request_body)
+            .await
+            .unwrap(),
+        SelectedUpstreamBodyOutcome::Continue
+    ));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-4.1-mini","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["input"], input,
+        "the resource must echo the array input reconstructed from state, not an empty value"
+    );
+}
+
+#[tokio::test]
 async fn chat_file_search_function_call_becomes_responses_function_call() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.time_source = &fixed_time;
     let request_value = json!({
         "model": "chat-only-model",
@@ -1900,7 +2160,7 @@ async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.time_source = &fixed_time;
     let request_value = json!({
         "model": "chat-only-model",
@@ -1973,10 +2233,13 @@ async fn malformed_success_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
-    context.set_metadata("responses.response_id", "resp_test_123");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    record_created_at(&mut context, 1_700_000_000);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_test_123")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello"
@@ -2008,10 +2271,13 @@ async fn malformed_success_shape_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
-    context.set_metadata("responses.response_id", "resp_test_123");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    record_created_at(&mut context, 1_700_000_000);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_test_123")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello"
@@ -2041,10 +2307,13 @@ async fn multiple_choice_success_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
-    context.set_metadata("responses.response_id", "resp_test_123");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    record_created_at(&mut context, 1_700_000_000);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_test_123")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello"
@@ -2081,8 +2350,8 @@ async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::TOO_MANY_REQUESTS;
     response.headers.insert(
@@ -2141,12 +2410,42 @@ async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
 }
 
 #[tokio::test]
+async fn finite_provider_error_without_a_code_takes_it_from_the_captured_status() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::TOO_MANY_REQUESTS;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut body = Some(Bytes::from_static(br#"{"error":{"message":"slow down"}}"#));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        parsed["error"]["code"], "rate_limit_exceeded",
+        "the 429 seen with the headers names a code the provider left out"
+    );
+}
+
+#[tokio::test]
 async fn expanded_provider_error_falls_back_within_configured_limit() {
     let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
+    let mut context = filter_context(&request);
+    arm(&mut context);
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.status = StatusCode::BAD_REQUEST;
     response.headers.insert(
@@ -2191,10 +2490,13 @@ async fn oversized_translated_success_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
-    context.set_metadata("responses.response_id", "resp_test_123");
+    let mut context = filter_context(&request);
+    arm(&mut context);
+    record_created_at(&mut context, 1_700_000_000);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_test_123")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello"
@@ -2235,11 +2537,19 @@ async fn successful_sse_chunks_translate_to_responses_events() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.current_filter_id = Some(0);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "true");
-    context.set_metadata("responses.response_id", "resp_stream");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_stream")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
@@ -2324,9 +2634,9 @@ async fn successful_sse_chunks_translate_to_responses_events() {
         text.contains("event: response.completed\n"),
         "translated stream must end with response.completed: {text}"
     );
-    // The message item id follows the finite convention.
+    // The message item id follows the finite convention (response + chat id).
     assert!(
-        text.contains("\"item_id\":\"msg_resp_stream\""),
+        text.contains("\"item_id\":\"msg_resp_stream_chatcmpl_1\""),
         "translated message item id must follow the finite convention: {text}"
     );
 
@@ -2435,12 +2745,18 @@ fn unknown_reasoning_config_key_is_rejected() {
 }
 
 #[tokio::test]
-async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary() {
+async fn reasoning_summary_auto_request_is_accepted_as_best_effort() {
+    // Codex CLI >= 0.166.0 sends `reasoning.summary: "auto"` for every model,
+    // so the translated route must accept it; the backend without a
+    // safe-summary contract simply produces no summary items.
     let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "deepseek-r1",
         "input": "hello",
@@ -2455,6 +2771,36 @@ async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary(
         .await
         .unwrap();
 
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "auto summary is a best-effort request and must translate"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_summary_explicit_value_is_rejected_for_dialect_without_safe_summary() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = filter_context(&request);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "deepseek-r1",
+        "input": "hello",
+        "reasoning": {"summary": "concise"}
+    })));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"deepseek-r1","input":"hello","reasoning":{"summary":"concise"}}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
     let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
@@ -2462,7 +2808,7 @@ async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary(
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
     assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
+        context.get_filter_state::<Exchange>().is_none(),
         "summary rejection must not arm response processing"
     );
 }
@@ -2473,11 +2819,20 @@ async fn vllm_reasoning_content_is_extracted_end_to_end() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata("openai_responses_request.format", "openai_responses");
-    context.set_metadata("openai_responses_request.stream", "false");
-    context.set_metadata("responses.response_id", "resp_reasoning_1");
+    context
+        .filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_reasoning_1")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let request_value = json!({
         "model": "deepseek-r1",
         "input": "hello",
@@ -2533,11 +2888,14 @@ async fn default_dialect_leaves_reasoning_content_unextracted() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
-    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut context = filter_context(&request);
     context.time_source = &fixed_time;
-    context.set_metadata(ARMED_KEY, "true");
-    context.set_metadata(CREATED_AT_KEY, "1700000000");
-    context.set_metadata("responses.response_id", "resp_plain_1");
+    arm(&mut context);
+    record_created_at(&mut context, 1_700_000_000);
+    context
+        .filter_metadata
+        .insert("responses.response_id", "resp_plain_1")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     context.extensions.insert(ResponsesState::from_request_body(json!({
         "model": "deepseek-r1",
         "input": "hello"
@@ -2567,7 +2925,6 @@ async fn default_dialect_leaves_reasoning_content_unextracted() {
     assert!(output.iter().all(|item| item["type"] != "reasoning"));
 }
 
-
 #[test]
 fn translated_late_reasoning_tracks_each_round_in_request_state() {
     use std::fmt::Write as _;
@@ -2575,20 +2932,19 @@ fn translated_late_reasoning_tracks_each_round_in_request_state() {
     let config: super::config::ResponsesToChatCompletionsConfig =
         serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut context = crate::test_utils::make_filter_context(&request);
-    context.current_filter_id = Some(0);
+    let mut context = filter_context(&request);
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hello", "stream": true}));
     state
         .accumulated_output
         .push(json!({"type": "message", "role": "assistant", "content": "earlier turn"}));
     context.extensions.insert(state);
     for _ in 0..2 {
-        context.insert_filter_state(super::stream::StreamConverter::new(
-            "resp_shared".to_owned(),
-            0,
-            config.stream_limits(),
-            config.reasoning,
-        ));
+        let converter =
+            super::stream::StreamConverter::new("resp_shared".to_owned(), 0, config.stream_limits(), config.reasoning);
+        context.insert_filter_state(Exchange {
+            created_at: None,
+            response: Some(ResponseTranslation::Stream(Some(Box::new(converter)))),
+        });
         let mut provider = String::new();
         for delta in [
             json!({"content": "answer"}),
@@ -2638,4 +2994,41 @@ fn translated_late_reasoning_tracks_each_round_in_request_state() {
             .translated_reasoning_replay,
         [1..=2, 4..=5]
     );
+}
+
+#[tokio::test]
+async fn access_programs_is_rejected_before_chat_translation() {
+    for selection in [
+        json!({}),
+        json!({"cyber": "standard"}),
+        json!({"cyber": "daybreak_blue"}),
+        json!({"cyber": "daybreak_red"}),
+        json!(null),
+    ] {
+        let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut context = filter_context(&request);
+        context
+            .filter_metadata
+            .insert("openai_responses_request.format", "openai_responses")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        let request_body = json!({"model": "m", "input": "hello", "access_programs": selection});
+        let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+        context
+            .extensions
+            .insert(ResponsesState::from_request_body(request_body));
+        let action = filter
+            .on_selected_upstream_request_body(&mut context, &mut body)
+            .await
+            .unwrap();
+        let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
+            panic!("expected access_programs rejection");
+        };
+        assert_eq!(rejection.status, 400);
+        let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["code"], "invalid_request_error");
+        assert!(error["error"]["message"].as_str().unwrap().contains("access_programs"));
+        assert!(context.get_filter_state::<Exchange>().is_none());
+    }
 }

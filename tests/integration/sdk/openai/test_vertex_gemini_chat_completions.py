@@ -179,6 +179,8 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             response["candidates"][0]["content"]["parts"].append(
                 {"thoughtSignature": "sig-only"}
             )
+        if "trigger cached usage" in user_text.lower():
+            response["usageMetadata"]["cachedContentTokenCount"] = 8
         self._send_json_response(200, response)
 
     def _handle_streaming(self, request_json: dict[str, Any]) -> None:
@@ -212,6 +214,8 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             if "trigger missing stream response id" in user_text.lower():
                 for chunk in chunks:
                     chunk.pop("responseId", None)
+            if "trigger cached usage" in user_text.lower():
+                chunks[-1]["usageMetadata"]["cachedContentTokenCount"] = 8
             if "trigger text metadata" in user_text.lower():
                 chunks[0]["candidates"][0]["content"]["parts"][0]["thought"] = False
                 chunks[-1]["candidates"][0]["content"]["parts"].append(
@@ -527,6 +531,24 @@ class TestVertexGeminiChatCompletions:
         assert exc_info.value.status_code == 400
         assert FakeVertexGeminiHandler.last_request_body is None
 
+    def test_non_string_text_part_is_rejected_before_vertex(self, openai_client: OpenAI) -> None:
+        """A malformed text part is rejected, not silently dropped from the request."""
+        FakeVertexGeminiHandler.last_request_body = None
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": None}],  # type: ignore[typeddict-item]
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            )
+        assert exc_info.value.status_code == 400
+        assert "assistant text part is missing" in exc_info.value.message
+        assert FakeVertexGeminiHandler.last_request_body is None
+
     def test_non_streaming_basic(self, openai_client: OpenAI) -> None:
         """Non-streaming request translates correctly and response is OpenAI-shaped."""
         response = openai_client.chat.completions.create(
@@ -777,6 +799,47 @@ class TestVertexGeminiChatCompletions:
         # Verify finish_reason on final chunk
         final_chunk = chunks[-1]
         assert final_chunk.choices[0].finish_reason == "stop", "Final chunk should have finish_reason"
+
+    def test_cached_usage_maps_to_cached_tokens(self, openai_client: OpenAI) -> None:
+        """cachedContentTokenCount surfaces as prompt_tokens_details.cached_tokens."""
+        response = openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "Trigger cached usage"}],
+        )
+
+        assert response.usage is not None
+        assert response.usage.prompt_tokens == 10
+        assert response.usage.total_tokens == 15
+        assert response.usage.prompt_tokens_details is not None
+        assert response.usage.prompt_tokens_details.cached_tokens == 8
+
+    def test_uncached_usage_omits_prompt_tokens_details(self, openai_client: OpenAI) -> None:
+        """Usage without cachedContentTokenCount carries no cached-token details."""
+        response = openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+
+        assert response.usage is not None
+        assert response.usage.prompt_tokens == 10
+        assert response.usage.prompt_tokens_details is None
+
+    def test_streaming_cached_usage_maps_to_cached_tokens(self, openai_client: OpenAI) -> None:
+        """The trailing include_usage chunk carries cached_tokens."""
+        with openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "Trigger cached usage"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        ) as stream:
+            chunks = list(stream)
+
+        usage_chunk = chunks[-1]
+        assert usage_chunk.choices == []
+        assert usage_chunk.usage is not None
+        assert usage_chunk.usage.prompt_tokens == 10
+        assert usage_chunk.usage.prompt_tokens_details is not None
+        assert usage_chunk.usage.prompt_tokens_details.cached_tokens == 8
 
     def test_truncated_stream_raises_after_preserving_valid_data(self, openai_client: OpenAI) -> None:
         """A clean EOF without finishReason is an SDK-visible failure."""

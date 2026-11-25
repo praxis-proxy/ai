@@ -20,8 +20,8 @@ use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
     types::{
-        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, ConversationSnapshot, EventLogStatus,
+        PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -71,6 +71,23 @@ impl OwnerScopedStore {
     /// Returns a store error when the backend query fails.
     pub async fn get_response(&self, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         self.store.get_response(&self.owner, id).await
+    }
+
+    /// Replace a response's stored object while it still matches
+    /// `expected_response_object`, for this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if serialization or the database operation fails.
+    pub async fn compare_and_swap_response_object(
+        &self,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        self.store
+            .compare_and_swap_response_object(&self.owner, id, expected_response_object, response_object)
+            .await
     }
 
     /// Fetch a response within a caller-supplied payload ceiling.
@@ -292,6 +309,23 @@ impl OwnerScopedStore {
         self.store.upsert_conversation(record).await
     }
 
+    /// Atomically create a conversation and items within this owner's scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner mismatch or the backend persistence error.
+    pub async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store.create_conversation_with_items(record, items).await
+    }
+
     /// Update only this owner's conversation message cache.
     ///
     /// # Errors
@@ -491,6 +525,21 @@ impl OwnerScopedStore {
         }
         self.store
             .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_append_charge_bytes)
+            .await
+    }
+
+    /// Delete an item and return the conversation snapshot under the same lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn delete_item_and_get_conversation(
+        &self,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
+        self.store
+            .delete_item_and_get_conversation(&self.owner, conversation_id, item_id)
             .await
     }
 

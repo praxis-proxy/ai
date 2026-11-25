@@ -165,9 +165,9 @@ fn text_path_emits_canonical_sequence() {
         assert_eq!(payload["sequence_number"], index as u64, "sequence number at {index}");
     }
 
-    // Stable message item id follows the finite convention.
+    // Stable message item id follows the finite convention (response + chat id).
     let added = &events[2].1;
-    assert_eq!(added["item"]["id"], "msg_resp_test");
+    assert_eq!(added["item"]["id"], "msg_resp_test_chatcmpl_1");
     assert_eq!(added["output_index"], 0);
 
     // Accumulated text and logprobs.
@@ -248,8 +248,13 @@ fn arbitrary_byte_splits_produce_identical_events() {
     }
     finish(&mut conv, &body, &mut raw);
 
-    let split = parse_events(&raw);
-    let whole = run_stream(&chunks, wide_limits());
+    let mut split = parse_events(&raw);
+    let mut whole = run_stream(&chunks, wide_limits());
+    for (_, payload) in split.iter_mut().chain(&mut whole) {
+        if let Some(padding) = payload.get_mut("obfuscation") {
+            *padding = json!(padding.as_str().unwrap().len());
+        }
+    }
     assert_eq!(split, whole);
 }
 
@@ -815,7 +820,7 @@ fn malformed_tool_after_partial_output_fails_with_empty_snapshot() {
         }
     }
     assert_eq!(
-        announced.get("msg_resp_test"),
+        announced.get("msg_resp_test_c1"),
         Some(&0),
         "the message claims output index 0 because the unidentified tool call never emits an item",
     );
@@ -927,7 +932,11 @@ fn tool_first_then_text_keeps_output_index_consistent() {
         }
     }
     assert_eq!(announced.get("fc_call_1"), Some(&0), "tool call streamed at index 0");
-    assert_eq!(announced.get("msg_resp_test"), Some(&1), "message streamed at index 1");
+    assert_eq!(
+        announced.get("msg_resp_test_c1"),
+        Some(&1),
+        "message streamed at index 1"
+    );
 
     let output = events.last().unwrap().1["response"]["output"]
         .as_array()
@@ -1412,6 +1421,28 @@ fn empty_callback_after_terminal_is_tolerated() {
         .push(b"", &inputs)
         .expect("an empty trailing callback must be tolerated");
     assert!(result.is_none(), "an empty trailing callback must emit nothing");
+}
+
+#[test]
+fn delta_padding_counts_toward_the_emitted_frame_limit() {
+    let event = || events::function_call_arguments_delta("call_1", 0, "{}");
+    let mut emit = converter(wide_limits()).emit;
+    let mut unpadded = Vec::new();
+    events::encode(event(), 0, false, &mut unpadded).unwrap();
+    let limits = StreamLimits {
+        max_emitted_sse_frame_bytes: unpadded.len(),
+        ..wide_limits()
+    };
+    let mut out = Vec::new();
+    assert!(matches!(
+        emit_event(&mut emit, &limits, true, event(), &mut out),
+        Err(ConvertError::FrameSizeLimit)
+    ));
+    assert!(out.is_empty());
+    assert_eq!(emit.sequence_number, 0);
+    emit.include_obfuscation = false;
+    emit_event(&mut emit, &limits, true, event(), &mut out).unwrap();
+    assert_eq!(out, unpadded);
 }
 
 #[test]
@@ -3208,7 +3239,6 @@ fn reasoning_stream_with_no_raw_reasoning_only_emits_the_answer() {
     assert!(!events.iter().any(|(name, _)| name.contains("reasoning")));
 }
 
-
 #[test]
 fn late_reasoning_replay_position_is_published_once_only_after_success() {
     for finish_reason in ["stop", "tool_calls", "length", "content_filter"] {
@@ -3257,4 +3287,90 @@ fn late_reasoning_replay_position_is_published_once_only_after_success() {
     );
     assert_eq!(parse_events(&raw).last().unwrap().0, "response.failed");
     assert_eq!(conv.take_replay_reasoning_index(), None);
+}
+
+#[test]
+fn streaming_heartbeats_do_not_rebuild_input_echo() {
+    // #1618: `input` moved out of `request_body`; the converter reconstructs the
+    // echo once (`ensure_echoed_input`) rather than on every SSE callback. Many
+    // heartbeat comments must therefore not reallocate the large input echo.
+    let big_input: Vec<_> = (0..400)
+        .map(|i| json!({"role": "user", "content": format!("message {i} with some filler text to add bytes")}))
+        .collect();
+    let state = ResponsesState::from_request_body(json!({"model": "m", "input": big_input}));
+    let input_bytes = serde_json::to_vec(&state.input).unwrap().len();
+    assert!(input_bytes > 20_000, "test needs a large input to be meaningful");
+
+    let mut conv = converter(wide_limits());
+    conv.ensure_echoed_input(&state); // one-time reconstruction, outside the measured region
+    let params_body = state.request_body.clone(); // input-stripped params, as production sees
+
+    let info = allocation_counter::measure(|| {
+        let mut raw = Vec::new();
+        for _ in 0..200 {
+            push(&mut conv, &params_body, b": ping\n\n", &mut raw);
+        }
+        std::hint::black_box(&raw);
+    });
+
+    assert!(
+        info.bytes_total < input_bytes as u64,
+        "200 heartbeat callbacks must not rebuild the {input_bytes}-byte input echo (allocated {} bytes)",
+        info.bytes_total
+    );
+}
+
+#[test]
+fn streaming_echoes_input_reconstructed_from_state() {
+    // #1618: input moved out of request_body; streaming lifecycle resources echo it
+    // from the converter's state-reconstructed copy, not from request_body.
+    let input = json!([{"role": "user", "content": [{"type": "input_text", "text": "hi there"}]}]);
+    let state = ResponsesState::from_request_body(json!({"model": "m", "input": input, "stream": true}));
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    let params_body = state.request_body.clone();
+
+    let mut conv = converter(wide_limits());
+    conv.ensure_echoed_input(&state);
+    let mut raw = Vec::new();
+    push(
+        &mut conv,
+        &params_body,
+        &provider_stream(&[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        ]),
+        &mut raw,
+    );
+    finish(&mut conv, &params_body, &mut raw);
+
+    let events = parse_events(&raw);
+    let mut checked = 0;
+    for (name, payload) in &events {
+        if name == "response.created" || name == "response.completed" {
+            assert_eq!(
+                payload["response"]["input"], input,
+                "{name} must echo the input reconstructed from state"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 2,
+        "both response.created and response.completed must be present and checked"
+    );
+}
+
+#[test]
+fn logprobs_accounting_counts_escaped_unicode_without_allocating_output() {
+    let value = json!([{"token": "é 東京\n\t\"\\\u{0000}".repeat(65_536), "logprob": -0.1}]);
+    let expected = serde_json::to_vec(&value).unwrap().len();
+    let allocations = allocation_counter::measure(|| {
+        assert_eq!(logprobs_byte_cost(&value), expected);
+    });
+    assert_eq!(allocations.bytes_total, 0, "{allocations:?}");
+    assert_eq!(logprobs_byte_cost(&json!([])), 0);
+    assert_eq!(logprobs_byte_cost(&Value::Null), 0);
 }

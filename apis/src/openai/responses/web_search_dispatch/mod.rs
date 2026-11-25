@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, Rejection, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -53,12 +53,18 @@ use super::{
     },
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     callout_policy::MISSING_CALLOUT_CONTEXT,
+    json_body::MAX_JSON_BODY_BYTES,
     web_search::{
         CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
-        SearchQueryValidation, SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results,
-        is_web_search_tool_type, provider::MAX_SEARCH_RESPONSE_BYTES, validate_search_query,
+        SearchQueryValidation, SearchResult, build_config,
+        config::MAX_CALLS_PER_ROUND,
+        domains::{DomainFilters, DomainList},
+        format_search_results, is_web_search_tool_type,
+        provider::MAX_SEARCH_RESPONSE_BYTES,
+        validate_search_query,
     },
 };
 
@@ -75,6 +81,33 @@ const MAX_QUERY_METADATA: &str = "responses.web_search_max_query_bytes";
 
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
+
+/// Maximum entries accepted in one `filters.allowed_domains` or
+/// `filters.blocked_domains` list.
+///
+/// Matches the hosted OpenAI limit per list and bounds the per-result matching
+/// work a client can request. The protocol-neutral
+/// [`crate::web_search::domains::DomainList`] itself accepts any length.
+const MAX_DOMAINS_PER_LIST: usize = 100;
+
+/// One client-declared web-search `filters` domain list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DomainField {
+    /// `filters.allowed_domains`: only these hosts and their subdomains are permitted.
+    Allowed,
+    /// `filters.blocked_domains`: these hosts and their subdomains are never permitted.
+    Blocked,
+}
+
+impl DomainField {
+    /// The JSON member name, used in client-facing messages.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed_domains",
+            Self::Blocked => "blocked_domains",
+        }
+    }
+}
 
 /// Server-side hard cap on search queries dispatched in one continuation.
 ///
@@ -129,6 +162,30 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// cross-cutting filters (headers, credentials, logging) on the callout; when
 /// omitted it defaults to an empty inline chain (pure passthrough), so the
 /// central protections still apply.
+///
+/// A client's web-search `filters.allowed_domains` and `filters.blocked_domains`
+/// are enforced by the proxy on every provider result, so a result outside the
+/// allow-list (or under a blocked domain) never reaches the model or
+/// `action.sources`. Malformed, unsupported, or conflicting `filters` are
+/// rejected with HTTP 400 before the first inference round whenever the
+/// request's `tool_choice` leaves a web-search tool eligible; a request that
+/// forbids every hosted search with `"none"` is not validated because no search
+/// can run. `filters` is accepted on every web-search tool type this filter
+/// executes, including the `web_search_preview` variants whose pinned schema
+/// does not declare it.
+///
+/// Domain handling matches hosted OpenAI where hosted documents it: each list
+/// accepts up to 100 bare domains (no scheme), both match subdomains, and an
+/// absent, null, or empty list restricts nothing. A wildcard entry such as
+/// `*.example.org` (including percent-encoded spellings) and an entry with an
+/// empty label are rejected rather than stored literally, and while either list
+/// is active a result whose URL is not an absolute `http`/`https` URL with a
+/// verifiable host is dropped. Hosted does not document how the two lists
+/// combine; dispatch applies the allow-list and then removes blocked domains,
+/// so a host matching both is blocked. Requests whose web-search tools declare
+/// different `filters` are rejected because dispatch applies one filter to
+/// every search in the request; hosted behavior for that disagreement is
+/// undocumented.
 ///
 /// # YAML
 ///
@@ -324,7 +381,7 @@ impl WebSearchDispatchFilter {
         ctx: &mut HttpFilterContext<'_>,
         prepared: PreparedCall<'_>,
         context_size: SearchContextSize,
-        country: Option<&str>,
+        scope: SearchScope<'_>,
         identity: &CalloutIdentity,
         query_cap: usize,
     ) -> usize {
@@ -359,13 +416,19 @@ impl WebSearchDispatchFilter {
                     callout,
                     query,
                     Some(context_size),
-                    country,
+                    scope.country,
                     identity,
                     response_limit,
                 )
                 .await
             {
-                SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
+                SearchOutcome::Results(mut query_results) => {
+                    // Providers cannot be trusted to honor a domain restriction, so
+                    // enforce it here before a result reaches the model or the
+                    // public `action.sources` (issue #1768).
+                    query_results.retain(|result| scope.domain_filters.permits_url(&result.url));
+                    results.append(&mut query_results);
+                },
                 SearchOutcome::RetainedLimitExceeded => {
                     record_web_search_budget_failure(ctx);
                     return dispatched;
@@ -564,7 +627,7 @@ impl WebSearchDispatchFilter {
                 continue;
             };
             let dispatched = self
-                .execute_single_search(ctx, prepared, batch.context_size, batch.country, &identity, query_cap)
+                .execute_single_search(ctx, prepared, batch.context_size, batch.scope, &identity, query_cap)
                 .await;
             if dispatched > 0 {
                 calls_dispatched = calls_dispatched.saturating_add(1);
@@ -603,7 +666,7 @@ impl HttpFilter for WebSearchDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -616,7 +679,7 @@ impl HttpFilter for WebSearchDispatchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -640,21 +703,24 @@ impl HttpFilter for WebSearchDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
-        ctx.set_metadata(MAX_QUERY_METADATA, self.max_query_bytes.to_string());
+        ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        ctx.record_ai_metadata(MAX_QUERY_METADATA, self.max_query_bytes.to_string());
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
 
-        // Round-0 location preflight. The canonical web-search state preserves the
-        // full `user_location`, but the dispatcher only forwards a supported ISO
-        // `country` to the provider. Reject unsupported location use explicitly
-        // rather than silently changing location-sensitive search semantics by
-        // dropping fields the provider cannot honor (issue #1548).
+        // Round-0 location and domain-filter preflight. The canonical web-search
+        // state preserves the full `user_location` and `filters`, but the dispatcher
+        // only forwards a supported ISO `country` and enforces `allowed_domains`
+        // and `blocked_domains`. Reject anything else explicitly rather than
+        // silently changing search semantics by dropping constraints dispatch
+        // cannot honor (issues #1548, #1768).
         if is_initial_request(ctx)
             && request_declares_eligible_web_search(state)
-            && let Err(rejection) = self.preflight_location_support(state)
+            && let Err(rejection) = self
+                .preflight_location_support(state)
+                .and_then(|()| preflight_domain_filters(state))
         {
             return Ok(FilterAction::Reject(rejection));
         }
@@ -682,7 +748,8 @@ impl HttpFilter for WebSearchDispatchFilter {
             .max_tool_calls
             .map(|_| current_round_tool_call_admissions(state, &selected_values));
         let context_size = ctx
-            .get_metadata("tool_parse.search_context_size")
+            .filter_metadata
+            .get("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
@@ -691,6 +758,10 @@ impl HttpFilter for WebSearchDispatchFilter {
         // takes a mutable borrow of state would otherwise conflict. The code is a
         // short alpha-2 string, so this owns the minimum needed across the boundary.
         let country: Option<String> = web_search_country_from_state(state).map(str::to_owned);
+        // Own the domain filters for the same reason. The round-0 preflight
+        // already rejected an unenforceable filter; should one still reach
+        // re-entry, fail closed by permitting no result rather than dropping it.
+        let domain_filters = web_search_domain_filters_from_state(state).unwrap_or(DomainFilters::DenyAll);
 
         // Only the ID and action fields need an async local owner while the
         // canonical full items stay in accumulated_output.
@@ -756,7 +827,10 @@ impl HttpFilter for WebSearchDispatchFilter {
                     call_budget,
                     query_budget: MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION,
                     context_size,
-                    country: country.as_deref(),
+                    scope: SearchScope {
+                        country: country.as_deref(),
+                        domain_filters: &domain_filters,
+                    },
                 },
             )
             .await;
@@ -777,7 +851,7 @@ impl HttpFilter for WebSearchDispatchFilter {
 /// Return the response fan-out cap this dispatcher published for the owner.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+    ctx.filter_metadata.get(MAX_CALLS_METADATA)?.parse().ok()
 }
 
 /// Replace the action of a model-streamed `web_search_call` that can never
@@ -794,7 +868,8 @@ pub(crate) fn bound_streamed_search_action(ctx: &HttpFilterContext<'_>, item: &m
         return;
     }
     let Some(max_query_bytes) = ctx
-        .get_metadata(MAX_QUERY_METADATA)
+        .filter_metadata
+        .get(MAX_QUERY_METADATA)
         .and_then(|value| value.parse::<usize>().ok())
     else {
         return;
@@ -938,7 +1013,7 @@ fn tool_search_is_client_executed(tool: &Value) -> bool {
 fn mcp_function_membership(
     mcp_tool_map: &std::collections::HashMap<(String, String), Value>,
 ) -> impl Fn(&str) -> bool + '_ {
-    let index = super::mcp_tool_resolve::McpToolIndex::new(mcp_tool_map);
+    let index = crate::mcp_core::naming::McpToolIndex::new(mcp_tool_map);
     move |name: &str| index.contains(name)
 }
 
@@ -1015,9 +1090,19 @@ struct PendingSearchBatch<'a> {
     query_budget: usize,
     /// Search result size requested for this response.
     context_size: SearchContextSize,
+    /// Request-wide constraints applied to every search in the batch.
+    scope: SearchScope<'a>,
+}
+
+/// Request-wide constraints the client declared on its web-search tools.
+#[derive(Clone, Copy)]
+struct SearchScope<'a> {
     /// Supported ISO country code forwarded to the provider, when the request's
     /// `user_location` set one (issue #1548). `None` leaves location unset.
     country: Option<&'a str>,
+    /// Domain filters enforced on every provider result (issue #1768).
+    /// [`DomainFilters::Unrestricted`] permits every result.
+    domain_filters: &'a DomainFilters,
 }
 
 /// Public and bridge identifiers for one appended web-search result.
@@ -1226,29 +1311,13 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     })
 }
 
-/// Recover the first web-search tool's `user_location` object from request state.
-///
-/// The canonical state preserves the full `user_location` the client sent; the
-/// dispatcher and preflight read it from here after IRR resets step-local
-/// metadata.
-fn web_search_user_location_from_state(state: &ResponsesState) -> Option<&Value> {
-    state.tools.iter().find_map(|tool| {
-        let tool_type = tool.get("type").and_then(Value::as_str)?;
-        if is_web_search_tool_type(tool_type) {
-            tool.get("user_location")
-        } else {
-            None
-        }
-    })
-}
-
 /// Every web-search tool's `user_location` object from request state, in
 /// declaration order.
 ///
 /// A request may declare more than one web-search tool, so the round-0 preflight
-/// inspects them all rather than only the first — an unsupported field or a
-/// conflicting country on a later tool must not slip past
-/// [`web_search_user_location_from_state`]'s first-match lookup.
+/// and outbound country pick inspect them all rather than only the first — an
+/// unsupported field or a conflicting country on a later tool must not slip
+/// past, and an earlier unset location must not hide a later country.
 fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator<Item = &Value> {
     state.tools.iter().filter_map(|tool| {
         let tool_type = tool.get("type").and_then(Value::as_str)?;
@@ -1258,16 +1327,112 @@ fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator
     })
 }
 
-/// Extract the supported ISO `country` code from the request's `user_location`.
+/// Extract the supported ISO `country` code to forward from web-search tools.
 ///
-/// Only `country` is forwarded to providers (issue #1548); the round-0 preflight
-/// already rejected any unsupported field, so a value returned here is known to
-/// be provider-supported. A null or empty `country` is a canonical "unset".
+/// Only `country` is forwarded to providers; the round-0 preflight already
+/// rejected any unsupported field and any *conflicting* countries, so a value
+/// returned here is known to be provider-supported. Walk every web-search tool
+/// the same way preflight does: a null `user_location`, a missing/null/empty
+/// `country`, or a non-object location is unset and must not hide a later
+/// tool's real country.
 fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
-    web_search_user_location_from_state(state)?
-        .get("country")
-        .and_then(Value::as_str)
-        .filter(|country| !country.is_empty())
+    web_search_user_locations_from_state(state).find_map(|user_location| {
+        user_location
+            .get("country")
+            .and_then(Value::as_str)
+            .filter(|country| !country.is_empty())
+    })
+}
+
+/// Fail closed with a 400 when the initial request declares web-search `filters`
+/// dispatch cannot enforce (issue #1768).
+fn preflight_domain_filters(state: &ResponsesState) -> Result<(), Rejection> {
+    web_search_domain_filters_from_state(state).map(drop)
+}
+
+/// Resolve the domain filters every declared web-search tool agrees on.
+///
+/// A model's `web_search_call` cannot be attributed to one declared tool, so
+/// tools that declare different filters — including one restricted tool next
+/// to an unrestricted one — are rejected rather than silently widened to the
+/// least restrictive declaration (issue #1768).
+fn web_search_domain_filters_from_state(state: &ResponsesState) -> Result<DomainFilters, Rejection> {
+    let mut tools = state.tools.iter().filter(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    });
+    let Some(first) = tools.next() else {
+        return Ok(DomainFilters::Unrestricted);
+    };
+    let filters = tool_domain_filters(first)?;
+    for tool in tools {
+        if tool_domain_filters(tool)? != filters {
+            return Err(invalid_filters(
+                "web-search tools declare conflicting filters; \
+                 dispatch applies a single domain filter, so declare the same filters on every tool.",
+            ));
+        }
+    }
+    Ok(filters)
+}
+
+/// Parse one web-search tool's `filters`, rejecting members dispatch cannot enforce.
+///
+/// Rejection messages never echo client-supplied keys or values.
+fn tool_domain_filters(tool: &Value) -> Result<DomainFilters, Rejection> {
+    let filters = match tool.get("filters") {
+        None | Some(Value::Null) => return Ok(DomainFilters::Unrestricted),
+        Some(Value::Object(filters)) => filters,
+        Some(_) => return Err(invalid_filters("web search filters must be an object or null.")),
+    };
+    if filters
+        .keys()
+        .any(|key| !matches!(key.as_str(), "allowed_domains" | "blocked_domains"))
+    {
+        return Err(responses_error_rejection_with_code(
+            400,
+            "invalid_request_error",
+            "unsupported_parameter",
+            "web search filters support only allowed_domains and blocked_domains.",
+        ));
+    }
+    let allowed = domain_list(filters.get("allowed_domains"), DomainField::Allowed)?;
+    let blocked = domain_list(filters.get("blocked_domains"), DomainField::Blocked)?;
+    Ok(DomainFilters::new(allowed, blocked))
+}
+
+/// Parse one `filters` domain list from its JSON member.
+///
+/// This adapter owns the hosted entry cap and the client-facing message; the
+/// shared [`DomainList`] owns host parsing and matching.
+fn domain_list(value: Option<&Value>, field: DomainField) -> Result<Option<DomainList>, Rejection> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(entries)) if entries.iter().all(Value::is_string) => {
+            if entries.len() > MAX_DOMAINS_PER_LIST {
+                return Err(invalid_filters(&format!(
+                    "filters.{} accepts at most {MAX_DOMAINS_PER_LIST} domains.",
+                    field.as_str()
+                )));
+            }
+            DomainList::parse(entries.iter().filter_map(Value::as_str)).map_err(|_entry_error| {
+                invalid_filters(&format!(
+                    "filters.{} entries must be bare domain names such as `example.com`.",
+                    field.as_str()
+                ))
+            })
+        },
+        Some(_) => Err(invalid_filters(&format!(
+            "filters.{} must be an array of strings or null.",
+            field.as_str()
+        ))),
+    }
+}
+
+/// A 400 `invalid_value` rejection for an unenforceable web-search `filters` value.
+fn invalid_filters(message: &str) -> Rejection {
+    responses_error_rejection_with_code(400, "invalid_request_error", "invalid_value", message)
 }
 
 /// Parse a hosted search action while preserving legacy compatibility. A valid,
@@ -1530,10 +1695,9 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// into state.
 ///
 /// `bridge` is the backend-valid `function_call`/`function_call_output` pair.
-/// The per-element clone is required: `messages` and `persisted_messages` are
-/// distinct owners of the bridge messages. The public `output_item` is upserted
-/// so the placeholder accumulated during the response phase is replaced in
-/// place, never duplicated.
+/// When durable history is enabled, the per-element clone keeps the working and
+/// persisted histories independent. The public `output_item` is upserted so the
+/// placeholder accumulated during the response phase is replaced in place.
 fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], ids: &SearchCallIds<'_>) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         let round_start = state
@@ -1552,10 +1716,7 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             });
             return;
         }
-        let result_start = state.messages.len();
-        state.messages.extend(bridge.iter().cloned());
-        state.persisted_messages.extend(bridge);
-        state.mark_local_tool_results_from(result_start);
+        state.append_local_tool_results(bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
         // this replaces the model's placeholder with an executed result, so only
         // now may the search's lifecycle be synthesized. A placeholder copied into
@@ -1611,7 +1772,7 @@ fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
             message: "Web search exceeds a processing limit set by the platform administrator.".to_owned(),
         });
     }
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.skip_persist", "true");
 }
 
 // -----------------------------------------------------------------------------

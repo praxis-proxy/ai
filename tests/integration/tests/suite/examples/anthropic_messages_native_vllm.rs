@@ -32,9 +32,9 @@ use std::{
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    assert_error_is_anthropic_shaped, assert_error_is_openai_shaped, basic_auth_header, free_port, http_send,
-    json_post_with_header, parse_body, parse_status, start_capturing_backend, start_header_echo_backend, start_proxy,
-    start_uri_echo_backend,
+    StatefulCapturingBackend, assert_error_is_anthropic_shaped, assert_error_is_openai_shaped, basic_auth_header,
+    free_port, http_send, json_post_with_header, parse_body, parse_status, start_capturing_backend,
+    start_header_echo_backend, start_proxy, start_uri_echo_backend,
 };
 
 use super::load_example_config;
@@ -117,11 +117,11 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
             "basic_auth",
             "ai_operation",
             "anthropic_messages_request",
-            "anthropic_messages_protocol",
             "headers",
             "router",
             "credential_injection",
             "load_balancer",
+            "anthropic_messages_protocol",
         ],
         "native-vLLM chain must be the native passthrough shape, in order"
     );
@@ -350,7 +350,7 @@ fn native_vllm_strips_client_credentials_and_injects_backend_bearer() {
 fn native_vllm_rejects_unauthenticated_gateway_request() {
     // `basic_auth` runs first and gates every path: a caller with no gateway
     // credential is rejected before any routing or credential injection happens.
-    let backend = start_header_echo_backend();
+    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
     let config = native_vllm_config(proxy_port, backend.port());
     let proxy = start_proxy(&config);
@@ -366,6 +366,51 @@ fn native_vllm_rejects_unauthenticated_gateway_request() {
         401,
         "an unauthenticated caller must be rejected by the gateway"
     );
+    let forwarded_posts = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .count();
+    assert_eq!(forwarded_posts, 0, "a rejected request must never reach the backend");
+
+    drop(proxy);
+}
+
+/// Anthropic SDK v2 sends its API key as `Authorization: Bearer`, the other
+/// form of the credential the v1 SDK sends in `x-api-key`. This native chain
+/// terminates gateway auth with `basic_auth`, which only accepts `Basic`, so a
+/// v2 caller is rejected before routing and its Anthropic key never reaches the
+/// backend. The legacy form is covered by
+/// `native_vllm_strips_client_credentials_and_injects_backend_bearer`.
+#[test]
+fn native_vllm_rejects_sdk_v2_bearer_gateway_credential() {
+    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", body, "Authorization: Bearer client-anthropic-secret"),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        401,
+        "a bearer-only caller must not pass basic_auth: {raw}"
+    );
+    let forwarded_posts = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .count();
+    assert_eq!(
+        forwarded_posts, 0,
+        "the rejected caller's credential must never reach the backend"
+    );
+
+    drop(proxy);
 }
 
 // -----------------------------------------------------------------------------
@@ -859,6 +904,101 @@ fn messages_failure_keeps_the_anthropic_error_shape() {
     assert_error_is_anthropic_shaped(&raw);
 
     drop(proxy);
+}
+
+// -----------------------------------------------------------------------------
+// MCP connector
+// -----------------------------------------------------------------------------
+
+/// A create-message body that uses Anthropic's server-side MCP connector.
+fn mcp_connector_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "List my repositories"}],
+        "mcp_servers": [{"type": "url", "url": "https://mcp.example.com/sse", "name": "example"}],
+        "tools": [{"type": "mcp_toolset", "mcp_server_name": "example"}],
+    })
+}
+
+/// vLLM cannot execute the MCP connector, so the gateway refuses it with an
+/// Anthropic error rather than forwarding a request the backend cannot honor.
+#[test]
+fn native_vllm_rejects_the_mcp_connector() {
+    // A forwarded request would come back 200 with the echoed path, so a 400
+    // naming the connector proves the gateway answered without forwarding.
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &mcp_connector_body().to_string(), &gateway_auth_line()),
+    );
+
+    assert_eq!(parse_status(&raw), 400, "the MCP connector must be refused: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error body should be JSON");
+    assert_eq!(
+        body["type"], "error",
+        "the refusal must use the Anthropic error envelope"
+    );
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MCP connector"),
+        "the error must name the MCP connector: {body}"
+    );
+
+    drop(proxy);
+}
+
+/// Retagging the cluster as Anthropic, or removing the tag, forwards the
+/// connector unchanged: only a declared non-Anthropic provider is refused.
+#[test]
+fn native_mcp_connector_passes_through_to_anthropic_and_untagged_clusters() {
+    for replacement in [
+        "application_provider: anthropic",
+        "application_protocol: anthropic_messages",
+    ] {
+        let backend = start_capturing_backend(r#"{"type":"message","role":"assistant","content":[]}"#);
+        let proxy_port = free_port();
+        let path = praxis_test_utils::example_config_path(CONFIG);
+        let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let yaml = yaml.replace("application_provider: vllm", replacement);
+        let patched =
+            praxis_test_utils::patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", backend.port())]));
+        let patched = patched
+            .replace("env_var: VLLM_API_KEY", "env_var: CARGO_PKG_NAME")
+            .replace(
+                "env_var: GATEWAY_AUTH_PASSWORD",
+                &format!("password: {}", gateway_password()),
+            );
+        let config = Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse {CONFIG}: {e}"));
+        let proxy = start_proxy(&config);
+
+        let request = mcp_connector_body();
+        let raw = http_send(
+            proxy.addr(),
+            &json_post_with_header("/v1/messages", &request.to_string(), &gateway_auth_line()),
+        );
+
+        assert_eq!(
+            parse_status(&raw),
+            200,
+            "{replacement}: connector must be forwarded: {raw}"
+        );
+        let forwarded: serde_json::Value =
+            serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+        assert_eq!(
+            forwarded, request,
+            "{replacement}: the connector must reach the backend byte-for-byte"
+        );
+
+        drop(proxy);
+    }
 }
 
 /// Starts a backend that flushes `first_chunks`, holds the connection open until

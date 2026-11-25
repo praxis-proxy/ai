@@ -7,9 +7,17 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+#[cfg_attr(
+    not(feature = "openai-mcp-tools"),
+    expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
+)]
 mod session_pool;
 mod sse_adapter;
 mod streaming_selector;
+#[cfg_attr(
+    not(feature = "openai-mcp-tools"),
+    expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
+)]
 mod subrequest_transport;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -43,12 +51,14 @@ use rmcp::{
 use secrecy::{ExposeSecret as _, SecretString};
 
 pub use self::streaming_selector::McpStreamingSelectorFilter;
+#[cfg(any(test, feature = "openai-mcp-tools"))]
+pub(crate) use self::subrequest_transport::validate_mcp_target;
 use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
         McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, mcp_resolution_policy,
-        transport_signal_error, validate_mcp_target,
+        transport_signal_error,
     },
 };
 use crate::StateOwner;
@@ -364,7 +374,7 @@ pub(crate) async fn list_tools(
     reason = "trusted forwarded headers extend the existing API"
 )]
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "anthropic-mcp-connector")),
     expect(dead_code, reason = "keeps the unbudgeted MCP listing entry point available")
 )]
 pub(crate) async fn list_tools_with_forwarded_headers(
@@ -1075,6 +1085,24 @@ fn connection_nominated_from_json(
     nominated
 }
 
+/// Raw body, SSE framing, rmcp parsing, and result conversion of one MCP
+/// reply. Measured peak is about 8x wire bytes plus 250 bytes per node.
+const MCP_RESULT_WIRE_MULTIPLIER: usize = 16;
+/// Per-node reserve for an MCP reply, about 2x the measured parse cost.
+const MCP_RESULT_NODE_RESERVE: usize = 512;
+
+/// Charge an MCP server reply before rmcp parses it.
+///
+/// Callers with a request-wide memory budget admit this charge before the
+/// transport buffers a reply, so the estimate stays independent of the
+/// inference protocol that owns the budget.
+pub(crate) fn mcp_result_charge(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .len()
+        .checked_mul(MCP_RESULT_WIRE_MULTIPLIER)?
+        .checked_add(crate::json_body::json_node_count(bytes)?.checked_mul(MCP_RESULT_NODE_RESERVE)?)
+}
+
 /// Headers that must not pass through from client-supplied MCP
 /// tool config into the proxy's outbound MCP transport.
 pub(crate) fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
@@ -1104,6 +1132,11 @@ fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>
         .collect()
 }
 
+/// Retain this error-path sink: core sizing discards progress on failure,
+/// but MCP listing charges the accepted prefix even when serialization fails.
+/// The normal successful path uses core sizing; an error is remeasured locally
+/// to preserve that caller-specific policy rather than charging zero.
+///
 /// `io::Write` sink that counts bytes written instead of retaining
 /// them, so a page's serialized size can be measured without a second
 /// heap buffer.
@@ -1128,11 +1161,13 @@ impl std::io::Write for ByteCounter {
 /// page without allocating a second buffer. A serialization error
 /// (which the caller would surface elsewhere) yields the bytes counted
 /// so far, keeping the cumulative budget conservative.
-fn measure_tools_json_bytes(tools: &[rmcp::model::Tool]) -> usize {
-    let mut counter = ByteCounter::default();
-    match serde_json::to_writer(&mut counter, tools) {
-        Ok(()) | Err(_) => counter.count,
-    }
+fn measure_tools_json_bytes<T: serde::Serialize + ?Sized>(tools: &T) -> usize {
+    praxis_filter::json_size::serialized_len(tools).unwrap_or_else(|_| {
+        let mut counter = ByteCounter::default();
+        match serde_json::to_writer(&mut counter, tools) {
+            Ok(()) | Err(_) => counter.count,
+        }
+    })
 }
 
 /// Add one page's decoded size to the running listing total and reject the

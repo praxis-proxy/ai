@@ -7,6 +7,11 @@
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/model-to-provider.yaml
+# Request buffering inherits body_limits.max_request_bytes and max_buffer_bytes.
+# Set max_body_bytes on the transforming filter to enforce a smaller processing
+# limit (HTTP 413 before parsing), even when another filter requests more buffer.
+# Omitted max_body_bytes has no implicit 10 MiB filter cap.
+
 listeners:
   - name: model-to-provider
     address: "127.0.0.1:8080"

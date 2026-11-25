@@ -14,11 +14,11 @@
 //! Required Linux CI wraps both pinned HTTP tests in a network namespace with
 //! only loopback enabled, so the client cannot reach an external provider.
 //!
-//! The executable must report the version in [`CODEX_VERSION`]. To update the
-//! pin, update that constant in both Codex acceptance modules, the fixture
-//! filename and checksum, and every version, archive, cache path/key, and
-//! version assertion in `.github/workflows/integration.yaml`. Run both pinned
-//! HTTP and WebSocket tests with the checksum-verified replacement binary.
+//! The executable must report the version in [`CODEX_PINNED_VERSION`], which
+//! `tests/integration/fixtures/codex-cli/pin.toml` single-sources together
+//! with the checksum fixture and the CI `CODEX_VERSION` env (see
+//! `codex_pin`). Run both pinned HTTP and WebSocket tests with the
+//! checksum-verified replacement binary before committing a bump.
 
 use std::{
     collections::HashMap,
@@ -47,7 +47,7 @@ use praxis_test_utils::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::harness::{CodexCompactionWorkspace, TempWorkspace};
+use super::harness::{CODEX_PINNED_VERSION, CodexCompactionWorkspace, TempWorkspace};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -57,8 +57,6 @@ use super::harness::{CodexCompactionWorkspace, TempWorkspace};
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum retained bytes from each child output pipe.
 const MAX_CHILD_OUTPUT_BYTES: usize = 4_194_304; // 4 MiB
-/// Required output from the pinned executable.
-const CODEX_VERSION: &str = "codex-cli 0.144.1";
 /// Synthetic credential that must reach the test backend.
 const TEST_API_KEY: &str = "praxis-http-test-key";
 /// Synthetic provider credential that replaces the client credential.
@@ -102,6 +100,14 @@ const COMPACTION_XFAIL_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// See docs/developing/gpu-nightly-suite.md.
 const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
 
+/// Codex 0.167.0 catalog entry that enables grammar-based `apply_patch`.
+/// The older gpt-5.4 entry was removed and falls back to metadata without it.
+/// The live test rewrites this client-facing slug to the configured vLLM model.
+const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.5";
+
+const CODEX_EDIT_SANDBOX: &str = "danger-full-access";
+const CODEX_WEB_SEARCH: &str = "disabled";
+
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
@@ -109,8 +115,8 @@ const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool
 // Compaction acceptance constants
 // -----------------------------------------------------------------------------
 //
-// Codex 0.144.1 against a provider named `praxis` does not qualify for remote
-// compaction (`supports_remote_compaction()` is false unless the provider is
+// Pinned Codex (verified 0.144.1 through 0.167.0) against a provider named
+// `praxis` does not qualify for remote compaction (`supports_remote_compaction()` is false unless the provider is
 // `openai`/Azure), and the `token_budget` window-reset feature ships disabled by
 // default. Auto-compaction therefore takes the local inline path
 // (`run_inline_auto_compact_task`), which POSTs the summarization prompt to
@@ -130,6 +136,8 @@ const CODEX_SUMMARIZATION_PROMPT_NEEDLE: &[u8] = b"You are performing a CONTEXT 
 /// summary traversed Praxis after compaction.
 const CODEX_SUMMARY_PREFIX_NEEDLE: &[u8] =
     b"Another language model started to solve this problem and produced a summary of its thinking process.";
+/// Custom-tool result Codex sends back after its local `apply_patch` handler runs.
+const CODEX_APPLY_PATCH_OUTPUT_NEEDLE: &[u8] = b"custom_tool_call_output";
 
 /// Advertised context window for the compaction run, kept under the Codex GPU
 /// job's vLLM `--max-model-len 16384` so real requests are never rejected.
@@ -171,14 +179,16 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
     let output = run_codex(
         &codex_bin,
         CodexRunOptions {
+            web_search: CODEX_WEB_SEARCH,
             proxy_base_url: &proxy_base_url,
-            model: "test-model",
+            model: CODEX_APPLY_PATCH_MODEL,
             working_dir: working_dir.path(),
             prompt: PROMPT,
             sandbox: "read-only",
             execution_timeout: Duration::from_secs(30),
             no_proxy: "127.0.0.1,localhost",
             netns: None,
+            reasoning_effort: Some("medium"),
             tolerate_timeout: false,
             compaction_limits: None,
         },
@@ -192,12 +202,33 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
         stderr = output.stderr
     );
     assert_codex_jsonl(&output.stdout);
+    assert!(output.stdout.lines().any(|line| {
+        let event = serde_json::from_str(line).expect("Codex --json output should be JSONL");
+        codex_turn_has_reasoning_usage(&event)
+    }));
 
     let requests = observe_codex_requests(&mut backend).await;
     assert!(
         !requests.is_empty(),
         "Codex should send at least one HTTP request; got none"
     );
+    // Exercise the same catalog entry as GPU acceptance. A client pin bump can
+    // remove a model's metadata and silently omit apply_patch before inference.
+    let request: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("Codex request should parse");
+    assert!(
+        request["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| {
+                tool["name"] == "apply_patch"
+                    && tool["type"] == "custom"
+                    && tool.pointer("/format/type").and_then(serde_json::Value::as_str) == Some("grammar")
+            })),
+        "pinned Codex must declare grammar-based apply_patch for {CODEX_APPLY_PATCH_MODEL}"
+    );
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("Codex request should parse");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+    }
     assert_no_websocket_upgrades(&mut backend).await;
     assert_no_unexpected_methods(&mut backend).await;
     observer.assert_http_only();
@@ -228,14 +259,16 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     let output = run_codex(
         &codex_bin,
         CodexRunOptions {
+            web_search: CODEX_WEB_SEARCH,
             proxy_base_url: &proxy_base_url,
             model: "test-model",
             working_dir: workspace.path(),
             prompt,
-            sandbox: "danger-full-access",
+            sandbox: CODEX_EDIT_SANDBOX,
             execution_timeout: Duration::from_secs(30),
             no_proxy: "127.0.0.1,localhost",
             netns: None,
+            reasoning_effort: None,
             tolerate_timeout: false,
             compaction_limits: None,
         },
@@ -256,14 +289,14 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     assert_coding_codex_jsonl(&output.stdout);
 }
 
-/// Prove pinned Codex completes a real coding/tool workflow through Praxis and
-/// vLLM's native Responses endpoint on the GPU runner.
+/// Prove pinned Codex applies a patch through Praxis and vLLM's native
+/// Responses endpoint on the GPU runner.
 ///
-/// Codex streams rich client-owned tools. The client-tool compatibility filter
-/// lowers those declarations to private functions for vLLM, while the shared
-/// stream owner restores the canonical tool lifecycle before Codex sees it.
+/// Codex declares `apply_patch` as a grammar-constrained custom tool. The
+/// client-tool compatibility filter lowers it to a private function for vLLM,
+/// then restores the canonical tool lifecycle before Codex sees it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
+async fn pinned_codex_completes_native_vllm_apply_patch_workflow_over_http() {
     let Some(live) = CodexLiveConfig::from_env() else {
         return;
     };
@@ -271,8 +304,9 @@ async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
     live.require_egress_isolation_if_demanded();
 
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/client-tool-compat.yaml"))
-        .expect("Codex native Responses example should exist");
+    let example = "openai/responses/client-tool-compat.yaml";
+    let yaml =
+        std::fs::read_to_string(example_config_path(example)).expect("Codex native Responses example should exist");
     let patched = patch_live_native_codex_config(
         &yaml,
         proxy_port,
@@ -282,13 +316,14 @@ async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
             .as_deref()
             .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the native vLLM acceptance test")),
     );
+    let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live native Codex config should parse");
 
-    run_live_codex_coding_workflow(&live, proxy_port, config).await;
+    run_live_codex_apply_patch_workflow(&live, proxy_port, config, example, live.candidate).await;
 }
 
-/// Prove pinned Codex completes the same real coding/tool workflow through
-/// Praxis's rich-client-tool Responses-to-Chat composition against live vLLM.
+/// Prove pinned Codex applies the same patch through Praxis's rich-client-tool
+/// Responses-to-Chat composition against live vLLM.
 ///
 /// The backend requires a fresh credential from [`LIVE_BACKEND_TOKEN_ENV`],
 /// while Codex only receives [`TEST_API_KEY`]. A successful turn therefore also
@@ -297,7 +332,7 @@ async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
 /// this test adds real-model and real-client behavior without asserting
 /// model-dependent prose or turn count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pinned_codex_completes_translated_vllm_coding_workflow_over_http() {
+async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http() {
     let Some(live) = CodexLiveConfig::from_env() else {
         return;
     };
@@ -305,10 +340,9 @@ async fn pinned_codex_completes_translated_vllm_coding_workflow_over_http() {
     live.require_egress_isolation_if_demanded();
 
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path(
-        "openai/responses/client-tool-compat-chat-completions.yaml",
-    ))
-    .expect("Codex client-tool Chat composition example should exist");
+    let example = "openai/responses/client-tool-compat-chat-completions.yaml";
+    let yaml = std::fs::read_to_string(example_config_path(example))
+        .expect("Codex client-tool Chat composition example should exist");
     let patched = patch_live_codex_config(
         &yaml,
         proxy_port,
@@ -318,9 +352,10 @@ async fn pinned_codex_completes_translated_vllm_coding_workflow_over_http() {
             .as_deref()
             .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the translated vLLM acceptance test")),
     );
+    let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live Codex config should parse");
 
-    run_live_codex_coding_workflow(&live, proxy_port, config).await;
+    run_live_codex_apply_patch_workflow(&live, proxy_port, config, example, false).await;
 }
 
 /// Prove a pinned Codex session crosses its own context limit mid-task, performs
@@ -344,8 +379,9 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     live.require_egress_isolation_if_demanded();
 
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/client-tool-compat.yaml"))
-        .expect("Codex native Responses example should exist");
+    let example = "openai/responses/client-tool-compat.yaml";
+    let yaml =
+        std::fs::read_to_string(example_config_path(example)).expect("Codex native Responses example should exist");
     let patched = patch_live_native_codex_config(
         &yaml,
         proxy_port,
@@ -357,40 +393,75 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     );
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live compaction Codex config should parse");
 
-    run_live_codex_compaction_workflow(&live, proxy_port, config).await;
+    run_live_codex_compaction_workflow(&live, proxy_port, config, example).await;
 }
 
-/// Drive the common pinned-Codex coding task through one live Praxis pipeline.
-async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16, config: praxis_core::config::Config) {
+/// Run the same verifier with default permissions in both live workflows.
+const LIVE_VERIFY_INSTRUCTION: &str = "Run exactly `./verify.sh` with default permissions, omit the sandbox_permissions argument, and confirm it exits 0.";
+
+/// Persist only assertions reached by this invocation for the CI qualification artifact.
+fn record_codex_capabilities(example: &str, options: &CodexRunOptions<'_>, transport: &str, outcomes: &[(&str, &str)]) {
+    if let Some(path) = std::env::var_os("PRAXIS_TEST_CODEX_EVIDENCE") {
+        let evidence = serde_json::json!({
+            "example": example,
+            "client_version": CODEX_PINNED_VERSION,
+            "client_model": options.model,
+            "transport": transport,
+            "sandbox": options.sandbox,
+            "web_search": options.web_search,
+            "outcomes": outcomes,
+        });
+        if let Err(error) = std::fs::write(path, evidence.to_string()) {
+            eprintln!("Could not write Codex capability evidence: {error}");
+        }
+    }
+}
+
+/// Drive a pinned-Codex apply_patch task through one live Praxis pipeline.
+async fn run_live_codex_apply_patch_workflow(
+    live: &CodexLiveConfig,
+    proxy_port: u16,
+    config: praxis_core::config::Config,
+    example: &str,
+    require_reasoning: bool,
+) {
     let workspace = TempWorkspace::new().expect("temporary coding workspace should be created");
+    std::fs::remove_file(workspace.path().join("result.txt"))
+        .expect("apply_patch target should be absent so Codex must create it");
     let _proxy = start_proxy(&config);
+    print_acceptance_filter_chain(&config);
     let observer = HttpTransportObserver::start_on(proxy_port, live.listen_address).await;
 
     if let Some(namespace) = &live.netns {
         verify_egress_isolation(namespace);
     }
 
-    let prompt = r#"Use exec_command immediately to run exactly this single command:
-python3 -c 'import json, pathlib; data = json.load(open("input.json")); pathlib.Path("result.txt").write_text(data["expected_content"])' && ./verify.sh
-Do not run a different command and do not answer before it succeeds. Then summarize what changed. /no_think"#;
+    let thinking_suffix = if require_reasoning { "" } else { " /no_think" };
+    let prompt = format!(
+        "You MUST use the apply_patch tool exactly once with this exact patch to add result.txt:\n\
+         *** Begin Patch\n*** Add File: result.txt\n+{}\n*** End Patch\n\n\
+         Do not use exec_command or another tool to write or edit files.\n\
+         After apply_patch succeeds, use exec_command only for verification. {LIVE_VERIFY_INSTRUCTION}\n\
+         Do not answer before verification succeeds. Then summarize what changed.{thinking_suffix}",
+        workspace.expected_content(),
+    );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
-    let output = run_codex(
-        &live.codex_bin,
-        CodexRunOptions {
-            proxy_base_url: &proxy_base_url,
-            model: &live.model,
-            working_dir: workspace.path(),
-            prompt,
-            sandbox: "danger-full-access",
-            execution_timeout: LIVE_CHILD_TIMEOUT,
-            no_proxy: &no_proxy,
-            netns: live.netns.as_deref(),
-            tolerate_timeout: false,
-            compaction_limits: None,
-        },
-    )
-    .await;
+    let options = CodexRunOptions {
+        web_search: CODEX_WEB_SEARCH,
+        proxy_base_url: &proxy_base_url,
+        model: CODEX_APPLY_PATCH_MODEL,
+        working_dir: workspace.path(),
+        prompt: &prompt,
+        sandbox: CODEX_EDIT_SANDBOX,
+        execution_timeout: LIVE_CHILD_TIMEOUT,
+        no_proxy: &no_proxy,
+        netns: live.netns.as_deref(),
+        reasoning_effort: require_reasoning.then_some("medium"),
+        tolerate_timeout: false,
+        compaction_limits: None,
+    };
+    let output = run_codex(&live.codex_bin, options).await;
     assert!(
         output.status.success(),
         "Codex failed with status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
@@ -399,9 +470,25 @@ Do not run a different command and do not answer before it succeeds. Then summar
         stderr = output.stderr
     );
 
-    observer.assert_http_only();
-    assert_live_coding_codex_jsonl(&output.stdout);
+    // Preserve the client trace even when a later workspace or wire assertion fails.
+    eprintln!(
+        "Codex live apply_patch stdout:\n{}\nstderr:\n{}",
+        output.stdout, output.stderr
+    );
+    let transport = observer.assert_http_only();
+    // Check the client-visible tool lifecycle and workspace result before the wire
+    // observer assertion. If the model completes without returning a client-tool
+    // result, this reports Codex's JSONL trace instead of masking it with the more
+    // generic missing-wire-output error.
+    assert_live_apply_patch_codex_jsonl(&output.stdout, require_reasoning);
+    assert_eq!(
+        workspace.read_result().expect("result.txt should be readable"),
+        format!("{}\n", workspace.expected_content()),
+        "the apply_patch call should create the exact expected file content",
+    );
+    observer.assert_apply_patch_output_traversed_praxis();
     workspace.assert_successful_completion();
+    record_codex_capabilities(example, &options, transport, &[("verified file edit", "passed")]);
 }
 
 /// Drive a pinned-Codex coding task whose growing context forces the client's own
@@ -424,8 +511,9 @@ async fn run_live_codex_compaction_workflow(
     live: &CodexLiveConfig,
     proxy_port: u16,
     config: praxis_core::config::Config,
+    example: &str,
 ) {
-    let compaction_is_xfail = live.model.to_ascii_lowercase().contains(COMPACTION_XFAIL_MODEL);
+    let compaction_is_xfail = allows_compaction_xfail(&live.model, live.candidate);
     let execution_timeout = if compaction_is_xfail {
         COMPACTION_XFAIL_CHILD_TIMEOUT
     } else {
@@ -437,6 +525,7 @@ async fn run_live_codex_compaction_workflow(
         .seed_context_ballast(CODEX_COMPACTION_BALLAST_CHAPTERS, CODEX_COMPACTION_BALLAST_BYTES)
         .expect("ballast chapters should be seeded");
     let _proxy = start_proxy(&config);
+    print_acceptance_filter_chain(&config);
     let observer =
         HttpTransportObserver::start_compaction_probe(proxy_port, live.listen_address, workspace.path().to_path_buf())
             .await;
@@ -452,30 +541,39 @@ async fn run_live_codex_compaction_workflow(
 2. Read every ballast chapter one at a time (a separate cat command per file, no more than one file per command), in this exact order: {chapter_list}. After each file, briefly acknowledge it before reading the next.
 3. Only after all chapters are read, re-read the token by running exactly: cat secret.txt
 4. Write the token printed in step 3 (and nothing else) into result.txt with exactly: printf '%s' '<TOKEN>' > result.txt  — substitute the exact token you just saw.
-5. Run ./verify.sh and confirm it exits 0.
+5. {LIVE_VERIFY_INSTRUCTION}
 6. Summarize what you changed. /no_think"#
     );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
-    let output = run_codex(
-        &live.codex_bin,
-        CodexRunOptions {
-            proxy_base_url: &proxy_base_url,
-            model: &live.model,
-            working_dir: workspace.path(),
-            prompt: &prompt,
-            sandbox: "danger-full-access",
-            execution_timeout,
-            no_proxy: &no_proxy,
-            netns: live.netns.as_deref(),
-            tolerate_timeout: true,
-            compaction_limits: Some(CodexCompactionLimits {
-                context_window: CODEX_COMPACTION_CONTEXT_WINDOW,
-                auto_compact_token_limit: CODEX_COMPACTION_AUTO_COMPACT_LIMIT,
-            }),
-        },
-    )
-    .await;
+    let options = CodexRunOptions {
+        web_search: CODEX_WEB_SEARCH,
+        proxy_base_url: &proxy_base_url,
+        model: &live.model,
+        working_dir: workspace.path(),
+        prompt: &prompt,
+        sandbox: CODEX_EDIT_SANDBOX,
+        execution_timeout,
+        no_proxy: &no_proxy,
+        netns: live.netns.as_deref(),
+        reasoning_effort: None,
+        tolerate_timeout: true,
+        compaction_limits: Some(CodexCompactionLimits {
+            context_window: CODEX_COMPACTION_CONTEXT_WINDOW,
+            auto_compact_token_limit: CODEX_COMPACTION_AUTO_COMPACT_LIMIT,
+        }),
+    };
+    let output = run_codex(&live.codex_bin, options).await;
+
+    // Wire assertions can fail before the completion checks that include this
+    // output. Keep the captured client evidence in the uploaded test log too.
+    eprintln!(
+        "Codex live compaction: exit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        output.timed_out,
+        output.stdout,
+        output.stderr,
+    );
 
     // HARD, always enforced (independent of model capability): the pinned client
     // performed its own inline auto-compaction, a post-compaction request carrying
@@ -484,9 +582,22 @@ async fn run_live_codex_compaction_workflow(
     // compaction mid-flight rather than being a batched pre-compaction write. All
     // three are proven on the wire and do not depend on the model finishing the
     // downstream task, so they gate the XFAIL path too.
-    observer.assert_http_only();
+    let transport = observer.assert_http_only();
     observer.assert_compaction_traversed_praxis();
     observer.assert_compaction_preceded_result_write();
+
+    let record = |completion| {
+        record_codex_capabilities(
+            example,
+            &options,
+            transport,
+            &[
+                ("client compaction observed", "passed"),
+                ("post-compaction task completion", completion),
+            ],
+        );
+    };
+    record("unverified");
 
     // XFAIL on the known-limited model: self-compaction is proven above, but
     // Qwen3-8B cannot reliably complete the post-compaction marker write. Record
@@ -522,6 +633,42 @@ async fn run_live_codex_compaction_workflow(
     );
     assert_live_compaction_codex_jsonl(&output.stdout, CODEX_COMPACTION_BALLAST_CHAPTERS);
     workspace.assert_successful_completion();
+    record("passed");
+}
+
+/// Only the default lane and its exact served alias may use the known XFAIL.
+fn allows_compaction_xfail(model: &str, candidate: bool) -> bool {
+    !candidate && model == COMPACTION_XFAIL_MODEL
+}
+
+/// Emit only ordered filter names from the loaded acceptance config. Never
+/// serialize the filter options: they include the live backend credential.
+fn print_acceptance_filter_chain(config: &praxis_core::config::Config) {
+    let json = serde_json::to_string(&acceptance_filter_chain(config)).expect("filter names must serialize");
+    eprintln!("Codex acceptance filter chain: {json}");
+}
+
+fn acceptance_filter_chain(config: &praxis_core::config::Config) -> Vec<&str> {
+    let [chain] = config.filter_chains.as_slice() else {
+        panic!("Codex acceptance should use a single chain");
+    };
+    let mut filter_names = Vec::new();
+    for filter in &chain.filters {
+        filter_names.push(filter.filter_type.as_str());
+        if filter.filter_type == "iterative_request_router" {
+            let steps = filter.config["steps"].as_sequence().expect("router must define steps");
+            let [step] = steps.as_slice() else {
+                panic!("Codex acceptance should use a single inference step");
+            };
+            let inference = step["filters"].as_sequence().expect("inference must define filters");
+            filter_names.extend(
+                inference
+                    .iter()
+                    .map(|filter| filter["filter"].as_str().expect("inference filter must have a name")),
+            );
+        }
+    }
+    filter_names
 }
 
 /// Keep the live backend credential ephemeral rather than coupled to the example fixture.
@@ -534,12 +681,15 @@ fn live_codex_config_replaces_the_provider_credential() {
     let backend_token = "ephemeral-backend-token-for-this-test";
     let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
     let patched = patch_live_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+    let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
+    assert_apply_patch_model_alias_precedes_state_initialization(&patched);
     assert!(patched.contains(backend_token));
     assert!(!patched.contains(TEST_PROVIDER_API_KEY));
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
+    assert!(patched.contains("\"gpt-5.5\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live Codex config should parse");
 }
@@ -553,14 +703,38 @@ fn live_native_codex_config_injects_the_provider_credential() {
     let backend_token = "ephemeral-native-backend-token-for-this-test";
     let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
     let patched = patch_live_native_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+    let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
+    assert_apply_patch_model_alias_precedes_state_initialization(&patched);
     assert!(patched.contains(backend_token));
     assert!(patched.contains("strip_client_credential: true"));
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
+    assert!(patched.contains("\"gpt-5.5\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
-    praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
+    let config =
+        praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
+    assert_eq!(
+        acceptance_filter_chain(&config),
+        [
+            "ai_operation",
+            "openai_responses_request",
+            "openai_responses_model_rewrite",
+            "openai_responses_request",
+            "state_owner",
+            "openai_responses_store",
+            "openai_responses_rehydrate",
+            "iterative_request_router",
+            "openai_stream_events",
+            "openai_agentic_loop",
+            "openai_client_tool_compat",
+            "openai_responses_proxy",
+            "router",
+            "credential_injection",
+            "load_balancer",
+        ]
+    );
 }
 
 /// Validate the native SSE fixture's resource snapshots against the pinned OpenResponses contract.
@@ -801,6 +975,8 @@ struct CodexLiveConfig {
     vllm_authority: String,
     /// Exact slash-free model alias served by vLLM.
     model: String,
+    /// Require candidate qualification with no legacy model exceptions.
+    candidate: bool,
     /// Ephemeral backend bearer that Praxis must inject toward vLLM.
     backend_token: String,
     /// Optional PostgreSQL response store used by the native Responses path.
@@ -844,6 +1020,7 @@ impl CodexLiveConfig {
             codex_bin,
             vllm_authority: authority_of(&vllm_base),
             model,
+            candidate: env_is_truthy("PRAXIS_TEST_CODEX_CANDIDATE"),
             backend_token,
             database_url: std::env::var(LIVE_DATABASE_URL_ENV).ok(),
             listen_address,
@@ -887,6 +1064,53 @@ fn patch_live_codex_config(
             "                  - name: chat-provider\n                    endpoints:",
             "                  - name: chat-provider\n                    read_timeout_ms: 300000\n                    endpoints:",
         )
+}
+
+/// Give Codex the pinned catalog metadata that enables its grammar-based
+/// `apply_patch` tool, while routing its inference to the actual vLLM model.
+fn patch_live_apply_patch_model_alias(yaml: &str, backend_model: &str) -> String {
+    const MARKER: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
+    let marker_count = yaml.matches(MARKER).count();
+    assert_eq!(
+        marker_count, 1,
+        "client-tool example should have one request-state initialization filter"
+    );
+
+    let backend_model = serde_json::to_string(backend_model).expect("backend model should serialize as a YAML string");
+    let insertion = format!(
+        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"{CODEX_APPLY_PATCH_MODEL}\": {backend_model}\n{MARKER}"
+    );
+    yaml.replacen(MARKER, &insertion, 1)
+}
+
+/// The translated request must build its managed state from the rewritten model.
+fn assert_apply_patch_model_alias_precedes_state_initialization(yaml: &str) {
+    const REWRITE: &str = "      - filter: openai_responses_model_rewrite\n";
+    const STATE_INITIALIZATION: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
+    let rewrite_position = yaml.find(REWRITE).expect("model alias filter should be present");
+    let state_position = yaml
+        .find(STATE_INITIALIZATION)
+        .expect("Responses state initializer should be present");
+    assert!(
+        rewrite_position < state_position,
+        "model alias rewrite must precede Responses state initialization"
+    );
 }
 
 /// Patch the native Responses example for a keyed, slower live vLLM backend.
@@ -1010,7 +1234,9 @@ struct CodexOutput {
 }
 
 /// Inputs controlling one isolated Codex child process.
+#[derive(Clone, Copy)]
 struct CodexRunOptions<'a> {
+    web_search: &'a str,
     /// Praxis base URL visible to the Codex child, without `/v1`.
     proxy_base_url: &'a str,
     /// Model name Codex sends through Praxis.
@@ -1027,6 +1253,8 @@ struct CodexRunOptions<'a> {
     no_proxy: &'a str,
     /// Optional egress-blocked Linux network namespace.
     netns: Option<&'a str>,
+    /// Optional pinned-Codex reasoning effort for the native candidate test.
+    reasoning_effort: Option<&'a str>,
     /// When `true`, a child that exceeds `execution_timeout` is reported via
     /// [`CodexOutput::timed_out`] instead of panicking. Only the compaction
     /// acceptance test opts in: on Qwen3-8B the model can loop past the deadline
@@ -1077,6 +1305,8 @@ struct HttpTransportObserver {
     summarization_request_seen: Arc<AtomicBool>,
     /// Whether client->upstream traffic carried the post-compaction summary prefix.
     summary_prefix_seen: Arc<AtomicBool>,
+    /// Whether Codex returned a custom-tool result in a follow-up request.
+    apply_patch_output_seen: Arc<AtomicBool>,
     /// At the instant the summarization request was first seen on the wire,
     /// whether `result.txt` was still empty (the marker not yet written). Codex
     /// drains all outstanding tool calls before it decides to compact, so an empty
@@ -1115,11 +1345,13 @@ impl HttpTransportObserver {
         let websocket_attempted = Arc::new(AtomicBool::new(false));
         let summarization_request_seen = Arc::new(AtomicBool::new(false));
         let summary_prefix_seen = Arc::new(AtomicBool::new(false));
+        let apply_patch_output_seen = Arc::new(AtomicBool::new(false));
         let result_empty_at_compaction = Arc::new(AtomicBool::new(false));
         let signals = ObservedConnectionSignals {
             websocket_attempted: Arc::clone(&websocket_attempted),
             summarization_request_seen: Arc::clone(&summarization_request_seen),
             summary_prefix_seen: Arc::clone(&summary_prefix_seen),
+            apply_patch_output_seen: Arc::clone(&apply_patch_output_seen),
             result_empty_at_compaction: Arc::clone(&result_empty_at_compaction),
             compaction_workspace: workspace.map(Arc::<Path>::from),
         };
@@ -1144,6 +1376,7 @@ impl HttpTransportObserver {
             websocket_attempted,
             summarization_request_seen,
             summary_prefix_seen,
+            apply_patch_output_seen,
             result_empty_at_compaction,
         }
     }
@@ -1154,11 +1387,12 @@ impl HttpTransportObserver {
     }
 
     /// Fail even when Codex recovered from an attempted WebSocket via HTTP.
-    fn assert_http_only(&self) {
+    fn assert_http_only(&self) -> &'static str {
         assert!(
             !self.websocket_attempted(),
             "Codex attempted a WebSocket upgrade before or during the successful HTTP workflow"
         );
+        "HTTP"
     }
 
     /// Return whether an opening request contained `Upgrade: websocket`.
@@ -1174,6 +1408,14 @@ impl HttpTransportObserver {
     /// Whether a post-compaction request carrying the summary prefix traversed Praxis.
     fn summary_prefix_seen(&self) -> bool {
         self.summary_prefix_seen.load(Ordering::SeqCst)
+    }
+
+    /// Assert Codex sent the result of its client-owned patch tool back through Praxis.
+    fn assert_apply_patch_output_traversed_praxis(&self) {
+        assert!(
+            self.apply_patch_output_seen.load(Ordering::SeqCst),
+            "Codex should send a custom_tool_call_output after applying its patch; no tool result was observed on the wire"
+        );
     }
 
     /// Assert the wire evidence that Codex compacted and then kept working through Praxis.
@@ -1222,6 +1464,8 @@ struct ObservedConnectionSignals {
     summarization_request_seen: Arc<AtomicBool>,
     /// Set when client->upstream bytes contain the summary prefix needle.
     summary_prefix_seen: Arc<AtomicBool>,
+    /// Set when client->upstream bytes contain a custom-tool output item.
+    apply_patch_output_seen: Arc<AtomicBool>,
     /// Snapshot of `result.txt`-is-empty taken when the summarization needle is first seen.
     result_empty_at_compaction: Arc<AtomicBool>,
     /// Compaction workspace to probe at that instant; `None` for non-compaction observers.
@@ -1237,8 +1481,8 @@ impl Drop for HttpTransportObserver {
     }
 }
 
-/// Longest compaction needle, bounding the client->upstream sliding-window carry.
-const MAX_COMPACTION_NEEDLE_LEN: usize = CODEX_SUMMARY_PREFIX_NEEDLE.len();
+/// Longest observed Codex request needle, bounding the client->upstream sliding-window carry.
+const MAX_CODEX_REQUEST_NEEDLE_LEN: usize = CODEX_SUMMARY_PREFIX_NEEDLE.len();
 
 /// Inspect one connection's opening request and client->upstream bytes, then
 /// forward both directions unchanged.
@@ -1276,7 +1520,7 @@ async fn forward_observed_connection(
     if request_head_has_websocket_upgrade(&opening) {
         signals.websocket_attempted.store(true, Ordering::SeqCst);
     }
-    scan_compaction_needles(&opening, &signals);
+    scan_codex_request_needles(&opening, &signals);
     if upstream_wr.write_all(&opening).await.is_err() {
         return;
     }
@@ -1285,7 +1529,7 @@ async fn forward_observed_connection(
     // head/body boundary is still detected.
     let carry_start = opening
         .len()
-        .saturating_sub(MAX_COMPACTION_NEEDLE_LEN.saturating_sub(1));
+        .saturating_sub(MAX_CODEX_REQUEST_NEEDLE_LEN.saturating_sub(1));
     let carry_seed = opening[carry_start..].to_vec();
     let scan_signals = signals.clone();
     let client_to_upstream = async move {
@@ -1298,8 +1542,10 @@ async fn forward_observed_connection(
             };
             let mut window = carry;
             window.extend_from_slice(&buffer[..read]);
-            scan_compaction_needles(&window, &scan_signals);
-            let keep = window.len().saturating_sub(MAX_COMPACTION_NEEDLE_LEN.saturating_sub(1));
+            scan_codex_request_needles(&window, &scan_signals);
+            let keep = window
+                .len()
+                .saturating_sub(MAX_CODEX_REQUEST_NEEDLE_LEN.saturating_sub(1));
             carry = window.split_off(keep);
             if upstream_wr.write_all(&buffer[..read]).await.is_err() {
                 break;
@@ -1314,12 +1560,12 @@ async fn forward_observed_connection(
     tokio::join!(client_to_upstream, upstream_to_client);
 }
 
-/// Set each compaction signal whose needle appears in `haystack`.
+/// Set each Codex request signal whose needle appears in `haystack`.
 ///
 /// The first time the summarization needle is seen, snapshot the compaction
 /// workspace (result still empty) BEFORE the caller forwards the request upstream.
 /// `compare_exchange` guarantees exactly one snapshot even if two connections race.
-fn scan_compaction_needles(haystack: &[u8], signals: &ObservedConnectionSignals) {
+fn scan_codex_request_needles(haystack: &[u8], signals: &ObservedConnectionSignals) {
     if !signals.summarization_request_seen.load(Ordering::SeqCst)
         && contains_subslice(haystack, CODEX_SUMMARIZATION_PROMPT_NEEDLE)
         && signals
@@ -1334,6 +1580,11 @@ fn scan_compaction_needles(haystack: &[u8], signals: &ObservedConnectionSignals)
     }
     if !signals.summary_prefix_seen.load(Ordering::SeqCst) && contains_subslice(haystack, CODEX_SUMMARY_PREFIX_NEEDLE) {
         signals.summary_prefix_seen.store(true, Ordering::SeqCst);
+    }
+    if !signals.apply_patch_output_seen.load(Ordering::SeqCst)
+        && contains_subslice(haystack, CODEX_APPLY_PATCH_OUTPUT_NEEDLE)
+    {
+        signals.apply_patch_output_seen.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1353,30 +1604,36 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[test]
-fn scan_compaction_needles_sets_each_flag_once_when_its_needle_appears() {
+fn scan_codex_request_needles_sets_each_flag_once_when_its_needle_appears() {
     let signals = ObservedConnectionSignals {
         websocket_attempted: Arc::new(AtomicBool::new(false)),
         summarization_request_seen: Arc::new(AtomicBool::new(false)),
         summary_prefix_seen: Arc::new(AtomicBool::new(false)),
+        apply_patch_output_seen: Arc::new(AtomicBool::new(false)),
         result_empty_at_compaction: Arc::new(AtomicBool::new(false)),
         compaction_workspace: None,
     };
 
     // Ordinary request bytes leave both compaction flags clear.
-    scan_compaction_needles(b"POST /v1/responses HTTP/1.1\r\n\r\n{\"input\":\"hi\"}", &signals);
+    scan_codex_request_needles(b"POST /v1/responses HTTP/1.1\r\n\r\n{\"input\":\"hi\"}", &signals);
     assert!(!signals.summarization_request_seen.load(Ordering::SeqCst));
     assert!(!signals.summary_prefix_seen.load(Ordering::SeqCst));
+    assert!(!signals.apply_patch_output_seen.load(Ordering::SeqCst));
 
     // The summarization prompt sets only its own flag.
     let mut summarization = b"{\"instructions\":\"".to_vec();
     summarization.extend_from_slice(CODEX_SUMMARIZATION_PROMPT_NEEDLE);
-    scan_compaction_needles(&summarization, &signals);
+    scan_codex_request_needles(&summarization, &signals);
     assert!(signals.summarization_request_seen.load(Ordering::SeqCst));
     assert!(!signals.summary_prefix_seen.load(Ordering::SeqCst));
 
     // The replayed summary prefix sets its flag too.
-    scan_compaction_needles(CODEX_SUMMARY_PREFIX_NEEDLE, &signals);
+    scan_codex_request_needles(CODEX_SUMMARY_PREFIX_NEEDLE, &signals);
     assert!(signals.summary_prefix_seen.load(Ordering::SeqCst));
+
+    // The apply_patch tool result sets its own independent signal.
+    scan_codex_request_needles(CODEX_APPLY_PATCH_OUTPUT_NEEDLE, &signals);
+    assert!(signals.apply_patch_output_seen.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -1417,36 +1674,37 @@ fn compaction_probe_signals(workspace: &Path) -> ObservedConnectionSignals {
         websocket_attempted: Arc::new(AtomicBool::new(false)),
         summarization_request_seen: Arc::new(AtomicBool::new(false)),
         summary_prefix_seen: Arc::new(AtomicBool::new(false)),
+        apply_patch_output_seen: Arc::new(AtomicBool::new(false)),
         result_empty_at_compaction: Arc::new(AtomicBool::new(false)),
         compaction_workspace: Some(Arc::from(workspace)),
     }
 }
 
 #[test]
-fn scan_compaction_needles_snapshots_a_sound_boundary_once() {
+fn scan_codex_request_needles_snapshots_a_sound_boundary_once() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("result.txt"), "").expect("seed result");
     let signals = compaction_probe_signals(dir.path());
 
-    scan_compaction_needles(&summarization_needle_bytes(), &signals);
+    scan_codex_request_needles(&summarization_needle_bytes(), &signals);
     assert!(signals.result_empty_at_compaction.load(Ordering::SeqCst));
 
     // A write that lands AFTER the first summarization must not retroactively flip
     // the snapshot: compare_exchange snapshots exactly once at the true boundary.
     std::fs::write(dir.path().join("result.txt"), "MARKER").expect("write result");
-    scan_compaction_needles(&summarization_needle_bytes(), &signals);
+    scan_codex_request_needles(&summarization_needle_bytes(), &signals);
     assert!(signals.result_empty_at_compaction.load(Ordering::SeqCst));
 }
 
 #[test]
-fn scan_compaction_needles_flags_a_result_written_before_compaction() {
+fn scan_codex_request_needles_flags_a_result_written_before_compaction() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     // The marker was already written (e.g. a batched pre-compaction write) when the
     // summarization request crosses the wire: result.txt is non-empty.
     std::fs::write(dir.path().join("result.txt"), "MARKER").expect("write result");
     let signals = compaction_probe_signals(dir.path());
 
-    scan_compaction_needles(&summarization_needle_bytes(), &signals);
+    scan_codex_request_needles(&summarization_needle_bytes(), &signals);
     assert!(
         !signals.result_empty_at_compaction.load(Ordering::SeqCst),
         "a result written before compaction must fail the boundary check"
@@ -1701,14 +1959,20 @@ async fn read_first_translated_delta(proxy_port: u16) {
     }
 }
 
-/// Build the scripted HTTP response turns.
-///
+/// Distinguishes streamed reasoning from the user-visible reply.
+const HTTP_REASONING_MARKER: &str = "scripted-reasoning-marker";
+
 /// The scripted backend delivers a `PONG` text response in SSE form for
 /// each request Codex sends. The test backend delivers the same response
 /// for every turn so the assertion is deterministic regardless of how
 /// many times Codex polls the endpoint.
 #[expect(clippy::large_stack_frames, reason = "scripted turns are test fixtures")]
 fn http_response_script() -> Vec<HttpServerAction> {
+    let reasoning = serde_json::json!({
+        "id": "rs_http_acceptance",
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": HTTP_REASONING_MARKER}]
+    });
     let turn = HttpServerAction::StreamSse {
         events: vec![
             sse_event(
@@ -1725,6 +1989,24 @@ fn http_response_script() -> Vec<HttpServerAction> {
                     "type": "response.output_item.added",
                     "sequence_number": 1,
                     "output_index": 0,
+                    "item": {"id": "rs_http_acceptance", "type": "reasoning", "summary": []}
+                }),
+            ),
+            sse_event(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": reasoning
+                }),
+            ),
+            sse_event(
+                "response.output_item.added",
+                &serde_json::json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": 3,
+                    "output_index": 1,
                     "item": {
                         "id": "msg_http_acceptance",
                         "type": "message",
@@ -1738,9 +2020,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.content_part.added",
                 &serde_json::json!({
                     "type": "response.content_part.added",
-                    "sequence_number": 2,
+                    "sequence_number": 4,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
@@ -1753,9 +2035,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.output_text.delta",
                 &serde_json::json!({
                     "type": "response.output_text.delta",
-                    "sequence_number": 3,
+                    "sequence_number": 5,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "delta": "PONG"
                 }),
@@ -1764,9 +2046,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.output_text.done",
                 &serde_json::json!({
                     "type": "response.output_text.done",
-                    "sequence_number": 4,
+                    "sequence_number": 6,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "text": "PONG"
                 }),
@@ -1775,9 +2057,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.content_part.done",
                 &serde_json::json!({
                     "type": "response.content_part.done",
-                    "sequence_number": 5,
+                    "sequence_number": 7,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
@@ -1790,8 +2072,8 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.output_item.done",
                 &serde_json::json!({
                     "type": "response.output_item.done",
-                    "sequence_number": 6,
-                    "output_index": 0,
+                    "sequence_number": 8,
+                    "output_index": 1,
                     "item": {
                         "id": "msg_http_acceptance",
                         "type": "message",
@@ -1811,10 +2093,10 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.completed",
                 &serde_json::json!({
                     "type": "response.completed",
-                    "sequence_number": 7,
+                    "sequence_number": 9,
                     "response": http_response_resource(
                         "completed",
-                        vec![serde_json::json!({
+                        vec![reasoning, serde_json::json!({
                             "id": "msg_http_acceptance",
                             "type": "message",
                             "role": "assistant",
@@ -1826,11 +2108,11 @@ fn http_response_script() -> Vec<HttpServerAction> {
                             }]
                         })],
                         serde_json::json!({
-                            "input_tokens": 0,
+                            "input_tokens": 16,
                             "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-                            "output_tokens": 0,
-                            "output_tokens_details": {"reasoning_tokens": 0},
-                            "total_tokens": 0
+                            "output_tokens": 8,
+                            "output_tokens_details": {"reasoning_tokens": 5},
+                            "total_tokens": 24
                         }),
                     )
                 }),
@@ -2018,7 +2300,7 @@ async fn assert_pinned_codex_version(codex_bin: &OsStr) {
     assert!(output.status.success(), "codex --version should succeed");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        CODEX_VERSION,
+        format!("codex-cli {CODEX_PINNED_VERSION}"),
         "acceptance fixture and executable pin must match"
     );
 }
@@ -2026,6 +2308,7 @@ async fn assert_pinned_codex_version(codex_bin: &OsStr) {
 /// Run Codex with isolated configuration, credentials, input, and workspace.
 async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutput {
     let CodexRunOptions {
+        web_search,
         proxy_base_url,
         model,
         working_dir,
@@ -2034,6 +2317,7 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
         execution_timeout,
         no_proxy,
         netns,
+        reasoning_effort,
         tolerate_timeout,
         compaction_limits,
     } = options;
@@ -2044,11 +2328,14 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
             limits.context_window, limits.auto_compact_token_limit
         )
     });
+    let reasoning_key =
+        reasoning_effort.map_or_else(String::new, |effort| format!("model_reasoning_effort = \"{effort}\"\n"));
     let config = format!(
         r#"model = "{model}"
 model_provider = "praxis"
-web_search = "disabled"
-{compaction_keys}
+approval_policy = "never"
+web_search = "{web_search}"
+{compaction_keys}{reasoning_key}
 [features]
 apps = false
 browser_use = false
@@ -2298,10 +2585,19 @@ fn assert_coding_codex_jsonl(stdout: &str) {
     );
 }
 
-/// Validate model-independent lifecycle invariants from the live Codex turn.
-fn assert_live_coding_codex_jsonl(stdout: &str) {
-    let mut started_commands = Vec::new();
-    let mut saw_correlated_successful_command = false;
+/// Validate that live Codex completed its apply_patch file-change lifecycle.
+fn codex_turn_has_reasoning_usage(event: &serde_json::Value) -> bool {
+    event["type"] == "turn.completed"
+        && event
+            .pointer("/usage/reasoning_output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|tokens| tokens > 0)
+}
+
+fn assert_live_apply_patch_codex_jsonl(stdout: &str, require_reasoning: bool) {
+    let mut started_result_file_changes = Vec::new();
+    let mut saw_completed_result_file_change = false;
+    let mut saw_reasoning_usage = false;
     let mut saw_summary = false;
     let mut saw_completed_turn = false;
     let mut saw_usage = false;
@@ -2315,18 +2611,43 @@ fn assert_live_coding_codex_jsonl(stdout: &str) {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
 
-        if event_type == Some("item.started") && item_type == Some("command_execution") && !item_id.is_empty() {
-            started_commands.push(item_id.to_owned());
+        saw_reasoning_usage |= codex_turn_has_reasoning_usage(&event);
+
+        if event_type == Some("item.started") && item_type == Some("file_change") && !item_id.is_empty() {
+            let adds_result_file = event
+                .pointer("/item/changes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change
+                            .pointer("/path")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|path| path.ends_with("result.txt"))
+                            && change.pointer("/kind").and_then(serde_json::Value::as_str) == Some("add")
+                    })
+                });
+            if adds_result_file {
+                started_result_file_changes.push(item_id.to_owned());
+            }
         }
-        if event_type == Some("item.completed") && item_type == Some("command_execution") {
-            let command = event
-                .pointer("/item/command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let exit_code = event.pointer("/item/exit_code").and_then(serde_json::Value::as_i64);
-            saw_correlated_successful_command |= !command.is_empty()
-                && exit_code == Some(0)
-                && started_commands.iter().any(|started| started == item_id);
+        if event_type == Some("item.completed")
+            && item_type == Some("file_change")
+            && event.pointer("/item/status").and_then(serde_json::Value::as_str) == Some("completed")
+        {
+            let adds_result_file = event
+                .pointer("/item/changes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change
+                            .pointer("/path")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|path| path.ends_with("result.txt"))
+                            && change.pointer("/kind").and_then(serde_json::Value::as_str) == Some("add")
+                    })
+                });
+            saw_completed_result_file_change |=
+                adds_result_file && started_result_file_changes.iter().any(|started| started == item_id);
         }
         saw_summary |= event_type == Some("item.completed")
             && item_type == Some("agent_message")
@@ -2348,8 +2669,8 @@ fn assert_live_coding_codex_jsonl(stdout: &str) {
     }
 
     assert!(
-        saw_correlated_successful_command,
-        "Codex must emit a correlated command_execution start/completion with exit code 0; stdout:\n{stdout}"
+        saw_completed_result_file_change,
+        "Codex must emit a correlated, completed file_change adding result.txt via apply_patch; stdout:\n{stdout}"
     );
     assert!(
         saw_summary,
@@ -2363,12 +2684,78 @@ fn assert_live_coding_codex_jsonl(stdout: &str) {
         saw_usage,
         "Codex must receive nonzero usage from live vLLM through Praxis; stdout:\n{stdout}"
     );
+    assert!(
+        !require_reasoning || saw_reasoning_usage,
+        "Codex must receive nonzero reasoning tokens from live vLLM through Praxis; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn live_apply_patch_codex_jsonl_requires_a_completed_result_file_change() {
+    let events = [
+        serde_json::json!({
+            "type": "item.started",
+            "item": {
+                "id": "item_1",
+                "type": "file_change",
+                "status": "in_progress",
+                "changes": [{"path": "/tmp/result.txt", "kind": "add"}]
+            }
+        }),
+        serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "file_change",
+                "status": "completed",
+                "changes": [{"path": "/tmp/result.txt", "kind": "add"}]
+            }
+        }),
+        serde_json::json!({
+            "type": "item.completed",
+            "item": {"id": "item_2", "type": "agent_message", "text": "Done."}
+        }),
+        serde_json::json!({
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    ];
+    let stdout = events
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_live_apply_patch_codex_jsonl(&stdout, false);
+
+    let without_reasoning = std::panic::catch_unwind(|| assert_live_apply_patch_codex_jsonl(&stdout, true));
+    assert!(
+        without_reasoning.is_err(),
+        "strict mode must not accept missing reasoning usage"
+    );
+
+    let nonterminal_reasoning =
+        format!("{stdout}\n{{\"type\":\"item.completed\",\"usage\":{{\"reasoning_output_tokens\":5}}}}");
+    assert!(std::panic::catch_unwind(|| assert_live_apply_patch_codex_jsonl(&nonterminal_reasoning, true)).is_err());
+    let with_reasoning = stdout.replace(
+        "\"output_tokens\":1",
+        "\"output_tokens\":1,\"reasoning_output_tokens\":5",
+    );
+    assert_live_apply_patch_codex_jsonl(&with_reasoning, true);
+}
+
+#[test]
+fn candidate_compaction_never_uses_qwen_xfail() {
+    assert!(allows_compaction_xfail("qwen3-8b", false));
+    assert!(!allows_compaction_xfail("qwen3-8b", true));
+    assert!(!allows_compaction_xfail("qwen3-8b-candidate", false));
 }
 
 /// Validate the compaction run's JSONL.
 ///
-/// Pinned Codex 0.144.1 emits exactly one `turn.completed` for the whole
-/// submitted prompt (covering every tool round), so accepted-turn growth is
+/// Pinned Codex (verified 0.144.1 through 0.167.0) emits exactly one
+/// `turn.completed` for the whole submitted prompt (covering every tool
+/// round), so accepted-turn growth is
 /// proven by counting correlated successful `command_execution` items, not
 /// `turn.completed` events.
 ///
@@ -2405,8 +2792,9 @@ fn chapter_labels(command: &str) -> Vec<&str> {
 }
 
 /// Unwraps a single `<shell> -c/-lc '<inner>'` layer and returns the command
-/// Codex actually executed. Pinned Codex 0.144.1 records shell-wrapped
-/// invocations such as `/bin/bash -lc './verify.sh'`; the unit fixtures use the
+/// Codex actually executed. Pinned Codex (verified 0.144.1 through 0.167.0)
+/// records shell-wrapped invocations such as `/bin/bash -lc './verify.sh'`;
+/// the unit fixtures use the
 /// bare form. Only one quoting layer is stripped, which is all Codex adds.
 fn unwrap_shell_command(command: &str) -> &str {
     let trimmed = command.trim();
@@ -2836,6 +3224,7 @@ async fn assert_no_unexpected_methods(backend: &mut praxis_test_utils::HttpBacke
 
 /// Validate the completed output and ensure Codex attempted no tool.
 fn assert_codex_jsonl(stdout: &str) {
+    let mut saw_reasoning = false;
     let mut saw_final_message = false;
     let mut saw_completed_turn = false;
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
@@ -2845,11 +3234,26 @@ fn assert_codex_jsonl(stdout: &str) {
             item_type.is_none_or(|kind| !TOOL_ITEM_TYPES.contains(&kind)),
             "Codex attempted a tool: {event}"
         );
+        saw_reasoning |= event["type"] == "item.completed"
+            && item_type == Some("reasoning")
+            && event["item"]["text"] == HTTP_REASONING_MARKER;
+        if item_type == Some("agent_message") {
+            assert!(
+                !event["item"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(HTTP_REASONING_MARKER)),
+                "reasoning appeared in a Codex agent message: {event}"
+            );
+        }
         saw_final_message |= event["type"] == "item.completed"
             && item_type == Some("agent_message")
             && event.pointer("/item/text").and_then(serde_json::Value::as_str) == Some("PONG");
         saw_completed_turn |= event["type"] == "turn.completed";
     }
+    assert!(
+        saw_reasoning,
+        "Codex should report the scripted reasoning as a reasoning item"
+    );
     assert!(
         saw_final_message,
         "Codex should complete an agent message whose exact text is PONG"

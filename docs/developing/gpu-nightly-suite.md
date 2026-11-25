@@ -15,7 +15,7 @@ also get faster CPU-side coverage against the inference simulator (see the
 | Workflow | Schedule (UTC) | What it exercises |
 | --- | --- | --- |
 | [`vllm-integration.yaml`](../../.github/workflows/vllm-integration.yaml) | `17 4 * * *` | Main GPU suite: live Responses SDK suite, OpenAI Agents SDK loop, and the Claude Code / Codex CLI acceptance jobs against real Qwen3-8B. |
-| [`anthropic-vllm-vision.yaml`](../../.github/workflows/anthropic-vllm-vision.yaml) | `31 6 * * *` | Vision companion: Anthropic SDK image requests through Praxis to `Qwen/Qwen3-VL-4B-Instruct` (the main nightly model is text-only). |
+| [`anthropic-vllm-vision.yaml`](../../.github/workflows/anthropic-vllm-vision.yaml) | `31 6 * * *` | Vision companion: Anthropic SDK image requests, plus OpenResponses image acceptance and an OpenAI SDK image request through Responses-to-Chat translation, against `Qwen/Qwen3-VL-4B-Instruct` (the main nightly model is text-only). |
 | [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | push / PR to `main` on path filters (`vllm/Containerfile`, `vllm/images.json`, the GPU actions, and the workflow itself), `merge_group`, and manual | Builds, live-tests, and publishes **every** model-baked GPU image in [`vllm/images.json`](../../vllm/images.json) to GHCR. Sole publisher; the two nightlies consume what it publishes. |
 | [`vllm-dev-endpoint.yaml`](../../.github/workflows/vllm-dev-endpoint.yaml) | manual only | On-demand vLLM endpoint over a Cloudflare tunnel for interactive testing. Not part of CI. |
 
@@ -55,16 +55,26 @@ backend can serve the same client.
 | **OpenAI Agents SDK** | native | SDK-owned tool loop over Responses | `/v1/responses` |
 | **OpenAI SDK (Responses)** | native | Responses SDK suite, SDK **2.x and 3.x** | `/v1/responses` |
 | **OpenAI SDK (Chat Completions)** | translated (selected provider) | `openai_chat_completions_to_anthropic[_stream]` | `/v1/messages` |
+| **Anthropic SDK (vision companion)** | native + translated | Messages passthrough / Messages → Chat Completions | `/v1/messages` / `/v1/chat/completions` |
+| **OpenResponses + OpenAI SDK (vision companion)** | translated | Responses → Chat Completions | `/v1/chat/completions` |
 
 Details per use case:
 
-- **Codex CLI — native vs translated.** A pinned Codex binary completes the same
-  coding workflow twice: once over vLLM's native `/v1/responses` (with a
-  PostgreSQL response store), once with Praxis translating Responses → Chat
-  Completions. Tests:
-  `codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http`
-  and `..._completes_chat_backend_coding_workflow_over_http`
-  (config `openai/responses/codex-http-chat-translation.yaml`).
+- **Codex CLI — native vs translated.** A pinned Codex binary uses its
+  grammar-constrained `apply_patch` tool to create `result.txt`, returns the
+  tool output through Praxis, and runs the verifier. The test covers vLLM's
+  native `/v1/responses` (with a PostgreSQL response store) and Praxis's
+  Responses-to-Chat translation:
+  `codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http`
+  and
+  `codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http`
+  (configs `openai/responses/client-tool-compat.yaml` and
+  `openai/responses/client-tool-compat-chat-completions.yaml`). The test selects
+  Codex's known `gpt-5.5` model metadata so the CLI exposes grammar-based
+  `apply_patch`, then rewrites the request's model field to the live vLLM model;
+  inference still runs against the configured Qwen backend. The offline pinned
+  HTTP test checks that this catalog entry declares the grammar tool, so client
+  upgrades cannot silently remove it (as 0.167.0 did for `gpt-5.4`).
 - **Claude Code — native vs translated.** A pinned Claude Code binary completes
   the same multi-step task under four scenarios: {native (`messages-native-vllm.yaml`)
   / transformed (`messages-to-openai-vllm.yaml`)} × {deterministic `acceptEdits`
@@ -102,8 +112,28 @@ Details per use case:
   (`claude_code_vllm::pinned_claude_code_compaction_crosses_context_window_on_native_vllm`).
   See the limitation note below for how task-completion is graded on Qwen3-8B.
 
-See also the vision companion workflow (`anthropic-vllm-vision.yaml`), which
-covers the Anthropic SDK image/vision path against `Qwen3-VL-4B-Instruct`.
+### Vision companion (`anthropic-vllm-vision.yaml`)
+
+The separate vision workflow reuses the revision-pinned `vision` image from
+[`vllm/images.json`](../../vllm/images.json), serving `Qwen3-VL-4B-Instruct`
+with a generated backend bearer token. It runs two test commands:
+
+| Command | What it proves |
+| --- | --- |
+| `uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k image` | Official Anthropic SDK image inputs reach the real model through both the native Messages and translated Chat Completions examples; generated red/blue PNGs are identified by color. |
+| `uv run tests/integration/sdk/openai/test_responses_acceptance_gateway.py -s -k live_image` | The pinned upstream OpenResponses `image-input` template passes through the managed Responses-to-Chat profile, then the official OpenAI SDK sends the same image input and receives a completed response with nonempty output text. |
+
+Both commands require live infrastructure via `PRAXIS_TEST_REQUIRE_LIVE=1`.
+The OpenResponses step uses pinned Bun and a Praxis binary built with
+`--no-default-features --features standard,openai-all,store-sqlite`.
+Only `live_image` is selected from the gateway test file; its controlled
+backend and timeout regression tests run separately in CPU translation CI.
+
+This adds image acceptance to the GPU inventory, not the complete upstream
+OpenResponses suite. The vision job does not run that suite's text, tool,
+compaction, or WebSocket templates. The explicit full-suite runner, its
+managed/passthrough profiles, and the recorded seven outstanding WebSocket
+cases are documented in [Full OpenResponses acceptance](../conformance/openresponses-acceptance.md).
 
 ### Known model limitation: self-compaction task completion on Qwen3-8B
 
@@ -136,8 +166,8 @@ The downstream task-completion oracle is an **XFAIL on Qwen3-8B**:
   proofs, the downstream
   task-completion assertions (correct `result.txt`, wire ordering of the write
   after compaction, the ordered JSONL trace, `./verify.sh`) are **skipped** when
-  the live model matches `COMPACTION_XFAIL_MODEL` (`qwen3-8b`), with an
-  `XFAIL (...)` line logged.
+  the non-candidate lane serves the exact alias `qwen3-8b`, with an
+  `XFAIL (...)` line logged. A candidate dispatch never uses this fallback.
 - **Claude Code.** After the hard proofs (self-compaction boundary and the
   pre-compaction Read carrying the marker through Praxis), the test checks for a
   post-compaction tool call. On Qwen3-8B, an absent call is logged as an expected
@@ -160,6 +190,40 @@ dispatch `vllm-integration.yaml` with `run_compaction_only=true` **alone** (do
 NOT also pass `run_live_vllm=true`, which would trigger the full suite): it
 provisions the GPU runner and runs only the Codex and Claude Code compaction
 steps, skipping the full Responses suite and every other acceptance step.
+
+### Qualifying a Codex candidate checkpoint
+
+Manually dispatch `vllm-integration.yaml` with `run_codex_acceptance=true`
+and every other `run_*` input false, including `run_compaction_only`. Set
+`codex_model` to the Hugging Face checkpoint ID and
+`codex_served_model_name` to a slash-free alias. This runs the Codex GPU job
+without holding the candidate GPU for the Qwen3-8B full suite. Scheduled and
+labeled jobs keep their Qwen3-8B settings.
+
+Set `gpu_instance_type`, `codex_tensor_parallel_size`, and
+`codex_max_model_len` for the checkpoint and runner. The context length must
+exceed Codex's 16,000-token test window. Select `codex_tool_call_parser` and
+`codex_reasoning_parser` from the pinned vLLM version. The value `none` omits
+the corresponding server flag. For `openai/gpt-oss-120b`, use the alias
+`gpt-oss-120b`, tool parser `openai`, and reasoning parser `openai_gptoss`.
+For Gemma 4 and Nemotron 3, select the exact checkpoint and matching parsers;
+these are candidates, not claims of passing GPU runs.
+
+The native test requires a completed `apply_patch` edit through
+`openai_client_tool_compat` and positive reasoning-token usage in a completed
+Codex turn. The compaction test requires Codex's own compaction request,
+continued traffic through Praxis, and a correct result that passes verification.
+`codex_skip_translated=true` skips only the translated Chat case and its
+preflight; both native gates still run.
+
+Download `qualification.json` from the `vllm-qualification` artifact. Under
+`suites.codex_acceptance`, `cases` contains the scenario results and
+`provenance` contains the checkpoint and alias, the Hugging Face commit SHA
+pinned for candidate runs, the pinned vLLM image, parser and
+GPU settings, Codex version, and ordered Praxis filter names by case. The
+report only merges Codex evidence matching its run ID, attempt, and checkout
+SHA. The top-level `not_requested` status on a Codex-only run refers to the
+full Responses suite, not the Codex cases.
 
 ### Known model limitation: server-side web search on Qwen3-8B
 
@@ -289,6 +353,10 @@ carry the detail.
   loop (deterministic vs live GPU mode).
 - `tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py` — Anthropic
   SDK → Praxis → real vLLM Messages acceptance.
+- `tests/integration/sdk/openai/test_responses_acceptance_gateway.py` —
+  OpenResponses and OpenAI SDK image acceptance in the vision companion
+  (`-k live_image`); controlled image/compaction and timeout regression
+  coverage in CPU translation CI (`-k 'not live_image'`).
 - `tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py` — Anthropic
   web search.
 - `tests/integration/sdk/openai/test_selected_anthropic_chat_completions_vllm.py`
@@ -331,6 +399,9 @@ VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
 
 ## Deeper references
 
+- [Full OpenResponses acceptance](../conformance/openresponses-acceptance.md)
+  — the separately invoked complete upstream suite, test profiles, and
+  scope of the recorded live results.
 - [vllm-qualification.md](vllm-qualification.md) — what the suite produces
   (`qualification.json` schema, report fields, pass/fail semantics, release
   selection).

@@ -24,9 +24,11 @@ use crate::dump;
 pub(crate) fn load_and_validate_for_cli(
     explicit: Option<&str>,
 ) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    let config = praxis_ai::load_config(explicit)?;
-    validate_config_for_startup(&config)?;
-    Ok(config)
+    praxis_core::logging::with_bootstrap_logging(|| {
+        let config = praxis_ai::load_config(explicit)?;
+        validate_config_for_startup(&config)?;
+        Ok(config)
+    })
 }
 
 /// Validate a parsed configuration by building filter pipelines.

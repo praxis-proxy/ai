@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::openai::{
     responses::{
         openai_client_tool_compat::{
-            custom_public_item_id, input_from_arguments_strict, restore_custom_call, restore_namespace_custom_call,
+            custom_input::CustomInputFormat, custom_public_item_id, decoded_input, restore_custom_like,
             restore_shell_call, restore_snapshot, restore_snapshot_tools, restore_tool_search_call,
         },
         state::{ClientToolEcho, ClientToolRestore, LoweredClientTool},
@@ -57,6 +57,9 @@ pub(super) struct ClientToolStreamItem {
     pub private_name: String,
     /// The typed item this lowered `function_call` restores to.
     pub restore: ClientToolRestore,
+    /// The recognized input format, used to validate the decoded `input` at
+    /// `arguments.done` before the canonical custom-input events are emitted.
+    pub format: CustomInputFormat,
     /// Lifecycle progress observed so far.
     pub phase: ClientToolPhase,
     /// Absolute output index carried by the item's lifecycle events.
@@ -284,6 +287,7 @@ fn plan_output_item_added(
         key,
         private_name: name.to_owned(),
         restore: lowered.restore,
+        format: lowered.format,
         phase: ClientToolPhase::Opened,
         output_index: payload.get("output_index").and_then(Value::as_u64).unwrap_or_default(),
         item_id: item.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
@@ -462,11 +466,11 @@ fn plan_custom_arguments_done(
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let input = input_from_arguments_strict(arguments).map_err(|()| {
-        client_tool_restore_error(
-            &tracked.key,
-            "lowered custom-tool arguments are not a {\"input\":...} envelope",
-        )
+    // Unwrap the envelope and validate the decoded input against the declared grammar
+    // before any canonical custom-input event is emitted; a malformed or grammar-invalid
+    // patch fails the stream closed (`Text` always validates).
+    let input = decoded_input(arguments, tracked.format).map_err(|()| {
+        client_tool_restore_error(&tracked.key, "lowered custom-tool input is not a valid patch envelope")
     })?;
     let raw_id = tracked
         .item_id
@@ -617,7 +621,7 @@ fn plan_done_disposition(
         // authoritative done item and splice it back onto the done envelope.
         ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
             Ok(ClientToolDisposition::EmitCustomItemDone {
-                item: build_custom_done_payload(payload, lowered, restore)?,
+                item: build_custom_done_payload(payload, lowered)?,
             })
         },
         // Shell/ToolSearch: rebuild the finalized typed call from the authoritative
@@ -637,25 +641,14 @@ fn plan_done_disposition(
 /// splices it onto a single owned clone of the committed done envelope (the plan
 /// pass only borrows the event — AGENTS.md ownership boundary). Fails closed if the
 /// item cannot be restored (missing `call_id`, un-unwrappable input).
-fn build_custom_done_payload(
-    payload: &Value,
-    lowered: &LoweredClientTool,
-    restore: ClientToolRestore,
-) -> Result<Value, SseParseError> {
+fn build_custom_done_payload(payload: &Value, lowered: &LoweredClientTool) -> Result<Value, SseParseError> {
     let Some(item) = payload.get("item") else {
         return Err(client_tool_restore_error(
             &lowered.original_name,
             "output_item.done carried no item to restore",
         ));
     };
-    let restored = match restore {
-        ClientToolRestore::NamespaceCustom => {
-            restore_namespace_custom_call(item, &lowered.original_name, lowered.namespace.as_deref())
-        },
-        // Plain Custom keeps the client's own name (the wire name is unobfuscated).
-        _ => restore_custom_call(item),
-    }
-    .map_err(|()| {
+    let restored = restore_custom_like(item, lowered).map_err(|()| {
         client_tool_restore_error(
             &lowered.original_name,
             "lowered custom-tool call could not be restored to custom_tool_call",
@@ -730,6 +723,7 @@ mod tests {
                 original_name: "read".to_owned(),
                 namespace: Some("fs".to_owned()),
                 restore: ClientToolRestore::Namespace,
+                format: CustomInputFormat::Text,
             },
         );
         m
@@ -743,6 +737,7 @@ mod tests {
                 original_name: "run_python".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::Text,
             },
         );
         m
@@ -756,6 +751,7 @@ mod tests {
                 original_name: "shell".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Shell,
+                format: CustomInputFormat::Text,
             },
         );
         m
@@ -769,6 +765,7 @@ mod tests {
                 original_name: "tool_search".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::ToolSearch,
+                format: CustomInputFormat::Text,
             },
         );
         m
@@ -1317,6 +1314,7 @@ mod tests {
                 original_name: "run_python".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::Text,
             },
         );
         let echo = ClientToolEcho {

@@ -58,7 +58,7 @@ impl HttpFilter for StoreReadinessGateFilter {
         // StreamBuffer filters execute before on_request. Participate in that
         // pre-read so a downstream store filter cannot observe the empty
         // registry first and turn an initializing request into a 500.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -113,7 +113,10 @@ mod tests {
         let gate = StoreReadinessGateFilter;
         let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
 
-        assert_eq!(gate.request_body_access(), BodyAccess::ReadOnly);
+        assert_eq!(
+            gate.request_body_access(),
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+        );
         assert!(matches!(
             gate.on_request_body(&mut context, &mut body, false)
                 .await

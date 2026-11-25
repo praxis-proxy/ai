@@ -24,8 +24,10 @@ use futures::stream::{BoxStream, StreamExt as _};
 use praxis_filter::{CalloutResponseTooLarge, StreamingResponseBody};
 use sse_stream::{Error as SseError, Sse, SseStream};
 
-use super::subrequest_transport::{TransportSignal, TransportSignalState};
-use crate::openai::responses::agentic_loop::budget::output_charge;
+use super::{
+    mcp_result_charge,
+    subrequest_transport::{TransportSignal, TransportSignalState},
+};
 
 /// Destination for an SSE size classification.
 #[derive(Clone)]
@@ -291,7 +293,7 @@ pub(super) fn sse_stream_from_body_with_budget(
         .map(move |event| {
             if let (Some(limit), Ok(value)) = (parse_charge_limit, &event)
                 && let Some(data) = &value.data
-                && output_charge(data.as_bytes()).is_none_or(|charge| charge > limit)
+                && mcp_result_charge(data.as_bytes()).is_none_or(|charge| charge > limit)
             {
                 parse_signal.record(TransportSignal::ResponseTooLarge { limit });
                 return Err(SseError::Body(Box::new(SseByteStreamError::Ceiling { limit })));

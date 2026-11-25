@@ -1133,7 +1133,7 @@ pipeline:
     name: iterative_request_router
     group: irr
     filter_type: iterative_request_router
-    phase: terminal filter; owns agentic model-tool-model loop; transitions on openai_agentic_loop action
+    phase: terminal filter for POST; owns agentic model-tool-model loop; transitions on openai_agentic_loop action
     config:
       initial_step: inference
       max_iterations: 8
@@ -1873,6 +1873,18 @@ pipeline:
       S13:
         state: active
         note: rewrites POST /v1/responses -> /v1/chat/completions
+  - id: unsupported_method
+    name: static_response (unsupported method 405)
+    group: irr
+    filter_type: static_response
+    phase: final fallback after resource handlers, direct dispatch, and managed inference
+    config:
+      status: 405
+      headers:
+      - name: Allow
+        value: POST
+    promotes: returns HTTP 405 for requests that reach the end of the pipeline
+    scenarios: {}
   scenarios:
   - id: S1
     label: Stateful create

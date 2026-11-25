@@ -40,10 +40,12 @@
 mod a2a;
 mod agentic_mocks;
 mod anthropic_messages;
+mod body_contracts;
 mod claude_code;
 mod claude_code_vllm;
 #[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 mod codex_http;
+mod codex_pin;
 #[cfg(all(
     feature = "openai-agentic-loop",
     feature = "openai-compact",
@@ -75,6 +77,7 @@ mod inference_fixtures;
 mod live_vllm;
 mod mcp;
 mod mcp_broker;
+mod mcp_broker_sessions;
 #[cfg(feature = "openai-mcp-tools")]
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;

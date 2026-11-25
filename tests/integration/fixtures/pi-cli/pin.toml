@@ -29,7 +29,7 @@
 # `pi_lane_is_wired_in_ci` enforce both pairs.
 #
 # `pi --version` prints the bare version with NO product prefix (`1.4.0`).
-version = "1.4.0"
+version = "1.5.2"
 # Platform slug of the pinned release archive.
 platform = "linux-x64"
 # How CI obtains the executable.
@@ -51,7 +51,7 @@ platform = "linux-x64"
 # version check in both lanes is what catches a binary staged without its
 # directory.
 install = "github-release"
-url = "https://github.com/earendil-works/pi/releases/download/v1.4.0/pi-linux-x64.tar.gz"
+url = "https://github.com/earendil-works/pi/releases/download/v1.5.2/pi-linux-x64.tar.gz"
 archive = "pi-linux-x64.tar.gz"
 # The executable's path inside the extracted archive.
 archive_binary = "pi/pi"

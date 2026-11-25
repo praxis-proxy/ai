@@ -18,9 +18,10 @@
 //!
 //! [`responses_error_rejection`]: super::error::responses_error_rejection
 
-use praxis_filter::{FilterAction, FilterError, Rejection, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::{FilterAction, FilterError, Rejection};
 
 use super::error::responses_error_rejection;
+use crate::json_body::MAX_JSON_BODY_BYTES;
 
 /// Validate a filter-specific byte limit, naming the actual field.
 ///

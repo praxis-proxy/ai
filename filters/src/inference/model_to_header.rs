@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
     parse_filter_config,
@@ -53,6 +54,14 @@ fn default_header() -> String {
 /// Promotion is deferred until end-of-stream so a later body-writing filter
 /// (for example `llmisvc_model_provider_resolver`) can observe the pending
 /// header in the same `StreamBuffer` pre-read pass.
+///
+/// Body inspection inherits the pipeline's `body_limits.max_buffer_bytes`
+/// and `body_limits.max_request_bytes`; the smaller bound applies. To accept
+/// requests above the default 10 MiB request limit, raise `max_request_bytes`
+/// and ensure `max_buffer_bytes` is at least as large (its default is 64 MiB).
+/// These bounds govern the shared pipeline buffer even when another filter
+/// declares a smaller buffer. Filters can still enforce separate validation
+/// limits while processing the body.
 ///
 /// # YAML configuration
 ///
@@ -142,7 +151,9 @@ impl HttpFilter for ModelToHeaderFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        self.inner.request_body_mode()
+        // The inner JSON extractor's 10 MiB default would silently prevent
+        // operators from raising the pipeline's configured inspection bound.
+        BodyMode::StreamBuffer { max_bytes: None }
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -181,7 +192,7 @@ impl HttpFilter for ModelToHeaderFilter {
             .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(self.header.as_str()))
             .map(|(_, value)| value.clone());
         if let Some(model) = model {
-            ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
+            ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
         }
         Ok(action)
     }
@@ -258,17 +269,36 @@ mod tests {
         let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
         assert_eq!(
             filter.request_body_access(),
-            BodyAccess::ReadOnly,
-            "body access should delegate to inner"
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Required),
+            "body access should delegate to the required body inspector"
         );
-        assert!(
-            matches!(
-                filter.request_body_mode(),
-                BodyMode::StreamBuffer {
-                    max_bytes: Some(limit)
-                } if limit > 0
-            ),
-            "body mode should be StreamBuffer with a default size limit"
+        assert_eq!(
+            filter.request_body_mode(),
+            BodyMode::StreamBuffer { max_bytes: None },
+            "inspection should inherit the configured pipeline limits"
+        );
+    }
+
+    #[test]
+    fn inherited_bounds_govern_the_shared_buffer_with_other_filters() {
+        let mut entries = serde_yaml::from_str::<Vec<praxis_core::config::FilterEntry>>(
+            "
+- filter: model_to_header
+- filter: prompt_enrich
+  max_body_bytes: 1024
+  prepend: [{role: system, content: hello}]
+",
+        )
+        .unwrap();
+        let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &crate::build_ai_registry()).unwrap();
+        let limits = serde_yaml::from_str("max_request_bytes: 33554432\nmax_buffer_bytes: 33554432").unwrap();
+        pipeline.configure_body_limits(&limits, false).unwrap();
+        assert_eq!(
+            pipeline.body_capabilities().request_body_mode,
+            BodyMode::StreamBuffer {
+                max_bytes: Some(33_554_432)
+            },
+            "filter mode declarations request shared capacity; listener bounds are the hard limits"
         );
     }
 
@@ -483,7 +513,7 @@ mod tests {
 
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_eq!(
-            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
             Some("gpt-x"),
             "model_to_header should publish the promoted body model, not a spoofed client header"
         );
@@ -498,7 +528,7 @@ mod tests {
 
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_eq!(
-            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
             None,
             "no model in the body should publish no model metadata"
         );

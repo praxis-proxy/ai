@@ -128,12 +128,13 @@ async fn opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker() {
 
     // 2.x renamed the 1.x `bash` tool to `shell`; naming the wrong tool would
     // leave the model to guess.
+    let tool = pin_value("shell_tool");
+    let command = format!("cp {} {} && echo COPY_OK", ToolWorkspace::SOURCE, ToolWorkspace::TARGET);
     let prompt = format!(
-        "Use the {tool} tool. Run exactly: cp {source} {target}. \
-         Then reply DONE. Do not print the file contents. /no_think",
-        tool = pin_value("shell_tool"),
-        source = ToolWorkspace::SOURCE,
-        target = ToolWorkspace::TARGET,
+        "Use the {tool} tool exactly once to run this exact command: `{command}`. \
+         Do not emit any text until the tool returns COPY_OK. \
+         Then reply exactly DONE and stop. \
+         Do not call any tool again or print the file contents. /no_think"
     );
 
     let output = run_live(&live, workspace.dir.path(), &prompt).await;
@@ -143,12 +144,71 @@ async fn opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker() {
     // marker rather than anything the client could have rewritten.
     workspace.assert_marker_copied();
 
-    // Oracle B: the client actually invoked a tool, rather than the file
-    // happening to exist. Lenient about event shape, strict about the fact.
+    // Oracle B: the client invoked exactly one tool and returned the requested
+    // final answer, rather than passing only because the file happened to exist.
     let types = trace.event_types();
+    let tool_use_count = types.iter().filter(|event| **event == "tool_use").count();
+    assert_eq!(
+        tool_use_count, 1,
+        "the turn should contain exactly one tool_use event, got {types:?}"
+    );
+
+    let events = trace.events();
+    let tool_event = events
+        .iter()
+        .find(|event| event["type"].as_str() == Some("tool_use"))
+        .expect("the single tool_use event should be available");
+    let tool_part = &tool_event["part"];
+    assert_eq!(
+        tool_part["tool"].as_str(),
+        Some(tool.as_str()),
+        "live 2.x tool-call round trip should invoke {tool}; got {types:?}"
+    );
+    assert_eq!(
+        tool_part["state"]["status"].as_str(),
+        Some("completed"),
+        "live 2.x tool-call round trip should complete the {tool} call; got {types:?}"
+    );
+    assert_eq!(
+        tool_part["state"]["input"]["command"].as_str(),
+        Some(command.as_str()),
+        "live 2.x tool-call round trip should run the exact requested command; tool event: {tool_event}"
+    );
+    let tool_output = tool_part["state"]["output"].as_str().unwrap_or_default();
     assert!(
-        types.iter().any(|event| event.contains("tool")),
-        "the turn should contain at least one tool event, got {types:?}"
+        tool_output.contains("COPY_OK"),
+        "live 2.x tool-call round trip should return visible COPY_OK; output: {tool_output:?}; tool event: {tool_event}"
+    );
+
+    let step_finish_index = events
+        .iter()
+        .rposition(|event| event["type"].as_str() == Some("step_finish"))
+        .expect("live 2.x tool-call round trip should emit step_finish");
+    let text_before_step_finish = events[..step_finish_index]
+        .iter()
+        .filter(|event| event["type"].as_str() == Some("text"))
+        .filter_map(|event| event["part"]["text"].as_str())
+        .collect::<String>();
+    let text_after_step_finish = events[step_finish_index + 1..]
+        .iter()
+        .filter(|event| event["type"].as_str() == Some("text"))
+        .filter_map(|event| event["part"]["text"].as_str())
+        .collect::<String>();
+    assert_eq!(
+        text_before_step_finish.trim(),
+        "",
+        "live 2.x tool-call round trip should not emit assistant text before step_finish; got {types:?}"
+    );
+    let assistant_text = trace.assistant_text();
+    assert_eq!(
+        assistant_text.trim(),
+        "DONE",
+        "live 2.x tool-call round trip should finish with DONE; text: {assistant_text:?}; events: {types:?}"
+    );
+    assert_eq!(
+        text_after_step_finish.trim(),
+        "DONE",
+        "live 2.x tool-call round trip should emit DONE after step_finish; got {types:?}"
     );
 }
 

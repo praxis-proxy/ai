@@ -3,10 +3,10 @@
 
 //! Configuration types for the `openai_doc_extract` filter.
 
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::openai::responses::body_limits::validate_size_limit;
+use crate::{json_body::MAX_JSON_BODY_BYTES, openai::responses::body_limits::validate_size_limit};
 
 /// Default maximum number of `input_file` parts extracted per request.
 const DEFAULT_MAX_FILE_REFERENCES: usize = 32;

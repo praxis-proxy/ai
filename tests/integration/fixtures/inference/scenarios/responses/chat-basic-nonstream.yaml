@@ -10,6 +10,7 @@ features:
   - responses.chat.continuation
   - responses.chat.auto_tool_choice_without_tools
   - responses.chat.shared_controls
+  - responses.chat.access_programs
 turns:
   - name: initial
     request:

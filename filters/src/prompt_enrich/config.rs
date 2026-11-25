@@ -3,10 +3,7 @@
 
 //! Deserialized YAML configuration types for the prompt enrichment filter.
 
-use praxis_filter::{
-    FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-};
+use praxis_filter::{FilterError, builtins::http::payload_processing::config_validation::validate_max_body_bytes};
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
@@ -29,9 +26,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PromptEnrichConfig {
-    /// Maximum request body size to buffer before parsing.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
+    /// Optional hard request-body processing limit in bytes. Omit to inherit pipeline
+    /// `max_request_bytes` and `max_buffer_bytes`; oversize bodies return HTTP 413 before parsing.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
 
     /// Behavior when the body is not valid JSON or lacks a
     /// `messages` array.
@@ -45,11 +43,6 @@ pub(super) struct PromptEnrichConfig {
     /// Messages to append at the end of the `messages` array.
     #[serde(default)]
     pub append: Vec<MessageConfig>,
-}
-
-/// Default for `max_body_bytes`.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
 }
 
 // -----------------------------------------------------------------------------
@@ -120,7 +113,9 @@ pub(super) fn validate_config(cfg: &PromptEnrichConfig) -> Result<(), FilterErro
         return Err("prompt_enrich: at least one of 'prepend' or 'append' must be non-empty".into());
     }
 
-    validate_max_body_bytes("prompt_enrich", cfg.max_body_bytes)?;
+    if let Some(limit) = cfg.max_body_bytes {
+        validate_max_body_bytes("prompt_enrich", limit)?;
+    }
 
     for msg in &cfg.prepend {
         if msg.content.is_empty() {
@@ -186,7 +181,7 @@ prepend:
         )
         .unwrap();
 
-        assert_eq!(cfg.max_body_bytes, DEFAULT_JSON_BODY_MAX_BYTES);
+        assert_eq!(cfg.max_body_bytes, None);
         assert_eq!(cfg.on_invalid, InvalidBodyBehavior::Continue);
         assert!(cfg.append.is_empty());
     }
@@ -263,7 +258,7 @@ extra: true
     #[test]
     fn validate_empty_prepend_and_append_rejected() {
         let cfg = PromptEnrichConfig {
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            max_body_bytes: None,
             on_invalid: InvalidBodyBehavior::Continue,
             prepend: vec![],
             append: vec![],
@@ -278,7 +273,7 @@ extra: true
     #[test]
     fn validate_prepend_only_ok() {
         let cfg = PromptEnrichConfig {
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            max_body_bytes: None,
             on_invalid: InvalidBodyBehavior::Continue,
             prepend: vec![MessageConfig {
                 role: MessageRole::System,
@@ -292,7 +287,7 @@ extra: true
     #[test]
     fn validate_append_only_ok() {
         let cfg = PromptEnrichConfig {
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            max_body_bytes: None,
             on_invalid: InvalidBodyBehavior::Continue,
             prepend: vec![],
             append: vec![MessageConfig {
@@ -306,7 +301,7 @@ extra: true
     #[test]
     fn validate_empty_content_rejected() {
         let cfg = PromptEnrichConfig {
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            max_body_bytes: None,
             on_invalid: InvalidBodyBehavior::Continue,
             prepend: vec![MessageConfig {
                 role: MessageRole::System,
@@ -324,7 +319,7 @@ extra: true
     #[test]
     fn validate_prepend_with_user_role_rejected() {
         let cfg = PromptEnrichConfig {
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            max_body_bytes: None,
             on_invalid: InvalidBodyBehavior::Continue,
             prepend: vec![MessageConfig {
                 role: MessageRole::User,
@@ -342,7 +337,7 @@ extra: true
     #[test]
     fn validate_zero_max_body_bytes_rejected() {
         let cfg = PromptEnrichConfig {
-            max_body_bytes: 0,
+            max_body_bytes: Some(0),
             on_invalid: InvalidBodyBehavior::Continue,
             prepend: vec![MessageConfig {
                 role: MessageRole::System,
