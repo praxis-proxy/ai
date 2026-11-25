@@ -17,6 +17,10 @@ name: Bump Pins
 #
 # The daily run opens a PR from `bot/bump-praxis-core` only when core main moves.
 #
+# Failures reach maintainers outside the Actions tab: a weekly bump held back by
+# people's commits on the open PR is posted there as a comment, and a failed
+# scheduled run opens or updates a tracking issue (`report-failure`).
+#
 # The PR is opened with the praxis-bot-app token rather than github.token, so
 # CI runs on it. The commit is created through the GitHub API, which signs it
 # as the app (a local `git commit` here would be unsigned and fail the
@@ -104,7 +108,8 @@ jobs:
           for pin in $PINS; do
             args+=(--pin "$pin")
           done
-          cargo xtask bump-pins "${args[@]}" --report "$RUNNER_TEMP/bump-report.md"
+          cargo xtask bump-pins "${args[@]}" --report "$RUNNER_TEMP/bump-report.md" \
+            --codex-discovery-failure "$RUNNER_TEMP/codex-discovery-failure"
 
       - name: Detect changes
         id: diff
@@ -133,6 +138,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
           bot="${APP_SLUG}[bot]"
@@ -146,11 +152,21 @@ jobs:
             head=$(jq -r .headRefOid <<<"$view")
 
             # A person re-validating on the bot branch pushes their own commits;
-            # replacing the branch would discard them. Leave that PR alone.
+            # replacing the branch would discard them. Leave the branch alone,
+            # but say on the PR which newer releases are waiting, so the held
+            # bump is not visible only in this run's log.
             others=$(jq --arg bot "$bot" \
               '[.commits[].authors[].login | select(. != $bot)] | length' <<<"$view")
             if [ "$others" -gt 0 ]; then
-              echo "::notice::#$pr has commits from people; not overwriting it."
+              echo "::warning::#$pr has commits from people; not overwriting it."
+              if [ "$CORE_REFRESH" != true ]; then
+                {
+                  echo "The [pin bump run]($RUN_URL) left this branch in place because it has commits from people. The report below compares release pins with main."
+                  echo
+                  cat "$RUNNER_TEMP/bump-report.md"
+                } > "$RUNNER_TEMP/held-bump.md"
+                gh pr comment "$pr" --body-file "$RUNNER_TEMP/held-bump.md"
+              fi
               exit 0
             fi
 
@@ -243,4 +259,48 @@ jobs:
             gh pr create "${draft[@]}" --base main --head "$BRANCH" \
               --title "$PR_TITLE" \
               --body-file "$RUNNER_TEMP/bump-report.md"
+          fi
+
+      # Publish any valid updates before raising a Codex discovery failure.
+      - name: Check Codex release discovery
+        if: env.CORE_REFRESH != 'true'
+        run: |
+          if [ -s "$RUNNER_TEMP/codex-discovery-failure" ]; then
+            cat "$RUNNER_TEMP/codex-discovery-failure" >&2
+            exit 1
+          fi
+
+  # A failed scheduled run is otherwise visible only in the Actions tab: the
+  # weekly bump failed twice at `Generate token` before anyone noticed (#2007).
+  # Keep one open issue per schedule and comment on it for each failure. This
+  # uses github.token, not the app token, because the app token mint is one of
+  # the steps that can fail.
+  report-failure:
+    needs: bump
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: >-
+            ${{ env.CORE_REFRESH == 'true'
+                && 'ci(bump-pins): daily Praxis Core refresh is failing'
+                || 'ci(bump-pins): weekly pinned-client bump is failing' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -o pipefail
+          body="The scheduled [Bump Pins run]($RUN_URL) failed. Open the run to find the failing step and see which updates, if any, were published."
+          issue=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title |
+            jq -r --arg title "$TITLE" '.[] | select(.title == $title) | .number' | head -n1)
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$TITLE" --label triage/needs-triage --body "$body
+
+          Close this issue once a scheduled run succeeds."
           fi

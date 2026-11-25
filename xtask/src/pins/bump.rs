@@ -50,6 +50,10 @@ pub(crate) struct BumpArgs {
     /// Also write the markdown report (the bump PR body) to this file.
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Write the Codex discovery failure reason, or an empty file if there was none.
+    #[arg(long)]
+    codex_discovery_failure: Option<PathBuf>,
 }
 
 // -----------------------------------------------------------------------------
@@ -77,11 +81,7 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
         ));
     }
 
-    let report = render_report(&repo, &outcomes);
-    println!("{report}");
-    if let Some(path) = &args.report {
-        fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
-    }
+    write_reports(args, &repo, &outcomes)?;
     if args.dry_run {
         eprintln!("dry run: nothing written");
         return Ok(());
@@ -89,6 +89,23 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
     repo.commit()?;
     for path in repo.staged_paths() {
         eprintln!("updated {path}");
+    }
+    Ok(())
+}
+
+/// Emit the human-readable bump report and the optional Codex failure status.
+fn write_reports(args: &BumpArgs, repo: &Repo, outcomes: &[Outcome]) -> Result<(), String> {
+    let report = render_report(repo, outcomes);
+    println!("{report}");
+    if let Some(path) = &args.report {
+        fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if let Some(path) = &args.codex_discovery_failure {
+        let reason = outcomes.iter().find_map(|outcome| match outcome {
+            Outcome::Skipped(Pin::Codex, reason) => Some(reason.as_str()),
+            _ => None,
+        });
+        fs::write(path, reason.unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -369,7 +386,11 @@ fn render_report(repo: &Repo, outcomes: &[Outcome]) -> String {
         .collect();
     let mut out = String::from("## Pinned client bumps\n\n");
     if updates.is_empty() {
-        out.push_str("All checked pins are current.\n");
+        if outcomes.iter().any(|outcome| matches!(outcome, Outcome::Skipped(..))) {
+            out.push_str("No pin updates were staged.\n");
+        } else {
+            out.push_str("All checked pins are current.\n");
+        }
     } else {
         render_table(&mut out, &updates);
     }
@@ -483,6 +504,16 @@ pub(crate) fn checklist(pin: Pin, old: &str, new: &str) -> Vec<String> {
     items
 }
 
+/// Codex re-validation items: the observed behaviors, then every lane that
+/// drives a documented Codex route against the new build.
+const CODEX_CHECKLIST: &[&str] = &[
+    "Re-check the observed behaviors cited in `codex_http.rs` against the new build.",
+    "Check that `codex-http` passes: it drives native Responses and Responses → Chat Completions over HTTP/SSE.",
+    "Check that `codex-websocket` passes: it drives native Responses over WebSocket.",
+    "Check that `vllm-gpu-codex-acceptance` passes under `vllm-full-suite`: inspect the per-capability results \
+     in the qualification report. The default model can pass with post-compaction task completion unverified.",
+];
+
 /// The fixed checklist items for each pin.
 const fn checklist_items(pin: Pin) -> &'static [&'static str] {
     match pin {
@@ -507,7 +538,7 @@ const fn checklist_items(pin: Pin) -> &'static [&'static str] {
             "Re-check JSON-mode exit codes, stdin behavior, and `unresolved_header_error`.",
             "Check that `pi-cpu` passes: the guide's \"verified against pi\" lines were updated on the strength of it.",
         ],
-        Pin::Codex => &["Re-check the observed behaviors cited in `codex_http.rs` against the new build."],
+        Pin::Codex => CODEX_CHECKLIST,
         Pin::Vllm => &[
             "Review version-conditioned xfails and skips in the live SDK and suite tests.",
             "Re-check the client guide's vLLM claims and the CUDA image notes in `vllm-integration.yaml`.",
