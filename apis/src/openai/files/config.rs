@@ -14,4 +14,8 @@ use serde::Deserialize;
 /// [`OpenaiFilesFilter`]: super::OpenaiFilesFilter
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "temporarily empty until catalog provisioning adds settings (#504); braces keep the YAML mapping form"
+)]
 pub(crate) struct FilesConfig {}

@@ -19,7 +19,7 @@ use super::{
     config::FilesConfig,
     contracts::ListFilesResponse,
     handlers,
-    routes::{FilesOperation, match_route},
+    routes::{FilesOperation, MatchedFilesRoute, match_route},
 };
 use crate::state_owner::{StateOwner, require_state_owner};
 
@@ -107,26 +107,36 @@ impl HttpFilter for OpenaiFilesFilter {
             warn!(operation = ?operation, status = 503_u16, "files service unavailable");
             return terminal(handlers::unavailable_response());
         };
-        let response = match operation {
-            FilesOperation::RetrieveFile => {
-                let id = route
-                    .params
-                    .get("file_id")
-                    .ok_or_else(|| FilterError::from("openai_files: matched retrieve route missing file id"))?;
-                retrieve(service.as_ref(), owner, id).await
-            },
-            FilesOperation::ListFiles => list(service.as_ref(), owner, ctx.request.uri.query()).await,
-            FilesOperation::CreateFile | FilesOperation::DeleteFile | FilesOperation::DownloadFile => {
-                return Ok(FilterAction::Continue);
-            },
-        };
-        terminal(response)
+        serve(service.as_ref(), owner, &route, ctx.request.uri.query()).await
     }
 }
 
 // -----------------------------------------------------------------------------
 // Dispatch
 // -----------------------------------------------------------------------------
+
+/// Serve a matched route that is implemented locally.
+async fn serve(
+    service: &dyn FileService,
+    owner: &StateOwner,
+    route: &MatchedFilesRoute<'_>,
+    query: Option<&str>,
+) -> Result<FilterAction, FilterError> {
+    let response = match route.spec.operation {
+        FilesOperation::RetrieveFile => {
+            let id = route
+                .params
+                .get("file_id")
+                .ok_or_else(|| FilterError::from("openai_files: matched retrieve route missing file id"))?;
+            retrieve(service, owner, id).await
+        },
+        FilesOperation::ListFiles => list(service, owner, query).await,
+        FilesOperation::CreateFile | FilesOperation::DeleteFile | FilesOperation::DownloadFile => {
+            return Ok(FilterAction::Continue);
+        },
+    };
+    terminal(response)
+}
 
 /// Wrap a rendered response as the filter's terminal action.
 fn terminal(response: Result<TerminalResponse, FilterError>) -> Result<FilterAction, FilterError> {
