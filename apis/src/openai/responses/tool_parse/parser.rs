@@ -142,7 +142,8 @@ impl ToolChoice {
 #[derive(Debug)]
 #[expect(clippy::struct_excessive_bools, reason = "presence flags for each hosted tool type")]
 pub(crate) struct ParsedTools {
-    /// Web search configuration (if a `web_search` entry is present).
+    /// Web search configuration from the last web-search entry, matching
+    /// hosted OpenAI, which ignores earlier web-search tools.
     pub web_search: Option<WebSearchConfig>,
     /// File search configuration (if a `file_search` entry is present).
     pub file_search: Option<FileSearchConfig>,
@@ -294,9 +295,11 @@ fn accumulate_tool(acc: &mut ParsedTools, entry_obj: &serde_json::Map<String, se
         ToolType::Function => {
             acc.function_count += 1;
         },
-        ToolType::WebSearch if acc.web_search.is_none() => {
+        ToolType::WebSearch => {
+            if acc.web_search.is_none() {
+                acc.builtin_count += 1;
+            }
             acc.web_search = Some(extract_web_search_config(entry_obj));
-            acc.builtin_count += 1;
         },
         ToolType::FileSearch if acc.file_search.is_none() => {
             acc.file_search = Some(extract_file_search_config(entry_obj));
@@ -314,7 +317,7 @@ fn accumulate_tool(acc: &mut ParsedTools, entry_obj: &serde_json::Map<String, se
         ToolType::Unknown => {
             acc.unknown_count += 1;
         },
-        ToolType::Unclassified | ToolType::WebSearch | ToolType::FileSearch => {},
+        ToolType::Unclassified | ToolType::FileSearch => {},
     }
 }
 
@@ -1071,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_web_search_takes_first() {
+    fn duplicate_web_search_takes_last() {
         let body = br#"{
             "input": "test",
             "tools": [
@@ -1088,8 +1091,8 @@ mod tests {
                 .web_search
                 .as_ref()
                 .and_then(|w| w.search_context_size.as_deref()),
-            Some("high"),
-            "should take first web_search entry"
+            Some("low"),
+            "should take last web_search entry"
         );
     }
 

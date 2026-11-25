@@ -2633,13 +2633,30 @@ async fn preflight_rejects_a_country_the_provider_cannot_represent() {
 }
 
 #[tokio::test]
-async fn preflight_inspects_every_declared_web_search_tool() {
-    // A request may declare more than one web-search tool. The first carries no
-    // location, but a second (`web_search_preview`) carries an unsupported `city`.
-    // The preflight must inspect every tool rather than only the first, or the
-    // unsupported field slips past (issue #1548).
+async fn preflight_checks_only_the_selected_web_search_tool() {
+    // Only the last web-search tool is used, as on hosted OpenAI, so location
+    // fields on an earlier tool are neither honored nor rejected.
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    for dropped in [
+        serde_json::json!({"type": "approximate", "city": "Paris"}),
+        serde_json::json!({"type": "approximate", "country": "FR\n"}),
+    ] {
+        let request = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "weather near me",
+            "tools": [
+                {"type": "web_search", "user_location": dropped},
+                {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+            ],
+        });
+        let action = run_initial_request(filter.as_ref(), request).await;
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a dropped tool's location must not be validated: {dropped} -> {action:?}"
+        );
+    }
+
     let request = serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2650,7 +2667,7 @@ async fn preflight_inspects_every_declared_web_search_tool() {
     });
     let action = run_initial_request(filter.as_ref(), request).await;
     let FilterAction::Reject(rejection) = action else {
-        panic!("an unsupported field on a later web-search tool must be rejected, got {action:?}");
+        panic!("an unsupported field on the selected tool must be rejected, got {action:?}");
     };
     assert_eq!(rejection.status, 400);
     let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
@@ -2659,10 +2676,8 @@ async fn preflight_inspects_every_declared_web_search_tool() {
 }
 
 #[tokio::test]
-async fn preflight_rejects_web_search_tools_with_conflicting_countries() {
-    // Dispatch forwards a single country, so two web-search tools that declare
-    // different countries cannot both be honored. Honoring only the first would
-    // silently drop the other, so the request is rejected (issue #1548).
+async fn preflight_allows_web_search_tools_with_different_countries() {
+    // Different countries do not conflict: dispatch forwards the last tool's.
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
     let request = serde_json::json!({
@@ -2674,89 +2689,87 @@ async fn preflight_rejects_web_search_tools_with_conflicting_countries() {
         ],
     });
     let action = run_initial_request(filter.as_ref(), request).await;
-    let FilterAction::Reject(rejection) = action else {
-        panic!("conflicting countries must be rejected, got {action:?}");
-    };
-    assert_eq!(rejection.status, 400);
-    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "invalid_value");
-    assert!(body["error"]["message"].as_str().unwrap().contains("conflicting"));
-}
-
-#[tokio::test]
-async fn preflight_allows_web_search_tools_repeating_the_same_country() {
-    // Two web-search tools naming the *same* country agree with the single country
-    // dispatch forwards, so the request passes the preflight and continues.
-    let yaml = make_filter_yaml("brave", "test-key");
-    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
-    let request = serde_json::json!({
-        "model": "gpt-4o",
-        "input": "weather near me",
-        "tools": [
-            {"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}},
-            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
-        ],
-    });
-    let action = run_initial_request(filter.as_ref(), request).await;
     assert!(
         matches!(action, FilterAction::Continue),
-        "matching countries across tools must pass preflight, got {action:?}"
+        "different countries across tools must pass preflight, got {action:?}"
     );
 }
 
 #[test]
-fn country_pick_skips_earlier_null_user_location() {
-    // An earlier `user_location: null` must not stop dispatch from taking a later
-    // tool's country. Preflight already accepts this shape.
-    let state = ResponsesState::from_request_body(serde_json::json!({
-        "model": "gpt-4o",
-        "input": "weather near me",
-        "tools": [
-            {"type": "web_search", "user_location": null},
-            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
-        ],
-    }));
-    assert_eq!(web_search_country_from_state(&state), Some("FR"));
+fn country_pick_uses_the_last_web_search_tool() {
+    let fr = serde_json::json!({"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}});
+    let de =
+        serde_json::json!({"type": "web_search_preview", "user_location": {"type": "approximate", "country": "DE"}});
+    let omitted = serde_json::json!({"type": "web_search_preview"});
+    let null = serde_json::json!({"type": "web_search_preview", "user_location": null});
+    let null_country =
+        serde_json::json!({"type": "web_search_preview", "user_location": {"type": "approximate", "country": null}});
+    let no_fields = serde_json::json!({"type": "web_search_preview", "user_location": {"type": "approximate"}});
+    let function = serde_json::json!({"type": "function", "name": "lookup", "parameters": {}});
+    let cases: [(Vec<&Value>, Option<&str>); 13] = [
+        (vec![&fr], Some("FR")),
+        (vec![&omitted], Some("US")),
+        (vec![&null], Some("US")),
+        (vec![&null_country], None),
+        (vec![&no_fields], None),
+        (vec![&null, &fr], Some("FR")),
+        (vec![&null_country, &fr], Some("FR")),
+        (vec![&fr, &null], Some("US")),
+        (vec![&fr, &omitted], Some("US")),
+        (vec![&fr, &null_country], None),
+        (vec![&fr, &de], Some("DE")),
+        (vec![&de, &fr, &function], Some("FR")),
+        (vec![&function], None),
+    ];
+    for (tools, expected) in cases {
+        let state = ResponsesState::from_request_body(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "weather near me",
+            "tools": tools,
+        }));
+        assert_eq!(
+            web_search_country_from_state(&state),
+            expected,
+            "tools: {}",
+            serde_json::to_string(&tools).unwrap()
+        );
+    }
 }
 
 #[test]
-fn country_pick_skips_earlier_null_country_member() {
-    // `{type:approximate,country:null}` is unset for forwarding; a later FR must
-    // still become the outbound country.
+fn tool_choice_does_not_change_the_selected_web_search_tool() {
+    // Hosted OpenAI keeps the last web-search tool even when `tool_choice`
+    // names the type of an earlier one.
     let state = ResponsesState::from_request_body(serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
         "tools": [
-            {"type": "web_search", "user_location": {"type": "approximate", "country": null}},
-            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"},
+             "search_context_size": "high"},
+            {"type": "web_search", "user_location": {"type": "approximate", "country": "DE"},
+             "search_context_size": "low"},
         ],
+        "tool_choice": {"type": "web_search_preview"},
     }));
-    assert_eq!(web_search_country_from_state(&state), Some("FR"));
+    assert_eq!(web_search_country_from_state(&state), Some("DE"));
+    assert_eq!(web_search_context_size_from_state(&state), Some("low"));
 }
 
 #[test]
-fn country_pick_keeps_single_tool_country() {
+fn context_size_comes_only_from_the_selected_web_search_tool() {
     let state = ResponsesState::from_request_body(serde_json::json!({
         "model": "gpt-4o",
-        "input": "weather near me",
+        "input": "search",
         "tools": [
-            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+            {"type": "web_search", "search_context_size": "high"},
+            {"type": "web_search_preview"},
         ],
     }));
-    assert_eq!(web_search_country_from_state(&state), Some("FR"));
-}
-
-#[test]
-fn country_pick_returns_none_when_every_location_is_unset() {
-    let state = ResponsesState::from_request_body(serde_json::json!({
-        "model": "gpt-4o",
-        "input": "weather near me",
-        "tools": [
-            {"type": "web_search", "user_location": null},
-            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": null}},
-        ],
-    }));
-    assert_eq!(web_search_country_from_state(&state), None);
+    assert_eq!(
+        web_search_context_size_from_state(&state),
+        None,
+        "an earlier tool's search_context_size must not fill in for the selected tool"
+    );
 }
 
 #[tokio::test]
@@ -3751,19 +3764,21 @@ async fn preflight_rejects_unenforceable_filters() {
 }
 
 #[tokio::test]
-async fn preflight_rejects_web_search_tools_with_conflicting_allowed_domains() {
-    // A call cannot be attributed to one tool, so a restricted tool next to an
-    // unrestricted one must not widen dispatch to the unrestricted filter.
+async fn only_the_selected_web_search_tool_filters_apply() {
+    // Hosted OpenAI ignores every web-search tool but the last, so an earlier
+    // tool's filters neither restrict results nor conflict with the last tool's.
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
-    for second in [
-        serde_json::json!({"type": "web_search_preview"}),
-        serde_json::json!({"type": "web_search_preview", "filters": {"allowed_domains": ["other.example"]}}),
-        serde_json::json!({"type": "web_search_preview", "filters": {"blocked_domains": ["other.example"]}}),
-        serde_json::json!({"type": "web_search_preview", "filters": {
-            "allowed_domains": ["example.org", "a.example"],
-            "blocked_domains": ["other.example"],
-        }}),
+    for (second, expected) in [
+        (serde_json::json!({"type": "web_search_preview"}), None),
+        (
+            serde_json::json!({"type": "web_search_preview", "filters": {"allowed_domains": ["other.example"]}}),
+            Some(serde_json::json!({"allowed_domains": ["other.example"]})),
+        ),
+        (
+            serde_json::json!({"type": "web_search_preview", "filters": {"blocked_domains": ["other.example"]}}),
+            Some(serde_json::json!({"blocked_domains": ["other.example"]})),
+        ),
     ] {
         let request = serde_json::json!({
             "model": "gpt-4o",
@@ -3772,9 +3787,46 @@ async fn preflight_rejects_web_search_tools_with_conflicting_allowed_domains() {
                 "allowed_domains": ["example.org", "a.example"],
             }}, second],
         });
-        let action = run_initial_request(filter.as_ref(), request).await;
-        assert_filters_rejected(&action, "invalid_value");
+        let state = ResponsesState::from_request_body(request.clone());
+        let expected = expected.map_or(DomainFilters::Unrestricted, |filters| {
+            tool_domain_filters(&serde_json::json!({"filters": filters})).unwrap()
+        });
+        assert!(
+            web_search_domain_filters_from_state(&state).unwrap() == expected,
+            "the last tool's filters must apply: {request}"
+        );
+        let action = run_initial_request(filter.as_ref(), request.clone()).await;
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "differing filters across tools must pass preflight: {request} -> {action:?}"
+        );
     }
+
+    // A dropped tool's unenforceable filters are not validated; the selected
+    // tool's still are.
+    let dropped_invalid = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "search praxis",
+        "tools": [
+            {"type": "web_search", "filters": {"search_domain_filter": ["example.org"]}},
+            {"type": "web_search_preview"},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), dropped_invalid).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a dropped tool's filters must not be validated, got {action:?}"
+    );
+    let selected_invalid = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "search praxis",
+        "tools": [
+            {"type": "web_search"},
+            {"type": "web_search_preview", "filters": {"search_domain_filter": ["example.org"]}},
+        ],
+    });
+    let action = run_initial_request(filter.as_ref(), selected_invalid).await;
+    assert_filters_rejected(&action, "unsupported_parameter");
 }
 
 #[tokio::test]
