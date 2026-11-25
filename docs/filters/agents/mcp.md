@@ -19,6 +19,8 @@ In the stateless profile, `tools/call` routes to the configured backend cluster 
 
 In the current profile, `tools/call` returns `-32601` unless `backend_sessions` is configured. With it, the broker lazily runs the backend `initialize` / `notifications/initialized` handshake once per `(Mcp-Session-Id, server)` pair through a generated outbound chain that dials the server's top-level cluster, then forwards the call to that cluster with the backend `Mcp-Session-Id`. A backend `404` drops the mapping so the next call reinitializes. Server clusters must be declared in top-level `clusters:` so the handshake chain can reference them.
 
+With `backend_sessions`, `initialize` issues signed gateway session ids, and a request carrying an id the broker did not issue, or one a `DELETE` ended, gets HTTP `404` on every method until the client initializes again. A `DELETE` that would end a session still holding backend sessions created with other credentials answers `409` and leaves it usable.
+
 Supports two protocol profiles: `current` (session-based, default) and `stateless` (MCP 2026-07-28, configurable). Version and cache fields are derived from the selected profile when omitted.
 
 ## Configuration

@@ -9,6 +9,7 @@
 
 mod backend;
 pub(crate) mod config;
+mod gateway;
 mod selector;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -70,6 +71,7 @@ use self::{
         McpBackendClient, McpBackendError,
     },
     config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
+    gateway::GatewaySessions,
     sessions::{
         BackendSessionKey, BackendSessionStore, BoundSession, Publish, RetiredSession, SessionSlot,
         credential_fingerprint,
@@ -104,6 +106,9 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 
 /// JSON-RPC error code for invalid requests.
 const ERR_INVALID_REQUEST: i32 = -32600;
+
+/// Message for a gateway `Mcp-Session-Id` that was never issued or has ended.
+const UNKNOWN_GATEWAY_SESSION: &str = "unknown or ended Mcp-Session-Id";
 
 /// JSON-RPC error code for internal errors (backend session failures).
 const ERR_INTERNAL: i32 = -32603;
@@ -141,6 +146,8 @@ struct BackendSessions {
     fallback_client: Option<SubRequestClient>,
     /// Client headers copied onto handshake exchanges.
     forward_headers: Vec<http::HeaderName>,
+    /// Issued and ended gateway session ids.
+    gateway: GatewaySessions,
     /// Deadline for one handshake exchange.
     handshake_timeout: Duration,
     /// Gateway → backend session map.
@@ -193,6 +200,12 @@ struct ForwardedCall {
 /// cluster with the backend `Mcp-Session-Id`. A backend `404` drops the
 /// mapping so the next call reinitializes. Server clusters must be declared
 /// in top-level `clusters:` so the handshake chain can reference them.
+///
+/// With `backend_sessions`, `initialize` issues signed gateway session ids,
+/// and a request carrying an id the broker did not issue, or one a `DELETE`
+/// ended, gets HTTP `404` on every method until the client initializes
+/// again. A `DELETE` that would end a session still holding backend sessions
+/// created with other credentials answers `409` and leaves it usable.
 ///
 /// # YAML
 ///
@@ -294,7 +307,7 @@ impl McpBrokerFilter {
                     fallback_client,
                     settings,
                     validated.supported_versions.clone(),
-                ))
+                )?)
             },
             _ => None,
         };
@@ -361,6 +374,15 @@ impl McpBrokerFilter {
         method_str: &str,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
+        if let Some((status, message)) = self.gateway_session_rejection(ctx) {
+            return Ok(json_rpc_error_action_with_status(
+                envelope,
+                status,
+                ERR_INVALID_REQUEST,
+                message,
+            ));
+        }
+
         if method_str.starts_with("notifications/") {
             return Ok(handle_notification(envelope));
         }
@@ -370,7 +392,7 @@ impl McpBrokerFilter {
         }
 
         let action = match method_str {
-            "initialize" => handle_initialize(ctx, value, envelope, &self.supported_versions, &self.default_version)?,
+            "initialize" => self.handle_initialize(ctx, value, envelope),
             "tools/list" => handle_tools_list(&self.catalog, envelope)?,
             "tools/call" => self.handle_current_tools_call(ctx, value, envelope, body).await,
             "ping" => handle_ping(envelope),
@@ -434,15 +456,46 @@ impl McpBrokerFilter {
         }
     }
 
+    /// Generates a new MCP session and returns MCP capabilities.
+    ///
+    /// With `backend_sessions`, the id is signed so later requests can prove
+    /// the broker issued it.
+    fn handle_initialize(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        value: &serde_json::Value,
+        envelope: &JsonRpcEnvelope,
+    ) -> FilterAction {
+        record_client_protocol_version(ctx, value);
+        let response_version = negotiate_protocol_version(value, &self.supported_versions, &self.default_version);
+        let session_id = match self.backend.as_ref().map(|backend| backend.gateway.issue()) {
+            Some(Ok(id)) => id,
+            Some(Err(error)) => {
+                warn!(%error, "mcp gateway session issuance failed");
+                return json_rpc_error_action(envelope, ERR_INTERNAL, "internal error");
+            },
+            None => format!("mcp-{}", ctx.id_generator.generate(ctx.time_source)),
+        };
+
+        debug!(session_id_len = session_id.len(), "MCP initialize");
+        ctx.record_ai_metadata("mcp.session_id", session_id.clone());
+
+        FilterAction::Reject(
+            Rejection::status(200)
+                .with_header("content-type", "application/json")
+                .with_header("mcp-session-id", &session_id)
+                .with_body(Bytes::from(
+                    initialize_response_body(envelope, response_version).to_string(),
+                )),
+        )
+    }
+
     /// Profile-aware DELETE handler.
     async fn handle_delete(&self, ctx: &HttpFilterContext<'_>) -> FilterAction {
         match self.protocol_profile {
-            ProtocolProfile::Current => {
-                let action = handle_delete_current(ctx);
-                if let (Some(backend), Some(gateway)) = (self.backend.as_ref(), gateway_session_id(ctx)) {
-                    self.terminate_backend_sessions(ctx, backend, gateway).await;
-                }
-                action
+            ProtocolProfile::Current => match self.backend.as_ref() {
+                Some(backend) => self.end_gateway_session(ctx, backend).await,
+                None => handle_delete_current(ctx),
             },
             ProtocolProfile::Stateless => FilterAction::Reject(Rejection::status(405)),
         }
@@ -479,10 +532,7 @@ impl McpBrokerFilter {
         backend.retire(&self.servers, &callout);
         let (slot, init) = match session {
             Ok(session) => session,
-            Err(error) => {
-                warn!(server = %tool.server_name, reason = error.reason(), "mcp backend session handshake failed");
-                return backend_error_action(envelope, &tool.server_name, &error);
-            },
+            Err(error) => return session_failure_action(envelope, &tool.server_name, &error),
         };
 
         forward_current_tools_call(ctx, value, body, tool, &init);
@@ -544,26 +594,90 @@ impl McpBrokerFilter {
             .ok_or_else(|| unsupported_version_action(envelope, requested, &self.supported_versions))
     }
 
-    /// Best-effort termination of every backend session a gateway session owns.
-    async fn terminate_backend_sessions(&self, ctx: &HttpFilterContext<'_>, backend: &BackendSessions, gateway: &str) {
-        let Some(callout) = backend.callout(ctx) else {
+    /// The status and message rejecting a request whose gateway
+    /// `Mcp-Session-Id` this broker did not issue or that a `DELETE` ended
+    /// (HTTP 404, so the client sends a new `initialize`), or whose header is
+    /// malformed (HTTP 400). Applies to every method, `initialize` included.
+    /// Requests without the header, and brokers without `backend_sessions`,
+    /// pass.
+    fn gateway_session_rejection(&self, ctx: &HttpFilterContext<'_>) -> Option<(u16, &'static str)> {
+        let backend = self.backend.as_ref()?;
+        ctx.request.headers.get(&MCP_SESSION_ID)?;
+        let Some(gateway) = gateway_session_id(ctx) else {
+            return Some((400, "missing or invalid Mcp-Session-Id"));
+        };
+        if backend.gateway.is_live(gateway) {
+            return None;
+        }
+        debug!("mcp gateway session unknown or ended");
+        Some((404, UNKNOWN_GATEWAY_SESSION))
+    }
+
+    /// Current-profile `DELETE` with `backend_sessions`: end a live gateway
+    /// session and terminate the backend sessions the caller created in it.
+    ///
+    /// When backend sessions or handshakes created with other credentials
+    /// remain, the caller's own sessions are still terminated but the gateway
+    /// session stays usable and the answer is `409`: presenting the id alone
+    /// must not end a session someone else is using.
+    async fn end_gateway_session(&self, ctx: &HttpFilterContext<'_>, backend: &BackendSessions) -> FilterAction {
+        if ctx.request.headers.get(&MCP_SESSION_ID).is_none() {
+            return FilterAction::Reject(Rejection::status(400));
+        }
+        if let Some((status, _)) = self.gateway_session_rejection(ctx) {
+            return FilterAction::Reject(Rejection::status(status));
+        }
+        let Some(gateway) = gateway_session_id(ctx) else {
+            return FilterAction::Reject(Rejection::status(400));
+        };
+        let callout = backend.callout(ctx);
+        let credential = match callout.as_ref() {
+            Some(callout) => credential_fingerprint(&callout.forwarded_headers),
+            None => credential_fingerprint(&backend.forwarded_headers(&ctx.request.headers)),
+        };
+        // Ending the id under the map lock orders it with every handshake
+        // start: a later handshake sees the id ended and opens nothing.
+        let removal = backend
+            .store
+            .remove_gateway(gateway, &credential, || backend.gateway.end(gateway));
+        let status = match (removal.foreign, removal.ended) {
+            (true, _) => 409,
+            // A concurrent DELETE ended it first.
+            (false, false) => 404,
+            (false, true) => 204,
+        };
+        self.terminate_retired(backend, callout.as_ref(), removal.retired).await;
+        FilterAction::Reject(Rejection::status(status))
+    }
+
+    /// Best-effort termination of backend sessions removed by a `DELETE`,
+    /// with the caller's credentials. Without a transport they are queued as
+    /// retired so a later request terminates them.
+    async fn terminate_retired(
+        &self,
+        backend: &BackendSessions,
+        callout: Option<&BackendCallout>,
+        retired: Vec<RetiredSession>,
+    ) {
+        let Some(callout) = callout else {
+            for session in retired {
+                backend.store.push_retired(session);
+            }
             return;
         };
-        let credential = credential_fingerprint(&callout.forwarded_headers);
-        let removed = backend.store.remove_gateway(gateway, &credential);
-        for retired in removed {
-            let Some(server) = self.servers.get(retired.server) else {
+        for session in retired {
+            let Some(server) = self.servers.get(session.server) else {
                 continue;
             };
             let target = BackendTarget {
                 cluster: &server.cluster,
                 path: &server.path,
             };
-            if let Err(error) = backend.client.terminate(target, &retired.session.init, &callout).await {
+            if let Err(error) = backend.client.terminate(target, &session.session.init, callout).await {
                 debug!(reason = error.reason(), "mcp backend session termination failed");
             }
         }
-        backend.retire(&self.servers, &callout);
+        backend.retire(&self.servers, callout);
     }
 
     // -------------------------------------------------------------------------
@@ -776,7 +890,11 @@ impl HttpFilter for McpBrokerFilter {
                 Ok(FilterAction::Continue)
             },
             http::Method::DELETE => Ok(self.handle_delete(ctx).await),
-            _ => Ok(FilterAction::Reject(Rejection::status(405))),
+            // A reconnecting client's GET with an ended id must learn the
+            // session is gone; a live id keeps the 405.
+            _ => Ok(FilterAction::Reject(Rejection::status(
+                self.gateway_session_rejection(ctx).map_or(405, |(status, _)| status),
+            ))),
         }
     }
 
@@ -884,22 +1002,28 @@ impl HttpFilter for McpBrokerFilter {
 }
 
 impl BackendSessions {
-    /// Build the runtime from validated settings.
+    /// Build the runtime from validated settings, drawing a fresh gateway
+    /// session signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the signing key cannot be generated.
     fn new(
         client: Arc<dyn McpBackendClient>,
         fallback_client: Option<SubRequestClient>,
         settings: &ValidatedBackendSessions,
         supported_versions: Vec<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, FilterError> {
+        Ok(Self {
             cleanup: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUPS)),
             client,
             fallback_client,
             forward_headers: settings.forward_headers.clone(),
+            gateway: GatewaySessions::new().map_err(|error| format!("mcp: backend_sessions: {error}"))?,
             handshake_timeout: settings.handshake_timeout,
             store: BackendSessionStore::new(settings.max_sessions, settings.idle_timeout),
             supported_versions,
-        }
+        })
     }
 
     /// Drop the mapping a forwarded call used, if it still holds that session.
@@ -963,7 +1087,7 @@ impl BackendSessions {
             return Ok((slot, init));
         }
         let (outcome, init) = self
-            .serialized_handshake(&slot, target, protocol_version, callout)
+            .serialized_handshake(key, &slot, target, protocol_version, callout)
             .await?;
         match outcome {
             None => Ok((slot, init)),
@@ -985,8 +1109,13 @@ impl BackendSessions {
 
     /// Run the handshake under the slot's permit. Returns `None` for the
     /// outcome when a concurrent caller published a usable session first.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the key gates the start on its gateway session"
+    )]
     async fn serialized_handshake(
         &self,
+        key: &BackendSessionKey,
         slot: &SessionSlot,
         target: BackendTarget<'_>,
         protocol_version: &str,
@@ -1000,7 +1129,14 @@ impl BackendSessions {
         if let Some(init) = slot.current(&credential) {
             return Ok((None, init));
         }
-        slot.begin(credential);
+        // A call that waited for the permit while a DELETE ended the gateway
+        // session stops here, before any backend I/O.
+        if !self
+            .store
+            .begin(slot, credential, || self.gateway.is_live(&key.gateway_session))
+        {
+            return Err(McpBackendError::GatewayEnded);
+        }
         match self.handshake(target, protocol_version, callout).await {
             Ok(init) => {
                 let outcome = slot.publish(BoundSession::new(&callout.forwarded_headers, init.clone()));
@@ -1244,6 +1380,18 @@ fn gateway_session_id<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
         return None;
     }
     value.to_str().ok()
+}
+
+/// The answer to a `tools/call` whose backend session could not be obtained:
+/// `404` when its gateway session ended while it waited for the handshake,
+/// otherwise a structured backend error.
+fn session_failure_action(envelope: &JsonRpcEnvelope, server: &str, error: &McpBackendError) -> FilterAction {
+    if matches!(error, McpBackendError::GatewayEnded) {
+        debug!("mcp gateway session ended while the call waited for its handshake");
+        return json_rpc_error_action_with_status(envelope, 404, ERR_INVALID_REQUEST, UNKNOWN_GATEWAY_SESSION);
+    }
+    warn!(server = %server, reason = error.reason(), "mcp backend session handshake failed");
+    backend_error_action(envelope, server, error)
 }
 
 /// JSON-RPC error for a failed backend handshake. `data` carries only the
@@ -1569,32 +1717,6 @@ fn handle_delete_current(ctx: &HttpFilterContext<'_>) -> FilterAction {
     } else {
         FilterAction::Reject(Rejection::status(400))
     }
-}
-
-/// Generates a new MCP session and returns MCP capabilities.
-#[expect(clippy::unnecessary_wraps, reason = "signature matches sibling handle_* fns")]
-fn handle_initialize(
-    ctx: &mut HttpFilterContext<'_>,
-    value: &serde_json::Value,
-    envelope: &JsonRpcEnvelope,
-    supported_versions: &[String],
-    default_version: &str,
-) -> Result<FilterAction, FilterError> {
-    record_client_protocol_version(ctx, value);
-    let response_version = negotiate_protocol_version(value, supported_versions, default_version);
-    let session_id = format!("mcp-{}", ctx.id_generator.generate(ctx.time_source));
-
-    debug!(session_id_len = session_id.len(), "MCP initialize");
-    ctx.record_ai_metadata("mcp.session_id", session_id.clone());
-
-    Ok(FilterAction::Reject(
-        Rejection::status(200)
-            .with_header("content-type", "application/json")
-            .with_header("mcp-session-id", &session_id)
-            .with_body(Bytes::from(
-                initialize_response_body(envelope, response_version).to_string(),
-            )),
-    ))
 }
 
 /// Echoes the client's requested version when supported, otherwise falls back.

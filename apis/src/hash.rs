@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! SHA-256 and HMAC-SHA256 through the system OpenSSL.
+//! SHA-256, HMAC-SHA256, and random bytes through the system OpenSSL.
 //!
 //! Every digest and MAC praxis-ai computes goes through the platform's
 //! OpenSSL rather than a pure-Rust implementation. On a FIPS host that
@@ -152,6 +152,29 @@ impl HmacSha256 {
         }
         Ok(out)
     }
+
+    /// Whether `tag` is the MAC of `data` under `key`.
+    ///
+    /// The comparison runs in constant time over the full tag, so a caller
+    /// checking client-supplied tags leaks nothing about how many leading
+    /// bytes matched. A tag of the wrong length is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HmacError`] if the MAC cannot be computed (see [`Self::mac`]).
+    pub fn verify(key: &[u8], data: &[u8], tag: &[u8]) -> Result<bool, HmacError> {
+        let expected = Self::mac(key, data)?;
+        Ok(tag.len() == SHA256_LEN && openssl::memcmp::eq(&expected, tag))
+    }
+}
+
+/// Fill `buf` from OpenSSL's CSPRNG (the FIPS DRBG on a FIPS host).
+///
+/// # Errors
+///
+/// Returns OpenSSL's error stack if the generator cannot supply bytes.
+pub fn random_bytes(buf: &mut [u8]) -> Result<(), ErrorStack> {
+    openssl::rand::rand_bytes(buf)
 }
 
 /// Lowercase hexadecimal encoding of a digest.
@@ -263,6 +286,39 @@ mod tests {
             HmacSha256::mac(b"k2", b"abc").expect("mac"),
             "a different key gives a different tag"
         );
+    }
+
+    #[test]
+    fn hmac_verify_accepts_only_the_matching_tag() {
+        let tag = HmacSha256::mac(b"Jefe", b"what do ya want for nothing?").expect("mac");
+        assert!(
+            HmacSha256::verify(b"Jefe", b"what do ya want for nothing?", &tag).expect("verify"),
+            "the RFC 4231 case 2 tag verifies"
+        );
+        let mut flipped = tag;
+        flipped[SHA256_LEN - 1] ^= 1;
+        assert!(
+            !HmacSha256::verify(b"Jefe", b"what do ya want for nothing?", &flipped).expect("verify"),
+            "a one-bit change is refused"
+        );
+        assert!(
+            !HmacSha256::verify(b"other", b"what do ya want for nothing?", &tag).expect("verify"),
+            "another key is refused"
+        );
+        assert!(
+            !HmacSha256::verify(b"Jefe", b"what do ya want for nothing?", &tag[..16]).expect("verify"),
+            "a truncated tag is refused"
+        );
+    }
+
+    #[test]
+    fn random_bytes_fill_the_buffer_with_fresh_values() {
+        let mut first = [0_u8; 32];
+        let mut second = [0_u8; 32];
+        random_bytes(&mut first).expect("random");
+        random_bytes(&mut second).expect("random");
+        assert_ne!(first, [0; 32], "the buffer is filled");
+        assert_ne!(first, second, "every call draws fresh bytes");
     }
 
     #[test]

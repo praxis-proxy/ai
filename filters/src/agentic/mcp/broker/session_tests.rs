@@ -40,6 +40,9 @@ struct MockBackend {
     /// When set, `initialize` signals the first notify once it starts and
     /// then waits for the second before completing.
     initialize_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// When set, `terminate` signals the first notify once it starts and
+    /// then waits for the second before completing.
+    terminate_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     /// Mint no session id (stateless backend).
     sessionless: bool,
     /// Version the backend negotiates instead of echoing the requested one.
@@ -120,6 +123,10 @@ impl McpBackendClient for MockBackend {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
         self.record("terminate", target, format!("{}|{auth}", session_label(session)));
+        if let Some((started, proceed)) = &self.terminate_gate {
+            started.notify_one();
+            proceed.notified().await;
+        }
         Ok(())
     }
 }
@@ -169,7 +176,8 @@ fn broker_from_yaml(mock: Arc<MockBackend>, yaml: &str) -> McpBrokerFilter {
         Some(crate::isolated_subrequest_client(1)),
         &settings,
         validated.supported_versions.clone(),
-    );
+    )
+    .unwrap();
     McpBrokerFilter::build(&validated, catalog, &servers, Some(backend))
 }
 
@@ -304,6 +312,48 @@ async fn delete(filter: &McpBrokerFilter, session: &str, auth: Option<&str>) -> 
     filter.on_request(&mut ctx).await.unwrap()
 }
 
+async fn get(filter: &McpBrokerFilter, session: &str) -> FilterAction {
+    let mut req = crate::test_utils::make_request(http::Method::GET, "/mcp");
+    req.headers.insert("mcp-session-id", session.parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    filter.on_request(&mut ctx).await.unwrap()
+}
+
+/// POST one JSON-RPC request with an optional gateway session.
+async fn post(filter: &McpBrokerFilter, session: Option<&str>, body: &str) -> FilterAction {
+    let req = call_request(session, None);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut body = Some(Bytes::from(body.to_owned()));
+    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
+}
+
+/// Run `initialize` and return the gateway session id the broker issued.
+async fn issue(filter: &McpBrokerFilter) -> String {
+    let action = post(
+        filter,
+        None,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("initialize must answer locally");
+    };
+    rejection
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+        .map(|(_, value)| value.clone())
+        .expect("initialize must issue a gateway session")
+}
+
+fn status_of(action: &FilterAction) -> Option<u16> {
+    match action {
+        FilterAction::Reject(rejection) => Some(rejection.status),
+        _ => None,
+    }
+}
+
 fn header<'a>(routed: &'a Routed, name: &str) -> Option<&'a str> {
     routed
         .set_headers
@@ -330,8 +380,9 @@ fn rejection_json(action: &FilterAction) -> (u16, serde_json::Value) {
 async fn missing_backend_session_runs_handshake_then_forwards() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
-    let routed = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
 
     assert!(matches!(routed.action, FilterAction::Release), "call must be forwarded");
     let calls = mock.calls.lock().unwrap().clone();
@@ -380,7 +431,8 @@ async fn missing_backend_session_runs_handshake_then_forwards() {
 async fn existing_backend_session_is_reused() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     route(&filter, &req, "weather_get_weather").await;
     let second = route(&filter, &req, "weather_get_weather").await;
@@ -397,10 +449,12 @@ async fn existing_backend_session_is_reused() {
 async fn sessions_are_scoped_per_gateway_session_and_server() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_a = issue(&filter).await;
+    let gw_b = issue(&filter).await;
 
-    let a = route(&filter, &call_request(Some("gw-a"), None), "weather_get_weather").await;
-    let b = route(&filter, &call_request(Some("gw-b"), None), "weather_get_weather").await;
-    let c = route(&filter, &call_request(Some("gw-a"), None), "cal_create_event").await;
+    let a = route(&filter, &call_request(Some(gw_a.as_str()), None), "weather_get_weather").await;
+    let b = route(&filter, &call_request(Some(gw_b.as_str()), None), "weather_get_weather").await;
+    let c = route(&filter, &call_request(Some(gw_a.as_str()), None), "cal_create_event").await;
 
     assert_eq!(
         mock.count("initialize"),
@@ -428,7 +482,8 @@ async fn sessions_are_scoped_per_gateway_session_and_server() {
 async fn backend_404_invalidates_and_next_call_reinitializes() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await;
     let next = route(&filter, &req, "weather_get_weather").await;
@@ -449,7 +504,8 @@ async fn backend_404_invalidates_and_next_call_reinitializes() {
 async fn forwarded_calls_are_pinned_to_the_session_endpoint() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     let first = route(&filter, &req, "weather_get_weather").await;
     let second = route(&filter, &req, "weather_get_weather").await;
@@ -469,7 +525,8 @@ async fn forwarded_calls_are_pinned_to_the_session_endpoint() {
 async fn backend_502_invalidates_and_next_call_reinitializes() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::BAD_GATEWAY).await;
     let next = route(&filter, &req, "weather_get_weather").await;
@@ -491,7 +548,8 @@ async fn unreachable_endpoint_without_response_invalidates() {
     for status in [502, 504] {
         let mock = Arc::new(MockBackend::default());
         let filter = broker_with(Arc::clone(&mock));
-        let req = call_request(Some("gw-1"), None);
+        let gw_1 = issue(&filter).await;
+        let req = call_request(Some(gw_1.as_str()), None);
 
         route_without_response(&filter, &req, "weather_get_weather", status).await;
         let next = route(&filter, &req, "weather_get_weather").await;
@@ -513,7 +571,8 @@ async fn unreachable_endpoint_without_response_invalidates() {
 async fn local_rejection_without_response_keeps_mapping() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     route_without_response(&filter, &req, "weather_get_weather", 403).await;
     route(&filter, &req, "weather_get_weather").await;
@@ -529,7 +588,8 @@ async fn local_rejection_without_response_keeps_mapping() {
 async fn successful_response_keeps_mapping() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::OK).await;
     route(&filter, &req, "weather_get_weather").await;
@@ -544,7 +604,9 @@ async fn in_flight_call_keeps_its_slot_until_completion() {
         Arc::clone(&mock),
         &SESSION_BROKER_YAML.replace("max_sessions: 16", "max_sessions: 1"),
     );
-    let first = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let gw_2 = issue(&filter).await;
+    let first = call_request(Some(gw_1.as_str()), None);
     let mut in_flight = crate::test_utils::make_filter_context(&first);
     in_flight.current_filter_id = Some(0);
     let mut body = Some(call_body("weather_get_weather"));
@@ -554,7 +616,7 @@ async fn in_flight_call_keeps_its_slot_until_completion() {
     in_flight.response_header = Some(&mut response);
     let _headers = filter.on_response(&mut in_flight).await.unwrap();
 
-    let blocked = route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
+    let blocked = route(&filter, &call_request(Some(gw_2.as_str()), None), "weather_get_weather").await;
     let (_, error) = rejection_json(&blocked.action);
     assert_eq!(
         error["error"]["data"]["reason"], "session_capacity",
@@ -563,7 +625,7 @@ async fn in_flight_call_keeps_its_slot_until_completion() {
 
     // The context stays alive: the completion hook alone must free the slot.
     filter.on_request_complete(&mut in_flight, 200);
-    let admitted = route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
+    let admitted = route(&filter, &call_request(Some(gw_2.as_str()), None), "weather_get_weather").await;
     assert!(
         matches!(admitted.action, FilterAction::Release),
         "a completed call must release its slot"
@@ -578,15 +640,17 @@ async fn evicted_session_is_terminated_with_its_credentials() {
         Arc::clone(&mock),
         &SESSION_BROKER_YAML.replace("max_sessions: 16", "max_sessions: 1"),
     );
+    let gw_1 = issue(&filter).await;
+    let gw_2 = issue(&filter).await;
     route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer alice")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer alice")),
         "weather_get_weather",
     )
     .await;
     route(
         &filter,
-        &call_request(Some("gw-2"), Some("Bearer bob")),
+        &call_request(Some(gw_2.as_str()), Some("Bearer bob")),
         "weather_get_weather",
     )
     .await;
@@ -603,15 +667,16 @@ async fn evicted_session_is_terminated_with_its_credentials() {
 async fn credential_change_terminates_replaced_session() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
     route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer alice")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer alice")),
         "weather_get_weather",
     )
     .await;
     route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer bob")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer bob")),
         "weather_get_weather",
     )
     .await;
@@ -633,13 +698,14 @@ async fn delete_during_handshake_terminates_instead_of_publishing() {
         ..MockBackend::default()
     });
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     // DELETE runs only once `initialize` has started, and `initialize` finishes
     // only after DELETE has returned.
     let (routed, deleted) = tokio::join!(route(&filter, &req, "weather_get_weather"), async {
         started.notified().await;
-        let deleted = delete(&filter, "gw-1", None).await;
+        let deleted = delete(&filter, &gw_1, None).await;
         proceed.notify_one();
         deleted
     });
@@ -658,32 +724,32 @@ async fn delete_during_handshake_terminates_instead_of_publishing() {
         ["backend-1|"],
         "the session the racing handshake created must be terminated"
     );
-    // Let the next handshake through the gate.
-    proceed.notify_one();
-    route(&filter, &req, "weather_get_weather").await;
-    assert_eq!(mock.count("initialize"), 2, "nothing stale may remain mapped");
+    let after = route(&filter, &req, "weather_get_weather").await;
+    assert_eq!(status_of(&after.action), Some(404), "the ended id must be a 404");
+    assert_eq!(mock.count("initialize"), 1, "an ended id must open no backend session");
 }
 
 #[tokio::test]
 async fn credential_change_rebinds_backend_session() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
     let first = route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer alice")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer alice")),
         "weather_get_weather",
     )
     .await;
     let same = route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer alice")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer alice")),
         "weather_get_weather",
     )
     .await;
     let other = route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer bob")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer bob")),
         "weather_get_weather",
     )
     .await;
@@ -717,7 +783,8 @@ async fn concurrent_first_calls_share_one_handshake() {
         ..MockBackend::default()
     });
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     let (a, b) = tokio::join!(
         route(&filter, &req, "weather_get_weather"),
@@ -749,8 +816,9 @@ async fn sessionless_backend_strips_gateway_session_header() {
         ..MockBackend::default()
     });
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
-    let routed = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
 
     assert!(matches!(routed.action, FilterAction::Release), "call must be forwarded");
     assert!(
@@ -771,9 +839,11 @@ async fn sessionless_backend_strips_gateway_session_header() {
 async fn client_protocol_version_is_offered_to_backend() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+    let gw_2 = issue(&filter).await;
 
-    route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
-    let mut req = call_request(Some("gw-2"), None);
+    route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
+    let mut req = call_request(Some(gw_2.as_str()), None);
     req.headers.remove("mcp-protocol-version");
     route(&filter, &req, "weather_get_weather").await;
 
@@ -793,7 +863,8 @@ async fn client_protocol_version_is_offered_to_backend() {
 async fn unsupported_client_version_is_rejected_before_handshake() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let mut req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let mut req = call_request(Some(gw_1.as_str()), None);
     req.headers
         .insert("mcp-protocol-version", "1999-01-01".parse().unwrap());
 
@@ -812,7 +883,8 @@ async fn unsupported_client_version_is_rejected_before_handshake() {
 async fn undecodable_client_version_is_rejected_before_handshake() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    let mut req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let mut req = call_request(Some(gw_1.as_str()), None);
     // RFC 9110 §5.5 allows obs-text bytes in a field value; `to_str` rejects them.
     req.headers
         .insert("mcp-protocol-version", HeaderValue::from_bytes(b"2025-\xff").unwrap());
@@ -861,8 +933,9 @@ async fn malformed_gateway_session_is_invalid_request() {
 async fn unknown_tool_is_invalid_params() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
-    let routed = route(&filter, &call_request(Some("gw-1"), None), "nope").await;
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "nope").await;
 
     let (_, body) = rejection_json(&routed.action);
     assert_eq!(body["error"]["code"], -32602, "unknown tool must be -32602");
@@ -874,7 +947,8 @@ async fn handshake_failure_is_structured_and_not_cached() {
     let mock = Arc::new(MockBackend::default());
     *mock.initialize_error.lock().unwrap() = Some(McpBackendError::ResponseTooLarge { limit: 1024 });
     let filter = broker_with(Arc::clone(&mock));
-    let req = call_request(Some("gw-1"), None);
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
 
     let routed = route(&filter, &req, "weather_get_weather").await;
 
@@ -901,8 +975,9 @@ async fn rejected_handshake_reports_backend_status() {
     let mock = Arc::new(MockBackend::default());
     *mock.initialize_error.lock().unwrap() = Some(McpBackendError::Rejected { status: 401 });
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
-    let routed = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
 
     let (_, body) = rejection_json(&routed.action);
     assert_eq!(
@@ -917,8 +992,9 @@ async fn initialized_failure_terminates_new_session() {
     let mock = Arc::new(MockBackend::default());
     *mock.initialized_error.lock().unwrap() = Some(McpBackendError::Timeout);
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
-    let routed = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
 
     let (_, body) = rejection_json(&routed.action);
     assert_eq!(body["error"]["data"]["reason"], "timeout", "timeout must be classified");
@@ -936,8 +1012,9 @@ async fn unsupported_backend_version_is_never_confirmed() {
         ..MockBackend::default()
     });
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
 
-    let routed = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
 
     let (_, body) = rejection_json(&routed.action);
     assert_eq!(
@@ -948,7 +1025,7 @@ async fn unsupported_backend_version_is_never_confirmed() {
     assert_eq!(mock.count("terminate"), 1, "the unusable session must be terminated");
     assert!(routed.cluster.is_none(), "no tool call may be forwarded");
 
-    let retried = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    let retried = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
     assert!(
         !matches!(retried.action, FilterAction::Release),
         "the rejected session must not be cached"
@@ -960,12 +1037,14 @@ async fn unsupported_backend_version_is_never_confirmed() {
 async fn delete_terminates_backend_sessions_of_that_gateway_session() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
-    route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
-    route(&filter, &call_request(Some("gw-1"), None), "cal_create_event").await;
-    route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
+    let gw_1 = issue(&filter).await;
+    let gw_2 = issue(&filter).await;
+    route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
+    route(&filter, &call_request(Some(gw_1.as_str()), None), "cal_create_event").await;
+    route(&filter, &call_request(Some(gw_2.as_str()), None), "weather_get_weather").await;
 
     let mut req = crate::test_utils::make_request(http::Method::DELETE, "/mcp");
-    req.headers.insert("mcp-session-id", "gw-1".parse().unwrap());
+    req.headers.insert("mcp-session-id", gw_1.parse().unwrap());
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -978,7 +1057,7 @@ async fn delete_terminates_backend_sessions_of_that_gateway_session() {
         2,
         "both backend sessions of gw-1 must be terminated"
     );
-    route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
+    route(&filter, &call_request(Some(gw_2.as_str()), None), "weather_get_weather").await;
     assert_eq!(mock.count("initialize"), 3, "other gateway sessions must survive");
 }
 
@@ -986,22 +1065,23 @@ async fn delete_terminates_backend_sessions_of_that_gateway_session() {
 async fn delete_with_other_credential_keeps_backend_sessions() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
     route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer alice")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer alice")),
         "weather_get_weather",
     )
     .await;
 
     let mut req = crate::test_utils::make_request(http::Method::DELETE, "/mcp");
-    req.headers.insert("mcp-session-id", "gw-1".parse().unwrap());
+    req.headers.insert("mcp-session-id", gw_1.parse().unwrap());
     req.headers.insert("authorization", "Bearer mallory".parse().unwrap());
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(
-        matches!(&action, FilterAction::Reject(r) if r.status == 204),
-        "DELETE must still return 204"
+        matches!(&action, FilterAction::Reject(r) if r.status == 409),
+        "a DELETE that leaves another caller's sessions must answer 409"
     );
 
     assert_eq!(
@@ -1011,11 +1091,331 @@ async fn delete_with_other_credential_keeps_backend_sessions() {
     );
     route(
         &filter,
-        &call_request(Some("gw-1"), Some("Bearer alice")),
+        &call_request(Some(gw_1.as_str()), Some("Bearer alice")),
         "weather_get_weather",
     )
     .await;
     assert_eq!(mock.count("initialize"), 1, "the owner's session must survive");
+}
+
+// -----------------------------------------------------------------------------
+// Gateway Sessions
+// -----------------------------------------------------------------------------
+
+const TOOLS_LIST_BODY: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+const PING_BODY: &str = r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#;
+const INITIALIZE_BODY: &str =
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#;
+const INITIALIZED_BODY: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+
+#[tokio::test]
+async fn forged_gateway_session_is_not_found_and_opens_no_backend_session() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+
+    let routed = route(&filter, &call_request(Some("mcp-forged"), None), "weather_get_weather").await;
+
+    assert_eq!(status_of(&routed.action), Some(404), "a forged id must be a 404");
+    assert_eq!(mock.count("initialize"), 0, "a forged id must open no backend session");
+}
+
+#[tokio::test]
+async fn tampered_gateway_session_is_not_found() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let issued = issue(&filter).await;
+    let mut tampered = issued.into_bytes();
+    let last = tampered.last_mut().unwrap();
+    *last = if *last == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered).unwrap();
+
+    let routed = route(&filter, &call_request(Some(&tampered), None), "weather_get_weather").await;
+
+    assert_eq!(status_of(&routed.action), Some(404), "a tampered id must be a 404");
+    assert_eq!(
+        mock.count("initialize"),
+        0,
+        "a tampered id must open no backend session"
+    );
+}
+
+#[tokio::test]
+async fn forged_gateway_session_is_not_found_on_every_method() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+
+    for body in [TOOLS_LIST_BODY, PING_BODY, INITIALIZED_BODY] {
+        let action = post(&filter, Some("mcp-forged"), body).await;
+        assert_eq!(status_of(&action), Some(404), "{body} with a forged id must be a 404");
+    }
+    let deleted = delete(&filter, "mcp-forged", None).await;
+    assert_eq!(status_of(&deleted), Some(404), "DELETE of a forged id must be a 404");
+}
+
+#[tokio::test]
+async fn ids_from_another_broker_instance_are_not_found() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+    let other = broker_with(Arc::new(MockBackend::default()));
+    let foreign = issue(&other).await;
+
+    let action = post(&filter, Some(&foreign), PING_BODY).await;
+
+    assert_eq!(
+        status_of(&action),
+        Some(404),
+        "each broker build signs with its own key"
+    );
+}
+
+#[tokio::test]
+async fn issued_gateway_session_works_on_every_method() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+    let gateway = issue(&filter).await;
+
+    for body in [TOOLS_LIST_BODY, PING_BODY] {
+        let action = post(&filter, Some(&gateway), body).await;
+        assert_eq!(status_of(&action), Some(200), "{body} with an issued id must succeed");
+    }
+    let routed = route(&filter, &call_request(Some(&gateway), None), "weather_get_weather").await;
+    assert!(
+        matches!(routed.action, FilterAction::Release),
+        "tools/call must be forwarded"
+    );
+}
+
+#[tokio::test]
+async fn initialize_issues_distinct_gateway_sessions() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+
+    let first = issue(&filter).await;
+    let second = issue(&filter).await;
+
+    assert_ne!(first, second, "every initialize must issue a fresh id");
+    assert!(first.starts_with("mcp-"), "issued ids keep the mcp- prefix");
+    assert!(first.len() <= 256, "issued ids must fit the accepted length");
+}
+
+#[tokio::test]
+async fn ended_gateway_session_is_not_found() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let gateway = issue(&filter).await;
+    route(&filter, &call_request(Some(&gateway), None), "weather_get_weather").await;
+
+    let deleted = delete(&filter, &gateway, None).await;
+    assert_eq!(status_of(&deleted), Some(204), "the first DELETE ends the session");
+
+    let routed = route(&filter, &call_request(Some(&gateway), None), "weather_get_weather").await;
+    assert_eq!(
+        status_of(&routed.action),
+        Some(404),
+        "tools/call after DELETE must be a 404"
+    );
+    assert_eq!(mock.count("initialize"), 1, "an ended id must open no backend session");
+    let action = post(&filter, Some(&gateway), PING_BODY).await;
+    assert_eq!(status_of(&action), Some(404), "ping after DELETE must be a 404");
+    let again = delete(&filter, &gateway, None).await;
+    assert_eq!(status_of(&again), Some(404), "a second DELETE must be a 404");
+}
+
+#[tokio::test]
+async fn new_initialize_after_delete_issues_a_working_session() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+    let ended = issue(&filter).await;
+    let deleted = delete(&filter, &ended, None).await;
+    assert_eq!(status_of(&deleted), Some(204), "DELETE ends the session");
+
+    let fresh = issue(&filter).await;
+
+    let routed = route(&filter, &call_request(Some(&fresh), None), "weather_get_weather").await;
+    assert!(matches!(routed.action, FilterAction::Release), "a fresh id must work");
+}
+
+#[tokio::test]
+async fn delete_by_other_credential_does_not_end_the_gateway_session() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let gateway = issue(&filter).await;
+    route(
+        &filter,
+        &call_request(Some(&gateway), Some("Bearer alice")),
+        "weather_get_weather",
+    )
+    .await;
+
+    let deleted = delete(&filter, &gateway, Some("Bearer mallory")).await;
+    assert_eq!(
+        status_of(&deleted),
+        Some(409),
+        "a DELETE that cannot end the session must not answer 204"
+    );
+
+    let routed = route(
+        &filter,
+        &call_request(Some(&gateway), Some("Bearer alice")),
+        "weather_get_weather",
+    )
+    .await;
+    assert!(
+        matches!(routed.action, FilterAction::Release),
+        "another caller's DELETE must not end the owner's gateway session"
+    );
+}
+
+#[tokio::test]
+async fn tools_call_during_delete_termination_is_not_found() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let mock = Arc::new(MockBackend {
+        terminate_gate: Some((Arc::clone(&started), Arc::clone(&proceed))),
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+    let gateway = issue(&filter).await;
+    let req = call_request(Some(&gateway), None);
+    route(&filter, &req, "weather_get_weather").await;
+
+    // The call arrives while DELETE waits for the backend termination.
+    let (deleted, racing) = tokio::join!(delete(&filter, &gateway, None), async {
+        started.notified().await;
+        let racing = route(&filter, &req, "weather_get_weather").await;
+        proceed.notify_one();
+        racing
+    });
+
+    assert_eq!(status_of(&deleted), Some(204), "DELETE ends the session");
+    assert_eq!(
+        status_of(&racing.action),
+        Some(404),
+        "a call racing the termination must see the session ended"
+    );
+    assert_eq!(
+        mock.count("initialize"),
+        1,
+        "the racing call must open no backend session"
+    );
+}
+
+#[tokio::test]
+async fn handshake_queued_behind_delete_does_not_keep_its_session() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let queued = Arc::new(tokio::sync::Notify::new());
+    let mock = Arc::new(MockBackend {
+        initialize_gate: Some((Arc::clone(&started), Arc::clone(&proceed))),
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+    let gateway = issue(&filter).await;
+    let req = call_request(Some(&gateway), None);
+
+    // First call is mid-handshake; the second passed the session check and
+    // waits for the handshake permit when DELETE runs.
+    let (first, second, deleted) = tokio::join!(
+        route(&filter, &req, "weather_get_weather"),
+        async {
+            started.notified().await;
+            queued.notify_one();
+            route(&filter, &req, "weather_get_weather").await
+        },
+        async {
+            queued.notified().await;
+            settle().await;
+            let deleted = delete(&filter, &gateway, None).await;
+            proceed.notify_one();
+            settle().await;
+            proceed.notify_one();
+            deleted
+        },
+    );
+
+    assert_eq!(status_of(&deleted), Some(204), "DELETE ends the session");
+    let (_, error) = rejection_json(&first.action);
+    assert_eq!(
+        error["error"]["data"]["reason"], "session_closed",
+        "the handshake DELETE cancelled must not be forwarded"
+    );
+    assert_eq!(
+        status_of(&second.action),
+        Some(404),
+        "a call still waiting for the handshake permit must see the session ended"
+    );
+    assert_eq!(
+        mock.count("initialize"),
+        1,
+        "the queued call must open no backend session"
+    );
+    assert_eq!(
+        terminations(&mock),
+        ["backend-1|"],
+        "the cancelled handshake's session is terminated"
+    );
+}
+
+#[tokio::test]
+async fn ended_gateway_session_is_not_found_on_get_and_initialize() {
+    let filter = broker_with(Arc::new(MockBackend::default()));
+    let live = issue(&filter).await;
+    let ended = issue(&filter).await;
+    let deleted = delete(&filter, &ended, None).await;
+    assert_eq!(status_of(&deleted), Some(204), "DELETE ends the session");
+
+    assert_eq!(
+        status_of(&get(&filter, &ended).await),
+        Some(404),
+        "GET with an ended id"
+    );
+    assert_eq!(
+        status_of(&get(&filter, "mcp-forged").await),
+        Some(404),
+        "GET with a forged id"
+    );
+    assert_eq!(
+        status_of(&get(&filter, &live).await),
+        Some(405),
+        "GET with a live id keeps its 405"
+    );
+    let reinit = post(&filter, Some(&ended), INITIALIZE_BODY).await;
+    assert_eq!(status_of(&reinit), Some(404), "initialize carrying an ended id");
+    let forged = post(&filter, Some("mcp-forged"), INITIALIZE_BODY).await;
+    assert_eq!(status_of(&forged), Some(404), "initialize carrying a forged id");
+    let fresh = post(&filter, None, INITIALIZE_BODY).await;
+    assert_eq!(status_of(&fresh), Some(200), "initialize without an id still succeeds");
+}
+
+#[tokio::test]
+async fn delete_during_another_credentials_handshake_is_refused() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let mock = Arc::new(MockBackend {
+        initialize_gate: Some((Arc::clone(&started), Arc::clone(&proceed))),
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+    let gateway = issue(&filter).await;
+    let alice = call_request(Some(&gateway), Some("Bearer alice"));
+
+    let (routed, deleted) = tokio::join!(route(&filter, &alice, "weather_get_weather"), async {
+        started.notified().await;
+        let deleted = delete(&filter, &gateway, Some("Bearer bob")).await;
+        proceed.notify_one();
+        deleted
+    });
+
+    assert_eq!(
+        status_of(&deleted),
+        Some(409),
+        "another credential's handshake in flight keeps the session"
+    );
+    assert!(
+        matches!(routed.action, FilterAction::Release),
+        "the in-flight handshake completes and is forwarded"
+    );
+    let again = route(&filter, &alice, "weather_get_weather").await;
+    assert!(
+        matches!(again.action, FilterAction::Release),
+        "the session stays usable"
+    );
+    assert_eq!(mock.count("initialize"), 1, "the published session is reused");
 }
 
 // -----------------------------------------------------------------------------

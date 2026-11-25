@@ -9,7 +9,11 @@
 # Later calls reuse that session. A backend 404 drops the
 # mapping, and the next call initializes a fresh backend
 # session. DELETE on the gateway session terminates its
-# backend sessions.
+# backend sessions. The broker accepts only gateway session
+# ids it issued and that were not deleted; any other id gets
+# 404 on every method, and the client must initialize again.
+# A DELETE that would end a session other credentials still
+# use answers 409 and leaves it usable.
 #
 # The handshake runs as a filtered subrequest through a
 # generated outbound chain whose load_balancer references
