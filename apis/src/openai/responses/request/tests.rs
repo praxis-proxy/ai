@@ -729,7 +729,7 @@ async fn filter_results_are_published_under_this_filter() {
         .expect("results belong to the filter that published them");
     assert_eq!(results.get("format"), Some("openai_responses"));
     assert_eq!(results.get("modality"), Some("image"));
-    assert_eq!(ctx.get_metadata("ai.modality"), Some("image"));
+    assert_eq!(ctx.filter_metadata.get("ai.modality"), Some("image"));
     assert_eq!(
         results.get("mode"),
         Some("stateful"),

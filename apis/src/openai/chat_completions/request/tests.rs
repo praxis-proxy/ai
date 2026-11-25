@@ -101,7 +101,7 @@ async fn create_request_publishes_routing_facts() {
         "stream flag comes from the buffered body"
     );
     assert_eq!(
-        ctx.get_metadata("ai.modality"),
+        ctx.filter_metadata.get("ai.modality"),
         Some("image"),
         "modality comes from structured message content"
     );
