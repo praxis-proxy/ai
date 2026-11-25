@@ -554,7 +554,7 @@ fn should_arm(ctx: &HttpFilterContext<'_>) -> bool {
     let is_encoded = ctx
         .response_header
         .as_ref()
-        .is_some_and(|response| response.headers.contains_key(http::header::CONTENT_ENCODING));
+        .is_some_and(|response| !super::has_identity_encoding(&response.headers));
     if is_encoded {
         debug!("streaming SSE response is encoded; skipping stream transformation");
         return false;

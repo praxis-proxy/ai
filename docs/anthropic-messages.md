@@ -106,9 +106,24 @@ of an `iterative_request_router`. Praxis then runs the connector itself:
   `server_url`; any other URL is rejected with a 400 unless the operator sets
   `allow_client_servers: true`.
 - Both the native Messages route and the Chat Completions translation are
-  supported. Streaming (`stream: true`) requests that use the connector, a
-  toolset's `defer_loading: true`, and pinned tool lists are rejected with a
-  400 for now.
+  supported. With `stream: true`, text and tool arguments arrive as the model
+  produces them. Each MCP call appears as an `mcp_tool_use` block, and its
+  result references the same ID. A mixed round returns the MCP results and
+  leaves client tools for the caller to answer. Rounds share the first message
+  ID, consecutive block indices, and one terminal usage delta and stop.
+  A complete model `message_stop` lets Praxis dispatch the next round or
+  finish the client response even if the backend keeps its HTTP body open.
+  MCP and web search share the Messages SSE parser. It recognizes CR line
+  endings immediately, rejects deltas for unopened blocks and malformed
+  lifecycle fields, preserves citations and compaction data for replay, and
+  carries provider metadata into the terminal delta.
+  Streamed MCP results follow the round's model blocks. Buffered responses
+  place each result immediately after its call. Both orders can be replayed.
+  If a later request filter rejects a resumed step after HTTP 200 is committed,
+  the stream can end without an Anthropic terminal event.
+  If a model round is truncated or exceeds the connector’s size limit after
+  streaming starts, the connector emits one SSE `error` and stops.
+- A toolset's `defer_loading: true` and pinned tool lists return HTTP 400.
 
 See [`examples/configs/anthropic/mcp-connector.yaml`](../examples/configs/anthropic/mcp-connector.yaml).
 

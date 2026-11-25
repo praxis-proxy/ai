@@ -152,7 +152,8 @@ def live_stack(request):
         log_path.unlink()
 
 
-def test_live_model_calls_mcp_tool_through_the_connector(live_stack):
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_live_model_calls_mcp_tool_through_the_connector(live_stack, streaming):
     client = Anthropic(
         base_url=f"http://127.0.0.1:{live_stack['proxy_port']}",
         api_key="unused-by-the-chat-route",
@@ -161,7 +162,8 @@ def test_live_model_calls_mcp_tool_through_the_connector(live_stack):
     )
     mcp = live_stack["mcp"]
 
-    response = client.beta.messages.create(
+    mcp.requests.clear()
+    params = dict(
         model=live_stack["model"],
         max_tokens=1024,
         betas=[BETA],
@@ -178,6 +180,11 @@ def test_live_model_calls_mcp_tool_through_the_connector(live_stack):
         messages=[{"role": "user", "content": "What is the weather in Paris? Use the weather tool. /no_think"}],
     )
 
+    if streaming:
+        with client.beta.messages.stream(**params) as stream:
+            response = stream.get_final_message()
+    else:
+        response = client.beta.messages.create(**params)
     assert response.type == "message", response
     types = [block.type for block in response.content]
     assert "mcp_tool_use" in types and "mcp_tool_result" in types, response.model_dump_json()
