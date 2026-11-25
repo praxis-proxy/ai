@@ -81,7 +81,21 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
         ));
     }
 
-    let report = render_report(&repo, &outcomes);
+    write_reports(args, &repo, &outcomes)?;
+    if args.dry_run {
+        eprintln!("dry run: nothing written");
+        return Ok(());
+    }
+    repo.commit()?;
+    for path in repo.staged_paths() {
+        eprintln!("updated {path}");
+    }
+    Ok(())
+}
+
+/// Emit the human-readable bump report and the optional Codex failure status.
+fn write_reports(args: &BumpArgs, repo: &Repo, outcomes: &[Outcome]) -> Result<(), String> {
+    let report = render_report(repo, outcomes);
     println!("{report}");
     if let Some(path) = &args.report {
         fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -92,14 +106,6 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
             _ => None,
         });
         fs::write(path, reason.unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    if args.dry_run {
-        eprintln!("dry run: nothing written");
-        return Ok(());
-    }
-    repo.commit()?;
-    for path in repo.staged_paths() {
-        eprintln!("updated {path}");
     }
     Ok(())
 }
