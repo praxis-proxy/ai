@@ -54,7 +54,7 @@ jobs:
       # workspace build artifacts, so caching them just adds restore/save I/O.
       - name: Setup Rust
         if: matrix.language == 'rust'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@8ba98632ca71176aa3e92b2017af2bcf5548d9d1 # v0.6.0
         with:
           cache-suffix: codeql-cargo
           cache-target: false
