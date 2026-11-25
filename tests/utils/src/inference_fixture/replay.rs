@@ -644,13 +644,7 @@ fn connector_steps_can_repeat<'a>(steps: &'a [Value], named_chains: &HashMap<&'a
             if !visited.insert(name) {
                 continue;
             }
-            let Some(step) = steps.get(name) else { continue };
-            for next in step["on_result"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|rule| rule["next"].as_str())
-            {
+            for next in steps.get(name).into_iter().flat_map(|step| step_result_targets(step)) {
                 if connector_steps.contains(next) {
                     return true;
                 }
@@ -659,6 +653,15 @@ fn connector_steps_can_repeat<'a>(steps: &'a [Value], named_chains: &HashMap<&'a
         }
         false
     })
+}
+
+/// Read the configured targets of a step's result rules.
+fn step_result_targets(step: &Value) -> impl Iterator<Item = &str> {
+    step["on_result"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule["next"].as_str())
 }
 
 /// Inspect only filters and their inline or named branch chains.
