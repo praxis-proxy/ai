@@ -347,12 +347,12 @@
 listeners:
   - name: ai-gateway
     address: "127.0.0.1:8080"
-    filter_chains: [ingress-and-binding, managed-responses, managed-execution]
+    filter_chains: [ingress-and-binding, managed-responses, managed-execution, unsupported-method]
 
-# The pipeline is expressed as three named chains composed in order by the
+# The pipeline is expressed as four named chains composed in order by the
 # listener. Splitting it lets the shared managed-provider gate be declared once
 # as a chain-level condition (praxis #1280) instead of repeated on every managed
-# body filter. The concatenation of the three chains in listener order is
+# body filter. The concatenation of the four chains in listener order is
 # equivalent, filter-for-filter and condition-for-condition, to a single flat
 # chain:
 #   1. ingress-and-binding — ingress, identity normalization, request
@@ -362,6 +362,7 @@ listeners:
 #      `unless application_provider: openai` via one inherited chain condition.
 #   3. managed-execution   — the local resource-store 404 and the agentic IRR.
 #      No shared condition (see that chain's note).
+#   4. unsupported-method returns 405 if no handler accepted the request.
 filter_chains:
   - name: ingress-and-binding
     filters:
@@ -726,7 +727,7 @@ filter_chains:
   # Terminal managed execution: the local resource-store 404 and the agentic
   # loop. This chain intentionally declares NO shared condition. OpenAI-bound
   # traffic already left through the direct-openai terminal branch, and the IRR
-  # must stay ungated — it owns an ordinary pre-read body hook that cannot depend
+  # uses an HTTP method gate — its ordinary pre-read body hook cannot depend
   # on bound_upstream metadata the binding router publishes later. static_response
   # keeps its own path conditions.
   - name: managed-execution
@@ -762,6 +763,9 @@ filter_chains:
       # step consumes the frozen logical binding directly; it must not route
       # again or attempt to replace the request-level provider decision.
       - filter: iterative_request_router
+        conditions:
+          - when:
+              methods: [POST]
         initial_step: inference
         # Safety cap: at least max_infer_iters + 1 (7 + 1 = 8).
         max_iterations: 8
@@ -993,6 +997,16 @@ filter_chains:
                 next: inference
               - default: true
                 done: true
+
+  # Resource handlers and direct routes have already dispatched. The
+  # managed inference loop accepts POST only.
+  - name: unsupported-method
+    filters:
+      - filter: static_response
+        status: 405
+        headers:
+          - name: Allow
+            value: POST
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
