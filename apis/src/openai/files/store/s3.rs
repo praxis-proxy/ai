@@ -3,32 +3,41 @@
 
 //! S3 byte storage for Files uploads and downloads.
 
-use async_trait::async_trait;
-use object_store::aws::AmazonS3;
+mod crypto;
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use object_store::aws::AmazonS3Builder;
+
+use self::crypto::OpensslCryptoProvider;
 use super::{FileStore, FileStoreError, FileStoreWriter, object_store_adapter::ObjectStoreFileStore};
 use crate::openai::files::FileStream;
 
 /// A Files byte store backed by a caller-configured S3 bucket.
 ///
-/// The caller configures credentials, endpoint, HTTP transport, and crypto on
-/// [`AmazonS3`] before constructing this adapter. Object keys are the trusted,
-/// globally unique storage keys supplied by the file registry. For recovery
-/// after a process crash, configure an S3 lifecycle rule to abort incomplete
-/// multipart uploads; an abandoned upload has no completed object for the
-/// Files reaper to delete.
+/// The caller configures the bucket, credentials, endpoint, and HTTP transport
+/// on an [`AmazonS3Builder`]. This adapter configures OpenSSL signing. Object keys
+/// are the trusted, globally unique storage keys supplied by the file registry.
+/// For recovery after a process crash, configure an S3 lifecycle rule to abort
+/// incomplete multipart uploads. An abandoned upload has no completed object
+/// for the Files reaper to delete.
 pub struct S3FileStore {
     /// Shared byte operations over the configured S3 client.
     adapter: ObjectStoreFileStore,
 }
 
 impl S3FileStore {
-    /// Wrap a configured S3 bucket.
-    #[must_use]
-    pub fn new(store: AmazonS3) -> Self {
-        Self {
+    /// Build the S3 client with OpenSSL signing, replacing any crypto provider
+    /// supplied on `builder`.
+    ///
+    /// # Errors
+    /// Returns an error if the S3 client could not be built.
+    pub fn new(builder: AmazonS3Builder) -> object_store::Result<Self> {
+        let store = builder.with_crypto_provider(Arc::new(OpensslCryptoProvider)).build()?;
+        Ok(Self {
             adapter: ObjectStoreFileStore::new(store),
-        }
+        })
     }
 }
 

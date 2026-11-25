@@ -12,13 +12,54 @@
 mod tests {
     use std::process::Command;
 
+    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::StreamExt as _;
-    use object_store::aws::AmazonS3Builder;
+    use object_store::{
+        ClientOptions,
+        aws::AmazonS3Builder,
+        client::{HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService},
+    };
     use praxis_ai_apis::openai::files::{FileStore as _, FileStoreError, S3FileStore};
     use serde_json::Value;
 
     const PART_BYTES: usize = 8 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn signs_requests_through_the_supplied_connector() {
+        #[derive(Debug)]
+        struct TestConnector;
+
+        impl HttpConnector for TestConnector {
+            fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
+                Ok(HttpClient::new(Self))
+            }
+        }
+
+        #[async_trait]
+        impl HttpService for TestConnector {
+            async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+                assert_eq!(req.method(), http::Method::DELETE);
+                let authorization = req
+                    .headers()
+                    .get(http::header::AUTHORIZATION)
+                    .expect("signed request")
+                    .to_str()
+                    .expect("ASCII signature");
+                assert!(authorization.starts_with("AWS4-HMAC-SHA256 Credential=test-access-key/"));
+                Ok(HttpResponse::new(Bytes::new().into()))
+            }
+        }
+
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_access_key_id("test-access-key")
+            .with_secret_access_key("test-secret-key")
+            .with_disable_bulk_delete(true)
+            .with_http_connector(TestConnector);
+        let store = S3FileStore::new(builder).expect("build S3 client with test connector");
+        store.delete("files/key").await.expect("send signed delete");
+    }
 
     fn listing_keys(response: &Value, field: &str) -> Vec<String> {
         let listing = response.as_object().expect("AWS CLI listing must be a JSON object");
@@ -70,17 +111,15 @@ mod tests {
         }
 
         fn store_with_credentials(&self, access_key: &str, secret_key: &str) -> S3FileStore {
-            let client = AmazonS3Builder::new()
+            let builder = AmazonS3Builder::new()
                 .with_endpoint(&self.endpoint)
                 .with_region(&self.region)
                 .with_bucket_name(&self.bucket)
                 .with_access_key_id(access_key)
                 .with_secret_access_key(secret_key)
                 .with_virtual_hosted_style_request(false)
-                .with_allow_http(true)
-                .build()
-                .expect("build RustFS S3 client");
-            S3FileStore::new(client)
+                .with_allow_http(true);
+            S3FileStore::new(builder).expect("build RustFS S3 client")
         }
 
         /// AWS CLI is deliberately independent of the `object_store` S3 client.
