@@ -34,7 +34,7 @@ permissions: {}
 
 jobs:
   assign:
-    uses: praxis-proxy/conventions/.github/workflows/pr-assignees.yaml@a94d5edb2929b4e623dcfc9f1820d67eab43f748 # conventions PR 49
+    uses: praxis-proxy/conventions/.github/workflows/pr-assignees.yaml@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
     with:
       auto-assign-maintainer: false
       max-open-prs: 3
