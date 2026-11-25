@@ -50,6 +50,10 @@ pub(crate) struct BumpArgs {
     /// Also write the markdown report (the bump PR body) to this file.
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Write the Codex discovery failure reason, or an empty file if there was none.
+    #[arg(long)]
+    codex_discovery_failure: Option<PathBuf>,
 }
 
 // -----------------------------------------------------------------------------
@@ -81,6 +85,13 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
     println!("{report}");
     if let Some(path) = &args.report {
         fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if let Some(path) = &args.codex_discovery_failure {
+        let reason = outcomes.iter().find_map(|outcome| match outcome {
+            Outcome::Skipped(Pin::Codex, reason) => Some(reason.as_str()),
+            _ => None,
+        });
+        fs::write(path, reason.unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     if args.dry_run {
         eprintln!("dry run: nothing written");
@@ -369,7 +380,11 @@ fn render_report(repo: &Repo, outcomes: &[Outcome]) -> String {
         .collect();
     let mut out = String::from("## Pinned client bumps\n\n");
     if updates.is_empty() {
-        out.push_str("All checked pins are current.\n");
+        if outcomes.iter().any(|outcome| matches!(outcome, Outcome::Skipped(..))) {
+            out.push_str("No pin updates were staged.\n");
+        } else {
+            out.push_str("All checked pins are current.\n");
+        }
     } else {
         render_table(&mut out, &updates);
     }
@@ -489,8 +504,8 @@ const CODEX_CHECKLIST: &[&str] = &[
     "Re-check the observed behaviors cited in `codex_http.rs` against the new build.",
     "Check that `codex-http` passes: it drives native Responses and Responses → Chat Completions over HTTP/SSE.",
     "Check that `codex-websocket` passes: it drives native Responses over WebSocket.",
-    "Check that `vllm-gpu-codex-acceptance` passes under `vllm-full-suite`: it proves the routes and \
-     capabilities in the client guide's Codex CLI qualification table on real vLLM.",
+    "Check that `vllm-gpu-codex-acceptance` passes under `vllm-full-suite`: inspect the per-capability results \
+     in the qualification report. The default model can pass with post-compaction task completion unverified.",
 ];
 
 /// The fixed checklist items for each pin.

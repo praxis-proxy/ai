@@ -422,7 +422,9 @@ mod bump {
         let items = checklist(Pin::Codex, "0.163.0", "0.164.0");
         for lane in ["`codex-http`", "`codex-websocket`", "`vllm-gpu-codex-acceptance`"] {
             assert!(
-                items.iter().any(|item| item.contains(lane)),
+                items
+                    .iter()
+                    .any(|item| item.starts_with(&format!("Check that {lane} passes"))),
                 "{lane} missing: {items:#?}"
             );
         }

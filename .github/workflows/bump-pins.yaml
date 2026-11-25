@@ -108,7 +108,8 @@ jobs:
           for pin in $PINS; do
             args+=(--pin "$pin")
           done
-          cargo xtask bump-pins "${args[@]}" --report "$RUNNER_TEMP/bump-report.md"
+          cargo xtask bump-pins "${args[@]}" --report "$RUNNER_TEMP/bump-report.md" \
+            --codex-discovery-failure "$RUNNER_TEMP/codex-discovery-failure"
 
       - name: Detect changes
         id: diff
@@ -160,7 +161,7 @@ jobs:
               echo "::warning::#$pr has commits from people; not overwriting it."
               if [ "$CORE_REFRESH" != true ]; then
                 {
-                  echo "The [weekly pin bump]($RUN_URL) found newer releases but did not update this branch because it has commits from people. Merge or close this pull request and the next run proposes them."
+                  echo "The [pin bump run]($RUN_URL) left this branch in place because it has commits from people. The report below compares release pins with main."
                   echo
                   cat "$RUNNER_TEMP/bump-report.md"
                 } > "$RUNNER_TEMP/held-bump.md"
@@ -260,6 +261,15 @@ jobs:
               --body-file "$RUNNER_TEMP/bump-report.md"
           fi
 
+      # Publish any valid updates before raising a Codex discovery failure.
+      - name: Check Codex release discovery
+        if: env.CORE_REFRESH != 'true'
+        run: |
+          if [ -s "$RUNNER_TEMP/codex-discovery-failure" ]; then
+            cat "$RUNNER_TEMP/codex-discovery-failure" >&2
+            exit 1
+          fi
+
   # A failed scheduled run is otherwise visible only in the Actions tab: the
   # weekly bump failed twice at `Generate token` before anyone noticed (#2007).
   # Keep one open issue per schedule and comment on it for each failure. This
@@ -284,7 +294,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
-          body="The scheduled [Bump Pins run]($RUN_URL) failed, so no pull request proposes the latest upstream releases. Open the run to find the failing step."
+          body="The scheduled [Bump Pins run]($RUN_URL) failed. Open the run to find the failing step and see which updates, if any, were published."
           issue=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title |
             jq -r --arg title "$TITLE" '.[] | select(.title == $title) | .number' | head -n1)
           if [ -n "$issue" ]; then
