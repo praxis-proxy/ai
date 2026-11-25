@@ -1233,6 +1233,7 @@ mod tests {
             vec![
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
+                vec!["chat_completions_to_bedrock_converse"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
@@ -1343,6 +1344,7 @@ mod tests {
             vec![
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
@@ -1444,7 +1446,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 101, "manifest feature inventory count");
+        assert_eq!(report.features_total, 102, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 78, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 83, "manifest recording inventory count");
         assert_eq!(
@@ -1530,7 +1532,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 101, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 102, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1545,6 +1547,10 @@ mod tests {
                 ),
                 (
                     &"bedrock.converse.response.text".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
+                (
+                    &"bedrock.converse.response.reasoning".to_owned(),
                     &vec!["bedrock/basic-nonstream".to_owned()]
                 ),
                 (

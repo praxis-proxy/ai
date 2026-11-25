@@ -30,6 +30,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: bedrock.converse.response.reasoning
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.minimal
     scopes:
       - messages_to_chat_completions
