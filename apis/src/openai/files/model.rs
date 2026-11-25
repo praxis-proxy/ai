@@ -48,8 +48,8 @@ pub struct FileInfo {
     pub purpose: FilePurpose,
 }
 
-/// List options supplied by a handler. The service rejects limits outside
-/// 1..=10000.
+/// List options supplied by a handler. The handler validates `limit` against
+/// 1..=10000; the service does not recheck it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileList {
     /// Optional purpose filter, preserved as a string for forward compatibility.

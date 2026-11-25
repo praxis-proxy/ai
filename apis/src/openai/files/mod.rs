@@ -5,7 +5,8 @@
 //!
 //! With `openai-files`, this module also exposes the service, metadata
 //! catalog, and byte-store contracts for a local implementation. The default
-//! service is currently a placeholder.
+//! service implements `retrieve` and `list`; upload, content and delete are
+//! still placeholders.
 
 #[cfg(feature = "openai-files")]
 pub(crate) mod contracts;

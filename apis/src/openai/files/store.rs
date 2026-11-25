@@ -15,6 +15,8 @@ mod s3;
 #[cfg(feature = "openai-files-s3")]
 pub use s3::S3FileStore;
 
+pub(crate) mod unavailable;
+
 /// Failures while writing or reading file bytes.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
