@@ -433,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_thirty_five_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_four_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
-        assert_eq!(nodes.len(), 35, "22 main + 13 IRR-step filters");
+        assert_eq!(nodes.len(), 34, "21 main + 13 IRR-step filters");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -490,14 +490,14 @@ mod tests {
         assert!(
             nodes
                 .iter()
-                .take(22)
+                .take(21)
                 .all(|node| node.depth == 0 && node.irr_step.is_none()),
             "all main-chain filters, including the IRR, have depth zero and no step owner"
         );
         assert!(
             nodes
                 .iter()
-                .skip(22)
+                .skip(21)
                 .all(|node| node.depth == 1 && node.irr_step.as_deref() == Some("inference")),
             "all inference-step filters have depth one and retain their step owner"
         );

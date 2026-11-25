@@ -10,7 +10,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_doc_extract`** — Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d).
 - **`openai_file_resolve`** — Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field.
 - **`openai_file_search_dispatch`** — Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend.
-- **`openai_mcp_connector`** — Discovers MCP tools and executes selected calls within the Responses API agentic loop.
+- **`openai_mcp_connector`** — Discovers and executes MCP tools for the Responses API agentic loop.
 - **`openai_responses_compact`** — Summarizes conversation history when the token count exceeds a configured threshold.
 - **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses and Chat Completions request bodies.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.

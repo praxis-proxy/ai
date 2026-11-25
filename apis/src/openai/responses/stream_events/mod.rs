@@ -2587,7 +2587,7 @@ pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, me
 /// Request-phase completion and dispatch failure have no later upstream
 /// response, so the normal response-body finalizer cannot drain pending
 /// synthesis or flush locally generated output items for them.
-fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Option<Vec<u8>> {
+pub(super) fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Option<Vec<u8>> {
     if !reserve_local_synthesis(ctx) {
         return None;
     }

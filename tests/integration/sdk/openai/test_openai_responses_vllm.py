@@ -8279,7 +8279,9 @@ def test_mcp_connector_inside_irr(tmp_path, nemo_guardrails_server, scenario):
     exchanges = []
 
     class RecordingMcp(MCPHandler):
-        def _json_rpc(self, rid, result, error=None):
+        _request_count = 0
+
+        def _json_rpc(self, rid, result, error=None) -> None:
             if result is not None and "tools" in result:
                 exchanges.append(("tools/list", self.headers.get("x-mcp-egress")))
                 if listing_fails:
@@ -8394,7 +8396,7 @@ def test_mcp_connector_inside_irr(tmp_path, nemo_guardrails_server, scenario):
                                     model=VLLM_MODEL, input="Find the weather.", tools=[tool],
                                     stream=True, store=False,
                                 )
-                            assert exchanges == []
+                            assert RecordingMcp.request_count() == 0
                             assert model_requests == []
                             return
                         if scenario == "cached":

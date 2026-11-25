@@ -596,32 +596,104 @@ fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScen
     Ok(())
 }
 
-/// A connector may use deferred declarations during replay only in a
-/// terminal inference step. Follow the whole router because a transition out
-/// of that step can lead back to it indirectly.
+/// Detect a route that can run the connector again after it prepares MCP state.
 fn connector_router_can_reenter(config: &Value) -> bool {
+    let named_chains = config["filter_chains"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|chain| Some((chain["name"].as_str()?, chain["filters"].as_array()?.as_slice())))
+        .collect();
+    router_has_connector_reentry(config, &named_chains)
+}
+
+/// Find routers throughout the configuration, including named filter chains.
+fn router_has_connector_reentry<'a>(config: &'a Value, named_chains: &HashMap<&'a str, &'a [Value]>) -> bool {
     match config {
         Value::Object(object) => {
-            if object.get("filter").and_then(Value::as_str) == Some("iterative_request_router")
-                && let Some(steps) = object.get("steps").and_then(Value::as_array)
-            {
-                let mut connectors = Vec::new();
-                collect_mcp_resolve_filters(config, &mut connectors);
-                if !connectors.is_empty()
-                    && steps.iter().any(|step| {
-                        step.get("on_result")
-                            .and_then(Value::as_array)
-                            .is_some_and(|rules| rules.iter().any(|rule| rule.get("next").is_some()))
-                    })
-                {
-                    return true;
-                }
-            }
-            object.values().any(connector_router_can_reenter)
+            (config["filter"].as_str() == Some("iterative_request_router")
+                && config["steps"]
+                    .as_array()
+                    .is_some_and(|steps| connector_steps_can_repeat(steps, named_chains)))
+                || object
+                    .values()
+                    .any(|child| router_has_connector_reentry(child, named_chains))
         },
-        Value::Array(values) => values.iter().any(connector_router_can_reenter),
+        Value::Array(values) => values
+            .iter()
+            .any(|child| router_has_connector_reentry(child, named_chains)),
         _ => false,
     }
+}
+
+/// Follow possible transitions from each connector-bearing step.
+fn connector_steps_can_repeat<'a>(steps: &'a [Value], named_chains: &HashMap<&'a str, &'a [Value]>) -> bool {
+    let steps: HashMap<_, _> = steps
+        .iter()
+        .filter_map(|step| Some((step["name"].as_str()?, step)))
+        .collect();
+    let connector_steps: BTreeSet<_> = steps
+        .iter()
+        .filter(|(_, step)| filters_reach_connector(&step["filters"], named_chains, &mut BTreeSet::new()))
+        .map(|(&name, _)| name)
+        .collect();
+    connector_steps.iter().any(|start| {
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![*start];
+        while let Some(name) = pending.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            let Some(step) = steps.get(name) else { continue };
+            for next in step["on_result"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|rule| rule["next"].as_str())
+            {
+                if connector_steps.contains(next) {
+                    return true;
+                }
+                pending.push(next);
+            }
+        }
+        false
+    })
+}
+
+/// Inspect only filters and their inline or named branch chains.
+fn filters_reach_connector<'a>(
+    filters: &'a Value,
+    named_chains: &HashMap<&'a str, &'a [Value]>,
+    visited: &mut BTreeSet<&'a str>,
+) -> bool {
+    chain_reaches_connector(filters.as_array().map_or(&[], Vec::as_slice), named_chains, visited)
+}
+
+/// Follow branch references once per step to bound traversal of chain cycles.
+fn chain_reaches_connector<'a>(
+    filters: &'a [Value],
+    named_chains: &HashMap<&'a str, &'a [Value]>,
+    visited: &mut BTreeSet<&'a str>,
+) -> bool {
+    filters.iter().any(|filter| {
+        filter["filter"].as_str() == Some("openai_mcp_connector")
+            || filter["branch_chains"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|branch| branch["chains"].as_array().into_iter().flatten())
+                .any(|chain| {
+                    if let Some(name) = chain.as_str() {
+                        visited.insert(name)
+                            && named_chains
+                                .get(name)
+                                .is_some_and(|filters| chain_reaches_connector(filters, named_chains, visited))
+                    } else {
+                        filters_reach_connector(&chain["filters"], named_chains, visited)
+                    }
+                })
+    })
 }
 
 /// Collect every `openai_mcp_connector` filter object in a config tree.
@@ -3269,6 +3341,28 @@ mod tests {
             error.to_string(),
             "scenario MCP connector iteration is not replay-contained"
         );
+    }
+
+    #[test]
+    fn replay_checks_named_connector_branches_only_on_reentry_paths() {
+        let mut config = json!({
+            "filter_chains": [
+                {"name": "mcp", "filters": [{"filter": "openai_mcp_connector"}]},
+                {"name": "entry", "filters": [{
+                    "filter": "iterative_request_router",
+                    "steps": [
+                        {"name": "prepare", "on_result": [{"next": "inference"}]},
+                        {"name": "inference", "filters": [{
+                            "filter": "router",
+                            "branch_chains": [{"chains": ["mcp"]}]
+                        }], "on_result": [{"done": true}]}
+                    ]
+                }]}
+            ]
+        });
+        assert!(!super::connector_router_can_reenter(&config));
+        config["filter_chains"][1]["filters"][0]["steps"][1]["on_result"] = json!([{"next": "prepare"}]);
+        assert!(super::connector_router_can_reenter(&config));
     }
 
     #[test]

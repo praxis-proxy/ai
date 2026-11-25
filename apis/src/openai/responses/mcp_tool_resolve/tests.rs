@@ -5439,6 +5439,40 @@ fn connection_failure() -> ResolveError {
     }
 }
 
+/// Flush completed local work before adding the terminal discovery failure.
+#[test]
+fn deferred_discovery_failure_flushes_pending_web_search() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState {
+        logical_stream_response_id: Some("resp_logical".to_owned()),
+        logical_stream_sequence: 5,
+        ..ResponsesState::default()
+    };
+    state.locally_executed_output_items.insert("ws_done".to_owned());
+    state.accumulated_output.push(serde_json::json!({
+        "type": "web_search_call", "id": "ws_done", "status": "completed",
+    }));
+    ctx.extensions.insert(state);
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), b"{}");
+    let added: Vec<_> = events
+        .iter()
+        .filter(|(kind, _)| kind == "response.output_item.added")
+        .collect();
+    assert_eq!(added.len(), 2);
+    assert_eq!(added[0].1["item"]["id"], "ws_done");
+    assert_eq!(added[0].1["output_index"], 0);
+    assert_eq!(added[1].1["item"]["type"], "mcp_list_tools");
+    assert_eq!(added[1].1["output_index"], 1);
+    for (sequence, (_, event)) in (5_u64..).zip(&events) {
+        assert_eq!(event["sequence_number"], sequence);
+    }
+    let (kind, terminal) = events.last().expect("terminal event");
+    assert_eq!(kind, "response.failed");
+    assert_eq!(terminal["response"]["output"][0]["id"], "ws_done");
+}
+
 /// The synthesized failure resource must echo the caller's request parameters in
 /// every snapshot, so a persisted or streamed failure reports the same
 /// configuration a real Responses object would rather than silently substituting

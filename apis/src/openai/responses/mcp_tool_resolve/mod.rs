@@ -1472,8 +1472,25 @@ fn build_list_tools_failure_response(
             .get::<ResponsesState>()
             .and_then(|state| state.request_body.get("store").and_then(serde_json::Value::as_bool))
             != Some(false);
+    let continuing_stream = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.logical_stream_response_id.is_some());
+    let mut body = if continuing_stream {
+        let Some(body) = super::stream_events::prepare_local_terminal_events(ctx) else {
+            return TerminalResponse::new(200)
+                .with_headers(discovery_failure_headers())
+                .with_body(
+                    super::stream_events::encode_local_error(ctx, "server_error", "response payload limit exceeded")
+                        .unwrap_or_default(),
+                );
+        };
+        body
+    } else {
+        Vec::new()
+    };
+    let flushed_bytes = body.len();
     let state = ctx.extensions.get::<ResponsesState>();
-    let continuing_stream = state.is_some_and(|state| state.logical_stream_response_id.is_some());
     let response_id = state
         .and_then(|state| state.logical_stream_response_id.as_deref())
         .or_else(|| ctx.filter_metadata.get("responses.response_id"))
@@ -1526,7 +1543,6 @@ fn build_list_tools_failure_response(
         "tools": [],
         "error": null,
     });
-    let mut body = Vec::new();
 
     if !continuing_stream {
         let response = discovery_response(&params, DiscoveryResponseState::InProgress);
@@ -1621,12 +1637,14 @@ fn build_list_tools_failure_response(
         state.accumulated_output.push(failed_item);
         if let Err(error) = super::stream_events::canonicalize_logical_response(state, state.history_rehydrated) {
             state.response_object = serde_json::Value::Null;
+            body.truncate(flushed_bytes);
+            if let Some(error_body) = super::stream_events::encode_local_error(ctx, "server_error", &error.to_string())
+            {
+                body.extend_from_slice(&error_body);
+            }
             return TerminalResponse::new(200)
                 .with_headers(discovery_failure_headers())
-                .with_body(
-                    super::stream_events::encode_local_error(ctx, "server_error", &error.to_string())
-                        .unwrap_or_default(),
-                );
+                .with_body(Bytes::from(body));
         }
         state.logical_stream_sequence = sequence.saturating_add(5);
         state.local_stream_terminal_emitted = true;
