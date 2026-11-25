@@ -13,6 +13,8 @@ The first inference round expands eager declarations into admitted functions and
 
 For approval resumes, include the MCP declaration alongside the approval response and configure `openai_responses_store` and `openai_responses_rehydrate`. The connector reapplies current operator policy and matches the approval against the target and caller identity.
 
+Results with `structuredContent` use a compact JSON object containing both `content` and `structuredContent` in the model-facing `function_call_output` and public `mcp_call.output` strings. This preserves structured-only results and distinct text or media blocks. Without structured content, text blocks remain newline-joined and non-text results remain JSON content arrays. The combined serialized output is subject to the existing result-byte limits.
+
 ## Configuration
 
 | Field | Type | Required | Description |
