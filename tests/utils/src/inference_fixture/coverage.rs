@@ -1446,7 +1446,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 101, "manifest feature inventory count");
+        assert_eq!(report.features_total, 102, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 78, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 83, "manifest recording inventory count");
         assert_eq!(
