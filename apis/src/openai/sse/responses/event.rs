@@ -344,6 +344,24 @@ mod tests {
     }
 
     #[test]
+    fn colonless_event_reset_reaches_type_validation() -> Result<(), SseParseError> {
+        let mut parser = crate::openai::sse::SseFrameParser::new(1024);
+        let frames =
+            parser.parse_chunk(b"event: response.created\nevent\ndata: {\"type\":\"response.created\"}\n\n")?;
+        assert_eq!(frames.len(), 1, "the event reset must not suppress the data record");
+        for frame in &frames {
+            assert!(
+                matches!(
+                    ResponsesEvent::from_frame(frame),
+                    Err(SseParseError::EventTypeMismatch { sse_event_type, .. }) if sse_event_type.is_empty()
+                ),
+                "the reset event type must reach the existing mismatch validation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn response_created() {
         let f = typed_frame("response.created", json!({"id": "resp_1"}));
         let event = ResponsesEvent::from_frame(&f).unwrap();

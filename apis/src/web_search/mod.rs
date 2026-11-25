@@ -4,6 +4,7 @@
 //! Protocol-neutral web-search provider support.
 
 pub(crate) mod config;
+pub(crate) mod domains;
 pub(crate) mod provider;
 
 use std::fmt::Write as _;

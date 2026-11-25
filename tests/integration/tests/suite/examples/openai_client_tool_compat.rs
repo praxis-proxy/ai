@@ -1333,6 +1333,100 @@ fn streaming_namespace_member_never_leaks_private_name() {
     );
 }
 
+#[test]
+fn namespace_blank_description_is_accepted_by_pinned_schema() {
+    // NamespaceToolParam requires `description` as a string but does not set
+    // minLength, so empty and whitespace-only values must reach the backend.
+    // Missing / non-string descriptions stay rejected.
+    use serde_json::json;
+
+    let mut outcomes = Vec::new();
+    for (label, description) in [
+        ("nonblank", Some(json!("Utilities"))),
+        ("empty", Some(json!(""))),
+        ("whitespace", Some(json!("   "))),
+        ("missing", None),
+        ("nonstring", Some(json!(17))),
+    ] {
+        let response = json!({
+            "id": "resp_namespace_validation",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "test",
+            "output": [],
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": {"effort": null, "summary": null},
+            "store": false,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 0,
+                "total_tokens": 1,
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0}
+            },
+            "metadata": {}
+        });
+        let backend = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+        let db = TempSqlite::new("namespace_blank_description");
+        let config = load_client_tool_compat_config(free_port(), backend.port(), db.url());
+        let proxy = start_proxy(&config);
+        let mut tool = json!({
+            "type": "namespace",
+            "name": "n",
+            "tools": [{
+                "type": "function",
+                "name": "f",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": false
+            }]
+        });
+        if let Some(value) = description {
+            tool["description"] = value;
+        }
+        let request = json!({
+            "model": "test",
+            "input": "hi",
+            "stream": false,
+            "store": false,
+            "tools": [tool]
+        });
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        let count = inference_requests(&backend).len();
+        let status = parse_status(&raw);
+        outcomes.push((label, status, count));
+    }
+
+    assert_eq!(outcomes[0], ("nonblank", 200, 1), "positive control");
+    assert_eq!(
+        outcomes[1],
+        ("empty", 200, 1),
+        "empty string description is schema-valid"
+    );
+    assert_eq!(
+        outcomes[2],
+        ("whitespace", 200, 1),
+        "whitespace-only description is schema-valid"
+    );
+    assert_eq!(
+        outcomes[3],
+        ("missing", 400, 0),
+        "required description remains required"
+    );
+    assert_eq!(outcomes[4], ("nonstring", 400, 0), "description remains a string");
+}
+
 // -----------------------------------------------------------------------------
 // Streaming: a deferred shell opening still precedes a later parallel function
 // -----------------------------------------------------------------------------

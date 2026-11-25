@@ -2506,7 +2506,8 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         extra_request_headers: Vec::new(),
         request_headers_to_remove: Vec::new(),
         request_headers_to_set: Vec::new(),
-        filter_metadata: HashMap::new(),
+        request_header_mutations: Vec::new(),
+        filter_metadata: praxis_filter::FilterMetadata::default(),
         structured_metadata: HashMap::new(),
         pre_read_mutations: Vec::new(),
         prior_pre_read_mutations: Vec::new(),
@@ -2531,8 +2532,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         attempted_endpoints: Vec::new(),
         retry_policy: None,
         route_retry_policy: None,
-        cluster_retry_state: None,
-        cluster_retry_state_released: false,
+        cluster_admission: None,
         endpoint_reselector: None,
         pinned_endpoint_address: None,
         rewritten_path: None,
@@ -6931,7 +6931,7 @@ processing_mode:
     let filter = ExtProcFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::ReadWrite,
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "full-duplex filter should declare ReadWrite body access"
     );
 }

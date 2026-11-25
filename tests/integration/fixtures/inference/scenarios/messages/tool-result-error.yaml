@@ -1,0 +1,44 @@
+version: 1
+id: messages/tool-result-error
+description: Errored tool_result blocks are translated into marked tool replies instead of being rejected.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.tool_result_error
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: assistant
+              content:
+                - type: tool_use
+                  id: call_error
+                  name: lookup
+                  input: {}
+            - role: user
+              content:
+                - type: tool_result
+                  tool_use_id: call_error
+                  is_error: true
+                  content:
+                    - type: text
+                      text: rate limited
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

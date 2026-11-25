@@ -66,8 +66,10 @@ fn checksum_fixture_names_the_pinned_release_archive() {
 #[test]
 fn websocket_recording_matches_the_pinned_version() {
     // The WebSocket lane replays a recording of the pinned client's wire
-    // protocol. A bump must recapture it against the new version; renaming the
-    // old recording would misstate its provenance.
+    // protocol. `bump-pins` carries the old recording forward with metadata
+    // naming the version its shapes came from (a bare rename would misstate
+    // that provenance); the lane then replays it against the new binary, and a
+    // failure there means recapturing it by hand.
     let relative = format!("openai/responses/websocket-codex-{CODEX_PINNED_VERSION}.json");
     assert!(
         fixture_path(&relative).is_file(),

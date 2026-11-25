@@ -17,8 +17,8 @@ use crate::hash::{self, Sha256};
 ///
 /// The Anthropic fields change behavior that the response would misreport:
 /// `wire.rs` hardcodes `service_tier`, `container` and `inference_geo` to
-/// null, and `mcp_servers` is a beta server-side feature
-/// (`mcp-client-2025-04-04`).
+/// null, and `mcp_servers` declares the MCP connector, which only
+/// Anthropic's servers execute (`mcp-client-2025-11-20` beta).
 ///
 /// The Chat Completions fields have no Anthropic counterpart, so no
 /// conforming client sends them, but forwarding would let them reach the
@@ -47,6 +47,13 @@ const UNREPRESENTABLE_FIELDS: [&str; 13] = [
     "moderation",
 ];
 
+/// Client-facing reason for refusing the MCP connector in translation.
+///
+/// Names both connector surfaces so a client that sent either one learns the
+/// feature, not just the field, is unavailable on this route.
+const MCP_CONNECTOR_UNSUPPORTED: &str = "the MCP connector (`mcp_servers` and `mcp_toolset` tools) is not supported \
+                                         when translating Anthropic Messages to Chat Completions";
+
 /// Anthropic Messages fields without a Chat Completions equivalent.
 ///
 /// The translated response cannot carry thinking blocks, `context_management`
@@ -69,18 +76,25 @@ const OUTPUT_CONFIG_KEYS: [&str; 3] = ["effort", "format", "task_budget"];
 /// A flag is set only when a recognized marker was actually removed, so the
 /// operator signals report real degradation rather than mere opt-in.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flat flag per allowlisted LossyFeature, mirroring the config enum"
+)]
 pub(crate) struct DegradedFeatures {
     /// A recognized `thinking` request or thinking-only `context_management`
     /// edit was removed.
     pub extended_thinking: bool,
     /// A valid `cache_control` marker was removed.
     pub prompt_caching: bool,
+    /// A mid-conversation `system` message was moved into the leading system
+    /// message.
+    pub mid_conversation_system: bool,
 }
 
 impl DegradedFeatures {
     /// Whether any feature was degraded.
     pub(crate) fn any(self) -> bool {
-        self.extended_thinking || self.prompt_caching
+        self.extended_thinking || self.prompt_caching || self.mid_conversation_system
     }
 }
 
@@ -112,8 +126,9 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
 ///
 /// Every top-level field falls into one of these buckets:
 /// - mapped fields are translated to their Chat Completions equivalent;
-/// - allowlisted lossy features are stripped after their wire markers are validated, and the removal is recorded in
-///   [`TransformOutput::degraded`];
+/// - allowlisted lossy features are degraded — most have their wire markers validated and then stripped;
+///   `mid_conversation_system` instead folds mid-conversation `system` messages into the leading one — and the
+///   degradation is recorded in [`TransformOutput::degraded`];
 /// - [`UNREPRESENTABLE_FIELDS`] reject the request with an error message, because the proxy would otherwise fabricate
 ///   their effect in the translated response;
 /// - [`UNMAPPABLE_FIELDS`] reject when they carry a value and are not allowlisted;
@@ -131,18 +146,22 @@ pub(crate) fn transform_request_degrading(
         return Err("request body is not a JSON object".to_owned());
     };
 
-    // Degrade allowlisted features first: validate each feature's wire markers,
-    // strip them in place, and record what was actually removed. The strict
-    // validation below then runs on the cleaned body, so a leftover marker in an
-    // unrecognized position still fails closed. The strippers walk only
-    // Anthropic-structured positions and never descend into user-controlled tool
-    // `input` or `input_schema` JSON (see [`degrade_prompt_caching`]).
+    // Degrade allowlisted features first: validate each feature's wire
+    // markers, strip or fold them in place, and record what was actually
+    // degraded. The strict validation below then runs on the cleaned body, so
+    // a leftover marker in an unrecognized position still fails closed. The
+    // degraders walk only Anthropic-structured positions and never descend
+    // into user-controlled tool `input` or `input_schema` JSON (see
+    // [`degrade_prompt_caching`]).
     let mut degraded = DegradedFeatures::default();
     if allow.extended_thinking {
         degraded.extended_thinking = degrade_extended_thinking(&mut body)?;
     }
     if allow.prompt_caching {
         degraded.prompt_caching = degrade_prompt_caching(&mut body)?;
+    }
+    if allow.mid_conversation_system {
+        degraded.mid_conversation_system = degrade_mid_conversation_system(&mut body)?;
     }
 
     normalize_nullable_tool_cache_control(&mut body);
@@ -391,7 +410,9 @@ fn clear_thinking_keep_is_recognized(keep: Option<&Value>) -> bool {
 ///
 /// Walks only the positions the Anthropic schema places cache markers in: the
 /// top-level request `cache_control`, `system` text blocks, `tools` definitions,
-/// message content blocks, and the nested text parts of a `tool_result`. It
+/// message content blocks, and the nested text parts of a `tool_result` —
+/// including the `content` of a `search_result` part and the `source.content`
+/// of a `document` part. It
 /// never descends into a `tool_use` block's `input` or a tool's `input_schema`,
 /// because a `cache_control` key there is user data, not Anthropic metadata. A
 /// present but malformed marker is rejected with a specific 400.
@@ -423,19 +444,49 @@ fn degrade_prompt_caching(body: &mut Map<String, Value>) -> Result<bool, String>
             for block in blocks.iter_mut() {
                 strip_cache_control(block, &mut degraded)?;
                 // A tool_result's content is itself an array of Anthropic text
-                // blocks, each a valid marker position.
+                // blocks, each a valid marker position; a `search_result` part
+                // and a `document` part nest text blocks one level deeper (see
+                // [`strip_tool_result_part_markers`]).
                 if block.get("type").and_then(Value::as_str) == Some("tool_result")
                     && let Some(Value::Array(parts)) = block.get_mut("content")
                 {
-                    for part in parts.iter_mut() {
-                        strip_cache_control(part, &mut degraded)?;
-                    }
+                    strip_tool_result_part_markers(parts, &mut degraded)?;
                 }
             }
         }
     }
 
     Ok(degraded)
+}
+
+/// Strip cache markers from a `tool_result` block's content parts.
+///
+/// A `search_result` part carries a further nested `content` array and a
+/// `document` part a `source.content` array; their text blocks are valid
+/// marker positions too, so each is stripped in place like its parent part.
+fn strip_tool_result_part_markers(parts: &mut [Value], degraded: &mut bool) -> Result<(), String> {
+    for part in parts.iter_mut() {
+        strip_cache_control(part, degraded)?;
+        let nested = if part.get("type").and_then(Value::as_str) == Some("search_result") {
+            part.get_mut("content")
+        } else if part.get("type").and_then(Value::as_str) == Some("document")
+            && part
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(Value::as_str)
+                == Some("content")
+        {
+            part.get_mut("source").and_then(|source| source.get_mut("content"))
+        } else {
+            None
+        };
+        if let Some(Value::Array(blocks)) = nested {
+            for block in blocks.iter_mut() {
+                strip_cache_control(block, degraded)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove a recognized `cache_control` marker from one block in place.
@@ -483,6 +534,280 @@ fn cache_control_marker_is_recognized(marker: &Value) -> bool {
             .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m" | "1h")))
 }
 
+/// One merged system-prompt source: per-block `(text, cache_control marker)`
+/// parts, moved rather than cloned from the consumed message content.
+type SystemParts = Vec<(String, Option<Value>)>;
+
+/// Error for a top-level `system` shape the strict validator would reject;
+/// surfaced verbatim by the degrade path so it never masks strict behavior.
+const SYSTEM_SHAPE_ERROR: &str = "`system` must be a string or array of text blocks";
+
+/// Move mid-conversation `system` messages into the top-level `system` field.
+///
+/// Chat Completions permits `system` messages anywhere in the array and real
+/// OpenAI serves them, but backends with strict chat templates — `vLLM`-hosted
+/// models behind a `LiteLLM` gateway — reject a `system` message that follows
+/// a non-system one ("System message must be at the beginning"). When the
+/// operator allowlists this feature, every text-only `system` message that
+/// appears after the first non-system turn is removed from its position and
+/// its text appended, in encounter order, to the top-level `system`, which
+/// [`hoist_system`] then emits as the single leading system message. A
+/// leading `system` message is merged first when a later instruction moves,
+/// and a message whose content is not text-only is left for the strict
+/// validator to reject.
+///
+/// `cache_control` markers surviving on moved blocks are carried onto the
+/// merged top-level blocks, so an operator who allowlisted this feature but
+/// not `prompt_caching` still fails closed in validation instead of silently
+/// losing cache breakpoints. (When `prompt_caching` is allowlisted it runs
+/// first and strips those markers, so nothing is carried.)
+///
+/// Only what the strict validator would fully accept may move: a message
+/// carrying fields beyond `role`/`content`, or a text block with non-empty
+/// `citations` or an unknown field, is left in place so its rejection keeps
+/// the strict error. The empty directive forms (`content: []` or `""`, which
+/// real clients send mid-array) count as movable: folding removes the
+/// message, which is exactly the position fix the feature promises.
+fn degrade_mid_conversation_system(body: &mut Map<String, Value>) -> Result<bool, String> {
+    // Only take the field when it is an array; any other shape is put back
+    // untouched for the strict validator, which rejects non-array `messages`.
+    let messages = match body.remove("messages") {
+        Some(Value::Array(messages)) => messages,
+        Some(other) => {
+            body.insert("messages".to_owned(), other);
+            return Ok(false);
+        },
+        None => return Ok(false),
+    };
+
+    // Partition in one pass: system messages after the first non-system turn
+    // are consumed into text groups; everything else is kept in order. The
+    // content is moved, not cloned — message values are already owned here.
+    // Each moved message stays its own group so the merge below can join
+    // blocks within a message with `\n` (hoist_system's intra-system join)
+    // and separate messages with a blank line.
+    let mut retained = Vec::with_capacity(messages.len());
+    let mut moved: Vec<SystemParts> = Vec::new();
+    let mut seen_non_system = false;
+    for message in messages {
+        match take_movable_system_content(message, seen_non_system) {
+            Ok(group) => moved.push(group),
+            Err(message) => {
+                seen_non_system |= message.get("role").and_then(Value::as_str) != Some("system");
+                retained.push(message);
+            },
+        }
+    }
+
+    if moved.is_empty() {
+        body.insert("messages".to_owned(), Value::Array(retained));
+        return Ok(false);
+    }
+    let groups = prepend_leading_system(&mut retained, moved);
+    merge_mid_conversation_system(body, groups)?;
+    body.insert("messages".to_owned(), Value::Array(retained));
+    Ok(true)
+}
+
+/// Include leading instructions before moved ones, retaining unsupported
+/// messages for strict validation.
+fn prepend_leading_system(retained: &mut Vec<Value>, moved: Vec<SystemParts>) -> Vec<SystemParts> {
+    // Once a later instruction moves, leading in-array instructions must join
+    // it first so hoisting cannot reverse their encounter order.
+    let leading_count = retained
+        .iter()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    let remaining = retained.split_off(leading_count);
+    let leading = std::mem::replace(retained, remaining);
+    let mut groups = Vec::with_capacity(leading.len() + moved.len());
+    for message in leading {
+        match take_movable_system_content(message, true) {
+            Ok(group) => groups.push(group),
+            Err(message) => retained.insert(0, message),
+        }
+    }
+    groups.extend(moved);
+    groups
+}
+
+/// Consume a message into its text-only system content parts when it is a
+/// movable system message, or hand the untouched message back.
+///
+/// Movable means: a `system`-role message that follows a non-system turn and
+/// whose content is a string or an array of text blocks. Anything else —
+/// including a non-text content a strict backend would also reject — is
+/// returned unchanged so the strict validator produces its own error.
+fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<SystemParts, Value> {
+    // The message field set is part of the gate: a message carrying anything
+    // beyond `role` and `content` is never moved, so it still fails closed in
+    // the strict validator below instead of being silently widened by the
+    // allowlist (e.g. an unknown `name` field must keep its 400).
+    match message {
+        Value::Object(mut fields)
+            if seen_non_system
+                && fields.len() == 2
+                && fields.get("role").and_then(Value::as_str) == Some("system")
+                && fields.get("content").is_some_and(content_is_text_only) =>
+        {
+            // The guard requires `content` to be present, so the `None` arm
+            // is unreachable; handing the message back keeps it total without
+            // a panic.
+            match fields.remove("content") {
+                Some(content) => Ok(system_parts_from_content(content)),
+                None => Err(Value::Object(fields)),
+            }
+        },
+        other => Err(other),
+    }
+}
+
+/// Merge moved system-message groups into the top-level `system` field.
+///
+/// Preserves the field's representation: a string stays a string (message
+/// groups joined with a blank line), a block array gains blocks, an absent
+/// field becomes a string. `cache_control` markers force the block
+/// representation so validation can still see them. A `system` value the
+/// strict validator would reject fails here with the same message; the
+/// request is answered 400 either way, so no state needs restoring.
+///
+/// The join deliberately depends on the representation: groups in a string
+/// system are separated by a blank line, while blocks appended to a block
+/// array are joined by [`hoist_system`]'s single-newline block join. The fold
+/// must not change how an existing block array is joined, so it inherits
+/// that join instead of re-separating pre-existing blocks.
+///
+/// A group that contributes neither text nor a `cache_control` marker — the
+/// empty directive forms, or an empty existing system — is dropped, so
+/// removing the message leaves no stray join separator behind.
+fn merge_mid_conversation_system(body: &mut Map<String, Value>, moved: Vec<SystemParts>) -> Result<(), String> {
+    let existing = body.remove("system").filter(|value| !value.is_null());
+    let (mut groups, existing_is_blocks) = existing_system_groups(existing)?;
+    // One group per source: the existing top-level system, then each moved
+    // message in encounter order.
+    groups.extend(moved);
+    // An empty directive (`content: []` or `""`) is an empty group; dropping
+    // it keeps its removal from leaving a separator artifact. A group with a
+    // surviving `cache_control` marker is always kept so the marker still
+    // fails closed in validation.
+    groups.retain(|group| group.iter().any(|(text, marker)| !text.is_empty() || marker.is_some()));
+
+    let carries_marker = groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .any(|(_, marker)| marker.is_some());
+    let system = if carries_marker || existing_is_blocks {
+        Value::Array(groups.into_iter().flat_map(system_blocks_from_group).collect())
+    } else {
+        Value::String(
+            groups
+                .into_iter()
+                .map(|group| group.into_iter().map(|(text, _)| text).collect::<Vec<_>>().join("\n"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    };
+    body.insert("system".to_owned(), system);
+    Ok(())
+}
+
+/// Parse the existing top-level `system` into one merged group, reporting
+/// whether it was a block array (so the merge keeps that representation).
+///
+/// A value the strict validator would reject fails with the same message; the
+/// request is answered 400 either way, so no state needs restoring.
+fn existing_system_groups(existing: Option<Value>) -> Result<(Vec<SystemParts>, bool), String> {
+    match existing {
+        None => Ok((Vec::new(), false)),
+        Some(Value::String(text)) => Ok((vec![vec![(text, None)]], false)),
+        Some(Value::Array(blocks)) => {
+            let mut group = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                // Only a block whose full shape the strict validator
+                // recognizes may be rebuilt here; an unsupported field (for
+                // example non-empty `citations`) must keep its 400 rather
+                // than be silently dropped because a message was folded.
+                if !foldable_text_block(&block) {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                }
+                let Value::Object(mut block) = block else {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                };
+                let Some(text) = take_string(&mut block, "text") else {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                };
+                let marker = block.remove("cache_control").filter(|value| !value.is_null());
+                group.push((text, marker));
+            }
+            Ok((vec![group], true))
+        },
+        Some(_) => Err(SYSTEM_SHAPE_ERROR.to_owned()),
+    }
+}
+
+/// Build Chat Completions text blocks from one merged system group, carrying
+/// any surviving `cache_control` marker onto its block.
+fn system_blocks_from_group(group: SystemParts) -> Vec<Value> {
+    group
+        .into_iter()
+        .map(|(text, marker)| {
+            let mut block = Map::new();
+            block.insert("type".to_owned(), Value::String("text".to_owned()));
+            block.insert("text".to_owned(), Value::String(text));
+            if let Some(marker) = marker {
+                block.insert("cache_control".to_owned(), marker);
+            }
+            Value::Object(block)
+        })
+        .collect()
+}
+
+/// Whether a message content is a string or an array of foldable text blocks.
+fn content_is_text_only(content: &Value) -> bool {
+    match content {
+        Value::String(_) => true,
+        Value::Array(blocks) => blocks.iter().all(foldable_text_block),
+        _ => false,
+    }
+}
+
+/// A text-block shape the fold may rebuild: the strict text-block validation
+/// rules minus the null-`cache_control` requirement.
+///
+/// The strict validator cannot be reused as-is because this feature
+/// deliberately carries a surviving `cache_control` marker forward, so an
+/// operator who allowlisted the fold but not `prompt_caching` still fails
+/// closed in validation instead of silently losing cache breakpoints. The
+/// remaining checks — key set and null-or-empty `citations` — keep the fold
+/// from silently dropping anything the strict validator would reject.
+fn foldable_text_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block.get("text").is_some_and(Value::is_string)
+        && block
+            .get("citations")
+            .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
+        && has_only_keys(block, &["type", "text", "citations", "cache_control"])
+}
+
+/// Consume a text-only content value into `(text, cache_control marker)` parts.
+fn system_parts_from_content(content: Value) -> SystemParts {
+    match content {
+        Value::String(text) => vec![(text, None)],
+        Value::Array(blocks) => blocks
+            .into_iter()
+            .filter_map(|block| {
+                let Value::Object(mut block) = block else {
+                    return None;
+                };
+                let text = take_string(&mut block, "text")?;
+                let marker = block.remove("cache_control").filter(|value| !value.is_null());
+                Some((text, marker))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Reject request data the translator would discard or change meaning.
 #[expect(
     clippy::too_many_lines,
@@ -497,7 +822,11 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
     if let Some(system) = body.get("system") {
         match system {
             Value::String(_) | Value::Null => {},
-            Value::Array(blocks) if blocks.iter().all(text_block_is_supported) => {},
+            Value::Array(blocks) => {
+                if let Some(reason) = blocks.iter().find_map(text_block_rejection) {
+                    return Err(format!("`system` text block cannot be translated: {reason}"));
+                }
+            },
             _ => return Err("`system` must be a string or array of text blocks".to_owned()),
         }
     }
@@ -553,6 +882,9 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
             let tool = tool.as_object().ok_or("tool must be an object")?;
             let supported_type = match tool.get("type") {
                 None | Some(Value::Null) => true,
+                Some(Value::String(kind)) if kind == "mcp_toolset" => {
+                    return Err(MCP_CONNECTOR_UNSUPPORTED.to_owned());
+                },
                 Some(Value::String(kind)) => kind == "custom",
                 _ => false,
             };
@@ -565,19 +897,32 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
             if !tool.get("input_schema").is_some_and(Value::is_object) {
                 return Err("tool requires an `input_schema` object".to_owned());
             }
-            if tool.keys().any(|key| {
+            // `defer_loading` marks a Claude Code deferred-tool placeholder;
+            // the Chat backend cannot honor deferred loading, but the marker
+            // itself carries no translatable meaning, so it is dropped rather
+            // than rejected (a rejection costs the client two failed
+            // round-trips at every session start while it falls back).
+            if let Some(key) = tool.keys().map(String::as_str).find(|key| {
                 !matches!(
-                    key.as_str(),
-                    "type" | "name" | "description" | "input_schema" | "strict"
+                    *key,
+                    "type" | "name" | "description" | "input_schema" | "strict" | "defer_loading"
                 )
-            }) || tool
+            }) {
+                return Err(format!(
+                    "unsupported Anthropic tool field `{key}` for Chat Completions translation"
+                ));
+            }
+            if tool
                 .get("description")
                 .is_some_and(|value| !value.is_string() && !value.is_null())
                 || tool
                     .get("strict")
                     .is_some_and(|value| !value.is_boolean() && !value.is_null())
+                || tool
+                    .get("defer_loading")
+                    .is_some_and(|value| !value.is_boolean() && !value.is_null())
             {
-                return Err("unsupported Anthropic tool field for Chat Completions translation".to_owned());
+                return Err("tool `description`, `strict`, and `defer_loading` must be scalars or null".to_owned());
             }
         }
     }
@@ -630,7 +975,11 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
         .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") if text_block_is_supported(block) => {},
+            Some("text") => {
+                if let Some(reason) = text_block_rejection(block) {
+                    return Err(format!("text block cannot be translated: {reason}"));
+                }
+            },
             Some("image") if role == "user" && !has_tool_use => {
                 let source = block.get("source").ok_or("image block is missing `source`")?;
                 if !image_source_is_supported(source)
@@ -657,32 +1006,50 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
                 }
             },
             Some("tool_result") if role == "user" => {
-                let text_content = match block.get("content") {
-                    None | Some(Value::String(_)) => true,
-                    Some(Value::Array(parts)) => parts.iter().all(text_block_is_supported),
-                    _ => false,
-                };
-                if !block.get("tool_use_id").is_some_and(Value::is_string)
-                    || !text_content
-                    || block.get("is_error") == Some(&Value::Bool(true))
-                    || block
-                        .get("is_error")
-                        .is_some_and(|value| !value.is_boolean() && !value.is_null())
-                    || !has_only_keys(
-                        block,
-                        &[
-                            "type",
-                            "tool_use_id",
-                            "content",
-                            "is_error",
-                            "toolset_name",
-                            "cache_control",
-                        ],
-                    )
-                    || !null_or_absent(block, "toolset_name")
+                if !block.get("tool_use_id").is_some_and(Value::is_string) {
+                    return Err("tool_result block requires a string `tool_use_id`".to_owned());
+                }
+                match block.get("content") {
+                    None | Some(Value::String(_)) => {},
+                    Some(Value::Array(parts)) => {
+                        if let Some(part) = parts.iter().find(|part| !tool_result_part_is_supported(part)) {
+                            // A `text` part keeps the field-naming strict
+                            // rejection, like a top-level message text block.
+                            let reason = if part.get("type").and_then(Value::as_str) == Some("text") {
+                                let reason =
+                                    text_block_rejection(part).unwrap_or_else(|| "`text` must be a string".to_owned());
+                                format!("tool_result `content` text block cannot be translated: {reason}")
+                            } else {
+                                let kind = part.get("type").and_then(Value::as_str).unwrap_or("missing");
+                                format!("tool_result `content` has an unsupported part `{kind}`")
+                            };
+                            return Err(reason);
+                        }
+                    },
+                    _ => {
+                        return Err("tool_result `content` must be a string or an array".to_owned());
+                    },
+                }
+                if block
+                    .get("is_error")
+                    .is_some_and(|value| !value.is_boolean() && !value.is_null())
+                {
+                    return Err("tool_result `is_error` must be a boolean or null".to_owned());
+                }
+                if !has_only_keys(
+                    block,
+                    &[
+                        "type",
+                        "tool_use_id",
+                        "content",
+                        "is_error",
+                        "toolset_name",
+                        "cache_control",
+                    ],
+                ) || !null_or_absent(block, "toolset_name")
                     || !null_or_absent(block, "cache_control")
                 {
-                    return Err("tool_result requires string `tool_use_id` and text `content`".to_owned());
+                    return Err("unsupported Anthropic tool_result field for Chat Completions translation".to_owned());
                 }
             },
             Some(kind) => return Err(format!("unsupported Anthropic content block `{kind}`")),
@@ -699,20 +1066,192 @@ fn has_only_keys(value: &Value, keys: &[&str]) -> bool {
         .is_some_and(|fields| fields.keys().all(|key| keys.contains(&key.as_str())))
 }
 
-/// Null or empty citations carry no source information to preserve.
-fn text_block_is_supported(block: &Value) -> bool {
-    block.get("type").and_then(Value::as_str) == Some("text")
-        && block.get("text").is_some_and(Value::is_string)
-        && block
-            .get("citations")
-            .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
-        && null_or_absent(block, "cache_control")
-        && has_only_keys(block, &["type", "text", "citations", "cache_control"])
+/// Why a text block cannot be faithfully translated, or `None` when it can.
+///
+/// Names the offending field so strict validation rejects with the actual
+/// cause — `cache_control` on a `system` block, non-empty `citations`, an
+/// unrecognized key — instead of the block's overall shape.
+fn text_block_rejection(block: &Value) -> Option<String> {
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return Some("`type` must be \"text\"".to_owned());
+    }
+    if !block.get("text").is_some_and(Value::is_string) {
+        return Some("`text` must be a string".to_owned());
+    }
+    if block
+        .get("citations")
+        .is_some_and(|citations| !citations.is_null() && !citations.as_array().is_some_and(Vec::is_empty))
+    {
+        return Some("`citations` cannot be translated to Chat Completions".to_owned());
+    }
+    if !null_or_absent(block, "cache_control") {
+        return Some(
+            "Prompt caching (`cache_control`) is not supported by this endpoint. Remove the caching \
+             markers from your request, or contact your platform administrator if your client adds \
+             them automatically."
+                .to_owned(),
+        );
+    }
+    block
+        .as_object()?
+        .keys()
+        .map(String::as_str)
+        .find(|key| !matches!(*key, "type" | "text" | "citations" | "cache_control"))
+        .map(|key| format!("`{key}` is not a recognized text block field"))
 }
 
 /// Nullable request metadata has no effect when absent or null.
 fn null_or_absent(value: &Value, key: &str) -> bool {
     value.get(key).is_none_or(Value::is_null)
+}
+
+/// Check a `tool_result` content part against what
+/// `split_tool_result_parts` translates: text, promoted images, and
+/// flattened `search_result`/`document` blocks. Anything else fails closed.
+fn tool_result_part_is_supported(part: &Value) -> bool {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => text_block_rejection(part).is_none(),
+        Some("image") => {
+            part.get("source").is_some_and(image_source_is_supported)
+                && has_only_keys(part, &["type", "source", "cache_control"])
+                && null_or_absent(part, "cache_control")
+        },
+        Some("search_result") => search_result_part_is_supported(part),
+        Some("document") => document_part_is_supported(part),
+        _ => false,
+    }
+}
+
+/// Check a `search_result` part of a `tool_result` against what
+/// `flatten_search_result` translates. A part whose `title`, `source`, and
+/// `content` are all absent or empty flattens to nothing, so the tool
+/// message would silently lose it; such a part fails closed here instead.
+/// A `citations` config or `cache_control` marker the flattener would drop
+/// is likewise rejected rather than silently discarded, as is a `content`
+/// holding non-text blocks or blocks carrying fields the flattener drops:
+/// the pinned spec allows only `text` items there, and `extract_text_blocks`
+/// keeps just each block's `text`. Present `title` or `source` metadata must
+/// be a string, so a malformed value the flattener would silently drop
+/// fails closed instead.
+fn search_result_part_is_supported(part: &Value) -> bool {
+    null_or_absent(part, "citations")
+        && null_or_absent(part, "cache_control")
+        && field_is_absent_or_string(part, "title")
+        && field_is_absent_or_string(part, "source")
+        && has_only_keys(
+            part,
+            &["type", "title", "source", "content", "citations", "cache_control"],
+        )
+        && part.get("content").is_none_or(|content| {
+            // A present, non-null `content` must be an array of text
+            // blocks: any other shape carries text the flattener would
+            // silently drop while keeping the title.
+            content.is_null()
+                || content
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().all(|block| text_block_rejection(block).is_none()))
+        })
+        && (non_empty_string_field(part, "title")
+            || non_empty_string_field(part, "source")
+            || part
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(text_block_has_text)))
+}
+
+/// Check a `document` part of a `tool_result` against what `flatten_document`
+/// translates. A part with no `title`, `context`, or translatable `source`
+/// would be silently dropped from the tool message, so it fails closed here
+/// instead, as does a `citations` config or `cache_control` marker the
+/// flattener would drop. A present `source` must itself be translatable:
+/// the flattener drops an unsupported source even when a `title` or
+/// `context` survives, so the whole part fails closed rather than lose it.
+/// Present `title` or `context` metadata must be a string, so a malformed
+/// value the flattener would silently drop fails closed instead.
+fn document_part_is_supported(part: &Value) -> bool {
+    null_or_absent(part, "citations")
+        && null_or_absent(part, "cache_control")
+        && field_is_absent_or_string(part, "title")
+        && field_is_absent_or_string(part, "context")
+        && has_only_keys(
+            part,
+            &["type", "title", "context", "source", "citations", "cache_control"],
+        )
+        && part
+            .get("source")
+            .filter(|source| !source.is_null())
+            .is_none_or(document_source_is_supported)
+        && (non_empty_string_field(part, "title")
+            || non_empty_string_field(part, "context")
+            || part.get("source").is_some_and(|source| !source.is_null()))
+}
+
+/// Check a `document` part's `source` against what `flatten_document_source`
+/// translates without data loss: a known source type carrying its extractable
+/// field. A `base64` source is rejected because the flattener keeps only its
+/// media type and drops the encoded payload, which would silently empty the
+/// document; `url` and `file` sources keep their reference string and stay
+/// accepted. A `content` source — whose schema (`ContentBlockSource`) allows
+/// a string or an array of text blocks — must hold only strictly
+/// translatable content, so nested `citations`, `cache_control`, or unknown
+/// fields that the flattener would drop fail closed instead.
+fn document_source_is_supported(source: &Value) -> bool {
+    let Some(fields) = source.as_object() else {
+        return false;
+    };
+    let variant = fields.get("type").and_then(Value::as_str);
+    // Each source variant carries only the keys its schema allows, so a
+    // field the flattener would silently drop — a source-level
+    // `cache_control`, for example — fails closed here instead.
+    let keys_supported = match variant {
+        Some("text") => has_only_keys(source, &["type", "data", "media_type"]),
+        Some("content") => has_only_keys(source, &["type", "content"]),
+        Some("url") => has_only_keys(source, &["type", "url"]),
+        Some("file") => has_only_keys(source, &["type", "file_id"]),
+        _ => return false,
+    };
+    keys_supported
+        && match variant {
+            Some("text") => non_empty_string_field(source, "data"),
+            // A `content` source may be the schema's string form or an
+            // array of text blocks; both flatten without loss, and any
+            // other shape carries text the flattener would drop.
+            Some("content") => match source.get("content") {
+                Some(Value::String(_)) => non_empty_string_field(source, "content"),
+                Some(Value::Array(blocks)) => {
+                    blocks.iter().all(|block| text_block_rejection(block).is_none())
+                        && blocks.iter().any(text_block_has_text)
+                },
+                _ => false,
+            },
+            Some("url") => non_empty_string_field(source, "url"),
+            Some("file") => non_empty_string_field(source, "file_id"),
+            _ => false,
+        }
+}
+
+/// Whether a block is a text block with non-empty text.
+fn text_block_has_text(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+}
+
+/// Whether `value` carries a non-empty string at `key`.
+fn non_empty_string_field(value: &Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|field| !field.is_empty())
+}
+
+/// A present, non-null metadata field must be a string: the flattener keeps
+/// string metadata only, so any other shape would be silently discarded
+/// while the rest of the part still translates.
+fn field_is_absent_or_string(value: &Value, key: &str) -> bool {
+    value.get(key).is_none_or(|field| field.is_null() || field.is_string())
 }
 
 /// A direct caller is the only caller form this translator emits and consumes.
@@ -761,6 +1300,9 @@ fn reject_unrepresentable_fields(body: &mut Map<String, Value>) -> Result<(), St
             .remove(field)
             .is_some_and(|value| !value.is_null() && !is_default_value(field, &value))
         {
+            if field == "mcp_servers" {
+                return Err(MCP_CONNECTOR_UNSUPPORTED.to_owned());
+            }
             return Err(format!(
                 "`{field}` is not supported when translating Anthropic Messages to Chat Completions"
             ));
@@ -888,6 +1430,19 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
         return;
     };
 
+    // Content deferred out of a tool-reply group: images promoted out of
+    // `tool_result` parts, plus the ordinary parts that follow them in the
+    // same message. Both are held until no further tool reply can arrive:
+    // Anthropic combines consecutive user messages into one turn, so parallel
+    // tool results may span several of them, and Chat Completions requires
+    // every tool reply to follow the assistant `tool_calls` message directly —
+    // a user message may only appear after the last tool message of the
+    // group, never between two of them. Deferring the trailing ordinary parts
+    // with the images keeps the backend-visible order intact: for
+    // `[tool_result(image A), text, image B]` the backend receives A, the
+    // text, then B, so "first image" keeps its Anthropic meaning.
+    let mut deferred_parts = Vec::new();
+
     for msg in anthropic_messages {
         let Value::Object(mut msg) = msg else {
             continue;
@@ -898,23 +1453,60 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
 
         match msg.remove("content") {
             Some(Value::String(text)) => {
+                flush_deferred_parts(messages, &mut deferred_parts);
                 messages.push(text_message(role, text));
             },
             Some(Value::Array(blocks)) => {
-                convert_content_blocks(messages, &role, blocks);
+                // A user message carrying a `tool_result` may extend the
+                // ongoing tool-reply group, so the deferred content must be
+                // held back past it; anything else ends the group.
+                if !adds_tool_replies(&role, &blocks) {
+                    flush_deferred_parts(messages, &mut deferred_parts);
+                }
+                convert_content_blocks(messages, &role, blocks, &mut deferred_parts);
             },
             _ => {
+                flush_deferred_parts(messages, &mut deferred_parts);
                 messages.push(text_message(role, String::new()));
             },
         }
     }
+
+    flush_deferred_parts(messages, &mut deferred_parts);
+}
+
+/// Whether converting this message can append tool replies to the ongoing
+/// group: only a `user` message with a `tool_result` block does.
+fn adds_tool_replies(role: &str, blocks: &[Value]) -> bool {
+    role == "user"
+        && blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+}
+
+/// Emit the deferred content of a tool-reply group as one user message.
+fn flush_deferred_parts(messages: &mut Vec<Value>, deferred_parts: &mut Vec<Value>) {
+    if deferred_parts.is_empty() {
+        return;
+    }
+    let mut image_message = Map::new();
+    image_message.insert("role".to_owned(), Value::String("user".to_owned()));
+    image_message.insert("content".to_owned(), Value::Array(std::mem::take(deferred_parts)));
+    messages.push(Value::Object(image_message));
 }
 
 /// Convert typed content blocks to Chat Completions-compatible format.
 /// Consumes the blocks to move their payloads into the translated message.
-fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+/// Images promoted out of `tool_result` parts and the ordinary parts that
+/// follow them accumulate in `deferred_parts` for the caller to flush once
+/// the whole tool-reply group has been emitted.
+fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>, deferred_parts: &mut Vec<Value>) {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    // Once a `tool_result` block has been seen, ordinary parts can no longer
+    // be emitted in place: they would overtake the deferred images and could
+    // split the tool-reply group, so they join `deferred_parts` instead.
+    let mut after_tool_result = false;
 
     for block in blocks {
         let mut block = match block {
@@ -922,22 +1514,27 @@ fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Val
             _ => Map::new(),
         };
         let block_type = take_string(&mut block, "type").unwrap_or_default();
-        convert_single_block(block, &block_type, messages, role, &mut content_parts, &mut tool_calls);
+        if block_type == "tool_result" {
+            after_tool_result = true;
+            flush_content_parts(messages, &mut content_parts, role);
+            convert_tool_result_block(block, messages, deferred_parts);
+        } else {
+            let parts = if after_tool_result {
+                &mut *deferred_parts
+            } else {
+                &mut content_parts
+            };
+            convert_single_block(block, &block_type, parts, &mut tool_calls);
+        }
     }
 
     finalize_content_blocks(messages, role, &mut content_parts, tool_calls);
 }
 
-/// Process a single content block within a message.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "accumulator pattern requires passing all state"
-)]
+/// Process a single non-`tool_result` content block within a message.
 fn convert_single_block(
     block: Map<String, Value>,
     block_type: &str,
-    messages: &mut Vec<Value>,
-    role: &str,
     content_parts: &mut Vec<Value>,
     tool_calls: &mut Vec<Value>,
 ) {
@@ -947,10 +1544,6 @@ fn convert_single_block(
         "search_result" => convert_search_result_block(block, content_parts),
         "document" => convert_document_block(block, content_parts),
         "tool_use" => convert_tool_use_block(block, tool_calls),
-        "tool_result" => {
-            flush_content_parts(messages, content_parts, role);
-            convert_tool_result_block(block, messages);
-        },
         "thinking" | "redacted_thinking" => {
             warn!(block_type, "dropping unsupported Anthropic content block");
         },
@@ -1036,7 +1629,15 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
 }
 
 /// Convert a `tool_result` content block to a Chat Completions tool message.
-fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<Value>) {
+///
+/// Image parts cannot live in a tool message, so they are handed to
+/// `deferred_parts` and emitted as one follow-up user message after every
+/// tool message of the tool-reply group (see [`convert_content_blocks`]).
+fn convert_tool_result_block(
+    mut block: Map<String, Value>,
+    messages: &mut Vec<Value>,
+    deferred_parts: &mut Vec<Value>,
+) {
     let tool_call_id = take_string(&mut block, "tool_use_id").unwrap_or_default();
     let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
 
@@ -1052,12 +1653,7 @@ fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<V
     tool_message.insert("content".to_owned(), Value::String(result_content));
     messages.push(Value::Object(tool_message));
 
-    if !image_content.is_empty() {
-        let mut image_message = Map::new();
-        image_message.insert("role".to_owned(), Value::String("user".to_owned()));
-        image_message.insert("content".to_owned(), Value::Array(image_content));
-        messages.push(Value::Object(image_message));
-    }
+    deferred_parts.extend(image_content);
 }
 
 /// Emit the final message for accumulated content and tool calls.
@@ -1131,7 +1727,8 @@ fn convert_image_source(source: Value) -> Option<String> {
 // -----------------------------------------------------------------------------
 
 /// Split a `tool_result` block's `content` into its flattened text and the
-/// image parts promoted to a follow-up user message.
+/// image parts promoted to a follow-up user message emitted after every tool
+/// message of the tool-reply group.
 fn split_tool_result_content(content: Option<Value>) -> (String, Vec<Value>) {
     match content {
         Some(Value::String(text)) => (text, Vec::new()),
@@ -1262,7 +1859,12 @@ fn flatten_document_source(source: Option<Value>) -> Option<String> {
             .filter(|data| !data.is_empty())
             .map(|data| format!("Content:\n{data}")),
         "content" => {
-            let lines = extract_text_blocks(source.remove("content"));
+            // The schema allows the string form as well as an array of
+            // text blocks; both carry text the flattener keeps.
+            let lines = match source.remove("content") {
+                Some(Value::String(text)) => vec![text],
+                other => extract_text_blocks(other),
+            };
             non_empty_lines(&lines).map(|content| format!("Content:\n{content}"))
         },
         "url" => take_string(&mut source, "url")
@@ -1636,6 +2238,93 @@ mod tests {
     }
 
     #[test]
+    fn strict_rejection_names_the_offending_system_block_field() {
+        // `cache_control` on a system block used to reject with the block's
+        // shape ("`system` must be a string or array of text blocks"),
+        // hiding the actual cause.
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        body["system"] = json!([{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`cache_control`"), "{error}");
+        assert!(
+            error.contains("not supported by this endpoint"),
+            "must tell the client what to do: {error}"
+        );
+
+        body["system"] = json!([{"type": "text", "text": "Be brief", "citations": [{"cited_text": "x"}]}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`citations`"), "{error}");
+
+        body["system"] = json!([{"type": "text", "text": "Be brief", "signed": "no"}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`signed`"), "an unknown key must be named: {error}");
+    }
+
+    #[test]
+    fn strict_rejection_names_the_offending_content_block_field() {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        body["messages"][0]["content"] =
+            json!([{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(
+            error.contains("`cache_control`"),
+            "message blocks name the field too: {error}"
+        );
+
+        body["messages"][0]["content"] = json!([
+            {"type": "tool_result", "tool_use_id": "c1", "content": [
+                {"type": "text", "text": "Sunny", "cache_control": {"type": "ephemeral"}}
+            ]}
+        ]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(
+            error.contains("`cache_control`"),
+            "tool_result content names the field too: {error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_tool_field_is_named_in_rejection() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}, "signed": "no"}]
+        });
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`signed`"), "the offending key must be named: {error}");
+    }
+
+    #[test]
+    fn strict_translation_accepts_deferred_tool_placeholder() {
+        // Claude Code's first request of a session carries a placeholder
+        // tool with `defer_loading: true`; rejecting it costs the client
+        // two failed round-trips before it falls back to the flat list.
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [
+                {"name": "DeferredToolPlaceholder", "description": "placeholder",
+                 "input_schema": {"type": "object"}, "defer_loading": true},
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        let tools = translated["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "both tools must be forwarded");
+        assert_eq!(tools[0]["function"]["name"], "DeferredToolPlaceholder");
+        for tool in tools {
+            assert!(
+                tool["function"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|key| key != "defer_loading"),
+                "the deferred-loading marker carries no translatable meaning and is dropped"
+            );
+        }
+    }
+
+    #[test]
     fn strict_translation_accepts_generated_history_and_text_tool_results() {
         let body = json!({
             "model": "m",
@@ -1867,17 +2556,164 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_error_is_rejected() {
+    fn tool_result_error_is_translated() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"cat: missing.txt: No such file or directory","is_error":true}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(parsed["messages"][0]["tool_call_id"], "call_1", "tool_call_id");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory",
+            "errored tool result content keeps the error marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_is_promoted() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(parsed["messages"][0]["tool_call_id"], "call_1", "tool_call_id");
+        assert_eq!(
+            parsed["messages"][0]["content"], "chart",
+            "text part stays in the tool message"
+        );
+
+        assert_eq!(parsed["messages"][1]["role"], "user", "promoted image role");
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["type"], "image_url",
+            "promoted image part type"
+        );
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image url"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_with_bad_source_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"file","file_id":"file_abc"}}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_image_is_rejected() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
+    fn tool_result_error_with_empty_content_uses_bare_marker() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"","is_error":true}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["content"], "Anthropic tool_result error",
+            "empty errored tool result uses the bare marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_error_with_omitted_content_uses_bare_marker() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","is_error":true}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["content"], "Anthropic tool_result error",
+            "omitted errored tool result uses the bare marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_false_and_null_is_error_leave_content_unchanged() {
+        for flag in ["false", "null"] {
+            let body = format!(
+                r#"{{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_1","content":"72F sunny","is_error":{flag}}}]}}]}}"#
+            );
+            let result = transform_bytes(body.as_bytes()).unwrap();
+            let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+            assert_eq!(
+                parsed["messages"][0]["content"], "72F sunny",
+                "is_error: {flag} must not add the error marker"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_non_boolean_is_error_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"72F sunny","is_error":"yes"}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("tool_result"), "{error}");
+        assert!(error.contains("is_error"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_promotion_preserves_message_order() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_chart","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]},{"role":"user","content":"What does it show?"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "user", "user"], "message order");
+        assert_eq!(
+            parsed["messages"][2]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image lands directly after the tool message"
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"], "What does it show?",
+            "subsequent message is intact"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_result_images_follow_all_tool_messages() {
+        // With parallel tool calls, one Anthropic user message carries several
+        // tool_result blocks. Chat Completions requires every tool reply to
+        // follow the assistant `tool_calls` message directly, so an image
+        // promoted out of the first result may only appear as a user message
+        // after the last tool message — never between two tool messages.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}},{"type":"tool_use","id":"call_2","name":"get_status","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]},{"type":"tool_result","tool_use_id":"call_2","content":"ready"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "user"],
+            "both tool replies precede the promoted image: {roles:?}"
+        );
+        assert_eq!(
+            parsed["messages"][1]["tool_call_id"], "call_1",
+            "first tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][2]["tool_call_id"], "call_2",
+            "second tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image follows the last tool message"
+        );
+    }
+
+    #[test]
+    fn tool_result_unsupported_content_part_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"thinking","thinking":"internal"}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
+        assert!(error.contains("thinking"), "{error}");
     }
 
     #[test]
@@ -1888,17 +2724,411 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_search_result_is_rejected() {
+    fn tool_result_search_result_is_flattened() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","source":"kb://timeouts","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."}]},{"type":"text","text":"Applies to version 2."}]}]}]}"#;
-        let error = transform_bytes(body).unwrap_err();
-        assert!(error.contains("tool_result"), "{error}");
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Search result: \"Timeout KB\"\nSource: \"kb://timeouts\"\nContent:\nTimeouts default to 30 seconds.\nApplies to version 2.",
+            "search_result part is flattened into the tool message content"
+        );
     }
 
     #[test]
-    fn tool_result_document_is_rejected() {
+    fn tool_result_document_is_flattened() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"Before document."},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document fact."}]},"title":"Nested Doc"},{"type":"text","text":"After document."}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Before document.\nDocument: \"Nested Doc\"\nContent:\nNested document fact.\nAfter document.",
+            "document part is flattened into the tool message content"
+        );
+    }
+
+    #[test]
+    fn tool_result_empty_search_result_part_is_rejected() {
+        // A search_result part with no title, source, or content flattens to
+        // nothing; rejecting it here fails closed instead of silently
+        // dropping the result from the tool message.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result"}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
-        assert!(error.contains("tool_result"), "{error}");
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_part_with_dropped_fields_is_rejected() {
+        // A citations config or cache_control marker on a search_result part
+        // is not translated, so it must fail closed rather than be dropped.
+        for (field, value) in [
+            ("citations", json!({"enabled": true})),
+            ("cache_control", json!({"type": "ephemeral"})),
+        ] {
+            let mut part = json!({"type": "search_result", "source": "kb://timeouts", "title": "Timeout KB"});
+            part.as_object_mut().unwrap().insert(field.to_owned(), value);
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [part]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("search_result"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_empty_document_part_is_rejected() {
+        // A document part with no title, context, or translatable source
+        // flattens to nothing and must fail closed instead of silently
+        // disappearing from the tool message.
+        for source in [
+            json!({"type": "unknown"}),
+            json!({"type": "url", "url": ""}),
+            json!({"type": "text", "data": ""}),
+        ] {
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{"type": "document", "source": source}]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("document"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_source_only_part_is_flattened() {
+        // A document part whose source alone carries extractable data (here a
+        // file reference) still translates, so it must not be rejected.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"file","file_id":"file_abc"}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "Document\nSource: \"file:file_abc\"",
+            "source-only document part is flattened into the tool message"
+        );
+    }
+
+    #[test]
+    fn tool_result_search_result_non_text_content_is_rejected() {
+        // The pinned spec allows only `text` blocks in a search_result's
+        // content, and the flattener would drop anything else, so a non-text
+        // block fails closed even when a title would keep the part alive.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."},{"type":"image","source":{"type":"url","url":"https://example.test/chart.png"}}]}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_nested_block_fields_are_rejected() {
+        // A nested text block carrying a citations config, a cache marker,
+        // or an unknown field would be flattened to its `text` only, so the
+        // dropped fields fail closed instead of being silently discarded.
+        for extra in [
+            json!({"citations": [{"type": "char_location", "cited_text": "t", "start_index": 0, "end_index": 1}]}),
+            json!({"cache_control": {"type": "ephemeral"}}),
+            json!({"unknown_field": "value"}),
+        ] {
+            let mut block = json!({"type": "text", "text": "Timeouts default to 30 seconds."});
+            block
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{
+                        "type": "search_result",
+                        "title": "Timeout KB",
+                        "content": [block]
+                    }]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("search_result"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_source_nested_block_fields_are_rejected() {
+        // A text block inside a document's `source.content` carrying fields
+        // the flattener drops fails closed, mirroring the search_result rule.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Nested Doc","source":{"type":"content","content":[{"type":"text","text":"Nested fact.","citations":[{"type":"char_location","cited_text":"t","start_index":0,"end_index":1}]}]}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_nested_cache_markers_stripped_when_prompt_caching_allowlisted() {
+        // With prompt_caching allowlisted, cache markers on the nested text
+        // blocks of search_result and document parts are stripped and
+        // recorded as degraded, so the parts still translate; without the
+        // allowlist the same request fails closed.
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": [
+                    {"type": "search_result", "title": "Timeout KB", "content": [
+                        {"type": "text", "text": "Timeouts default to 30 seconds.", "cache_control": {"type": "ephemeral"}}
+                    ]},
+                    {"type": "document", "title": "Nested Doc", "source": {"type": "content", "content": [
+                        {"type": "text", "text": "Nested fact.", "cache_control": {"type": "ephemeral"}}
+                    ]}}
+                ]
+            }]}]
+        });
+
+        let output = transform_request_degrading(body.clone(), CACHE).unwrap();
+        assert!(
+            output.degraded.prompt_caching,
+            "nested markers must be recorded as degraded"
+        );
+        let parsed: Value = serde_json::from_slice(&output.body).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Search result: \"Timeout KB\"\nContent:\nTimeouts default to 30 seconds.\nDocument: \"Nested Doc\"\nContent:\nNested fact.",
+            "marker-carrying nested blocks still translate under the allowlist"
+        );
+
+        let error = transform_request_degrading(body, LossyFeatureAllowlist::default()).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_base64_source_is_rejected() {
+        // The flattener keeps only the media type of a base64 source and
+        // drops the encoded payload, so the part fails closed instead of
+        // forwarding a document label with no content — even with a title.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjcK"}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_unsupported_source_with_title_is_rejected() {
+        // The flattener drops an unsupported source even when a title
+        // survives, so the whole part fails closed rather than lose it.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"unknown","data":"ignored"}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_non_array_content_is_rejected() {
+        // A string `content` carries text the flattener would silently drop
+        // while keeping the title, so a present, non-null `content` must be
+        // an array of text blocks.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","title":"KB","content":"Important result"}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_source_unknown_field_is_rejected() {
+        // A source-level field outside the variant's schema — a
+        // `cache_control` marker, for example — is dropped by the flattener
+        // without the prompt-caching allowlist ever seeing it, so it fails
+        // closed even when the source otherwise carries valid text.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"content","content":[{"type":"text","text":"Valid fact."}],"cache_control":{"type":"ephemeral"}}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_source_string_content_is_flattened() {
+        // The ContentBlockSource schema allows `content` to be a string or
+        // an array of text blocks; the string form is valid client output,
+        // so it flattens instead of failing closed.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"content","content":"The full contract text."}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "Document: \"Contract\"\nContent:\nThe full contract text.",
+            "string-form source.content flattens into the tool message"
+        );
+    }
+
+    #[test]
+    fn tool_result_document_source_non_text_content_is_rejected() {
+        // Neither the string nor the array form: a numeric `content` carries
+        // text the flattener would drop, so it fails closed.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"content","content":42}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_malformed_metadata_is_rejected() {
+        // A non-string `title` (or `source`) would be silently dropped by
+        // the flattener while the rest of the part translates, so present
+        // metadata must be a string.
+        for field in ["title", "source"] {
+            let mut part = json!({
+                "type": "search_result",
+                "content": [{"type": "text", "text": "Timeouts default to 30 seconds."}]
+            });
+            part.as_object_mut().unwrap().insert(field.to_owned(), json!(42));
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [part]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("search_result"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_malformed_metadata_is_rejected() {
+        // A non-string `title` or `context` would be silently dropped by
+        // the flattener while the source still translates, so present
+        // metadata must be a string.
+        for field in ["title", "context"] {
+            let mut part = json!({
+                "type": "document",
+                "source": {"type": "text", "data": "Contract text."}
+            });
+            part.as_object_mut().unwrap().insert(field.to_owned(), json!(42));
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [part]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("document"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_text_source_media_type_is_accepted() {
+        // `media_type` is part of the plain-text source schema, so it stays
+        // accepted even though the flattener only forwards the `data` text.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"The grass is green."}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "Document\nContent:\nThe grass is green.",
+            "text source with media_type flattens its data"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_result_images_across_consecutive_user_messages() {
+        // Anthropic combines consecutive user messages into one turn, so a
+        // client may return parallel tool results in two separate user
+        // messages. The promoted image may only appear as a user message
+        // after the last tool reply of the whole group.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}},{"type":"tool_use","id":"call_2","name":"get_status","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"ready"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "user"],
+            "both tool replies precede the promoted image: {roles:?}"
+        );
+        assert_eq!(
+            parsed["messages"][1]["tool_call_id"], "call_1",
+            "first tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][2]["tool_call_id"], "call_2",
+            "second tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image follows the last tool reply of the group"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_keeps_backend_order_with_trailing_content() {
+        // Ordinary content emitted in place would overtake the deferred image:
+        // for [tool_result(image A), text, image B] the backend must receive
+        // A, then the text, then B, so "first image" keeps its meaning.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]},{"type":"text","text":"meanwhile"},{"type":"image","source":{"type":"url","url":"https://example.com/b.png"}}]},{"role":"assistant","content":"done"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "user", "assistant"], "message order");
+
+        let deferred = &parsed["messages"][2]["content"];
+        assert_eq!(
+            deferred[0]["image_url"]["url"], "https://example.com/a.png",
+            "tool_result image stays first"
+        );
+        assert_eq!(deferred[1]["type"], "text", "trailing text follows the image");
+        assert_eq!(deferred[1]["text"], "meanwhile", "trailing text content");
+        assert_eq!(
+            deferred[2]["image_url"]["url"], "https://example.com/b.png",
+            "trailing image stays last"
+        );
+    }
+
+    #[test]
+    fn trailing_content_is_deferred_across_the_whole_tool_reply_group() {
+        // A user message may extend the group after ordinary content was
+        // deferred; that content may not split the tool replies.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}},{"type":"tool_use","id":"call_2","name":"get_status","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]},{"type":"text","text":"meanwhile"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"ready"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "user"],
+            "both tool replies precede the deferred content: {roles:?}"
+        );
+        let deferred = &parsed["messages"][3]["content"];
+        assert_eq!(
+            deferred[0]["image_url"]["url"], "https://example.com/chart.png",
+            "deferred image keeps its place before the trailing text"
+        );
+        assert_eq!(deferred[1]["text"], "meanwhile", "trailing text stays after the image");
     }
 
     #[test]
@@ -2566,6 +3796,21 @@ mod tests {
     }
 
     #[test]
+    fn mcp_toolset_is_rejected_as_the_mcp_connector() {
+        // An empty `mcp_servers` alone is accepted, so the toolset is what is refused.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"mcp_servers":[],"tools":[{"name":"get_weather","input_schema":{"type":"object"}},{"type":"mcp_toolset","mcp_server_name":"example"}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert_eq!(error, MCP_CONNECTOR_UNSUPPORTED);
+    }
+
+    #[test]
+    fn mcp_servers_is_rejected_as_the_mcp_connector() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"mcp_servers":[{"type":"url","url":"https://mcp.example.com/sse","name":"example"}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert_eq!(error, MCP_CONNECTOR_UNSUPPORTED);
+    }
+
+    #[test]
     fn nullable_tool_fields_are_equivalent_to_omission() {
         let base = json!({
             "model": "m",
@@ -2747,6 +3992,426 @@ mod tests {
             parsed_args["cache_control"],
             json!({"type": "ephemeral"}),
             "user data inside tool input is preserved: {args}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_merged_into_leading_system() {
+        // Claude Code sends a text-only system message inside the messages
+        // array, after the first user turn. Backends with strict chat
+        // templates (vLLM-hosted models) reject a system message that follows
+        // a non-system one, so the allowlisted degradation folds each
+        // mid-conversation system message into the single leading system
+        // message, in encounter order.
+        let body = json!({
+            "model": "m",
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "# Environment\nworking directory: /tmp"},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system, "a system message moved");
+        assert!(!degraded.prompt_caching);
+        assert!(!degraded.extended_thinking);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "the system message must not survive in place: {messages:?}"
+        );
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "You are helpful.\n\n# Environment\nworking directory: /tmp"}),
+            "mid-conversation system text merges into the leading system message"
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "Hi"}));
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": "Reply with exactly: OK"})
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_without_top_level_system() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "no system message may remain in history: {messages:?}"
+        );
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Be terse."}),
+            "the moved text becomes the leading system message"
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "Hi"}));
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": "Reply with exactly: OK"})
+        );
+    }
+
+    #[test]
+    fn multiple_mid_conversation_systems_join_in_encounter_order() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "system", "content": "first"},
+                {"role": "assistant", "content": "two"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "second-a"},
+                    {"type": "text", "text": "second-b"}
+                ]},
+                {"role": "user", "content": "three"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "both system messages moved: {messages:?}");
+        assert_eq!(
+            messages[0]["content"], "first\n\nsecond-a\nsecond-b",
+            "messages join with a blank line; blocks within a message with a newline"
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "one"}));
+        assert_eq!(messages[2], json!({"role": "assistant", "content": "two"}));
+        assert_eq!(messages[3], json!({"role": "user", "content": "three"}));
+    }
+
+    #[test]
+    fn mid_conversation_system_merges_leading_instructions_in_order() {
+        for system in [json!(null), json!("top")] {
+            let (translated, degraded) = degrade(
+                json!({
+                    "model": "m", "system": system,
+                    "messages": [
+                        {"role": "system", "content": "A"},
+                        {"role": "system", "content": "B"},
+                        {"role": "user", "content": "U"},
+                        {"role": "system", "content": "C"}
+                    ]
+                }),
+                MIDSYS,
+            )
+            .unwrap();
+            let expected = if system.is_null() {
+                "A\n\nB\n\nC"
+            } else {
+                "top\n\nA\n\nB\n\nC"
+            };
+            assert_eq!(
+                translated["messages"],
+                json!([
+                    {"role": "system", "content": expected},
+                    {"role": "user", "content": "U"}
+                ]),
+                "all instructions must keep encounter order"
+            );
+            assert!(degraded.mid_conversation_system);
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_preserves_leading_validation() {
+        for leading in [
+            json!({"role": "system", "content": "A", "name": "extra"}),
+            json!({"role": "system", "content": [{"type": "text", "text": "A", "citations": [{"url": "https://example.test"}]}]}),
+            json!({"role": "system", "content": [{"type": "text", "text": "A", "cache_control": {"type": "ephemeral"}}]}),
+        ] {
+            let error = degrade(
+                json!({
+                    "model": "m",
+                    "messages": [leading, {"role": "user", "content": "U"}, {"role": "system", "content": "B"}]
+                }),
+                MIDSYS,
+            )
+            .unwrap_err();
+            assert!(!error.is_empty(), "folding must retain strict validation");
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_leading_system_message_untouched() {
+        // A system message in the leading position needs no move: strict
+        // backends accept system messages before the first non-system turn,
+        // so the degradation leaves it in place.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "leading"},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(!degraded.mid_conversation_system, "nothing needed moving");
+        assert_eq!(
+            translated["messages"],
+            json!([
+                {"role": "system", "content": "leading"},
+                {"role": "user", "content": "Hi"}
+            ])
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_preserves_marker_when_prompt_caching_not_allowed() {
+        // Moving the text must not silently strip a cache_control marker the
+        // operator did not allowlist: the marker is carried onto the merged
+        // top-level block, so strict validation still fails closed.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("cache_control"),
+            "the carried marker must fail closed in strict system validation: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_with_prompt_caching_allowed_strips_and_reports_both() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        let allow = LossyFeatureAllowlist {
+            prompt_caching: true,
+            extended_thinking: false,
+            mid_conversation_system: true,
+        };
+        let (translated, degraded) = degrade(body, allow).unwrap();
+        assert!(degraded.mid_conversation_system);
+        assert!(degraded.prompt_caching);
+        let serialized = translated.to_string();
+        assert!(
+            !serialized.contains("cache_control"),
+            "the allowed marker is stripped: {serialized}"
+        );
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Be terse."})
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_appends_to_block_array_system() {
+        // An existing top-level block-array system keeps its representation:
+        // moved text is appended as blocks, which hoist_system joins.
+        let body = json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "Part 1"}],
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Part 2"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Part 1\nPart 2"})
+        );
+        assert_eq!(translated["messages"][1], json!({"role": "user", "content": "Hi"}));
+    }
+
+    #[test]
+    fn mid_conversation_system_leaves_non_text_system_for_strict_validation() {
+        // A system message with non-text content is not moved; the strict
+        // validator produces the proper rejection instead.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "ok"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("image"),
+            "left in place, the strict validator rejects the block: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_unknown_message_field() {
+        // The fold must not widen the allowlist into "drop arbitrary message
+        // fields": a message beyond `{role, content}` is left for the strict
+        // validator, which rejects it exactly as without the feature.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse.", "name": "bob"}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("unsupported Anthropic message field"),
+            "an extra message field must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_nonempty_citations_on_moved_block() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "citations": [{"url": "https://example.test"}]}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("text"),
+            "non-empty citations must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_unknown_block_field_on_moved_block() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "x_extra": true}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("text"),
+            "an unknown block field must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_citations_on_existing_system_block() {
+        // Rebuilding the existing top-level system must not silently drop a
+        // field the strict validator rejects just because a message moved.
+        let body = json!({
+            "model": "m",
+            "system": [
+                {"type": "text", "text": "Be brief", "citations": [{"url": "https://example.test"}]}
+            ],
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse."}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert_eq!(
+            error, "`system` must be a string or array of text blocks",
+            "the existing block must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_folds_empty_directive_forms() {
+        // Real clients send the directive form `content: []` mid-array
+        // (#1859); folding removes the message, which is the position fix
+        // the feature promises, and reports the degradation.
+        for content in [json!([]), json!("")] {
+            let body = json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": "Reply with exactly: OK"}
+                ]
+            });
+            let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+            assert!(
+                degraded.mid_conversation_system,
+                "the empty directive message was folded: {translated}"
+            );
+            let messages = translated["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2, "the message must not survive: {messages:?}");
+            assert_eq!(messages[0], json!({"role": "user", "content": "Hi"}));
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_empty_directives_leave_no_separator() {
+        // A removed directive must not leave a join separator behind: the
+        // surviving system text is exactly what existed plus what real
+        // messages contributed.
+        let body = json!({
+            "model": "m",
+            "system": "Be brief",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": []},
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(
+            degraded.mid_conversation_system,
+            "the empty directives were folded: {translated}"
+        );
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Be brief"}),
+            "no trailing blank lines: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_empty_directive_before_real_leaves_no_separator() {
+        // An empty directive before a real moved message (no top-level
+        // system) must not prefix the folded text with separators.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": ""},
+                {"role": "system", "content": "Real"},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(
+            degraded.mid_conversation_system,
+            "the empty directive before the real message was folded: {translated}"
+        );
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Real"}),
+            "no leading blank lines: {messages:?}"
         );
     }
 
@@ -3055,7 +4720,8 @@ mod tests {
             degraded,
             DegradedFeatures {
                 prompt_caching: true,
-                extended_thinking: true
+                extended_thinking: true,
+                mid_conversation_system: false
             }
         );
     }
@@ -3075,14 +4741,22 @@ mod tests {
     const CACHE: LossyFeatureAllowlist = LossyFeatureAllowlist {
         prompt_caching: true,
         extended_thinking: false,
+        mid_conversation_system: false,
     };
     const THINK: LossyFeatureAllowlist = LossyFeatureAllowlist {
         prompt_caching: false,
         extended_thinking: true,
+        mid_conversation_system: false,
     };
     const BOTH: LossyFeatureAllowlist = LossyFeatureAllowlist {
         prompt_caching: true,
         extended_thinking: true,
+        mid_conversation_system: false,
+    };
+    const MIDSYS: LossyFeatureAllowlist = LossyFeatureAllowlist {
+        prompt_caching: false,
+        extended_thinking: false,
+        mid_conversation_system: true,
     };
 
     fn degrade(body: Value, allow: LossyFeatureAllowlist) -> Result<(Value, DegradedFeatures), String> {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use praxis_ai_apis::RecordAiMetadata as _;
+
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
 
@@ -70,6 +72,36 @@ metering_url: "http://metering:8080"
 
     assert!(filter.default_username.is_none());
     assert!(filter.default_model.is_none());
+}
+
+#[test]
+fn config_parses_identity_claims() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+identity_username_claim: "preferred_username"
+identity_group_claim: "groups"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert_eq!(filter.identity_username_claim.as_deref(), Some("preferred_username"));
+    assert_eq!(filter.identity_group_claim.as_deref(), Some("groups"));
+}
+
+#[test]
+fn config_without_identity_claims_leaves_them_unset() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(filter.identity_username_claim.is_none());
+    assert!(filter.identity_group_claim.is_none());
 }
 
 #[test]
@@ -207,8 +239,7 @@ fn captured_model_wins_over_default_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(META_METERING_MODEL.to_owned(), "gpt-4".to_owned());
+    ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), "gpt-4".to_owned());
     let state = state_for("alice", "");
 
     assert_eq!(filter.resolve_report_model(&ctx, &state), "gpt-4");
@@ -219,9 +250,8 @@ fn provider_resolved_public_model_wins_over_rewritten_body_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
-    ctx.filter_metadata
-        .insert(META_METERING_MODEL.to_owned(), "vertex/claude-sonnet-4-5".to_owned());
+    ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), "vertex/claude-sonnet-4-5".to_owned());
     let state = state_for("alice", "");
 
     assert_eq!(filter.resolve_report_model(&ctx, &state), "claude-sonnet-4-5");
@@ -232,7 +262,7 @@ fn provider_resolved_model_does_not_override_captured_identity_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
     let state = state_for("alice", "tenant-model");
 
     assert_eq!(filter.resolve_report_model(&ctx, &state), "tenant-model");
@@ -245,7 +275,7 @@ async fn provider_resolved_public_model_is_used_for_balance_check() {
     );
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -422,9 +452,10 @@ fn usage_event_has_correct_structure() {
         cache_read: 80,
         cache_write: 20,
         reasoning: 30,
+        ..TokenCounts::default()
     };
 
-    let event = build_usage_event(&event_ctx("evt-1", &state), &tokens);
+    let event = build_usage_event(&event_ctx("evt-1", &state), tokens);
 
     assert_eq!(event["specversion"], "1.0");
     assert_eq!(event["type"], CE_TYPE_USAGE);
@@ -451,9 +482,10 @@ fn usage_event_carries_reasoning_tokens() {
         cache_read: 0,
         cache_write: 0,
         reasoning: 64,
+        ..TokenCounts::default()
     };
 
-    let event = build_usage_event(&event_ctx("evt-r", &state), &tokens);
+    let event = build_usage_event(&event_ctx("evt-r", &state), tokens);
 
     assert_eq!(
         event["data"]["reasoning_tokens"], 64,
@@ -465,8 +497,7 @@ fn usage_event_carries_reasoning_tokens() {
 fn token_counts_read_includes_reasoning() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(META_TOKEN_REASONING.to_owned(), "17".to_owned());
+    ctx.record_ai_metadata(META_TOKEN_REASONING.to_owned(), "17".to_owned());
 
     let tokens = TokenCounts::read(&ctx);
 
@@ -487,6 +518,47 @@ fn token_counts_read_defaults_reasoning_to_zero() {
         tokens.reasoning, 0,
         "absent token.reasoning must read as zero, not error"
     );
+}
+
+#[test]
+fn usage_event_carries_shared_quota_audit_fields() {
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let filter_ctx = make_filter_context(&req);
+    let tokens = TokenCounts::read_with_policy(&filter_ctx, quota_snapshot_fixture());
+    let state = state_for("testuser", "gpt-4");
+
+    let event = build_usage_event(&event_ctx("evt-quota", &state), tokens);
+
+    assert_eq!(event["data"]["quota_value"], 55);
+    assert_eq!(event["data"]["quota_formula"], "weighted-quota-v1");
+    assert_eq!(event["data"]["quota_unit"], "quota_units");
+    assert_eq!(event["data"]["quota_status"], "evaluated");
+    assert_eq!(event["data"]["quota_usage"]["input"]["uncached"], 12);
+    assert_eq!(event["data"]["quota_usage"]["reported"]["cache_read"], false);
+    assert_eq!(event["data"]["quota_context"]["route"], "chat");
+    assert_eq!(event["data"]["quota_context"]["backend"], "openai-primary");
+}
+
+/// Build the exact typed PPE snapshot retained by metering for auditing.
+fn quota_snapshot_fixture() -> PolicyQuotaSnapshot {
+    PolicyQuotaSnapshot {
+        value: Some(55),
+        formula: Some("weighted-quota-v1".to_owned()),
+        unit: Some("quota_units".to_owned()),
+        status: Some("evaluated".to_owned()),
+        usage: Some(
+            serde_json::from_str(
+            r#"{"input":{"total":12,"uncached":12,"cache_read":0,"cache_write":0},"output":{"total":3,"visible":3,"reasoning":0},"total":15,"unclassified":0,"typed":true,"reported":{"input":true,"output":true,"total":true,"cache_read":false,"cache_write":false,"reasoning":false}}"#,
+        )
+            .unwrap(),
+        ),
+        context: Some(
+            serde_json::from_str(
+            r#"{"route":"chat","backend":"openai-primary","provider":"openai","model":"gpt-4"}"#,
+        )
+            .unwrap(),
+        ),
+    }
 }
 
 #[test]
@@ -512,13 +584,14 @@ fn absent_organization_and_cost_center_emit_empty_strings() {
 
     let event = build_usage_event(
         &event_ctx("evt-empty", &state),
-        &TokenCounts {
+        TokenCounts {
             input: 1,
             output: 1,
             total: 2,
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            ..TokenCounts::default()
         },
     );
 
@@ -541,7 +614,7 @@ fn captures_tenant_headers_with_default_prefix() {
     req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "alice");
     assert_eq!(state.group, "engineering");
@@ -560,7 +633,7 @@ fn strips_identity_and_auth_headers() {
     req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let _state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"x-tenant-username"));
@@ -571,12 +644,39 @@ fn strips_identity_and_auth_headers() {
 }
 
 #[test]
+fn identity_claims_configured_but_no_extension_falls_through_to_headers() {
+    // Tier 0 is only consulted when a policy/auth filter published an
+    // AuthenticatedIdentity. With the claims configured but no such extension
+    // (the common case for a request the policy engine did not authenticate),
+    // capture must fall through to the lower tiers rather than yielding an
+    // empty identity. End-to-end tier-0 resolution is covered by the
+    // external_metering_policy_engine integration test, since the extension's
+    // constructor is private to Praxis core.
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers.insert("x-tenant-username", "alice".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let state = capture_identity(
+        &mut ctx,
+        "x-tenant-",
+        "identity",
+        Some("preferred_username"),
+        Some("groups"),
+    );
+
+    assert_eq!(
+        state.username, "alice",
+        "header identity must survive when no extension is present"
+    );
+}
+
+#[test]
 fn custom_prefix_captures_correctly() {
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     req.headers.insert("x-myco-username", "bob".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-myco-", "identity");
+    let state = capture_identity(&mut ctx, "x-myco-", "identity", None, None);
 
     assert_eq!(state.username, "bob");
 }
@@ -585,7 +685,7 @@ fn custom_prefix_captures_correctly() {
 fn missing_username_returns_empty() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert!(state.username.is_empty());
 }
@@ -600,17 +700,13 @@ fn verified_identity_ignores_forged_headers_and_guard_metadata() {
 
     let mut ctx = make_filter_context(&req);
     // Verified claims written by an authentication filter (unnamespaced).
-    ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
-    ctx.filter_metadata
-        .insert("x-tenant-group".to_owned(), "engineering".to_owned());
+    ctx.record_ai_metadata("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.record_ai_metadata("x-tenant-group".to_owned(), "engineering".to_owned());
     // Guard-captured copies of the forged headers (namespaced).
-    ctx.filter_metadata
-        .insert("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
-    ctx.filter_metadata
-        .insert("identity.x-tenant-model".to_owned(), "model-forged".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-model".to_owned(), "model-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "alice");
     assert_eq!(state.group, "engineering");
@@ -634,16 +730,12 @@ fn verified_billing_identity_ignores_forged_org_and_cost_center() {
     req.headers.insert("x-tenant-cost-center", "cc-forged".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("x-tenant-organization-id".to_owned(), "org-verified".to_owned());
-    ctx.filter_metadata
-        .insert("x-tenant-cost-center".to_owned(), "cc-verified".to_owned());
-    ctx.filter_metadata
-        .insert("identity.x-tenant-organization-id".to_owned(), "org-forged".to_owned());
-    ctx.filter_metadata
-        .insert("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned());
+    ctx.record_ai_metadata("x-tenant-organization-id".to_owned(), "org-verified".to_owned());
+    ctx.record_ai_metadata("x-tenant-cost-center".to_owned(), "cc-verified".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-organization-id".to_owned(), "org-forged".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.organization_id, "org-verified");
     assert_eq!(state.cost_center, "cc-verified");
@@ -653,16 +745,12 @@ fn verified_billing_identity_ignores_forged_org_and_cost_center() {
 fn guard_metadata_supplies_identity_without_verified_claims() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-username".to_owned(), "bob".to_owned());
-    ctx.filter_metadata
-        .insert("identity.x-tenant-group".to_owned(), "ml".to_owned());
-    ctx.filter_metadata
-        .insert("identity.x-tenant-subscription".to_owned(), "sub-7".to_owned());
-    ctx.filter_metadata
-        .insert("identity.x-tenant-model".to_owned(), "claude-3".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-username".to_owned(), "bob".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-group".to_owned(), "ml".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-subscription".to_owned(), "sub-7".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-model".to_owned(), "claude-3".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "bob");
     assert_eq!(state.group, "ml");
@@ -678,13 +766,11 @@ fn partial_verified_identity_blocks_lower_tiers() {
 
     let mut ctx = make_filter_context(&req);
     // An auth filter that maps only the group claim, no username.
-    ctx.filter_metadata
-        .insert("x-tenant-group".to_owned(), "engineering".to_owned());
+    ctx.record_ai_metadata("x-tenant-group".to_owned(), "engineering".to_owned());
     // Guard-captured copy of a forged subscription.
-    ctx.filter_metadata
-        .insert("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.group, "engineering", "verified group must survive");
     assert!(
@@ -702,10 +788,9 @@ fn partial_verified_identity_blocks_lower_tiers() {
 fn custom_namespace_supplies_guard_identity() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("tenant-meta.x-tenant-username".to_owned(), "bob".to_owned());
+    ctx.record_ai_metadata("tenant-meta.x-tenant-username".to_owned(), "bob".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "tenant-meta");
+    let state = capture_identity(&mut ctx, "x-tenant-", "tenant-meta", None, None);
 
     assert_eq!(state.username, "bob", "configured namespace must resolve tier 2");
 }
@@ -717,7 +802,7 @@ fn multi_value_identity_header_is_fully_stripped() {
     req.headers.append("x-tenant-username", "mallory".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "alice", "first value wins during capture");
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
@@ -735,10 +820,9 @@ fn guard_identity_blocks_raw_header_fallback() {
     req.headers.insert("x-tenant-subscription", "raw-sub".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-username".to_owned(), "bob".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-username".to_owned(), "bob".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "bob");
     assert!(
@@ -760,10 +844,9 @@ fn guard_group_only_blocks_raw_header_username() {
         .insert("x-tenant-username", "header-mallory".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-group".to_owned(), "ml".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-group".to_owned(), "ml".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.group, "ml", "guard group must survive");
     assert!(
@@ -779,7 +862,7 @@ fn group_falls_back_to_subscription() {
     req.headers.insert("x-tenant-subscription", "sub-99".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.group, "sub-99");
 }
@@ -792,7 +875,7 @@ fn strips_accept_encoding_to_keep_response_readable() {
         .insert("accept-encoding", "gzip, deflate, br".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let _state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"accept-encoding"));
@@ -884,9 +967,9 @@ fn extract_model_returns_none_on_non_string_value() {
 fn reads_token_metadata() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata.insert("token.input".to_owned(), "150".to_owned());
-    ctx.filter_metadata.insert("token.output".to_owned(), "80".to_owned());
-    ctx.filter_metadata.insert("token.total".to_owned(), "230".to_owned());
+    ctx.record_ai_metadata("token.input".to_owned(), "150".to_owned());
+    ctx.record_ai_metadata("token.output".to_owned(), "80".to_owned());
+    ctx.record_ai_metadata("token.total".to_owned(), "230".to_owned());
 
     assert_eq!(read_token_meta(&ctx, META_TOKEN_INPUT), 150);
     assert_eq!(read_token_meta(&ctx, META_TOKEN_OUTPUT), 80);
@@ -932,10 +1015,7 @@ async fn request_body_records_model_in_metadata() {
     let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release));
-    assert_eq!(
-        ctx.filter_metadata.get(META_METERING_MODEL).map(String::as_str),
-        Some("gpt-4")
-    );
+    assert_eq!(ctx.filter_metadata.get(META_METERING_MODEL), Some("gpt-4"));
 }
 
 #[tokio::test]
@@ -943,16 +1023,12 @@ async fn request_body_does_not_override_identity_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(META_METERING_MODEL.to_owned(), "from-header".to_owned());
+    ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), "from-header".to_owned());
     let mut body = Some(Bytes::from_static(br#"{"model":"from-body"}"#));
 
     let _action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
 
-    assert_eq!(
-        ctx.filter_metadata.get(META_METERING_MODEL).map(String::as_str),
-        Some("from-header")
-    );
+    assert_eq!(ctx.filter_metadata.get(META_METERING_MODEL), Some("from-header"));
 }
 
 // -----------------------------------------------------------------------------

@@ -7,13 +7,15 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use http::HeaderMap;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter as _};
 
 use super::{
-    A2aFilter, JsonBalanceState,
+    A2aFilter, CapturedBody, JsonBalanceState, JsonCapture, ResponseCapture,
     config::{A2aConfig, build_config},
     envelope::{A2aFamily, A2aMethod, extract_a2a_envelope},
     scan_json_balance,
+    sse::SseScanState,
     task_routing::LocalTaskRouteStore,
 };
 
@@ -218,14 +220,14 @@ async fn null_context_id_header_disables_header_but_promotes_metadata_and_result
     let filter = make_filter(r#"{"headers": {"context_id": null}}"#);
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-null-hdr","role":"ROLE_USER","parts":[]}}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "should release");
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         Some("ctx-null-hdr"),
         "metadata should still promote context_id when header is null"
     );
@@ -675,15 +677,15 @@ async fn send_message_extracts_metadata() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":"Hello"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "should release on valid A2A");
-    assert_eq!(ctx.get_metadata("a2a.method"), Some("SendMessage"));
-    assert_eq!(ctx.get_metadata("a2a.family"), Some("message"));
-    assert_eq!(ctx.get_metadata("a2a.streaming"), Some("false"));
+    assert_eq!(ctx.filter_metadata.get("a2a.method"), Some("SendMessage"));
+    assert_eq!(ctx.filter_metadata.get("a2a.family"), Some("message"));
+    assert_eq!(ctx.filter_metadata.get("a2a.streaming"), Some("false"));
 }
 
 #[tokio::test]
@@ -691,14 +693,14 @@ async fn send_message_context_id_promoted_to_metadata_headers_results() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-promo","role":"ROLE_USER","parts":[]}}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "should release");
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         Some("ctx-promo"),
         "context_id should be in durable metadata"
     );
@@ -727,7 +729,7 @@ async fn streaming_message_sets_streaming_true() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -737,12 +739,12 @@ async fn streaming_message_sets_streaming_true() {
         "streaming message should release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.streaming"),
+        ctx.filter_metadata.get("a2a.streaming"),
         Some("true"),
         "streaming should be true"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.family"),
+        ctx.filter_metadata.get("a2a.family"),
         Some("message"),
         "family should be message"
     );
@@ -753,20 +755,24 @@ async fn get_task_extracts_task_id() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"task-999"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "GetTask should release");
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("GetTask"),
         "method should be GetTask"
     );
-    assert_eq!(ctx.get_metadata("a2a.family"), Some("task"), "family should be task");
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.family"),
+        Some("task"),
+        "family should be task"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("a2a.task_id"),
         Some("task-999"),
         "task_id should be extracted"
     );
@@ -778,7 +784,7 @@ async fn push_notification_config_extracts_task_id_from_params() {
     let body_str =
         r#"{"jsonrpc":"2.0","id":1,"method":"GetTaskPushNotificationConfig","params":{"taskId":"task-abc"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -788,12 +794,12 @@ async fn push_notification_config_extracts_task_id_from_params() {
         "push notification config should release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.family"),
+        ctx.filter_metadata.get("a2a.family"),
         Some("push_notification"),
         "family should be push_notification"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.task_id"),
         Some("task-abc"),
         "task_id should be extracted from params"
     );
@@ -804,19 +810,19 @@ async fn alias_resolves_and_sets_original_method() {
     let filter = make_filter(r#"{"method_aliases": {"message/send": "SendMessage"}, "on_invalid": "continue"}"#);
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("SendMessage"),
         "canonical method should be promoted"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.original_method"),
+        ctx.filter_metadata.get("a2a.original_method"),
         Some("message/send"),
         "original aliased method should be stored"
     );
@@ -827,7 +833,7 @@ async fn unknown_method_classifies_as_family_unknown() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"CustomUnknown","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -837,12 +843,12 @@ async fn unknown_method_classifies_as_family_unknown() {
         "unknown methods should still be classified, not rejected"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("CustomUnknown"),
         "unknown method should be promoted"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.family"),
+        ctx.filter_metadata.get("a2a.family"),
         Some("unknown"),
         "unknown method family should be unknown"
     );
@@ -854,14 +860,14 @@ async fn version_header_extracted_to_metadata() {
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#;
     let mut req = make_a2a_request(&[]);
     req.headers.insert("a2a-version", "1.0".parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "should release with version");
     assert_eq!(
-        ctx.get_metadata("a2a.version"),
+        ctx.filter_metadata.get("a2a.version"),
         Some("1.0"),
         "A2A-Version header should be promoted to metadata"
     );
@@ -872,7 +878,7 @@ async fn non_json_rpc_rejected_by_default() {
     let filter = make_default_filter();
     let body_str = r#"{"message":"hello"}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -888,7 +894,7 @@ async fn non_json_rpc_continues_when_configured() {
     let filter = make_filter(r#"{"on_invalid": "continue"}"#);
     let body_str = r#"{"message":"hello"}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -904,7 +910,7 @@ async fn batch_rejected_even_with_on_invalid_continue() {
     let filter = make_filter(r#"{"on_invalid": "continue"}"#);
     let body_str = r#"[{"jsonrpc":"2.0","id":1,"method":"SendMessage"}]"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -921,7 +927,7 @@ async fn batch_rejected_even_with_on_invalid_continue() {
 async fn on_request_is_noop() {
     let filter = make_default_filter();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -932,7 +938,7 @@ async fn on_request_is_noop() {
 async fn returns_continue_on_none_body() {
     let filter = make_default_filter();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body: Option<Bytes> = None;
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -945,7 +951,7 @@ fn body_access_is_read_only() {
     let filter = make_default_filter();
     assert_eq!(
         filter.request_body_access(),
-        praxis_filter::body::BodyAccess::ReadOnly,
+        praxis_filter::body::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
         "A2A filter should use ReadOnly body access"
     );
 }
@@ -971,7 +977,7 @@ async fn complete_json_before_eos_still_continues() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
@@ -987,7 +993,7 @@ async fn complete_json_at_eos_releases() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1007,7 +1013,7 @@ async fn promotes_filter_results() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"task-42"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1043,7 +1049,7 @@ async fn promotes_method_and_family_headers() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1073,7 +1079,7 @@ async fn promotes_kind_and_streaming_headers() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1103,14 +1109,14 @@ async fn notification_sets_kind() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","method":"SendMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "notification should release");
     assert_eq!(
-        ctx.get_metadata("json_rpc.kind"),
+        ctx.filter_metadata.get("json_rpc.kind"),
         Some("notification"),
         "message without id should be a notification"
     );
@@ -1122,7 +1128,7 @@ async fn version_promoted_to_headers_and_results() {
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#;
     let mut req = make_a2a_request(&[]);
     req.headers.insert("a2a-version", "1.0".parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1157,7 +1163,7 @@ async fn control_char_method_skips_all_promotions() {
     let filter = make_default_filter();
     let body_str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Send\\nMessage\"}";
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1185,7 +1191,7 @@ async fn control_char_method_skips_all_promotions() {
     );
 
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         None,
         "method with control chars should not be set in durable metadata"
     );
@@ -1196,7 +1202,7 @@ async fn control_char_task_id_skips_promotion() {
     let filter = make_default_filter();
     let body_str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"GetTask\",\"params\":{\"id\":\"task\\n123\"}}";
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1206,7 +1212,7 @@ async fn control_char_task_id_skips_promotion() {
         "control char task ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.task_id"),
         None,
         "task ID with control chars should not be promoted to metadata"
     );
@@ -1218,7 +1224,7 @@ async fn too_long_task_id_not_promoted() {
     let long_id = "x".repeat(257);
     let body_str = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{{"id":"{long_id}"}}}}"#);
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1228,7 +1234,7 @@ async fn too_long_task_id_not_promoted() {
         "too-long task ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.task_id"),
         None,
         "task ID exceeding 256 bytes should not be promoted"
     );
@@ -1249,7 +1255,7 @@ async fn context_id_control_chars_not_promoted() {
     let filter = make_default_filter();
     let body_str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"contextId\":\"ctx\\n123\",\"role\":\"ROLE_USER\",\"parts\":[]}}}";
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1259,7 +1265,7 @@ async fn context_id_control_chars_not_promoted() {
         "control char context ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         None,
         "context ID with control chars should not be promoted to metadata"
     );
@@ -1289,7 +1295,7 @@ async fn context_id_too_long_not_promoted() {
         r#"{{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{{"message":{{"contextId":"{long_ctx}","role":"ROLE_USER","parts":[]}}}}}}"#
     );
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1299,7 +1305,7 @@ async fn context_id_too_long_not_promoted() {
         "too-long context ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         None,
         "context ID exceeding 256 bytes should not be promoted"
     );
@@ -1327,7 +1333,7 @@ async fn too_long_version_not_promoted() {
     let mut req = make_a2a_request(&[]);
     let long_version = "v".repeat(257);
     req.headers.insert("a2a-version", long_version.parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1337,7 +1343,7 @@ async fn too_long_version_not_promoted() {
         "too-long version should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.version"),
+        ctx.filter_metadata.get("a2a.version"),
         None,
         "version exceeding 256 bytes should not be promoted"
     );
@@ -1349,7 +1355,7 @@ async fn too_long_unknown_method_releases_without_error() {
     let long_method = "X".repeat(257);
     let body_str = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{long_method}","params":{{}}}}"#);
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1358,7 +1364,11 @@ async fn too_long_unknown_method_releases_without_error() {
         matches!(action, FilterAction::Release),
         "257-byte unknown method should still release, not error"
     );
-    assert_eq!(ctx.get_metadata("a2a.method"), None, "too-long method skips metadata");
+    assert_eq!(
+        ctx.filter_metadata.get("a2a.method"),
+        None,
+        "too-long method skips metadata"
+    );
 
     let headers: std::collections::HashMap<_, _> = ctx
         .extra_request_headers
@@ -1380,24 +1390,24 @@ async fn alias_stores_original_in_json_rpc_method() {
     let filter = make_filter(r#"{"method_aliases": {"message/send": "SendMessage"}, "on_invalid": "continue"}"#);
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.get_metadata("json_rpc.method"),
+        ctx.filter_metadata.get("json_rpc.method"),
         Some("message/send"),
         "json_rpc.method should store the original wire method"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("SendMessage"),
         "a2a.method should store the canonical method"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.original_method"),
+        ctx.filter_metadata.get("a2a.original_method"),
         Some("message/send"),
         "a2a.original_method should track the alias input"
     );
@@ -1408,7 +1418,7 @@ async fn canonical_method_stores_same_in_json_rpc_method() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1418,17 +1428,17 @@ async fn canonical_method_stores_same_in_json_rpc_method() {
         "canonical method should release"
     );
     assert_eq!(
-        ctx.get_metadata("json_rpc.method"),
+        ctx.filter_metadata.get("json_rpc.method"),
         Some("SendMessage"),
         "json_rpc.method should match body method when no alias"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("SendMessage"),
         "a2a.method should match canonical"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.original_method"),
+        ctx.filter_metadata.get("a2a.original_method"),
         None,
         "a2a.original_method should be absent for canonical methods"
     );
@@ -1640,7 +1650,7 @@ async fn task_route_hit_injects_route_cluster_header() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"task-123"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1665,7 +1675,7 @@ async fn task_route_miss_continues_without_route_cluster_header() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"unknown-task"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1682,7 +1692,7 @@ async fn task_route_miss_continues_without_route_cluster_header() {
         "task route miss should not inject route cluster header"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("task_route_miss"),
         "task miss should record task_route_miss, not generic route_miss"
     );
@@ -1696,18 +1706,18 @@ async fn task_route_hit_records_bounded_route_metadata() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"task-abc"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("task_route_hit"),
         "route decision metadata should be set"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_cluster"),
+        ctx.filter_metadata.get("a2a.route_cluster"),
         Some("agent-b"),
         "route cluster metadata should be set"
     );
@@ -1722,7 +1732,7 @@ async fn json_response_split_across_chunks_defers_capture_until_eos() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json =
@@ -1747,7 +1757,7 @@ async fn json_response_split_across_chunks_defers_capture_until_eos() {
         Some("agent-a"),
         "route must be committed once EOS confirms no trailing bytes"
     );
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -1755,7 +1765,7 @@ async fn complete_json_prefix_then_garbage_does_not_capture_route() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json =
@@ -1773,7 +1783,7 @@ async fn complete_json_prefix_then_garbage_does_not_capture_route() {
         store.get_by_task_id("task-poison").is_none(),
         "trailing garbage must prevent the route from being committed"
     );
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -1781,7 +1791,7 @@ async fn tentative_survives_whitespace_chunk_before_eos() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json =
@@ -1795,8 +1805,9 @@ async fn tentative_survives_whitespace_chunk_before_eos() {
         store.get_by_task_id("task-ws-wait").is_none(),
         "route must not be committed while EOS has not arrived"
     );
-    assert!(
-        ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
+    assert_eq!(
+        capture_mode(&ctx),
+        Some("tentative"),
         "tentative must survive a whitespace-only intermediate chunk"
     );
 
@@ -1807,7 +1818,7 @@ async fn tentative_survives_whitespace_chunk_before_eos() {
         Some("agent-a"),
         "route must be committed once EOS arrives after whitespace-only intermediate chunks"
     );
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -1815,7 +1826,7 @@ async fn complete_json_followed_by_whitespace_at_eos_captures_route() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ws","status":{"state":"TASK_STATE_WORKING"}}}}"#;
@@ -1829,7 +1840,7 @@ async fn complete_json_followed_by_whitespace_at_eos_captures_route() {
         Some("agent-a"),
         "whitespace at EOS must confirm the tentative route"
     );
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -1838,7 +1849,7 @@ async fn multibyte_char_split_across_chunks_still_captures_route() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     // "é" is U+00E9, encoded as [0xC3, 0xA9] in UTF-8.
@@ -1871,7 +1882,7 @@ async fn oversized_response_passes_through_without_route_capture() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let large_json = format!(
@@ -1885,7 +1896,7 @@ async fn oversized_response_passes_through_without_route_capture() {
         store.get_by_task_id("task-big").is_none(),
         "oversized response should skip route capture"
     );
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -1894,7 +1905,7 @@ async fn invalid_json_response_body_does_not_error() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let mut body = Some(Bytes::from("not valid json at all"));
@@ -1907,17 +1918,16 @@ async fn invalid_json_response_body_does_not_error() {
         "response bytes should not be modified"
     );
     assert!(store.get_by_task_id("anything").is_none(), "no route should be stored");
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
 async fn on_response_enables_capture_for_success_non_sse_send_message() {
     let filter = make_task_routing_filter();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1927,16 +1937,8 @@ async fn on_response_enables_capture_for_success_non_sse_send_message() {
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert_eq!(
-        ctx.get_metadata("a2a.response.capture_enabled"),
-        Some("true"),
-        "capture enabled"
-    );
-    assert_eq!(
-        ctx.get_metadata("a2a.response.cluster"),
-        Some("agent-a"),
-        "cluster recorded"
-    );
+    assert_eq!(capture_mode(&ctx), Some("json"), "capture enabled");
+    assert_eq!(capture_cluster(&ctx), Some("agent-a"), "cluster recorded");
 }
 
 #[tokio::test]
@@ -1944,10 +1946,9 @@ async fn sse_response_skips_task_route_capture() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1961,12 +1962,13 @@ async fn sse_response_skips_task_route_capture() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.is_sse"),
+        ctx.filter_metadata.get("a2a.response.is_sse"),
         Some("true"),
         "SSE response should be flagged"
     );
-    assert!(
-        ctx.get_metadata("a2a.response.capture_enabled").is_none(),
+    assert_ne!(
+        capture_mode(&ctx),
+        Some("json"),
         "SSE response should not enable capture"
     );
 }
@@ -1976,10 +1978,9 @@ async fn mixed_case_sse_content_type_skips_capture() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1993,12 +1994,13 @@ async fn mixed_case_sse_content_type_skips_capture() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.is_sse"),
+        ctx.filter_metadata.get("a2a.response.is_sse"),
         Some("true"),
         "mixed-case SSE content-type should be detected"
     );
-    assert!(
-        ctx.get_metadata("a2a.response.capture_enabled").is_none(),
+    assert_ne!(
+        capture_mode(&ctx),
+        Some("json"),
         "mixed-case SSE should not enable capture"
     );
 }
@@ -2009,7 +2011,7 @@ async fn many_single_byte_chunks_capture_route_at_eos() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-many-chunks","status":{"state":"TASK_STATE_WORKING"}}}}"#;
@@ -2032,7 +2034,7 @@ async fn many_single_byte_chunks_capture_route_at_eos() {
         Some("agent-a"),
         "route should be captured at EOS even when delivered as many single-byte chunks"
     );
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -2040,7 +2042,7 @@ async fn balanced_but_invalid_json_abandons_capture_immediately() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     // Brackets balance (scanner reports complete) but the trailing comma
@@ -2052,14 +2054,14 @@ async fn balanced_but_invalid_json_abandons_capture_immediately() {
     let mut first = Some(Bytes::from_static(br#"{"a":1,}"#));
     drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
 
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 
     // Capture is fully disabled now, not merely gated: further chunks
     // (even ones that would otherwise look like valid JSON) are ignored.
     let mut more = Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#));
     let action = filter.on_response_body(&mut ctx, &mut more, false).unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -2067,7 +2069,7 @@ async fn mismatched_bracket_types_abandon_capture_immediately() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     // `{` closed by `]` marks the scanner permanently invalid; `is_complete`
@@ -2078,12 +2080,12 @@ async fn mismatched_bracket_types_abandon_capture_immediately() {
     let mut first = Some(Bytes::from_static(b"{]"));
     drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
 
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 
     let mut more = Some(Bytes::from_static(b"more-bytes-that-must-be-ignored"));
     let action = filter.on_response_body(&mut ctx, &mut more, false).unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    assert_capture_scratch_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 // -----------------------------------------------------------------------------
@@ -2099,7 +2101,7 @@ async fn context_route_hit_injects_route_cluster_header_for_list_tasks() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-list"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2117,17 +2119,17 @@ async fn context_route_hit_injects_route_cluster_header_for_list_tasks() {
         "ListTasks context route hit should inject route cluster header"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("context_route_hit"),
         "route_decision should reflect context hit"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_source"),
+        ctx.filter_metadata.get("a2a.route_source"),
         Some("context"),
         "route_source should be context"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_cluster"),
+        ctx.filter_metadata.get("a2a.route_cluster"),
         Some("agent-a"),
         "route_cluster metadata should be set"
     );
@@ -2141,7 +2143,7 @@ async fn context_route_hit_injects_route_cluster_header_for_send_message() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-msg","role":"ROLE_USER","parts":[]}}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2158,7 +2160,7 @@ async fn context_route_hit_injects_route_cluster_header_for_send_message() {
         Some(&"agent-a"),
         "SendMessage context route hit should inject route cluster header"
     );
-    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_decision"), Some("context_route_hit"));
 }
 
 #[tokio::test]
@@ -2169,7 +2171,7 @@ async fn context_route_hit_injects_route_cluster_header_for_send_streaming_messa
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"contextId":"ctx-stream","role":"ROLE_USER","parts":[]}}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2186,7 +2188,7 @@ async fn context_route_hit_injects_route_cluster_header_for_send_streaming_messa
         Some(&"agent-a"),
         "SendStreamingMessage context route hit should inject route cluster header"
     );
-    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_decision"), Some("context_route_hit"));
 }
 
 #[tokio::test]
@@ -2195,7 +2197,7 @@ async fn context_route_miss_continues_without_route_header() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-missing"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2212,7 +2214,7 @@ async fn context_route_miss_continues_without_route_header() {
         "context route miss should not inject route cluster header"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("context_route_miss"),
         "context miss should record context_route_miss"
     );
@@ -2249,7 +2251,7 @@ async fn context_route_not_used_for_non_context_methods() {
     // GetTask with no task mapping should miss (context not consulted).
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"no-task"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2274,7 +2276,7 @@ async fn classifier_only_unchanged_when_task_routing_disabled() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-123"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2282,7 +2284,7 @@ async fn classifier_only_unchanged_when_task_routing_disabled() {
 
     // No task_routing.enabled means no route lookup attempted.
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         None,
         "classifier-only mode should not set route_decision"
     );
@@ -2305,16 +2307,16 @@ async fn context_route_hit_records_bounded_metadata() {
 
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-meta"}}"#;
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
-    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
-    assert_eq!(ctx.get_metadata("a2a.route_source"), Some("context"));
-    assert_eq!(ctx.get_metadata("a2a.route_cluster"), Some("agent-b"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_source"), Some("context"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_cluster"), Some("agent-b"));
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         Some("ctx-meta"),
         "classifier-promoted context_id should still be in metadata"
     );
@@ -2329,7 +2331,7 @@ async fn context_id_with_control_chars_is_not_promoted_and_does_not_route() {
 
     let body_str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ListTasks\",\"params\":{\"contextId\":\"ctx\\n-bad\"}}";
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2345,7 +2347,7 @@ async fn context_id_with_control_chars_is_not_promoted_and_does_not_route() {
         "context ID with control chars should not route"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         None,
         "context ID with control chars should not be promoted"
     );
@@ -2357,7 +2359,7 @@ async fn too_long_context_id_is_not_promoted_and_does_not_route() {
     let long_ctx = "c".repeat(257);
     let body_str = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{{"contextId":"{long_ctx}"}}}}"#);
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2384,7 +2386,7 @@ async fn non_streaming_task_response_stores_task_and_context_routes() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ctx-1","contextId":"ctx-resp-1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
@@ -2411,7 +2413,7 @@ async fn terminal_task_zero_ttl_removes_task_but_keeps_context_route() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-term","contextId":"ctx-term","status":{"state":"TASK_STATE_COMPLETED"}}}}"#;
@@ -2438,7 +2440,7 @@ async fn completed_task_context_uses_normal_ttl() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-norml-ctx","contextId":"ctx-norml","status":{"state":"TASK_STATE_COMPLETED"}}}}"#;
@@ -2466,7 +2468,7 @@ async fn split_json_response_with_context_stores_context_route() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-split-ctx","contextId":"ctx-split","status":{"state":"TASK_STATE_WORKING"}}}}"#;
@@ -2503,7 +2505,7 @@ async fn oversized_response_does_not_store_context_route() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let large_json = format!(
@@ -2525,7 +2527,7 @@ async fn invalid_json_response_does_not_store_context_route() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_response_capture(&mut ctx);
 
     let mut body = Some(Bytes::from("not valid json"));
@@ -2543,7 +2545,7 @@ async fn sse_task_event_with_context_stores_context_route() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data =
@@ -2679,10 +2681,9 @@ async fn sse_streaming_response_enables_capture_for_send_streaming_message() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -2696,17 +2697,18 @@ async fn sse_streaming_response_enables_capture_for_send_streaming_message() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled"),
-        Some("true"),
+        capture_mode(&ctx),
+        Some("sse"),
         "SSE capture should be enabled for SendStreamingMessage"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.response.cluster"),
+        capture_cluster(&ctx),
         Some("agent-a"),
         "cluster should be recorded for SSE capture"
     );
-    assert!(
-        ctx.get_metadata("a2a.response.capture_enabled").is_none(),
+    assert_ne!(
+        capture_mode(&ctx),
+        Some("json"),
         "non-streaming capture should NOT be enabled"
     );
 }
@@ -2717,7 +2719,7 @@ async fn sse_streaming_capture_single_frame() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-sse-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
@@ -2737,7 +2739,7 @@ async fn sse_streaming_capture_split_across_chunks() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let full = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-split\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
@@ -2765,7 +2767,7 @@ async fn sse_streaming_capture_line_split_across_chunks() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     // Split in the middle of "data:" field name
@@ -2790,7 +2792,7 @@ async fn sse_streaming_capture_multiline_data() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     // JSON split across multiple data: lines
@@ -2813,7 +2815,7 @@ async fn sse_streaming_capture_crlf_line_endings() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-crlf\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\r\n\r\n";
@@ -2833,7 +2835,7 @@ async fn sse_streaming_capture_ignores_comments_and_unknown_fields() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data = b": this is a comment\nevent: task_update\nid: 42\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-ignore\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\nretry: 5000\n\n";
@@ -2853,7 +2855,7 @@ async fn sse_streaming_capture_invalid_json_does_not_fail() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data = b"data: not valid json at all\n\n";
@@ -2866,8 +2868,8 @@ async fn sse_streaming_capture_invalid_json_does_not_fail() {
         "invalid JSON should not create mapping"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled"),
-        Some("true"),
+        capture_mode(&ctx),
+        Some("sse"),
         "capture should remain enabled after invalid JSON"
     );
 }
@@ -2880,7 +2882,7 @@ async fn sse_streaming_capture_oversized_scratch_drops_event_and_continues() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-big\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
@@ -2892,8 +2894,8 @@ async fn sse_streaming_capture_oversized_scratch_drops_event_and_continues() {
         "oversized SSE event should be discarded, not parsed"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled"),
-        Some("true"),
+        capture_mode(&ctx),
+        Some("sse"),
         "capture should remain enabled after discarding one oversized event"
     );
 }
@@ -2907,7 +2909,7 @@ async fn sse_streaming_capture_terminal_state_uses_terminal_ttl() {
 
     // First, capture a working task
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let working = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-term\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
@@ -2933,13 +2935,13 @@ async fn sse_streaming_capture_clears_on_eos() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let mut body: Option<Bytes> = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    assert_sse_capture_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -2948,7 +2950,7 @@ async fn sse_streaming_capture_flushes_pending_event_at_eos_without_trailing_bla
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-no-trail\",\"contextId\":\"ctx-no-trail\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n";
@@ -2973,7 +2975,7 @@ async fn sse_streaming_capture_flushes_pending_event_at_eos_without_trailing_bla
         Some("agent-a"),
         "EOS flush should also capture context route from the flushed event"
     );
-    assert_sse_capture_cleared(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
@@ -2981,10 +2983,9 @@ async fn non_sse_response_does_not_enter_sse_capture_path() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -2996,8 +2997,9 @@ async fn non_sse_response_does_not_enter_sse_capture_path() {
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled").is_none(),
+    assert_ne!(
+        capture_mode(&ctx),
+        Some("sse"),
         "non-SSE response for SendStreamingMessage should not enable SSE capture"
     );
 }
@@ -3008,9 +3010,9 @@ async fn non_sse_response_falls_through_to_non_streaming_capture() {
         let filter = make_task_routing_filter();
 
         let req = make_a2a_request(&[]);
-        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut ctx = make_ctx(&req);
         ctx.cluster = Some(Arc::from("agent-a"));
-        ctx.filter_metadata.insert("a2a.method".to_owned(), method.to_owned());
+        ctx.record_ai_metadata("a2a.method".to_owned(), method.to_owned());
 
         let mut resp = praxis_filter::Response {
             status: http::StatusCode::OK,
@@ -3023,12 +3025,12 @@ async fn non_sse_response_falls_through_to_non_streaming_capture() {
         ctx.response_header = None;
 
         assert_eq!(
-            ctx.get_metadata("a2a.response.capture_enabled"),
-            Some("true"),
+            capture_mode(&ctx),
+            Some("json"),
             "{method} with non-SSE success response should enable non-streaming capture"
         );
         assert_eq!(
-            ctx.get_metadata("a2a.response.cluster"),
+            capture_cluster(&ctx),
             Some("agent-a"),
             "{method} with non-SSE success response should record cluster for capture"
         );
@@ -3040,10 +3042,9 @@ async fn wrong_method_does_not_enter_sse_capture() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "GetTask".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "GetTask".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3056,8 +3057,9 @@ async fn wrong_method_does_not_enter_sse_capture() {
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled").is_none(),
+    assert_ne!(
+        capture_mode(&ctx),
+        Some("sse"),
         "GetTask with SSE should not enable SSE capture"
     );
 }
@@ -3068,9 +3070,9 @@ async fn error_sse_response_does_not_enable_capture() {
         let filter = make_task_routing_filter();
 
         let req = make_a2a_request(&[]);
-        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut ctx = make_ctx(&req);
         ctx.cluster = Some(Arc::from("agent-a"));
-        ctx.filter_metadata.insert("a2a.method".to_owned(), method.to_owned());
+        ctx.record_ai_metadata("a2a.method".to_owned(), method.to_owned());
 
         let mut resp = praxis_filter::Response {
             status: http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -3083,12 +3085,13 @@ async fn error_sse_response_does_not_enable_capture() {
         drop(filter.on_response(&mut ctx).await.unwrap());
         ctx.response_header = None;
 
-        assert!(
-            ctx.get_metadata("a2a.response.sse_capture_enabled").is_none(),
+        assert_ne!(
+            capture_mode(&ctx),
+            Some("sse"),
             "{method} with 500 + text/event-stream should not enable SSE capture"
         );
         assert!(
-            ctx.get_metadata("a2a.response.cluster").is_none(),
+            capture_cluster(&ctx).is_none(),
             "{method} with 500 should not record cluster"
         );
     }
@@ -3099,7 +3102,7 @@ async fn sse_streaming_bytes_pass_through_unchanged() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let original = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-pass\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
@@ -3118,10 +3121,9 @@ async fn sse_streaming_capture_mixed_case_content_type() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3135,8 +3137,8 @@ async fn sse_streaming_capture_mixed_case_content_type() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled"),
-        Some("true"),
+        capture_mode(&ctx),
+        Some("sse"),
         "mixed-case text/event-stream should enable SSE capture"
     );
 }
@@ -3147,7 +3149,7 @@ async fn sse_streaming_capture_direct_result_shape() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data =
@@ -3172,7 +3174,7 @@ async fn sse_streaming_capture_status_update_event() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data =
@@ -3195,7 +3197,7 @@ async fn sse_streaming_capture_terminal_status_update() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     // First event creates the route.
@@ -3225,7 +3227,7 @@ async fn sse_streaming_capture_artifact_update_event() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data =
@@ -3252,7 +3254,7 @@ async fn valid_task_before_and_after_oversized_sse_frame_are_both_stored() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     // First event (~110 bytes) fits within 128-byte limit.
@@ -3293,10 +3295,9 @@ async fn on_response_enables_capture_for_success_sse_subscribe_to_task() {
     let filter = make_task_routing_filter();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SubscribeToTask".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SubscribeToTask".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3310,12 +3311,12 @@ async fn on_response_enables_capture_for_success_sse_subscribe_to_task() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.sse_capture_enabled"),
-        Some("true"),
+        capture_mode(&ctx),
+        Some("sse"),
         "SSE capture should be enabled for SubscribeToTask"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.response.cluster"),
+        capture_cluster(&ctx),
         Some("agent-a"),
         "cluster should be recorded for SubscribeToTask SSE capture"
     );
@@ -3327,7 +3328,7 @@ async fn subscribe_to_task_sse_status_update_stores_route() {
     let store = filter.task_route_store.as_ref().unwrap();
 
     let req = make_a2a_request(&[]);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     seed_sse_capture(&mut ctx);
 
     let sse_data =
@@ -3530,11 +3531,43 @@ fn canonical_method_cases() -> Vec<(&'static str, A2aMethod)> {
     ]
 }
 
+/// A filter context with a filter id, as in a pipeline, so `filter_state` works.
+fn make_ctx(req: &praxis_filter::Request) -> praxis_filter::HttpFilterContext<'_> {
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.current_filter_id = Some(0);
+    ctx
+}
+
 fn seed_response_capture(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
-    ctx.filter_metadata
-        .insert("a2a.response.capture_enabled".to_owned(), "true".to_owned());
-    ctx.filter_metadata
-        .insert("a2a.response.cluster".to_owned(), "agent-a".to_owned());
+    seed_capture(ctx, CapturedBody::Json(JsonCapture::default()));
+}
+
+fn seed_sse_capture(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+    seed_capture(ctx, CapturedBody::Sse(SseScanState::default()));
+}
+
+/// Starts capture as `on_response` does for a response served by `agent-a`.
+fn seed_capture(ctx: &mut praxis_filter::HttpFilterContext<'_>, body: CapturedBody) {
+    ctx.insert_filter_state(ResponseCapture {
+        cluster: "agent-a".to_owned(),
+        body,
+    });
+}
+
+/// The capture in progress (`json`, `tentative` or `sse`), if any.
+fn capture_mode(ctx: &praxis_filter::HttpFilterContext<'_>) -> Option<&'static str> {
+    ctx.get_filter_state::<ResponseCapture>()
+        .map(|capture| match &capture.body {
+            CapturedBody::Json(_) => "json",
+            CapturedBody::Tentative(_) => "tentative",
+            CapturedBody::Sse(_) => "sse",
+        })
+}
+
+/// The cluster the capture in progress stores routes for, if any.
+fn capture_cluster<'a>(ctx: &'a praxis_filter::HttpFilterContext<'_>) -> Option<&'a str> {
+    ctx.get_filter_state::<ResponseCapture>()
+        .map(|capture| capture.cluster.as_str())
 }
 
 fn assert_tentative_pending(store: &LocalTaskRouteStore, ctx: &praxis_filter::HttpFilterContext<'_>, task_id: &str) {
@@ -3542,54 +3575,15 @@ fn assert_tentative_pending(store: &LocalTaskRouteStore, ctx: &praxis_filter::Ht
         store.get_by_task_id(task_id).is_none(),
         "route must not be committed before EOS is confirmed"
     );
-    assert!(
-        ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
+    assert_eq!(
+        capture_mode(ctx),
+        Some("tentative"),
         "tentative parse must be held pending EOS"
     );
 }
 
-#[expect(clippy::too_many_lines, reason = "repetitive per-key cleared assertions")]
-fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.capture_enabled"),
-        "capture_enabled not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.buffer_hex"),
-        "buffer_hex not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.buffer_bytes"),
-        "buffer_bytes not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.cluster"),
-        "cluster not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.json_stack"),
-        "json_stack not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.json_started"),
-        "json_started not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.json_in_string"),
-        "json_in_string not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.json_escaped"),
-        "json_escaped not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.json_invalid"),
-        "json_invalid not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
-        "tentative_json not cleared"
-    );
+fn assert_capture_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
+    assert_eq!(capture_mode(ctx), None, "capture state not cleared");
 }
 
 fn make_task_routing_filter() -> A2aFilter {
@@ -3625,42 +3619,4 @@ fn make_a2a_request(extra_headers: &[(&str, &str)]) -> praxis_filter::Request {
         );
     }
     req
-}
-
-fn seed_sse_capture(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
-    ctx.filter_metadata
-        .insert("a2a.response.sse_capture_enabled".to_owned(), "true".to_owned());
-    ctx.filter_metadata
-        .insert("a2a.response.cluster".to_owned(), "agent-a".to_owned());
-}
-
-fn assert_sse_capture_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.sse_capture_enabled"),
-        "sse_capture_enabled not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.sse_line_buf_hex"),
-        "sse_line_buf_hex not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.sse_data_hex"),
-        "sse_data_hex not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.sse_has_data"),
-        "sse_has_data not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.sse_prev_cr"),
-        "sse_prev_cr not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.sse_scratch_bytes"),
-        "sse_scratch_bytes not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.cluster"),
-        "cluster not cleared"
-    );
 }

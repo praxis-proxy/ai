@@ -39,6 +39,7 @@ llmd-ext-proc = [
     "dep:tonic",
 ]
 vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter"]
+anthropic-mcp-connector-filter = ["praxis-ai-proxy/anthropic-mcp-connector-filter"]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]

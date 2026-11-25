@@ -23,14 +23,21 @@ pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
 pub mod credential_source;
+pub mod gemini;
 pub mod guardrail_messages;
 pub mod hash;
 #[cfg(all(test, feature = "openai-responses"))]
 mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) mod mcp_client;
+#[cfg(feature = "mcp")]
+pub(crate) mod mcp_core;
+/// Outbound MCP chain selector shared by every MCP adapter. Registered under
+/// its historical `openai_mcp_streaming_selector` name for config stability.
+#[cfg(feature = "mcp")]
+pub use mcp_client::McpStreamingSelectorFilter;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;
@@ -51,9 +58,24 @@ pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use callout_identity::credential_authority;
+pub use openai::sse::buffered_sse_event_data;
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwnerFilter, project_state_owner};
+
+/// Best-effort AI request metadata shared by the API and filter crates.
+pub trait RecordAiMetadata {
+    /// Record a routing or response fact, logging rejected writes through Core.
+    fn record_ai_metadata(&mut self, key: impl Into<String>, value: impl Into<String>);
+}
+
+impl RecordAiMetadata for praxis_filter::HttpFilterContext<'_> {
+    fn record_ai_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.filter_metadata
+            .insert(key, value)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    }
+}
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -113,6 +135,47 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Run `f` and return every tracing event it emits on this thread, at
+    /// every level, rendered as `name=value` fields.
+    ///
+    /// Installs a thread-local subscriber, so parallel tests sharing the
+    /// process-wide subscriber are unaffected. Use it to assert that request
+    /// or response content never reaches logs.
+    #[cfg(any(feature = "openai-responses", feature = "anthropic-mcp-connector"))]
+    pub(crate) fn capture_log_output<F: FnOnce()>(f: F) -> String {
+        use std::{
+            fmt::Write as _,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Capture(Arc<Mutex<String>>);
+
+        struct FieldWriter<'a>(&'a mut String);
+
+        impl tracing::field::Visit for FieldWriter<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                write!(self.0, " {}={value:?}", field.name()).expect("writing to a String cannot fail");
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                let mut line = event.metadata().level().to_string();
+                event.record(&mut FieldWriter(&mut line));
+                let mut out = self.0.lock().expect("log capture lock");
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&output)));
+        tracing::subscriber::with_default(subscriber, f);
+        std::mem::take(&mut *output.lock().expect("log capture lock"))
+    }
+
     /// Build a minimal filter context for unit tests.
     #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
     #[allow(
@@ -136,7 +199,8 @@ pub(crate) mod test_utils {
             extra_request_headers: Vec::new(),
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
-            filter_metadata: std::collections::HashMap::new(),
+            request_header_mutations: Vec::new(),
+            filter_metadata: praxis_filter::FilterMetadata::default(),
             pre_read_mutations: Vec::new(),
             prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
@@ -161,8 +225,7 @@ pub(crate) mod test_utils {
             attempted_endpoints: Vec::new(),
             retry_policy: None,
             route_retry_policy: None,
-            cluster_retry_state: None,
-            cluster_retry_state_released: false,
+            cluster_admission: None,
             endpoint_reselector: None,
             pinned_endpoint_address: None,
             rewritten_path: None,

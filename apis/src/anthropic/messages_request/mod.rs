@@ -63,6 +63,7 @@ use tracing::{debug, trace};
 
 use self::config::{AnthropicMessagesRequestConfig, build_config};
 use crate::{
+    RecordAiMetadata as _,
     anthropic::{
         routes::{AnthropicMessagesOperation, match_route},
         wire,
@@ -73,6 +74,19 @@ use crate::{
 
 /// Filter name as configured in a pipeline.
 const FILTER_NAME: &str = "anthropic_messages_request";
+
+/// Metadata key set to `"true"` when the body uses the Anthropic MCP connector.
+///
+/// Read by `anthropic_messages_protocol` after upstream selection to refuse the
+/// connector on backends that cannot execute it. Metadata, unlike the typed
+/// state, survives `iterative_request_router` re-entry.
+pub(crate) const MCP_CONNECTOR_METADATA_KEY: &str = "anthropic_messages_request.mcp_connector";
+
+/// [`MCP_CONNECTOR_METADATA_KEY`] value once Praxis has resolved the connector.
+///
+/// `anthropic_mcp_connector` rewrites the connector into plain tools, so the
+/// backend no longer receives it and the protocol filter must not refuse it.
+pub(crate) const MCP_CONNECTOR_RESOLVED: &str = "resolved";
 
 /// Processes an Anthropic create-message body once and publishes its facts.
 ///
@@ -138,13 +152,14 @@ impl AnthropicMessagesRequestFilter {
         object: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), FilterError> {
         let classified = classify_object(object, AiRequestFormat::AnthropicMessages);
+        let mcp_connector = uses_mcp_connector(object);
 
-        debug!(model = ?classified.model, "processed anthropic create-message body");
+        debug!(model = ?classified.model, mcp_connector, "processed anthropic create-message body");
 
-        write_metadata(ctx, &classified);
+        write_metadata(ctx, &classified, mcp_connector);
         promote_headers(ctx, &classified, &self.config);
-        promote_filter_results(ctx, &classified)?;
-        insert_state(ctx, &classified);
+        promote_filter_results(ctx, &classified, mcp_connector)?;
+        insert_state(ctx, &classified, mcp_connector);
         Ok(())
     }
 
@@ -183,6 +198,10 @@ pub struct AnthropicMessagesState {
 
     /// Whether `tools` is a non-empty array.
     pub has_tools: bool,
+
+    /// Whether the body uses the Anthropic MCP connector: a non-empty
+    /// `mcp_servers` or any `tools` entry of type `mcp_toolset`.
+    pub uses_mcp_connector: bool,
 }
 
 #[async_trait]
@@ -192,7 +211,7 @@ impl HttpFilter for AnthropicMessagesRequestFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -320,26 +339,50 @@ fn parse_envelope(body: &Option<Bytes>) -> Result<serde_json::Map<String, serde_
     }
 }
 
+/// Whether the body uses the Anthropic MCP connector.
+///
+/// The connector is declared by `mcp_servers` (an empty list or `null`
+/// configures nothing) or by a `tools` entry with `type: "mcp_toolset"`. A
+/// malformed `mcp_servers` still counts: it signals connector intent, and the
+/// backend owns validating its shape.
+fn uses_mcp_connector(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let declares_servers = object
+        .get("mcp_servers")
+        .is_some_and(|servers| !servers.is_null() && servers.as_array().is_none_or(|list| !list.is_empty()));
+    let declares_toolset = object
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("mcp_toolset"))
+        });
+    declares_servers || declares_toolset
+}
+
 /// Write durable routing metadata.
-fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
-    ctx.set_metadata("anthropic_messages_request.format", classified.format.as_str());
+fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mcp_connector: bool) {
+    ctx.record_ai_metadata("anthropic_messages_request.format", classified.format.as_str());
 
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.set_metadata("anthropic_messages_request.model", model.clone());
+        ctx.record_ai_metadata("anthropic_messages_request.model", model.clone());
     }
     if let Some(stream) = classified.stream {
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             "anthropic_messages_request.stream",
             if stream { "true" } else { "false" },
         );
     }
     if let Some(max_tokens) = classified.max_tokens {
-        ctx.set_metadata("anthropic_messages_request.max_tokens", max_tokens.to_string());
+        ctx.record_ai_metadata("anthropic_messages_request.max_tokens", max_tokens.to_string());
     }
     if classified.has_tools {
-        ctx.set_metadata("anthropic_messages_request.has_tools", "true");
+        ctx.record_ai_metadata("anthropic_messages_request.has_tools", "true");
+    }
+    if mcp_connector {
+        ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, "true");
     }
     if let Some(modality) = classified.modality {
         ctx.set_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
@@ -380,7 +423,11 @@ fn promote_headers(
 /// # Errors
 ///
 /// Returns [`FilterError`] when a filter result cannot be published.
-fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) -> Result<(), FilterError> {
+fn promote_filter_results(
+    ctx: &mut HttpFilterContext<'_>,
+    classified: &ClassifiedRequest,
+    mcp_connector: bool,
+) -> Result<(), FilterError> {
     let results = ctx.filter_results.entry(FILTER_NAME).or_default();
 
     results.set("format", classified.format.as_str())?;
@@ -402,16 +449,20 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &Classifi
     if let Some(modality) = classified.modality {
         results.set("modality", modality.as_str())?;
     }
+    if mcp_connector {
+        results.set("mcp_connector", "true")?;
+    }
 
     Ok(())
 }
 
 /// Insert the typed facts derived from the one parse.
-fn insert_state(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
+fn insert_state(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mcp_connector: bool) {
     ctx.extensions.insert(AnthropicMessagesState {
         model: classified.model.clone(),
         stream: classified.stream,
         max_tokens: classified.max_tokens,
         has_tools: classified.has_tools,
+        uses_mcp_connector: mcp_connector,
     });
 }

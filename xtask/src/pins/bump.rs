@@ -6,17 +6,23 @@
 //!
 //! This automates the mechanical half of a bump: discover the newest release
 //! within each manifest's `major_series`, fetch its checksum, rewrite every
-//! site in the shared table, swap the checksum fixture, and run `check-pins`
-//! on the staged tree before writing anything.
+//! site in the shared table, swap the checksum fixture, carry the Codex
+//! WebSocket recording forward, and run `check-pins` on the staged tree
+//! before writing anything.
 //!
-//! The behavioral half stays human. Tool lists, exit-code semantics,
-//! version-conditioned test expectations, replay recordings, and "verified
-//! against X" claims are never touched; the report lists them as a
-//! re-validation checklist instead.
+//! Where an acceptance lane re-proves a claim on every PR, the bump updates it
+//! and the lane is the re-validation: the guide's lane-tested "verified
+//! against" lines (see `sites`), and the Codex recording, whose wire shapes
+//! are carried unchanged with provenance metadata saying so for the
+//! `codex-websocket` lane to replay against the new binary. The rest of the
+//! behavioral half stays human. Tool lists, exit-code semantics,
+//! version-conditioned test expectations, and claims no lane exercises are
+//! never touched; the report lists them as a re-validation checklist instead.
 
 use std::{fmt::Write as _, fs, path::PathBuf};
 
 use clap::Parser;
+use regex::Regex;
 
 use super::{
     Repo, check,
@@ -44,6 +50,10 @@ pub(crate) struct BumpArgs {
     /// Also write the markdown report (the bump PR body) to this file.
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Write the Codex discovery failure reason, or an empty file if there was none.
+    #[arg(long)]
+    codex_discovery_failure: Option<PathBuf>,
 }
 
 // -----------------------------------------------------------------------------
@@ -71,11 +81,7 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
         ));
     }
 
-    let report = render_report(&repo, &outcomes);
-    println!("{report}");
-    if let Some(path) = &args.report {
-        fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
-    }
+    write_reports(args, &repo, &outcomes)?;
     if args.dry_run {
         eprintln!("dry run: nothing written");
         return Ok(());
@@ -83,6 +89,23 @@ fn bump(args: &BumpArgs) -> Result<(), String> {
     repo.commit()?;
     for path in repo.staged_paths() {
         eprintln!("updated {path}");
+    }
+    Ok(())
+}
+
+/// Emit the human-readable bump report and the optional Codex failure status.
+fn write_reports(args: &BumpArgs, repo: &Repo, outcomes: &[Outcome]) -> Result<(), String> {
+    let report = render_report(repo, outcomes);
+    println!("{report}");
+    if let Some(path) = &args.report {
+        fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if let Some(path) = &args.codex_discovery_failure {
+        let reason = outcomes.iter().find_map(|outcome| match outcome {
+            Outcome::Skipped(Pin::Codex, reason) => Some(reason.as_str()),
+            _ => None,
+        });
+        fs::write(path, reason.unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -266,7 +289,68 @@ fn stage(repo: &mut Repo, update: &Update) -> Result<(), String> {
     };
     repo.stage_removal(&old_fixture.path());
     repo.stage(&new_fixture.path(), format!("{sha256}  {}\n", new_fixture.artifact));
+    if update.pin == Pin::Codex {
+        stage_codex_recording(repo, update)?;
+    }
     Ok(())
+}
+
+/// Stage the carried-forward Codex recording for a Codex update.
+fn stage_codex_recording(repo: &mut Repo, update: &Update) -> Result<(), String> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let old_recording = repo.read(&codex_recording(&update.old))?;
+    let recording = carry_codex_recording(&old_recording, &update.old, &update.new, &today)?;
+    repo.stage(&codex_recording(&update.new), recording);
+    Ok(())
+}
+
+/// The Codex WebSocket replay recording for `version`.
+fn codex_recording(version: &str) -> String {
+    format!("tests/integration/fixtures/openai/responses/websocket-codex-{version}.json")
+}
+
+/// Carry the `old` Codex recording forward to `new`.
+///
+/// The wire shapes are copied unchanged; only the metadata moves, and its
+/// provenance says the shapes came from `old` and await replay against the
+/// real `new` binary in the `codex-websocket` lane. A protocol change fails
+/// that lane, which is the signal to recapture by hand.
+pub(crate) fn carry_codex_recording(recording: &str, old: &str, new: &str, today: &str) -> Result<String, String> {
+    let path = codex_recording(old);
+    let version_anchor = format!("\"codex_cli_version\": \"{old}\"");
+    if recording.matches(&version_anchor).count() != 1 {
+        return Err(format!("{path}: expected `{version_anchor}` exactly once"));
+    }
+    let carried = recording.replace(&version_anchor, &format!("\"codex_cli_version\": \"{new}\""));
+    let source = format!(
+        "OpenAI Codex rust-v{new} Responses WebSocket test shapes and Responses streaming event schema; shapes \
+         carried unchanged from the {old} recording by cargo xtask bump-pins, for replay against the real \
+         rust-v{new} musl binary in the codex-websocket lane"
+    );
+    let carried = replace_metadata_string(&carried, &path, "created_at", today)?;
+    let carried = replace_metadata_string(&carried, &path, "wire_protocol_source", &source)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&carried).map_err(|e| format!("{path}: carried recording is not JSON: {e}"))?;
+    if parsed
+        .pointer("/metadata/codex_cli_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(new)
+    {
+        return Err(format!("{path}: carried recording does not name {new}"));
+    }
+    Ok(carried)
+}
+
+/// Replace the one string value of `key` in `json`.
+fn replace_metadata_string(json: &str, path: &str, key: &str, value: &str) -> Result<String, String> {
+    let pattern = Regex::new(&format!(r#""{key}": "(?:[^"\\]|\\.)*""#)).map_err(|e| e.to_string())?;
+    if pattern.find_iter(json).count() != 1 {
+        return Err(format!("{path}: expected one `{key}` string"));
+    }
+    let encoded = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    Ok(pattern
+        .replace(json, regex::NoExpand(&format!("\"{key}\": {encoded}")))
+        .into_owned())
 }
 
 /// The checksum fixture the staged manifests require for `pin`, if any.
@@ -302,7 +386,11 @@ fn render_report(repo: &Repo, outcomes: &[Outcome]) -> String {
         .collect();
     let mut out = String::from("## Pinned client bumps\n\n");
     if updates.is_empty() {
-        out.push_str("All checked pins are current.\n");
+        if outcomes.iter().any(|outcome| matches!(outcome, Outcome::Skipped(..))) {
+            out.push_str("No pin updates were staged.\n");
+        } else {
+            out.push_str("All checked pins are current.\n");
+        }
     } else {
         render_table(&mut out, &updates);
     }
@@ -328,9 +416,10 @@ fn render_table(out: &mut String, updates: &[&Update]) {
         .unwrap();
     }
     out.push_str(
-        "\nGenerated by `cargo xtask bump-pins`. `cargo xtask check-pins` passes on the bumped tree. Nothing \
-         behavioral was changed: work through the checklist below, run the GPU acceptance lanes \
-         (`vllm-full-suite` label), and only then mark this ready for review.\n",
+        "\nGenerated by `cargo xtask bump-pins`. `cargo xtask check-pins` passes on the bumped tree. Only \
+         lane-tested claims were changed (the guide's \"verified against\" lines and the carried Codex \
+         recording), so they hold once CI is green. Work through the checklist below, run the GPU acceptance \
+         lanes (`vllm-full-suite` label), and only then mark this ready for review.\n",
     );
 }
 
@@ -360,7 +449,7 @@ fn render_checklist(out: &mut String, repo: &Repo, update: &Update) {
         display_version(update.pin, &update.new),
     );
     writeln!(out, "\n### {} `{old}` → `{new}`\n", update.pin.name()).unwrap();
-    for item in checklist(update.pin, &new) {
+    for item in checklist(update.pin, &old, &new) {
         writeln!(out, "- [ ] {item}").unwrap();
     }
     let mentions = mentions_of(repo, &old);
@@ -402,17 +491,28 @@ fn release_link(pin: Pin, value: &str) -> String {
     }
 }
 
-/// Behavioral pins to re-validate by hand after bumping `pin` to `new`.
-pub(crate) fn checklist(pin: Pin, new: &str) -> Vec<String> {
+/// Behavioral pins to re-validate by hand after bumping `pin` from `old` to
+/// `new`.
+pub(crate) fn checklist(pin: Pin, old: &str, new: &str) -> Vec<String> {
     let mut items: Vec<String> = checklist_items(pin).iter().map(|item| (*item).to_owned()).collect();
     if pin == Pin::Codex {
         items.push(format!(
-            "Record `tests/integration/fixtures/openai/responses/websocket-codex-{new}.json` against the new build; \
-             `codex_pin::websocket_recording_matches_the_pinned_version` stays red until then."
+            "`{}` was carried forward from `{old}`. If `codex-websocket` fails, recapture it against the new build.",
+            codex_recording(new)
         ));
     }
     items
 }
+
+/// Codex re-validation items: the observed behaviors, then every lane that
+/// drives a documented Codex route against the new build.
+const CODEX_CHECKLIST: &[&str] = &[
+    "Re-check the observed behaviors cited in `codex_http.rs` against the new build.",
+    "Check that `codex-http` passes: it drives native Responses and Responses → Chat Completions over HTTP/SSE.",
+    "Check that `codex-websocket` passes: it drives native Responses over WebSocket.",
+    "Check that `vllm-gpu-codex-acceptance` passes under `vllm-full-suite`: inspect the per-capability results \
+     in the qualification report. The default model can pass with post-compaction task completion unverified.",
+];
 
 /// The fixed checklist items for each pin.
 const fn checklist_items(pin: Pin) -> &'static [&'static str] {
@@ -436,10 +536,9 @@ const fn checklist_items(pin: Pin) -> &'static [&'static str] {
         Pin::Pi => &[
             "Re-capture `[pi.tools] registered` from the new build.",
             "Re-check JSON-mode exit codes, stdin behavior, and `unresolved_header_error`.",
-            "Update \"verified against pi\" in the client guide; `pi::documented_models_json_matches_fixture` stays \
-             red until then.",
+            "Check that `pi-cpu` passes: the guide's \"verified against pi\" lines were updated on the strength of it.",
         ],
-        Pin::Codex => &["Re-check the observed behaviors cited in `codex_http.rs` against the new build."],
+        Pin::Codex => CODEX_CHECKLIST,
         Pin::Vllm => &[
             "Review version-conditioned xfails and skips in the live SDK and suite tests.",
             "Re-check the client guide's vLLM claims and the CUDA image notes in `vllm-integration.yaml`.",

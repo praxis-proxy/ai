@@ -50,11 +50,8 @@ use rmcp::{
 };
 use sse_stream::{Error as SseError, Sse};
 
-use super::{McpBudgetedCallLimits, McpClientError, McpDisplayUrl};
-use crate::{
-    StateOwner, callout_target::AddressPolicy, is_event_stream_content_type,
-    openai::responses::agentic_loop::budget::mcp_result_charge,
-};
+use super::{McpBudgetedCallLimits, McpClientError, McpDisplayUrl, mcp_result_charge};
+use crate::{StateOwner, callout_target::AddressPolicy, is_event_stream_content_type};
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -113,7 +110,7 @@ fn session_id_header() -> HeaderName {
 ///
 /// Inserted into the callout's [`RequestExtensions`] only by the streaming
 /// entry points ([`McpSubrequestClient::execute_streaming`] and the GET-stream
-/// path). The auto-injected [`McpStreamingSelectorFilter`](crate::openai::McpStreamingSelectorFilter)
+/// path). The auto-injected [`McpStreamingSelectorFilter`](super::McpStreamingSelectorFilter)
 /// reads it during `on_request` and, when present, sets the subrequest response
 /// mode to streaming. Its absence keeps every other callout (buffered
 /// `initialize`/`tools/list`/`tools/call`, DELETE) on the unchanged buffered ladder.

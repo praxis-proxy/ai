@@ -24,8 +24,10 @@ use futures::stream::{BoxStream, StreamExt as _};
 use praxis_filter::{CalloutResponseTooLarge, StreamingResponseBody};
 use sse_stream::{Error as SseError, Sse, SseStream};
 
-use super::subrequest_transport::{TransportSignal, TransportSignalState};
-use crate::openai::responses::agentic_loop::budget::mcp_result_charge;
+use super::{
+    mcp_result_charge,
+    subrequest_transport::{TransportSignal, TransportSignalState},
+};
 
 /// Destination for an SSE size classification.
 #[derive(Clone)]

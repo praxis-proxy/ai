@@ -8,8 +8,8 @@
 #   Request phase:
 #     passed   - request forwarded to the upstream unchanged
 #     blocked  - 403 returned to the client (triggered rail names in body)
-#     modified - Chat Completions user messages rewritten with masked text;
-#                Responses and Anthropic requests rejected with HTTP 502
+#     modified - supported Chat, Responses, and Anthropic user text is masked;
+#                unsupported or unsafe rewrites are rejected with HTTP 502
 #     provider HTTP error - 500 returned to the client
 #
 # Each user message triggers one /v1/checks call (cumulative slices).

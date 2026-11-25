@@ -6,13 +6,10 @@
 //! Split from the runtime operation metadata so builds that only classify
 //! operations do not compile `utoipa`.
 
-#![expect(
-    clippy::allow_attributes,
-    reason = "parameter contracts used when conversations feature is enabled"
-)]
-
 use std::borrow::{Borrow, Cow};
 
+#[cfg(test)]
+use serde_json::Value as JsonValue;
 use utoipa::openapi::{
     Components, Content, Info, OpenApi, Paths, Ref, RefOr, Required, Tag,
     path::{HttpMethod as OpenApiHttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn},
@@ -81,9 +78,62 @@ macro_rules! schema_binding {
 
 pub(crate) use schema_binding;
 
+/// Declare a required string path parameter.
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+macro_rules! path_parameter {
+    ($name:literal, $description:literal) => {
+        $crate::openai::operation::ParameterSpec::new(
+            $name,
+            $crate::openai::operation::ParameterLocation::Path,
+            true,
+            $description,
+            <String as utoipa::PartialSchema>::schema,
+        )
+    };
+}
+
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) use path_parameter;
+
+/// Declare an optional typed query parameter.
+///
+/// The `$schema:ty` form derives the schema from a type's `PartialSchema`
+/// impl. The `schema_fn = $path` form takes an explicit schema constructor for
+/// parameters whose emitted contract must match the official reference exactly.
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+macro_rules! query_parameter {
+    ($name:literal, $schema:ty, $description:literal) => {
+        $crate::openai::operation::ParameterSpec::new(
+            $name,
+            $crate::openai::operation::ParameterLocation::Query,
+            false,
+            $description,
+            <$schema as utoipa::PartialSchema>::schema,
+        )
+    };
+    ($name:literal,schema_fn = $schema_fn:path, $description:literal) => {
+        $crate::openai::operation::ParameterSpec::new(
+            $name,
+            $crate::openai::operation::ParameterLocation::Query,
+            false,
+            $description,
+            $schema_fn,
+        )
+    };
+}
+
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) use query_parameter;
+
 /// Location of one operation parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
+#[cfg_attr(
+    not(any(feature = "openai-conversations", feature = "openai-files")),
+    expect(
+        dead_code,
+        reason = "parameter contracts used when the conversations or files feature is enabled"
+    )
+)]
 pub(crate) enum ParameterLocation {
     /// Parameter embedded in the request path.
     Path,
@@ -92,8 +142,11 @@ pub(crate) enum ParameterLocation {
 }
 
 /// `OpenAPI` metadata for one operation parameter.
+///
+/// Unlike the enum and constructor below, the struct itself stays live in every
+/// feature combination: [`build_parameter`](Self::schema) consumes it whenever
+/// an owned contract is generated.
 #[derive(Clone, Copy)]
-#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
 pub(crate) struct ParameterSpec {
     /// Parameter name.
     pub(crate) name: &'static str,
@@ -107,7 +160,13 @@ pub(crate) struct ParameterSpec {
     schema: fn() -> RefOr<Schema>,
 }
 
-#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
+#[cfg_attr(
+    not(any(feature = "openai-conversations", feature = "openai-files")),
+    expect(
+        dead_code,
+        reason = "parameter contracts used when the conversations or files feature is enabled"
+    )
+)]
 impl ParameterSpec {
     /// Declare one parameter backed by a concrete Rust schema type.
     pub(crate) const fn new(
@@ -210,6 +269,9 @@ const fn openapi_method(method: HttpMethod) -> OpenApiHttpMethod {
 }
 
 /// Generate an implementation `OpenAPI` document from runtime operation specs.
+///
+/// Emits every operation that declares an owned contract, regardless of its
+/// handling mode; specs without a contract are skipped.
 pub(crate) fn implementation_openapi<I>(title: &str, version: &str, tag: &str, specs: I) -> OpenApi
 where
     I: IntoIterator,
@@ -224,9 +286,6 @@ where
         let Some(contract) = spec.owned_contract() else {
             continue;
         };
-        if !spec.owns_contract() {
-            continue;
-        }
 
         register_contract_schemas(&mut components, contract);
         openapi.paths.add_path_operation(
@@ -327,11 +386,34 @@ const fn required(value: bool) -> Required {
     if value { Required::True } else { Required::False }
 }
 
+/// Collect every `#/components/schemas/...` reference in a JSON document.
+#[cfg(test)]
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) fn collect_component_references<'a>(value: &'a JsonValue, references: &mut Vec<&'a str>) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(JsonValue::as_str)
+                && reference.starts_with("#/components/schemas/")
+            {
+                references.push(reference);
+            }
+            for value in object.values() {
+                collect_component_references(value, references);
+            }
+        },
+        JsonValue::Array(values) => {
+            for value in values {
+                collect_component_references(value, references);
+            }
+        },
+        _ => {},
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use serde_json::Value as JsonValue;
     use utoipa::ToSchema;
 
     use super::*;
@@ -470,5 +552,29 @@ mod tests {
                 .is_some()
         );
         assert!(value.pointer("/paths/~1files/post/responses/204/content").is_none());
+    }
+
+    #[test]
+    fn passthrough_operation_with_a_contract_is_emitted() {
+        let mut passthrough = FILE_OPERATION;
+        passthrough.runtime.mode = HandlingMode::Passthrough;
+        assert!(!passthrough.owns_contract());
+
+        let document = implementation_openapi("Files test", "0.1.0", "Files", std::iter::once(&passthrough));
+        let value = serde_json::to_value(document).unwrap();
+
+        assert_eq!(
+            value.pointer("/paths/~1files/post/operationId"),
+            Some(&JsonValue::from("createFile"))
+        );
+    }
+
+    #[test]
+    fn operation_without_a_contract_is_skipped_in_any_mode() {
+        let mut local = PROXIED_UPLOAD;
+        local.runtime.mode = HandlingMode::Local;
+        let document = implementation_openapi("Files test", "0.1.0", "Files", [&PROXIED_UPLOAD, &PROXIED_GET, &local]);
+
+        assert!(document.paths.paths.is_empty());
     }
 }

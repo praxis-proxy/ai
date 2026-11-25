@@ -52,30 +52,12 @@ use tracing::debug;
 
 use self::{
     config::{FILTER_NAME, VertexAnthropicConfig, build_config},
-    request::{Operation, TransformedRequest, classify, transform_request},
+    request::{TransformedRequest, classify, transform_request},
 };
 use crate::{
     MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     anthropic::{ErrorType, error_rejection, invalid_request_rejection},
 };
-
-/// Metadata key carrying the classified operation (`messages`,
-/// `count_tokens`). Absent means "not a Vertex-handled request": no
-/// request, response, or SSE transform may run.
-const OPERATION_KEY: &str = "vertex_anthropic.operation";
-/// Metadata key carrying the user-facing model id to restore in
-/// responses.
-const MODEL_KEY: &str = "vertex_anthropic.model";
-/// Metadata key selecting the response transformation mode.
-const TRANSFORM_KEY: &str = "vertex_anthropic.response_transform";
-/// Response transform marker for a successful JSON response.
-const TRANSFORM_SUCCESS: &str = "success";
-/// Response transform marker for an upstream error.
-const TRANSFORM_ERROR: &str = "error";
-/// Response transform marker for an SSE stream.
-const TRANSFORM_SSE: &str = "sse";
-/// Metadata key preserving the upstream status for the body phase.
-const STATUS_KEY: &str = "vertex_anthropic.response_status";
 
 /// `anthropic-beta` header name, for the beta-flag allowlist.
 const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
@@ -83,6 +65,52 @@ const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
 /// token set by the credential filters, so the client's Anthropic key must
 /// never reach Google.
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+
+/// This filter's state for one translated request, kept in `filter_state`
+/// from upstream selection until the response body ends. Absent means "not
+/// a Vertex-handled request": no response or SSE transform may run.
+struct Exchange {
+    /// User-facing model id to restore in responses.
+    model: String,
+    /// How the response body is translated, once its headers arrive.
+    response: Option<ResponseTranslation>,
+}
+
+/// How a response body is translated, chosen from its headers.
+enum ResponseTranslation {
+    /// A successful JSON response, whose model id is restored.
+    Success,
+    /// A Google error envelope, translated under this upstream status.
+    Error(u16),
+    /// An SSE stream; only the in-flight frame is buffered, in the parser.
+    Sse(sse::WireParser),
+}
+
+impl ResponseTranslation {
+    /// Select the translation while response headers are available.
+    fn for_response(ctx: &HttpFilterContext<'_>, max_body_bytes: usize) -> Self {
+        let error_status = ctx
+            .response_header
+            .as_ref()
+            .map(|r| r.status)
+            .filter(|status| status.is_client_error() || status.is_server_error());
+        let is_sse = ctx
+            .response_header
+            .as_ref()
+            .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(crate::is_event_stream_content_type);
+
+        if is_sse {
+            Self::Sse(sse::WireParser::new(max_body_bytes))
+        } else if let Some(status) = error_status {
+            Self::Error(status.as_u16())
+        } else {
+            Self::Success
+        }
+    }
+}
+
 /// Translates Anthropic Messages requests to Vertex AI `rawPredict` and
 /// Vertex responses back to the Anthropic dialect.
 ///
@@ -172,12 +200,11 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
     }
 
     /// Install a translated request: header hygiene, the
-    /// metadata the response side keys on, and the rewritten body.
+    /// state the response side keys on, and the rewritten body.
     fn apply_transformed(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        operation: Operation,
         transformed: TransformedRequest,
     ) {
         self.filter_beta_flags(ctx);
@@ -188,7 +215,8 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
         // target earlier in the chain, the client sent that public id, so it
         // is the one responses must carry back.
         let user_model = ctx
-            .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+            .filter_metadata
+            .get(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
             .map_or(transformed.target_model, str::to_owned);
         debug!(
             model = %user_model,
@@ -198,8 +226,10 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
         ctx.rewritten_path = Some(transformed.path);
         // Marks "this request was transformed"; response-side transforms only
         // run for marked requests after selected-upstream translation succeeds.
-        ctx.set_metadata(OPERATION_KEY, operation.as_str());
-        ctx.set_metadata(MODEL_KEY, user_model);
+        ctx.insert_filter_state(Exchange {
+            model: user_model,
+            response: None,
+        });
         *body = Some(Bytes::from(transformed.body));
     }
 }
@@ -211,7 +241,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -221,7 +251,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -254,7 +284,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         };
         match transform_request(bytes, operation, &self.config) {
             Ok(transformed) => {
-                self.apply_transformed(ctx, body, operation, transformed);
+                self.apply_transformed(ctx, body, transformed);
                 Ok(SelectedUpstreamBodyOutcome::Continue)
             },
             Err(error) => Ok(SelectedUpstreamBodyOutcome::Reject(invalid_request_rejection(
@@ -267,28 +297,17 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         // A response to a request this filter did not transform (wrong
         // path, or an upstream hit via another route) must not be
         // transformed either.
-        if ctx.get_metadata(OPERATION_KEY).is_none() {
+        if ctx.get_filter_state::<Exchange>().is_none() {
             return Ok(FilterAction::Continue);
         }
         if let Some(rejection) = encoded_response_rejection(ctx) {
             return Ok(FilterAction::Reject(rejection));
         }
 
-        let transform = response_transform(ctx);
-        ctx.set_metadata(TRANSFORM_KEY, transform);
-        if transform == TRANSFORM_ERROR {
-            let status = ctx
-                .response_header
-                .as_ref()
-                .map_or(500, |response| response.status.as_u16());
-            ctx.set_metadata(STATUS_KEY, status.to_string());
-        }
-
-        if transform == TRANSFORM_SSE {
-            // Streaming stays Stream mode; only the (small) in-flight
-            // frame is ever buffered, inside the per-request parser.
-            ctx.insert_filter_state(sse::WireParser::new(self.config.max_body_bytes));
-        } else {
+        // Streaming stays Stream mode; only the (small) in-flight frame is
+        // ever buffered, inside the per-request parser.
+        let translation = ResponseTranslation::for_response(ctx, self.config.max_body_bytes);
+        if !matches!(translation, ResponseTranslation::Sse(_)) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(self.config.max_body_bytes),
             });
@@ -297,6 +316,9 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
             resp.headers.remove(http::header::CONTENT_LENGTH);
             resp.headers.remove(http::header::CONTENT_ENCODING);
             ctx.response_headers_modified = true;
+        }
+        if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
+            exchange.response = Some(translation);
         }
 
         Ok(FilterAction::Continue)
@@ -308,11 +330,17 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        match ctx.get_metadata(TRANSFORM_KEY) {
-            Some(TRANSFORM_SSE) => patch_sse_chunk(ctx, body, end_of_stream),
-            Some(TRANSFORM_ERROR) if end_of_stream => translate_error_body(ctx, body),
-            Some(TRANSFORM_SUCCESS) if end_of_stream => restore_response_model(ctx, body),
-            _ => {},
+        let Some(Exchange { model, response }) = ctx.get_filter_state_mut::<Exchange>() else {
+            return Ok(FilterAction::Continue);
+        };
+        match response {
+            Some(ResponseTranslation::Sse(parser)) => patch_sse_chunk(parser, model, body, end_of_stream),
+            Some(ResponseTranslation::Error(status)) if end_of_stream => translate_error_body(*status, body),
+            Some(ResponseTranslation::Success) if end_of_stream => restore_response_model(model, body),
+            Some(ResponseTranslation::Error(_) | ResponseTranslation::Success) | None => {},
+        }
+        if end_of_stream {
+            ctx.remove_filter_state::<Exchange>();
         }
         Ok(FilterAction::Continue)
     }
@@ -429,66 +457,33 @@ fn encoded_response_rejection(ctx: &HttpFilterContext<'_>) -> Option<Rejection> 
     ))
 }
 
-/// Select the response transformation mode while headers are available.
-fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
-    let is_error = ctx
-        .response_header
-        .as_ref()
-        .is_some_and(|r| r.status.is_client_error() || r.status.is_server_error());
-    let is_sse = ctx
-        .response_header
-        .as_ref()
-        .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(crate::is_event_stream_content_type);
-
-    if is_sse {
-        TRANSFORM_SSE
-    } else if is_error {
-        TRANSFORM_ERROR
-    } else {
-        TRANSFORM_SUCCESS
-    }
-}
-
 /// Patch an SSE chunk: parse complete frames, restore the model in
 /// `message_start` only, and re-emit. Partial frames stay in the
 /// per-request parser across chunk boundaries.
-fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
-    let Some(mut parser) = ctx.remove_filter_state::<sse::WireParser>() else {
-        return;
-    };
+fn patch_sse_chunk(parser: &mut sse::WireParser, user_model: &str, body: &mut Option<Bytes>, end_of_stream: bool) {
     let initial_frame = parser.completed_frames == 0;
     let output = if parser.failed {
         Vec::new()
     } else {
         match parser.parse_chunk(body.as_deref().unwrap_or_default(), end_of_stream) {
-            Ok(frames) => response::rebuild_sse_frames(&frames, ctx.get_metadata(MODEL_KEY), initial_frame),
+            Ok(frames) => response::rebuild_sse_frames(&frames, user_model, initial_frame),
             Err(error) => {
                 debug!(error = error.message, "vertex: SSE translation failed");
-                let mut output =
-                    response::rebuild_sse_frames(&error.frames, ctx.get_metadata(MODEL_KEY), initial_frame);
+                let mut output = response::rebuild_sse_frames(&error.frames, user_model, initial_frame);
                 output.extend_from_slice(&response::sse_error(error.message));
                 output
             },
         }
     };
-    if !end_of_stream {
-        ctx.insert_filter_state(parser);
-    }
     *body = Some(Bytes::from(output));
 }
 
 /// Translate a buffered Google error envelope to the Anthropic shape,
 /// preserving the HTTP status.
-fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+fn translate_error_body(status: u16, body: &mut Option<Bytes>) {
     let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
         return;
     };
-    let status = ctx
-        .get_metadata(STATUS_KEY)
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(500);
 
     if let Some(translated) = response::translate_google_error(bytes, status) {
         debug!(
@@ -501,8 +496,8 @@ fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
 }
 
 /// Restore the user-facing model id in a buffered JSON response.
-fn restore_response_model(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
-    let (Some(bytes), Some(user_model)) = (body.as_ref().filter(|b| !b.is_empty()), ctx.get_metadata(MODEL_KEY)) else {
+fn restore_response_model(user_model: &str, body: &mut Option<Bytes>) {
+    let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
         return;
     };
 
@@ -524,13 +519,39 @@ fn restore_response_model(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>)
 )]
 mod tests {
     use http::{HeaderValue, Method, StatusCode, header};
+    use praxis_filter::Request;
 
     use super::*;
-    use crate::test_utils::{make_filter_context, make_request, make_response};
+    use crate::{
+        RecordAiMetadata as _,
+        test_utils::{make_filter_context, make_request, make_response},
+    };
 
     fn filter(yaml: &str) -> Box<dyn HttpFilter> {
         let config: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         AnthropicMessagesToVertexaiAnthropicFilter::from_config(&config).unwrap()
+    }
+
+    /// A filter context with a filter ID, as in a pipeline.
+    fn filter_context(request: &Request) -> HttpFilterContext<'_> {
+        let mut ctx = make_filter_context(request);
+        ctx.current_filter_id = Some(0);
+        ctx
+    }
+
+    /// The exchange state this filter keeps in `ctx`, if it translated the
+    /// request.
+    fn exchange<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a Exchange> {
+        ctx.get_filter_state::<Exchange>()
+    }
+
+    /// Record a request translated for the user-facing `model`, as the
+    /// selected-upstream hook does.
+    fn translated(ctx: &mut HttpFilterContext<'_>, model: &str) {
+        ctx.insert_filter_state(Exchange {
+            model: model.to_owned(),
+            response: None,
+        });
     }
 
     fn messages_body(extra: &str) -> Bytes {
@@ -574,7 +595,7 @@ mod tests {
     async fn messages_request_becomes_rawpredict_url() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         let action = run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -588,8 +609,7 @@ mod tests {
             serde_json::from_slice(ctx.buffered_request_body.as_ref().unwrap().as_ref()).unwrap();
         assert!(body.get("model").is_none());
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
-        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("claude-sonnet-4-5"));
-        assert_eq!(ctx.get_metadata(OPERATION_KEY), Some("messages"));
+        assert_eq!(exchange(&ctx).map(|e| e.model.as_str()), Some("claude-sonnet-4-5"));
         assert!(
             ctx.request_headers_to_set.is_empty(),
             "the adapter must not select a route"
@@ -600,7 +620,10 @@ mod tests {
     fn body_translation_waits_for_upstream_selection() {
         let filter = filter("project: demo");
         assert_eq!(filter.request_body_access(), BodyAccess::None);
-        assert_eq!(filter.selected_upstream_request_body_access(), BodyAccess::ReadWrite);
+        assert_eq!(
+            filter.selected_upstream_request_body_access(),
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+        );
     }
 
     #[tokio::test]
@@ -609,7 +632,7 @@ mod tests {
         for provider in [Some("anthropic"), None] {
             for raw in ["not json", r#"{"model":"vertex/claude-sonnet-4-5","messages":[]}"#] {
                 let request = make_request(Method::POST, "/v1/messages");
-                let mut ctx = make_filter_context(&request);
+                let mut ctx = filter_context(&request);
                 select_provider(&mut ctx, provider).await;
                 let original = Bytes::from(raw);
                 let action = run_request_body(filter.as_ref(), &mut ctx, original.clone())
@@ -618,7 +641,7 @@ mod tests {
                 assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
                 assert_eq!(ctx.buffered_request_body.as_ref(), Some(&original));
                 assert!(ctx.rewritten_path.is_none());
-                assert!(ctx.get_metadata(OPERATION_KEY).is_none());
+                assert!(exchange(&ctx).is_none());
                 assert!(ctx.request_headers_to_set.is_empty());
                 assert!(ctx.request_headers_to_remove.is_empty());
             }
@@ -629,7 +652,7 @@ mod tests {
     async fn missing_selection_does_not_activate_translation() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         let mut body = Some(Bytes::from_static(b"not json"));
         assert!(matches!(
             filter
@@ -648,7 +671,7 @@ mod tests {
         request
             .headers
             .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, br"));
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -669,7 +692,7 @@ mod tests {
         request
             .headers
             .insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer ya29.token"));
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -691,7 +714,7 @@ mod tests {
         request
             .headers
             .insert(ANTHROPIC_BETA, HeaderValue::from_static("original"));
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         ctx.request_headers_to_set
             .push((X_API_KEY, HeaderValue::from_static("earlier-key")));
         ctx.extra_request_headers
@@ -716,7 +739,7 @@ mod tests {
     async fn stream_true_selects_stream_verb() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(
             filter.as_ref(),
@@ -738,7 +761,7 @@ mod tests {
     async fn count_tokens_keeps_model_in_body() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages/count_tokens");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -754,7 +777,7 @@ mod tests {
             body["model"], "claude-sonnet-4-5",
             "count_tokens needs the publisher model in the body"
         );
-        assert_eq!(ctx.get_metadata(OPERATION_KEY), Some("count_tokens"));
+        assert!(exchange(&ctx).is_some(), "count_tokens requests are translated");
     }
 
     #[tokio::test]
@@ -762,7 +785,7 @@ mod tests {
         let filter = filter("project: demo");
         for path in ["/v1/models", "/v1/messages/batches", "/healthz"] {
             let request = make_request(Method::POST, path);
-            let mut ctx = make_filter_context(&request);
+            let mut ctx = filter_context(&request);
             let original = messages_body(r#""max_tokens":8"#);
 
             let action = run_request_body(filter.as_ref(), &mut ctx, original.clone())
@@ -782,7 +805,7 @@ mod tests {
     async fn unsafe_model_rejected_with_anthropic_error_shape() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         let evil = Bytes::from_static(br#"{"model":"vertex/../../secrets","messages":[]}"#);
         let action = run_request_body(filter.as_ref(), &mut ctx, evil).await.unwrap();
         let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
@@ -804,7 +827,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -829,7 +852,7 @@ mod tests {
             HeaderName::from_static("anthropic-beta"),
             "tool-search-2025-04-14".parse().unwrap(),
         );
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -859,7 +882,7 @@ mod tests {
         ] {
             request.headers.append(ANTHROPIC_BETA, value);
         }
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
@@ -888,7 +911,7 @@ mod tests {
             ANTHROPIC_BETA,
             HeaderValue::from_bytes(b"context-1m-2025-08-07, \xff").unwrap(),
         );
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
@@ -915,7 +938,7 @@ mod tests {
         request
             .headers
             .append(ANTHROPIC_BETA, HeaderValue::from_bytes(b"\xff").unwrap());
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -932,7 +955,7 @@ mod tests {
     async fn beta_allowlist_keeps_an_absent_header_absent() {
         let filter = filter("project: demo\nbeta_allowlist: [context-1m-2025-08-07]");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
@@ -952,8 +975,8 @@ mod tests {
     async fn google_error_response_translated_on_buffered_body() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
@@ -963,7 +986,10 @@ mod tests {
         ctx.response_header = Some(&mut response);
 
         filter.on_response(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata(TRANSFORM_KEY), Some(TRANSFORM_ERROR));
+        assert!(matches!(
+            exchange(&ctx).unwrap().response,
+            Some(ResponseTranslation::Error(429))
+        ));
 
         let mut body = Some(Bytes::from_static(
             br#"{"error":{"code":429,"message":"Quota exceeded.","status":"RESOURCE_EXHAUSTED"}}"#,
@@ -979,9 +1005,8 @@ mod tests {
     async fn encoded_json_response_fails_closed() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1001,7 +1026,7 @@ mod tests {
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "api_error");
         assert!(
-            ctx.get_metadata(TRANSFORM_KEY).is_none(),
+            exchange(&ctx).unwrap().response.is_none(),
             "no body transform may run on an encoded response"
         );
     }
@@ -1010,9 +1035,8 @@ mod tests {
     async fn encoded_sse_response_fails_closed() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1022,7 +1046,6 @@ mod tests {
             .headers
             .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
         ctx.response_header = Some(&mut response);
-        ctx.current_filter_id = Some(0);
 
         let action = filter.on_response(&mut ctx).await.unwrap();
         let FilterAction::Reject(rejection) = action else {
@@ -1032,7 +1055,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(rejection.body.as_ref().unwrap().as_ref()).unwrap();
         assert_eq!(body["error"]["type"], "api_error");
         assert!(
-            ctx.get_metadata(TRANSFORM_KEY).is_none(),
+            exchange(&ctx).unwrap().response.is_none(),
             "no SSE parser may be armed for an encoded stream"
         );
     }
@@ -1041,8 +1064,8 @@ mod tests {
     async fn encoded_error_response_keeps_upstream_status() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
@@ -1067,9 +1090,8 @@ mod tests {
     async fn identity_encoded_response_is_restored() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1107,9 +1129,8 @@ mod tests {
     async fn success_response_model_restored() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "claude-sonnet-4-5");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
 
         let mut response = make_response();
         response
@@ -1131,9 +1152,9 @@ mod tests {
     async fn model_to_provider_client_model_is_restored_instead_of_the_target() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+        let mut ctx = filter_context(&request);
         // model_to_provider mapped a public alias before upstream selection.
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude");
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude");
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
@@ -1143,7 +1164,7 @@ mod tests {
             Some("/v1/projects/demo/locations/global/publishers/anthropic/models/claude-sonnet-4-5:rawPredict"),
             "the resolved target supplies the publisher model"
         );
-        assert_eq!(ctx.get_metadata(MODEL_KEY), Some("public-claude"));
+        assert_eq!(exchange(&ctx).map(|e| e.model.as_str()), Some("public-claude"));
 
         let mut response = make_response();
         response
@@ -1171,20 +1192,19 @@ mod tests {
         // restored model.
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.set_metadata(MODEL_KEY, "public-claude");
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "public-claude");
 
         let mut response = make_response();
         response
             .headers
             .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         ctx.response_header = Some(&mut response);
-        // filter_state is keyed by the executing filter's id; unit tests
-        // must stand in for the pipeline executor.
-        ctx.current_filter_id = Some(0);
         filter.on_response(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata(TRANSFORM_KEY), Some(TRANSFORM_SSE));
+        assert!(matches!(
+            exchange(&ctx).unwrap().response,
+            Some(ResponseTranslation::Sse(_))
+        ));
 
         let event = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\"}}\n\n";
         // Split exactly before the `model` key name: neither half is a
@@ -1216,9 +1236,8 @@ mod tests {
     async fn sse_failure_emits_anthropic_error_and_suppresses_later_success() {
         let filter = filter("project: demo\nmax_body_bytes: 64");
         let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(OPERATION_KEY, "messages");
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&request);
+        translated(&mut ctx, "claude-sonnet-4-5");
         let mut response = make_response();
         response
             .headers

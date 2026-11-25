@@ -1,0 +1,74 @@
+# MCP Session Broker (current profile)
+#
+# Static-catalog MCP broker for stateful backends. Clients
+# initialize with Praxis and receive a gateway
+# Mcp-Session-Id. On the first tools/call for each backend
+# server, the broker runs the backend initialize and
+# notifications/initialized handshake, then forwards the call
+# to the server's cluster with the backend Mcp-Session-Id.
+# Later calls reuse that session. A backend 404 drops the
+# mapping, and the next call initializes a fresh backend
+# session. DELETE on the gateway session terminates its
+# backend sessions.
+#
+# The handshake runs as a filtered subrequest through a
+# generated outbound chain whose load_balancer references
+# each server cluster by name, so declare the clusters in
+# top-level `clusters:`. The main chain's load_balancer
+# references the same declarations.
+#
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/mcp-session-broker.yaml
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+
+clusters:
+  - name: weather-mcp
+    endpoints:
+      - "127.0.0.1:3001"
+  - name: calendar-mcp
+    endpoints:
+      - "127.0.0.1:3002"
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: mcp
+        path: /mcp
+        max_body_bytes: 65536
+        backend_sessions:
+          max_sessions: 4096
+          idle_timeout_ms: 600000
+          handshake_timeout_ms: 5000
+          max_response_bytes: 1048576
+          forward_headers: [authorization]
+        servers:
+          - name: weather
+            cluster: weather-mcp
+            path: /mcp
+            tool_prefix: "weather_"
+            tools:
+              - name: get_weather
+                description: Get current weather
+                inputSchema:
+                  type: object
+                  properties:
+                    city:
+                      type: string
+          - name: calendar
+            cluster: calendar-mcp
+            path: /mcp
+            tool_prefix: "cal_"
+            tools:
+              - name: create_event
+                description: Create a calendar event
+
+      - filter: load_balancer
+        clusters:
+          - name: weather-mcp
+          - name: calendar-mcp
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

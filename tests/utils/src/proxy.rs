@@ -915,6 +915,8 @@ mod tests {
         let mut config =
             Config::from_yaml(&simple_proxy_yaml(proxy_port, backend.port())).expect("test config should parse");
         config.body_limits.max_buffer_bytes = 64.try_into().expect("buffer cap should be valid");
+        config.body_limits.max_request_bytes = None;
+        config.insecure_options.allow_unbounded_body = true;
         config.filter_chains[0].filters.insert(
             0,
             serde_yaml::from_str("filter: json_body\nrequest_remove: [/secret]")
@@ -927,7 +929,7 @@ mod tests {
         assert_eq!(
             crate::http_post(&address, "/", &oversized).0,
             413,
-            "the buffering cap must reject bodies below the larger transfer ceiling"
+            "the buffering cap must reject oversized bodies without a transfer ceiling"
         );
     }
 

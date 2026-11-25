@@ -57,6 +57,7 @@ def timeout_anthropic_client(error_proxy_ports):
 
 
 class TestAnthropicErrorFormatter:
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "content",
         [
@@ -65,11 +66,12 @@ class TestAnthropicErrorFormatter:
         ],
         ids=["text", "image"],
     )
-    def test_messages_connection_refused(self, anthropic_client, content):
+    def test_messages_connection_refused(self, anthropic_client, content, stream):
         with pytest.raises(APIStatusError) as exc_info:
             anthropic_client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=100,
+                stream=stream,
                 messages=[{"role": "user", "content": content}],
             )
         err = exc_info.value

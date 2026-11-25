@@ -43,7 +43,7 @@ make lint           # clippy, fmt, dependency, docs, and example checks
 make doc            # rustdoc with -D warnings
 make audit          # cargo audit + cargo deny check
 make container      # build praxis-ai container image
-make container-fips # FIPS runtime image on UBI 9 (see docs/fips.md)
+make container-fips # FIPS runtime image on UBI 9 (see docs/operations/fips.md)
 ```
 
 Run a single test:
@@ -75,7 +75,7 @@ targets.
 server (praxis-ai-proxy)
   -> filters (praxis-ai-filters)
   -> apis (praxis-ai-apis)
-  -> praxis-filter (versioned Praxis core dependency)
+  -> praxis-filter (pinned Praxis Core dependency)
 ```
 
 - **server** (`praxis-ai-proxy`): binary entry point,
@@ -90,11 +90,72 @@ server (praxis-ai-proxy)
   inference routing, prompt enrichment, token usage
   header injection)
 
-**Dependencies on Praxis core** use the versioned crates in the root
-`Cargo.toml`: `praxis-filter` for `HttpFilter`, pipeline, and registry;
+**Dependencies on Praxis core** track core main in the root `Cargo.toml` and share a commit pinned
+in `Cargo.lock`: `praxis-filter` for `HttpFilter`, pipeline, and registry;
 `praxis-core` for config types; `praxis-protocol` for HTTP/TCP adapters;
 and `praxis-tls` for TLS. Use `make patch-praxis` only when testing a
 local sibling checkout at `../praxis`.
+
+## Core or AI
+
+Praxis core owns proxy mechanisms; this repository owns the AI meaning
+layered on them. Decide where a change lands before writing it, and state
+the decision in the PR description.
+
+Apply the **AI-removal test**: describe the mechanism without naming a
+model, provider, prompt, token count, or AI protocol (OpenAI, Anthropic,
+MCP, A2A). If the description still makes sense to a non-AI Praxis user,
+the mechanism belongs in core. Typical core mechanisms: outbound
+transport and URL resolution, address classification and SSRF policy,
+HTTP header hygiene, DNS, TLS, retries, generic limiters, credential
+injection, cluster and listener config, and filter lifecycle hooks.
+Typical AI responsibilities: provider API types, request classification,
+token usage, provider SSE event semantics, response and conversation
+state.
+
+When a feature spans both, split it. Land the generic mechanism in core
+first, develop against it with `make patch-praxis`, then bump the core
+version here and add a **thin surface**: the AI filter that derives AI
+facts and hands them to the core mechanism. When core lacks a hook the AI
+filter needs, add the hook in core rather than wrapping or shadowing
+core types here. Precedent: #1665 deleted roughly 900 lines of bespoke
+subrequest transport in favor of core `UrlResolutionPolicy`, and #1527
+replaced duplicated IP range tables with core's classifier.
+
+When release timing forces an interim copy here, keep it minimal, link the
+core issue in a module comment, and treat it as migration debt rather than
+precedent.
+
+## Behavior shared across application protocols
+
+When a change starts in one protocol, identify the underlying operation and trace where else Praxis performs it. Follow execution paths as well as field names. OpenAI Responses and Anthropic Messages, for example, can both trigger a proxy-executed web search through different tool declarations.
+
+- Compare the contracts of the affected protocols. Put common behavior in the module that owns the operation, and keep request parsing, validation, and error responses in each protocol adapter.
+- Apply the shared behavior to every existing path whose contract requires it. Check that each path can use the implementation with its own feature flags. If a related path is outside the change, explain why in the PR.
+- Test the common behavior once at its owner, then test each affected protocol through its normal entry point. For web-search domain restrictions, verify which results reach the model through each adapter.
+
+## Filter ordering and dependencies
+
+When implementing or reviewing behavior that spans filters, trace each
+supported pipeline from the input through the decision that depends on it.
+Use the documented filter contracts, example configurations, and hook
+implementations to establish which filter sees the input first, what it
+guarantees, and which later filters rely on that guarantee. Account for
+branches and operations where an earlier filter skips processing or hands
+the body to another filter.
+
+Give each check one owner per execution path. A downstream filter may rely
+on a required predecessor while its guarantee still holds. For example, if
+a request filter validates the body model and publishes it for routing,
+the router can consume that fact directly. A supported pipeline that
+selects a provider directly from the body needs an owner for the same
+check on that path.
+
+Make required ordering explicit in the filter contract. An example shows
+one supported order; establishing a new prerequisite for a filter that
+already supports standalone use is a compatibility change. Cover edge
+cases at the owning filter and verify the client-visible outcome through
+the supported pipeline.
 
 ## Conventions
 
@@ -155,7 +216,8 @@ truthful provider, model, and provenance metadata.
 
 ## Adding a Filter
 
-Before creating a filter, inspect existing filters in `apis/src/` and
+Before creating a filter, settle the [Core or AI](#core-or-ai) split, then
+inspect existing filters in `apis/src/` and
 `filters/src/` for overlapping responsibilities, including filters that
 already parse the same protocol or derive related routing facts. Prefer
 extending the filter that owns that behavior and reusing its parsed data.
@@ -173,7 +235,12 @@ which existing filters were considered and why extending them is unsuitable.
 
 ## Key Patterns
 
+- **Protocol compliance**: Follow the specs Praxis speaks (SSE, MCP, OpenAI, Anthropic, etc.). Let upstream violations fail.
+  Do not add lenient parsing, synthetic terminators, or retries solely to accommodate a violation.
+  Fix or track gaps for permitted behavior, including SHOULD-level choices such as an MCP server keeping an SSE stream open after its response.
+  Decline review findings that only help a spec-violating upstream and cite the relevant spec section.
 - **Filter callouts**: use `FilteredSubrequestExecutor` for every outbound call made by a filter. It runs the configured outbound filter chain around the HTTP exchange, including credential injection and other outbound policies. `SubRequestClient::execute_url()` performs the HTTP exchange without running a configured filter pipeline.
+- **Callout targets**: an operator-configured target is a `cluster` name from top-level `clusters:`, so endpoints, TLS, client certificates, private-address policy, and `credential_injection` come from the cluster. URL fields are for request-derived and protocol-owned targets only. Existing operator URL fields (`server_url`, `endpoint`, `*_url`) are migration debt, not precedent. Classification and checklist: `docs/architecture/outbound-callouts.md`.
 - **Classify → route → branch**: classifier filters
   promote facts to internal headers
   (`x-praxis-ai-*`) and the router matches those
@@ -182,9 +249,38 @@ which existing filters were considered and why extending them is unsuitable.
   streaming and SSE filters should use
   `BodyMode::Stream` and process chunks
   incrementally.
+- **Per-response working state**: keep private parser
+  buffers, counters, indices, and progress in a typed
+  struct in `filter_state`, isolated per filter instance.
+  Reserve `filter_metadata` for intentional consumers
+  outside the filter; inspect readers before moving keys.
+  Retain bytes directly rather than encoding private
+  buffers as strings or hex. Release retained buffers
+  on completion or abandonment.
+- **Incremental parsing**: before adding a streaming
+  parser, inspect existing helpers and reuse them when
+  their boundary, UTF-8, limit, and EOF behavior matches.
+  Explain behavior or crate-dependency constraints that
+  prevent reuse. Carry owned buffers and scanning progress
+  across chunks so unfinished prefixes are not repeatedly
+  copied or rescanned. For buffering changes, measure
+  allocated bytes across increasing event sizes at a fixed
+  chunk size to detect quadratic growth.
+- **Streaming regressions**: test delivery before EOF,
+  split delimiters and UTF-8, configured limits, terminal
+  cleanup, and two instances sharing one request context.
+  Assert output after intermediate chunks as well as the
+  final combined output.
 - **Validate only proxy-needed fields**: let the
   backend handle parameter ranges, model
   availability, and role ordering.
+- **Log metadata, never content**: tracing fields
+  carry sizes, counts, JSON types, IDs, and bounded
+  classification fields (`type`, `code`). Request,
+  response, tool-argument, and provider error
+  `message` text stays out of logs, since providers
+  echo user input in errors. Prove it with
+  `test_utils::capture_log_output` and a marker string.
 
 ## Filter Organization
 

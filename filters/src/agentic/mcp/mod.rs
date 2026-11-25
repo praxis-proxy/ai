@@ -26,7 +26,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::promotion::contains_control_chars;
+use praxis_ai_apis::{RecordAiMetadata as _, promotion::contains_control_chars};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
@@ -34,6 +34,7 @@ use praxis_filter::{
 };
 use tracing::{trace, warn};
 
+pub use self::broker::McpBrokerBackendSelectorFilter;
 use self::{
     config::{McpConfig, MismatchBehavior, MissingHeaderBehavior, build_config},
     envelope::{McpEnvelope, extract_mcp_envelope},
@@ -99,8 +100,28 @@ impl McpFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::from_config_with_binding(config, None, None)
+    }
+
+    /// Create a filter with a chain-binding context, which the static catalog
+    /// broker needs to bind its `backend_sessions` handshake chain.
+    ///
+    /// `fallback_client` is used for handshakes when the request context
+    /// exposes no shared sub-request client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid or the broker's
+    /// handshake chain cannot be bound.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    pub fn from_config_with_binding(
+        config: &serde_yaml::Value,
+        binding: Option<&praxis_filter::ChainBindingContext<'_>>,
+        fallback_client: Option<praxis_core::subrequest::SubRequestClient>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         if broker::McpBrokerFilter::matches_config(config) {
-            return broker::McpBrokerFilter::from_config(config);
+            return broker::McpBrokerFilter::from_config_with_binding(config, binding, fallback_client);
         }
 
         let cfg: McpConfig = parse_filter_config("mcp", config)?;
@@ -123,7 +144,7 @@ impl HttpFilter for McpFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -360,28 +381,28 @@ fn write_metadata(
 
     let method_str = mcp.method.as_str();
     if !contains_control_chars(method_str) && method_str.len() <= max_len {
-        ctx.set_metadata("json_rpc.method", method_str);
-        ctx.set_metadata("mcp.method", method_str);
+        ctx.record_ai_metadata("json_rpc.method", method_str);
+        ctx.record_ai_metadata("mcp.method", method_str);
     }
-    ctx.set_metadata("json_rpc.kind", envelope.kind.as_str());
+    ctx.record_ai_metadata("json_rpc.kind", envelope.kind.as_str());
 
     if let Some(name) = &mcp.name
         && !contains_control_chars(name)
         && name.len() <= max_len
     {
-        ctx.set_metadata("mcp.name", name.clone());
+        ctx.record_ai_metadata("mcp.name", name.clone());
     }
     if let Some(sid) = &mcp.session_id
         && !contains_control_chars(sid)
         && sid.len() <= max_len
     {
-        ctx.set_metadata("mcp.session_id", sid.clone());
+        ctx.record_ai_metadata("mcp.session_id", sid.clone());
     }
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
         && pv.len() <= max_len
     {
-        ctx.set_metadata("mcp.protocol_version", pv.clone());
+        ctx.record_ai_metadata("mcp.protocol_version", pv.clone());
     }
 }
 

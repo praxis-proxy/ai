@@ -33,8 +33,10 @@ conftest), e.g.:
     uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=2.x
 """
 
+import base64
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -52,6 +54,7 @@ from conftest import free_port as _free_port
 from conftest import wait_for_proxy as _wait_for_proxy
 
 NATIVE_CONFIG_PATH = "examples/configs/anthropic/messages-protocol.yaml"
+NATIVE_VLLM_CONFIG_PATH = "examples/configs/anthropic/messages-native-vllm.yaml"
 TRANSLATED_CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
 
@@ -304,6 +307,33 @@ def translated_client():
         )
 
 
+@pytest.fixture(scope="module")
+def native_vllm_client():
+    """Anthropic SDK client against the native-vLLM example (`application_provider: vllm`)."""
+    with ExitStack() as stack:
+        server, thread = _start_backend(NATIVE_STATE, _NativeHandler)
+        stack.callback(_stop_backend, server, thread)
+        proxy_port = _free_port()
+        password = secrets.token_hex(16)
+        config_path = _retarget_example(NATIVE_VLLM_CONFIG_PATH, [
+            ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
+            ("127.0.0.1:8000", f"127.0.0.1:{server.server_address[1]}"),
+            ("env_var: GATEWAY_AUTH_PASSWORD", f"password: {password}"),
+            ("env_var: VLLM_API_KEY", "value: backend-token"),
+        ])
+        stack.callback(os.unlink, config_path)
+        proc = _start_proxy(config_path, proxy_port)
+        stack.callback(_stop_proxy, proc)
+        gateway = base64.b64encode(f"gateway:{password}".encode()).decode()
+        yield Anthropic(
+            base_url=f"http://127.0.0.1:{proxy_port}",
+            api_key="test-key",
+            default_headers={"Authorization": f"Basic {gateway}"},
+            max_retries=0,
+            timeout=10.0,
+        )
+
+
 @pytest.fixture()
 def native_guardrails_client():
     """Exercise the checked-in request guardrails example with recording providers."""
@@ -372,19 +402,35 @@ class TestNativeGuardrails:
         for name, expected in _native_expected_headers(lane).items():
             assert headers.get(name) == expected, f"guardrails must preserve SDK {lane} header {name}"
 
-    @pytest.mark.parametrize("verdict, expected_status", [("blocked", 403), ("modified", 502)])
-    def test_unsafe_verdicts_prevent_model_calls(self, native_guardrails_client, verdict, expected_status):
+    @pytest.mark.parametrize("verdict, content, expected_status", [
+        ("blocked", "Contact alice@example.com", 403),
+        ("modified", [{"type": "text", "text": "Contact alice@"},
+                      {"type": "text", "text": "example.com"}], 502),
+    ])
+    def test_unsafe_verdicts_prevent_model_calls(self, native_guardrails_client, verdict, content, expected_status):
         NEMO_STATE.script(200, "application/json", {
             "status": verdict, "content": "masked", "rail": "pii",
         })
         with pytest.raises(APIStatusError) as error:
             native_guardrails_client.messages.create(
                 model=MODEL, max_tokens=64, system="Follow policy.",
-                messages=[{"role": "user", "content": "Contact alice@example.com"}],
+                messages=[{"role": "user", "content": content}],
             )
         assert error.value.status_code == expected_status, "the SDK must observe the guardrail rejection"
         assert len(NEMO_STATE.requests) == 1, "the rejection must follow a real provider call"
-        assert not NATIVE_STATE.requests, "blocked or modified native input must never reach the model"
+        assert not NATIVE_STATE.requests, "blocked or unsupported input must never reach the model"
+
+    def test_modified_text_reaches_model_masked(self, native_guardrails_client):
+        NEMO_STATE.script(200, "application/json", {"status": "modified", "content": "Contact <EMAIL_ADDRESS>"})
+        response = native_guardrails_client.messages.create(
+            model=MODEL, max_tokens=64, system="Follow policy.",
+            messages=[{"role": "user", "content": "Contact alice@example.com"}],
+        )
+        assert response.content[0].text == "hello", "the model response must parse through the SDK"
+        assert len(NEMO_STATE.requests) == 1, "the original input must be screened"
+        assert len(NATIVE_STATE.requests) == 1, "the masked input must reach the model once"
+        _, _, forwarded = NATIVE_STATE.requests[0]
+        assert forwarded["messages"][0]["content"] == "Contact <EMAIL_ADDRESS>", "only masked text may reach the model"
 
     def test_unchanged_modification_keeps_native_body(self, native_guardrails_client):
         NEMO_STATE.script(200, "application/json", {"status": "modified", "content": "Hello"})
@@ -678,7 +724,7 @@ class TestTranslatedToChatCompletions:
             )
 
         assert excinfo.value.status_code == 400
-        assert "unsupported Anthropic content block" in str(excinfo.value)
+        assert "`citations` cannot be translated" in str(excinfo.value)
         assert TRANSLATED_STATE.requests == [], "rejected request must not reach the backend"
 
     def test_document_block_is_rejected(self, translated_client):
@@ -717,6 +763,67 @@ class TestTranslatedToChatCompletions:
         assert excinfo.value.status_code == 400
         assert "unsupported Anthropic content block" in str(excinfo.value)
         assert TRANSLATED_STATE.requests == []
+
+
+
+MCP_BETA = "mcp-client-2025-11-20"
+MCP_CONNECTOR = {
+    "mcp_servers": [{"type": "url", "url": "https://mcp.example.com/sse", "name": "example"}],
+    "tools": [{"type": "mcp_toolset", "mcp_server_name": "example"}],
+}
+
+
+def _create_with_mcp_connector(client: Anthropic):
+    # Sent through `extra_body` so the request does not depend on whether this
+    # SDK lane types the beta connector fields.
+    return client.messages.create(
+        model=MODEL,
+        max_tokens=64,
+        messages=[{"role": "user", "content": "List my repositories"}],
+        extra_headers={"anthropic-beta": MCP_BETA},
+        extra_body=MCP_CONNECTOR,
+    )
+
+
+class TestMcpConnector:
+    """Anthropic's server-side MCP connector on each Messages route (#638)."""
+
+    def test_untagged_native_route_forwards_the_connector_unchanged(self, native_client):
+        _create_with_mcp_connector(native_client)
+
+        [(path, headers, body)] = NATIVE_STATE.requests
+        assert path == "/v1/messages"
+        assert headers.get("anthropic-beta") == MCP_BETA, "the MCP beta header must reach the backend"
+        assert body["mcp_servers"] == MCP_CONNECTOR["mcp_servers"], "mcp_servers must pass through unchanged"
+        assert body["tools"] == MCP_CONNECTOR["tools"], "mcp_toolset must pass through unchanged"
+
+    def test_native_vllm_route_rejects_the_connector(self, native_vllm_client):
+        with pytest.raises(BadRequestError) as excinfo:
+            _create_with_mcp_connector(native_vllm_client)
+
+        assert excinfo.value.status_code == 400
+        assert excinfo.value.body["error"]["type"] == "invalid_request_error"
+        assert "MCP connector" in excinfo.value.body["error"]["message"]
+        assert NATIVE_STATE.requests == [], "a vLLM backend must never receive the connector"
+
+    def test_native_vllm_route_still_serves_ordinary_requests(self, native_vllm_client):
+        response = native_vllm_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+
+        assert response.content[0].text == "hello"
+        assert len(NATIVE_STATE.requests) == 1, "only the MCP connector is refused"
+
+    def test_translated_route_rejects_the_connector(self, translated_client):
+        with pytest.raises(BadRequestError) as excinfo:
+            _create_with_mcp_connector(translated_client)
+
+        assert excinfo.value.status_code == 400
+        assert excinfo.value.body["error"]["type"] == "invalid_request_error"
+        assert "MCP connector" in excinfo.value.body["error"]["message"]
+        assert TRANSLATED_STATE.requests == [], "rejected request must not reach the backend"
 
 
 if __name__ == "__main__":

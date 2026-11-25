@@ -12,12 +12,7 @@ name: FIPS
 # Also runs on merge_group: ubi-image is a required merge-queue check, so it
 # must report on the queue ref or the queue times out waiting for it.
 #
-# Everything runs through the Makefile targets developers use locally (see
-# docs/developing/fips.md), with podman: Red Hat's image signatures can only
-# be verified with podman, and the scanner reads podman's image store.
-# Ubuntu's podman packaging ships no registries.d entry for Red Hat's
-# registry, so the job first tells podman where the signatures live
-# (make fips-signature-store), as a developer on Debian or Ubuntu would.
+# The shared cargo-fips-check action runs the hosted checks using Podman.
 #
 # The second job, fips-host, is the runtime proof the hosted job cannot
 # give: on the self-hosted RHEL 9 runner in FIPS mode it attests the host
@@ -63,51 +58,28 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
-          # Only xtask (without its default features) is built on the host;
-          # keep that off the shared cache key and skip caching its target.
+          # The workspace builds inside UBI. Skip caching the host target.
           cache-suffix: fips
           cache-target: "false"
 
-      - name: Set up Go (builds Red Hat's scanner)
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
-        with:
-          go-version: "1.26"
-          # The scanner is fetched by make fips-scanner and vendors its modules.
-          cache: false
+      - name: Read the image and scanner pins
+        id: pins
+        run: make -s fips-ci-inputs >> "$GITHUB_OUTPUT"
 
-      - name: Build Red Hat's scanner (check-payload) at the pinned revision
-        run: make fips-scanner
-
-      - name: Download the OpenShift CLI the scanner insists on (pinned, checksum-verified)
-        run: make fips-oc
-
-      - name: Point podman at Red Hat's signature store (Ubuntu's podman has no entry for it)
-        run: make fips-signature-store
-
-      - name: Verify the Red Hat base images are signed by Red Hat
-        run: make fips-verify-image
-
-      - name: Build on UBI 9 with Red Hat's toolchain and print the compliance report
-        run: make fips-check
-
-      - name: Build the FIPS runtime image
-        run: make container-fips
-
-      - name: Run the image once (validates its built-in config with the system OpenSSL)
-        run: make fips-smoke
-
-      - name: Scan the image with check-payload (warnings fatal)
-        run: make fips-scan
-
-      # The merge queue never runs fips-host, so it skips the handoff too.
-      - name: Save the image for the FIPS runner
+      - name: Build, report and scan the FIPS image
         id: save
-        if: github.event_name != 'merge_group'
-        run: |
-          make fips-image-save
-          echo "image-id=$(cat target/fips/praxis-ai-fips-image.tar.id)" >> "$GITHUB_OUTPUT"
+        uses: praxis-proxy/cargo-fips-check@a8dae23f90eb77e6890cc86df5ec6cf6da4e2e79 # main
+        with:
+          base-images: ${{ steps.pins.outputs.base-images }}
+          image: ${{ steps.pins.outputs.image }}
+          check-payload-rev: ${{ steps.pins.outputs.scanner-rev }}
+          oc-url: ${{ steps.pins.outputs.oc-url }}
+          oc-sha256: ${{ steps.pins.outputs.oc-sha256 }}
+          smoke: podman run --rm --entrypoint praxis-ai "$IMAGE" --validate
+          # The merge queue never runs fips-host, so it skips the handoff.
+          save-image: ${{ github.event_name != 'merge_group' && 'target/fips/praxis-ai-fips-image.tar' || '' }}
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name != 'merge_group'

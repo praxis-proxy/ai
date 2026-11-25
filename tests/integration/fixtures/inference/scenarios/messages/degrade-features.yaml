@@ -1,11 +1,12 @@
 version: 1
 id: messages/degrade-features
-description: Operator-approved degradation strips allowlisted prompt-caching and extended-thinking markers so an unmodified client reaches the Chat Completions backend.
+description: Operator-approved degradation folds system instructions in order and strips allowlisted prompt-caching and extended-thinking markers so an unmodified client reaches the Chat Completions backend.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai-degrade-fixture.yaml
 upstream_authority: 127.0.0.1:8000
 features:
   - messages.request.degrade_prompt_caching
+  - messages.request.degrade_mid_conversation_system
   - messages.request.degrade_extended_thinking
 turns:
   - name: initial
@@ -31,12 +32,16 @@ turns:
               cache_control:
                 type: ephemeral
           messages:
+            - role: system
+              content: Keep instruction order.
             - role: user
               content:
                 - type: text
                   text: What is 2+2? Reply with just the number.
                   cache_control:
                     type: ephemeral
+            - role: system
+              content: Answer tersely.
     expect:
       client_status: 200
       client_body_kind: json

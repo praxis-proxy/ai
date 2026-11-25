@@ -1,408 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Terminal Anthropic Messages SSE streaming for the web-search loop.
-//!
-//! The buffered loop accumulates each backend round, classifies it, and either
-//! loops (server-owned `WebSearch`) or returns the final message. Terminal
-//! streaming keeps that control flow but delivers the client-visible response
-//! incrementally: text content blocks are forwarded as they arrive across IRR
-//! rounds, the managed `WebSearch` tool-use block is suppressed, and a single
-//! coherent Anthropic Messages SSE lifecycle is presented to the client.
-//!
-//! One logical stream spans every IRR round:
-//!
-//! * `message_start` is forwarded once, from the first round, with a stable id.
-//! * `content_block_*` frames for text (and client-owned tools) are forwarded with a running output-block-index offset
-//!   so indices stay monotonic across rounds.
-//! * The managed `WebSearch` `tool_use` block is suppressed entirely.
-//! * Per-round `message_delta` / `message_stop` are deferred; a single terminal `message_delta` (aggregated
-//!   `output_tokens`) and `message_stop` are emitted only when the loop finishes on a non-managed round.
-//!
-//! Every failure mode is fail-closed: a terminal `error` event is emitted and no
-//! raw upstream bytes leak into the transformed stream.
+//! Web search policy for the shared Messages stream lifecycle.
 
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-};
 
-use serde_json::{Value, json};
+use std::borrow::Cow;
 
-/// A parsed SSE event: the decoded JSON `data` payload.
-#[derive(Debug)]
-pub(super) struct SseEvent {
-    /// Decoded JSON `data` payload.
-    pub(super) data: Value,
-}
+pub(super) use super::super::tool_stream::StreamError;
+use super::super::tool_stream::{BlockPresentation, MessagesStream};
 
-/// Fail-closed streaming error, mapped to a terminal Anthropic `error` event.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum StreamError {
-    /// Upstream bytes were not valid UTF-8.
-    MalformedUtf8,
-    /// An SSE event — a retained partial or a single complete frame — exceeded
-    /// the configured bound.
-    OversizedPartialEvent,
-    /// An SSE event was missing a required field (for example a block index).
-    MalformedEvent,
-    /// A managed `WebSearch` call was malformed (empty id or query).
-    InvalidManagedCall,
-    /// A managed `WebSearch` query exceeded the configured size bound, carried
-    /// so the client-facing error names the operator's actual limit.
-    QueryTooLong {
-        /// Configured per-query byte bound the query exceeded.
-        max_bytes: usize,
-    },
-    /// A `WebSearch` block was suppressed but the round did not classify as a
-    /// managed call, so forwarding it would silently drop a tool call.
-    SuppressionMismatch,
-    /// The reconstructed round message exceeded the configured body-size bound.
-    Oversized,
-    /// Re-entering inference would exceed the router's iteration ceiling; the
-    /// loop is terminated with a coherent error rather than an abrupt EOF.
-    IterationLimit,
-    /// Re-entering inference would exceed the router's deadline; opening the next
-    /// round would fail, so the loop is terminated with a coherent error rather
-    /// than an abrupt EOF.
-    DeadlineExceeded,
-    /// Re-entering inference would send a rebuilt request larger than the
-    /// configured body-size bound — the appended search result pushed it over the
-    /// limit. On a committed streaming response the buffered path's request-phase
-    /// 413 cannot replace the open SSE lifecycle, so the loop terminates with one
-    /// coherent error event instead of forwarding an oversized round.
-    ReentryTooLarge,
-    /// A later round returned a non-2xx status or a content-encoded body after
-    /// the client-visible SSE lifecycle had already started, so it cannot be
-    /// transformed and its raw bytes must not corrupt the open stream.
-    UpstreamUnprocessable,
-    /// The upstream stream ended cleanly before the round reported a stop reason
-    /// (a truncated `message_delta`), so a successful terminal cannot be
-    /// fabricated in its place.
-    IncompleteStream,
-    /// The upstream streaming source terminated abnormally mid-round — a
-    /// transport fault, circuit trip, admission or idle timeout, or byte-ceiling
-    /// breach reported by Praxis as a stream termination — so the round cannot
-    /// complete and the loop fails closed rather than ending in an abrupt EOF.
-    UpstreamTerminated,
-}
-
-/// Incremental native-Messages SSE parser for one backend round.
-///
-/// Owns its cross-chunk continuation buffers so it is self-contained and unit
-/// testable without a filter context. A new parser is used for each round.
-#[derive(Default)]
-pub(super) struct SseParser {
-    /// Trailing bytes of an incomplete UTF-8 sequence carried between chunks.
-    utf8_tail: Vec<u8>,
-    /// Trailing text of an incomplete SSE event block carried between chunks.
-    ///
-    /// Line endings are normalized to `\n` as bytes are appended, so this buffer
-    /// only ever contains `\n`; a complete event ends at a `\n\n` boundary.
-    line_buffer: String,
-    /// A lone trailing `\r` withheld from `line_buffer` because it may be the
-    /// first half of a `\r\n` split across chunks. Resolved on the next push (or
-    /// at end-of-stream) into a single `\n`.
-    pending_cr: bool,
-}
-
-impl SseParser {
-    /// Feed one response chunk, returning every complete SSE event it yields.
-    ///
-    /// Partial UTF-8 sequences and partial event blocks are buffered until the
-    /// next chunk completes them. `max_partial_event_bytes` bounds the retained
-    /// partial-event buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamError::MalformedUtf8`] when the combined bytes contain an
-    /// invalid (not merely incomplete) UTF-8 sequence, or when a trailing
-    /// incomplete sequence survives end-of-stream. Returns
-    /// [`StreamError::OversizedPartialEvent`] when the retained partial event
-    /// exceeds `max_partial_event_bytes`.
-    pub(super) fn push(
-        &mut self,
-        chunk: &[u8],
-        end_of_stream: bool,
-        max_partial_event_bytes: usize,
-    ) -> Result<Vec<SseEvent>, StreamError> {
-        let text = self.decode_utf8(chunk, end_of_stream)?;
-
-        // Append the newly decoded text onto the retained partial in place,
-        // normalizing line endings as it goes, instead of rebuilding the whole
-        // buffer each chunk (which was quadratic across a long fragmented event).
-        let prev_len = self.line_buffer.len();
-        self.normalize_into_buffer(&text, end_of_stream);
-
-        // A `\n\n` terminator can only straddle the old/new boundary when the
-        // last retained byte was already a `\n`; every other complete event lies
-        // entirely within the appended region. Resume the scan there, never from
-        // the start, so total work stays linear in the buffer length.
-        let starts_on_prior_newline = prev_len > 0 && self.line_buffer.as_bytes().get(prev_len - 1) == Some(&b'\n');
-        let mut from = prev_len - usize::from(starts_on_prior_newline);
-
-        let mut events = Vec::new();
-        let mut consumed = 0;
-        while let Some(offset) = self.line_buffer.get(from..).and_then(|tail| tail.find("\n\n")) {
-            let end = from + offset;
-            let Some(block) = self.line_buffer.get(consumed..end) else {
-                break;
-            };
-            // Bound each complete event by the same cap as the retained partial,
-            // so a single huge frame cannot be materialized in full and bypass the
-            // body-size bound.
-            if block.len() > max_partial_event_bytes {
-                return Err(StreamError::OversizedPartialEvent);
-            }
-            if let Some(event) = parse_event_block(block)? {
-                events.push(event);
-            }
-            consumed = end + 2;
-            from = consumed;
-        }
-
-        // The retained partial (a deferred `\r` lives in `pending_cr`, not here)
-        // is bounded too.
-        if self.line_buffer.len() - consumed > max_partial_event_bytes {
-            return Err(StreamError::OversizedPartialEvent);
-        }
-        self.line_buffer.drain(..consumed);
-        Ok(events)
-    }
-
-    /// Append `text` to `line_buffer`, normalizing `\r\n` and lone `\r` to `\n`.
-    ///
-    /// A trailing `\r` is withheld in `pending_cr` (unless `end_of_stream`) so a
-    /// `\r\n` split across chunks collapses to one `\n` rather than two.
-    fn normalize_into_buffer(&mut self, text: &str, end_of_stream: bool) {
-        if !self.pending_cr && !text.contains('\r') {
-            // Hot path: no carriage returns to fold, so append in a single copy.
-            self.line_buffer.push_str(text);
-            return;
-        }
-        for ch in text.chars() {
-            if self.pending_cr {
-                self.pending_cr = false;
-                self.line_buffer.push('\n');
-                if ch == '\n' {
-                    // `\r\n` already folded to a single `\n`; drop this `\n`.
-                    continue;
-                }
-            }
-            if ch == '\r' {
-                self.pending_cr = true;
-            } else {
-                self.line_buffer.push(ch);
-            }
-        }
-        if end_of_stream && self.pending_cr {
-            // No further chunk can complete a `\r\n`; emit the lone `\r` as `\n`.
-            self.pending_cr = false;
-            self.line_buffer.push('\n');
-        }
-    }
-
-    /// Combine any retained UTF-8 tail with `chunk` and return the valid prefix.
-    ///
-    /// A trailing incomplete sequence (fewer than four bytes) is retained for
-    /// the next chunk; a genuinely invalid sequence, or an incomplete sequence
-    /// at end-of-stream, fails closed.
-    ///
-    /// When no tail is retained (the common case) the valid prefix borrows
-    /// `chunk` directly, so a well-formed chunk is validated once and reaches
-    /// `line_buffer` in a single copy with no intermediate heap allocation.
-    /// Only joining a retained tail with `chunk` — the rare split-code-point
-    /// case — needs one owned buffer, which is handed back by value (moved, not
-    /// copied) so no further copy follows.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamError::MalformedUtf8`] on genuinely invalid UTF-8, on an
-    /// incomplete sequence at end-of-stream, or on a retained tail longer than a
-    /// single truncated code point.
-    fn decode_utf8<'chunk>(
-        &mut self,
-        chunk: &'chunk [u8],
-        end_of_stream: bool,
-    ) -> Result<Cow<'chunk, str>, StreamError> {
-        if self.utf8_tail.is_empty() {
-            // Hot path: with no retained tail the valid prefix borrows `chunk`,
-            // so there is no intermediate `String` to allocate and drop.
-            return match std::str::from_utf8(chunk) {
-                Ok(text) => Ok(Cow::Borrowed(text)),
-                Err(error) if error.error_len().is_none() => {
-                    let valid = self.retain_incomplete_tail(chunk, error.valid_up_to(), end_of_stream)?;
-                    Ok(Cow::Borrowed(
-                        std::str::from_utf8(chunk.get(..valid).ok_or(StreamError::MalformedUtf8)?)
-                            .map_err(|_prefix_not_utf8| StreamError::MalformedUtf8)?,
-                    ))
-                },
-                Err(_) => Err(StreamError::MalformedUtf8),
-            };
-        }
-        // A code point split across the previous chunk boundary: joining the
-        // retained tail with `chunk` needs one owned buffer, returned by value
-        // so the decoded text is never copied a second time.
-        let mut pending = std::mem::take(&mut self.utf8_tail);
-        pending.extend_from_slice(chunk);
-        let valid = match std::str::from_utf8(&pending) {
-            Ok(_) => pending.len(),
-            Err(error) if error.error_len().is_none() => {
-                self.retain_incomplete_tail(&pending, error.valid_up_to(), end_of_stream)?
-            },
-            Err(_) => return Err(StreamError::MalformedUtf8),
-        };
-        pending.truncate(valid);
-        Ok(Cow::Owned(
-            String::from_utf8(pending).map_err(|_combined_not_utf8| StreamError::MalformedUtf8)?,
-        ))
-    }
-
-    /// Retain the trailing incomplete UTF-8 sequence of `bytes` (the run after
-    /// `valid`) for the next chunk and return `valid`.
-    ///
-    /// # Errors
-    ///
-    /// Fails closed at end-of-stream (no later chunk can complete the sequence)
-    /// and when the retained tail is longer than a single truncated code point
-    /// (at most three bytes), which is not a mere split.
-    fn retain_incomplete_tail(
-        &mut self,
-        bytes: &[u8],
-        valid: usize,
-        end_of_stream: bool,
-    ) -> Result<usize, StreamError> {
-        if end_of_stream {
-            return Err(StreamError::MalformedUtf8);
-        }
-        let tail = bytes.get(valid..).ok_or(StreamError::MalformedUtf8)?;
-        if tail.len() > 3 {
-            return Err(StreamError::MalformedUtf8);
-        }
-        self.utf8_tail.extend_from_slice(tail);
-        Ok(valid)
-    }
-}
-
-/// Parse one SSE event block into an [`SseEvent`], reading the JSON `data`.
-///
-/// Returns `Ok(None)` for a block that carries no `data` field (for example a
-/// bare comment or keep-alive) or whose sole `data` payload is the `[DONE]`
-/// sentinel, matching the SSE specification's handling of `data`, `data:value`,
-/// and `data: value` field forms.
-///
-/// # Errors
-///
-/// Returns [`StreamError::MalformedEvent`] when a `data` payload is present but
-/// is not a JSON object carrying a string `type`. Such a block is malformed
-/// framing: silently dropping it would truncate the client-visible stream and
-/// could turn a real failure into a successful-but-incomplete response, so the
-/// caller fails closed instead.
-fn parse_event_block(block: &str) -> Result<Option<SseEvent>, StreamError> {
-    let Some(data) = collect_data_field(block) else {
-        return Ok(None);
-    };
-    // The OpenAI-style `[DONE]` sentinel is not Anthropic JSON; skip it rather
-    // than fail so a backend that emits it does not poison the stream.
-    if data == "[DONE]" {
-        return Ok(None);
-    }
-    let data: Value = serde_json::from_str(&data).map_err(|_invalid_json| StreamError::MalformedEvent)?;
-    if data.get("type").and_then(Value::as_str).is_none() {
-        return Err(StreamError::MalformedEvent);
-    }
-    Ok(Some(SseEvent { data }))
-}
-
-/// Concatenate an SSE block's `data` field lines, or `None` if it carries none.
-///
-/// Joins multiple `data:` lines with a newline per the SSE specification and
-/// accepts the `data`, `data:value`, and `data: value` field forms.
-fn collect_data_field(block: &str) -> Option<Cow<'_, str>> {
-    let mut data: Option<Cow<'_, str>> = None;
-    for line in block.lines() {
-        let field = if line == "data" {
-            Some("")
-        } else {
-            line.strip_prefix("data:")
-                .map(|value| value.strip_prefix(' ').unwrap_or(value))
-        };
-        if let Some(field) = field {
-            match &mut data {
-                Some(existing) => {
-                    let existing = existing.to_mut();
-                    existing.push('\n');
-                    existing.push_str(field);
-                },
-                None => data = Some(Cow::Borrowed(field)),
-            }
-        }
-    }
-    data
-}
-
-// -----------------------------------------------------------------------------
-// Cross-round logical stream
-// -----------------------------------------------------------------------------
-
-/// One round's incremental reconstruction and forwarding bookkeeping.
-#[derive(Default)]
-struct RoundState {
-    /// Base message object captured from this round's `message_start`.
-    message: Option<Value>,
-    /// Reconstructed content blocks, dense by backend block index.
-    content: Vec<Value>,
-    /// Accumulated text per backend block index, materialized once at reconstruct.
-    partial_text: HashMap<usize, String>,
-    /// Accumulated tool `input_json` text per backend block index.
-    partial_json: HashMap<usize, String>,
-    /// Accumulated extended-thinking text per backend block index.
-    partial_thinking: HashMap<usize, String>,
-    /// Accumulated thinking-block signature per backend block index.
-    partial_signature: HashMap<usize, String>,
-    /// Backend block index -> client output index for forwarded blocks.
-    forwarded: HashMap<usize, u64>,
-    /// Backend index of a suppressed managed `WebSearch` block, if any.
-    suppressed_web_search: Option<usize>,
-    /// Stop reason captured from this round's `message_delta`.
-    stop_reason: Option<String>,
-    /// Matched stop sequence captured from this round's `message_delta`.
-    stop_sequence: Option<String>,
-    /// Container metadata captured from this round's `message_delta`.
-    container: Option<Value>,
-    /// Stop details captured from this round's `message_delta`.
-    stop_details: Option<Value>,
-    /// Output tokens captured from this round's `message_delta`.
-    round_output_tokens: u64,
-    /// Input tokens captured from this round's `message_start` / `message_delta`.
-    round_input_tokens: Option<u64>,
-    /// Cache-read input tokens captured from this round's usage.
-    round_cache_read: Option<u64>,
-    /// Cache-creation input tokens captured from this round's usage.
-    round_cache_creation: Option<u64>,
-    /// Output-token details captured from this round's usage.
-    round_output_tokens_details: Option<Value>,
-    /// Server-tool usage captured from this round's usage.
-    round_server_tool_use: Option<Value>,
-    /// Cumulative bytes of streamed text/tool-input fragments this round.
-    ///
-    /// Bounds attacker-controlled fragment growth before the round message is
-    /// reconstructed, independent of the final serialized-size check.
-    accumulated_bytes: usize,
-    /// Whether this round's closing `message_stop` frame arrived.
-    ///
-    /// A clean transport EOF can still leave the Messages lifecycle incomplete;
-    /// without `message_stop` the round was truncated and must fail closed.
-    message_stopped: bool,
-    /// Backend indices of content blocks started but not yet closed.
-    ///
-    /// Tracked by identity, not a bare count: a stray or duplicate
-    /// `content_block_stop` must not silently cancel a different genuinely-open
-    /// block. A non-empty set at round end means a block was left open by a
-    /// truncated stream, so the round must fail closed rather than fabricate
-    /// success.
-    open_blocks: HashSet<usize>,
-}
 
 /// The loop transition selected after finishing one backend round.
 #[derive(Debug, PartialEq, Eq)]
@@ -422,671 +28,100 @@ pub(super) struct FinishOutcome {
     pub(super) terminal: Vec<u8>,
 }
 
-/// A coherent Anthropic Messages SSE lifecycle assembled across IRR rounds.
+/// Web search classification and cross-round replay.
 pub(super) struct LogicalStream {
-    /// Per-round native-Messages SSE parser.
-    parser: SseParser,
-    /// Maximum reconstructed round-message size before failing closed.
-    max_body_bytes: usize,
-    /// Maximum retained partial-event bytes for the SSE parser.
-    max_partial_event_bytes: usize,
-    /// Configured per-query UTF-8 bound for managed search queries.
+    /// Shared parser, reconstructed blocks and cross-round usage.
+    messages: MessagesStream,
+    /// Configured limit for a managed search query.
     max_query_bytes: usize,
-    /// Whether the client-visible `message_start` has been emitted.
-    message_started: bool,
-    /// Next client-visible content-block index to assign (monotonic across rounds).
-    next_output_index: u64,
-    /// Aggregated output tokens across all rounds, for the terminal `message_delta`.
-    output_tokens_total: u64,
-    /// Aggregated input tokens across rounds, `None` until any round reports usage.
-    input_tokens_total: Option<u64>,
-    /// Aggregated cache-read input tokens across rounds, `None` until reported.
-    cache_read_total: Option<u64>,
-    /// Aggregated cache-creation input tokens across rounds.
-    cache_creation_total: Option<u64>,
-    /// Aggregated output-token details across rounds.
-    output_tokens_details_total: Option<Value>,
-    /// Aggregated server-tool usage across rounds.
-    server_tool_use_total: Option<Value>,
-    /// Reconstructed managed-round message bytes retained for IRR re-entry.
-    ///
-    /// A streamed round leaves the IRR buffered response body empty, so re-entry
-    /// recovers the pending search from this reconstruction instead.
+    /// Completed managed round awaiting IRR re-entry.
     reconstructed: Option<Vec<u8>>,
-    /// Whether the stream has failed closed; once set, no more bytes are forwarded.
-    failed: bool,
-    /// Current round reconstruction and forwarding state.
-    round: RoundState,
+    /// Whether this round hid a model-facing web search block.
+    suppressed: bool,
 }
 
 impl LogicalStream {
-    /// Create a logical stream bounded by the loop's body, partial-event, and
-    /// per-query caps.
+    /// Create a bounded web search stream.
     pub(super) fn new(max_body_bytes: usize, max_partial_event_bytes: usize, max_query_bytes: usize) -> Self {
         Self {
-            parser: SseParser::default(),
-            max_body_bytes,
-            max_partial_event_bytes,
+            messages: MessagesStream::new(max_body_bytes, max_partial_event_bytes),
             max_query_bytes,
-            message_started: false,
-            next_output_index: 0,
-            output_tokens_total: 0,
-            input_tokens_total: None,
-            cache_read_total: None,
-            cache_creation_total: None,
-            output_tokens_details_total: None,
-            server_tool_use_total: None,
             reconstructed: None,
-            failed: false,
-            round: RoundState::default(),
+            suppressed: false,
         }
     }
 
-    /// Whether the stream has failed closed and forwards nothing further.
+    /// Whether a terminal error has ended the lifecycle.
     pub(super) fn has_failed(&self) -> bool {
-        self.failed
+        self.messages.has_failed()
     }
 
-    /// Whether the client-visible `message_start` has already been forwarded.
-    ///
-    /// Once true the client is mid-stream on a committed 200 SSE lifecycle, so a
-    /// later untransformable round must fail closed rather than pass raw bytes
-    /// through and corrupt the open stream.
+    /// Whether the first `message_start` has reached the client.
     pub(super) fn has_started(&self) -> bool {
-        self.message_started
+        self.messages.has_started()
     }
 
-    /// Poison the stream so subsequent chunks forward nothing further.
-    ///
-    /// The caller emits the single terminal `error` event; this only records that
-    /// the stream has failed closed.
+    /// Stop forwarding after an upstream or transport error.
     pub(super) fn fail(&mut self) {
-        self.failed = true;
+        self.messages.fail();
     }
 
-    /// Take the reconstructed managed-round message bytes retained for re-entry.
+    /// Move the classified assistant turn into the next model request.
     pub(super) fn take_reconstructed(&mut self) -> Option<Vec<u8>> {
         self.reconstructed.take()
     }
 
-    /// Reset per-round state before a resumed inference round.
+    /// Reset per-round reconstruction while preserving the client lifecycle.
     pub(super) fn begin_round(&mut self) {
-        self.parser = SseParser::default();
-        self.round = RoundState::default();
+        self.messages.begin_round();
+        self.suppressed = false;
     }
 
-    /// Process one response chunk, returning client-visible forwarded bytes.
-    ///
-    /// Once the stream has failed closed, further chunks are dropped so exactly
-    /// one terminal `error` event reaches the client.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StreamError`] on malformed upstream framing or a suppression
-    /// invariant violation, so the caller can fail closed. The stream is then
-    /// poisoned: subsequent calls yield nothing.
+    /// Forward Messages events incrementally, hiding the managed search call.
     pub(super) fn on_chunk(&mut self, chunk: &[u8], end_of_stream: bool) -> Result<Vec<u8>, StreamError> {
-        if self.failed {
-            return Ok(Vec::new());
-        }
-        self.process_chunk(chunk, end_of_stream)
-            .inspect_err(|_| self.failed = true)
-    }
-
-    /// Parse and forward one chunk without the fail-closed guard.
-    fn process_chunk(&mut self, chunk: &[u8], end_of_stream: bool) -> Result<Vec<u8>, StreamError> {
-        let events = self.parser.push(chunk, end_of_stream, self.max_partial_event_bytes)?;
         let mut output = Vec::new();
-        for event in events {
-            // A forwarded upstream `error` poisons the stream; stop processing so
-            // no further frames follow the terminal error.
-            if self.failed {
-                break;
+        self.messages.write_chunk(chunk, end_of_stream, &mut output, |block| {
+            let suppress = block["type"] == "tool_use" && block["name"] == "WebSearch";
+            self.suppressed |= suppress;
+            if suppress {
+                BlockPresentation::Suppress
+            } else {
+                BlockPresentation::Forward
             }
-            self.process_event(event, &mut output)?;
-        }
+        })?;
         Ok(output)
     }
 
-    /// Reconstruct and forward one parsed SSE event.
-    fn process_event(&mut self, event: SseEvent, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        match event_kind(&event.data) {
-            EventKind::MessageStart => {
-                self.on_message_start(&event.data, output);
-                Ok(())
-            },
-            EventKind::ContentBlockStart => self.on_block_start(event.data, output),
-            EventKind::ContentBlockDelta => self.on_block_delta(event.data, output),
-            EventKind::ContentBlockStop => self.on_block_stop(event.data, output),
-            EventKind::MessageDelta => {
-                self.on_message_delta(&event.data);
-                Ok(())
-            },
-            // Keep-alives are forwarded so the client connection stays live while
-            // intermediate rounds run.
-            EventKind::Ping => {
-                emit_event(output, "ping", &event.data);
-                Ok(())
-            },
-            // An upstream `error` after HTTP 200 is a real backend failure: forward
-            // it verbatim and poison the stream so `finish_round` never fabricates a
-            // synthetic success terminal in its place.
-            EventKind::Error => {
-                emit_event(output, "error", &event.data);
-                self.failed = true;
-                Ok(())
-            },
-            // `message_stop` closes the round's Messages lifecycle. It is not
-            // forwarded per round (the terminal lifecycle is emitted once by
-            // `finish_round`), but it is recorded so a round truncated before it
-            // arrives fails closed instead of fabricating a successful terminal.
-            EventKind::MessageStop => {
-                self.round.message_stopped = true;
-                Ok(())
-            },
-            // Every other unmodeled event is deferred without forwarding.
-            EventKind::Other => Ok(()),
-        }
-    }
-
-    /// Capture the base message and forward the client-visible `message_start`.
-    fn on_message_start(&mut self, data: &Value, output: &mut Vec<u8>) {
-        if let Some(message) = data.get("message") {
-            if let Some(usage) = message.get("usage") {
-                self.capture_round_usage(usage);
-            }
-            self.round.message = Some(message.clone());
-        }
-        if !self.message_started {
-            self.message_started = true;
-            emit_event(output, "message_start", data);
-        }
-    }
-
-    /// Capture per-round input and cache-read token counts from a usage object.
-    ///
-    /// The final `message_delta` may repeat these fields; the last value seen
-    /// wins for the round, and rounds are summed in [`Self::finish_round`].
-    fn capture_round_usage(&mut self, usage: &Value) {
-        if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
-            self.round.round_input_tokens = Some(input);
-        }
-        if let Some(cache_read) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-            self.round.round_cache_read = Some(cache_read);
-        }
-        if let Some(cache_creation) = usage.get("cache_creation_input_tokens").and_then(Value::as_u64) {
-            self.round.round_cache_creation = Some(cache_creation);
-        }
-        if let Some(output_tokens_details) = usage.get("output_tokens_details") {
-            self.round.round_output_tokens_details = Some(output_tokens_details.clone());
-        }
-        if let Some(server_tool_use) = usage.get("server_tool_use") {
-            self.round.round_server_tool_use = Some(server_tool_use.clone());
-        }
-    }
-
-    /// Assign a client output index to a content block and forward its start.
-    ///
-    /// The managed `WebSearch` `tool_use` block is suppressed entirely: it is
-    /// neither forwarded nor assigned a client output index, so its subsequent
-    /// delta and stop frames are dropped as well.
-    fn on_block_start(&mut self, data: Value, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        let index = block_index(&data)?;
-        // Content blocks are dense and sequential in the Anthropic wire format. A
-        // backend-controlled index that skips ahead would force an unbounded
-        // sparse allocation, so a non-sequential index fails closed instead.
-        if index != self.round.content.len() {
-            return Err(StreamError::MalformedEvent);
-        }
-        // Reconstruct every block, including the suppressed managed call, so the
-        // finished message can be classified exactly as the buffered loop would.
-        let block = data.get("content_block").cloned().unwrap_or(Value::Null);
-        self.round.content.push(block);
-        // Track every started block by index (suppressed calls included) so a
-        // block left open by a truncated stream is detected at round end. The
-        // index is fresh: it was validated equal to the pre-push content length.
-        self.round.open_blocks.insert(index);
-        if is_web_search_tool_use(&data) {
-            self.round.suppressed_web_search = Some(index);
-            return Ok(());
-        }
-        let output_index = self.next_output_index;
-        self.next_output_index += 1;
-        self.round.forwarded.insert(index, output_index);
-        emit_remapped(output, "content_block_start", data, output_index);
-        Ok(())
-    }
-
-    /// Reconstruct and, for forwarded blocks, forward a content-block delta.
-    fn on_block_delta(&mut self, data: Value, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        let index = block_index(&data)?;
-        self.accumulate_delta(index, &data)?;
-        if let Some(output_index) = self.round.forwarded.get(&index).copied() {
-            emit_remapped(output, "content_block_delta", data, output_index);
-        }
-        Ok(())
-    }
-
-    /// Finalize text and tool input and, for forwarded blocks, forward a stop.
-    fn on_block_stop(&mut self, data: Value, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        let index = block_index(&data)?;
-        // A stop must close a currently-open block. A stray (never-started) or
-        // duplicate stop is rejected so it cannot silently cancel a different
-        // genuinely-open block and mask a truncated round from the completeness
-        // gate. Reject before any materialize/forward side effects.
-        if !self.round.open_blocks.remove(&index) {
-            return Err(StreamError::MalformedEvent);
-        }
-        materialize_string_field(&mut self.round.content, index, "text", &mut self.round.partial_text);
-        materialize_string_field(
-            &mut self.round.content,
-            index,
-            "thinking",
-            &mut self.round.partial_thinking,
-        );
-        materialize_string_field(
-            &mut self.round.content,
-            index,
-            "signature",
-            &mut self.round.partial_signature,
-        );
-        if let Some(fragment) = self.round.partial_json.remove(&index)
-            && let Ok(input) = serde_json::from_str::<Value>(&fragment)
-            && let Some(block) = self.round.content.get_mut(index)
-        {
-            block["input"] = input;
-        }
-        if let Some(output_index) = self.round.forwarded.get(&index).copied() {
-            emit_remapped(output, "content_block_stop", data, output_index);
-        }
-        Ok(())
-    }
-
-    /// Capture the round's stop reason and output-token count; do not forward.
-    fn on_message_delta(&mut self, data: &Value) {
-        if let Some(delta) = data.get("delta") {
-            if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
-                self.round.stop_reason = Some(stop_reason.to_owned());
-            }
-            if let Some(stop_sequence) = delta.get("stop_sequence") {
-                self.round.stop_sequence = stop_sequence.as_str().map(ToOwned::to_owned);
-            }
-            if let Some(container) = delta.get("container") {
-                self.round.container = Some(container.clone());
-            }
-            if let Some(stop_details) = delta.get("stop_details") {
-                self.round.stop_details = Some(stop_details.clone());
-            }
-        }
-        if let Some(usage) = data.get("usage") {
-            if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
-                self.round.round_output_tokens = tokens;
-            }
-            self.capture_round_usage(usage);
-        }
-    }
-
-    /// Accumulate one content-block delta into a per-index buffer.
-    ///
-    /// Text and tool-input fragments are appended to mutable buffers and
-    /// materialized once at block stop, so reconstruction stays linear rather
-    /// than recopying the accumulated content on every delta.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamError::Oversized`] once the cumulative fragment bytes for
-    /// the round exceed the configured body-size bound, failing closed before the
-    /// round message is reconstructed.
-    fn accumulate_delta(&mut self, index: usize, data: &Value) -> Result<(), StreamError> {
-        let Some(delta) = data.get("delta") else {
-            return Ok(());
-        };
-        // Each streamed delta carries its fragment under a type-specific field.
-        // Text and tool-input reconstruct the client-visible content; thinking
-        // and signature reconstruct the extended-thinking block so the assistant
-        // turn replayed on re-entry keeps its verifiable signature.
-        let Some(delta_type) = delta.get("type").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let field = match delta_type {
-            "text_delta" => "text",
-            "input_json_delta" => "partial_json",
-            "thinking_delta" => "thinking",
-            "signature_delta" => "signature",
-            _ => return Ok(()),
-        };
-        let Some(fragment) = delta.get(field).and_then(Value::as_str) else {
-            return Ok(());
-        };
-        // Charge before taking the target borrow so the running budget stays a
-        // single mutable borrow of `self`.
-        self.charge_fragment_bytes(fragment.len())?;
-        let bucket = match delta_type {
-            "text_delta" => &mut self.round.partial_text,
-            "input_json_delta" => &mut self.round.partial_json,
-            "thinking_delta" => &mut self.round.partial_thinking,
-            "signature_delta" => &mut self.round.partial_signature,
-            _ => return Ok(()),
-        };
-        bucket.entry(index).or_default().push_str(fragment);
-        Ok(())
-    }
-
-    /// Charge `bytes` against the round's cumulative fragment budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamError::Oversized`] when the running total exceeds the
-    /// configured body-size bound.
-    fn charge_fragment_bytes(&mut self, bytes: usize) -> Result<(), StreamError> {
-        self.round.accumulated_bytes = self.round.accumulated_bytes.saturating_add(bytes);
-        if self.round.accumulated_bytes > self.max_body_bytes {
-            return Err(StreamError::Oversized);
-        }
-        Ok(())
-    }
-
-    /// Reconstruct this round's Messages JSON from the accumulated blocks.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamError::MalformedEvent`] when the captured `message_start`
-    /// object is missing or serialization fails, or [`StreamError::Oversized`]
-    /// when the reconstructed message exceeds the configured body-size bound.
-    fn reconstruct_round_message(&mut self) -> Result<Vec<u8>, StreamError> {
-        // Materialize any fragments whose `content_block_stop` never arrived
-        // (a truncated block) so the reconstruction is faithful for re-entry.
-        self.flush_pending_fragments();
-        let mut message = self.round.message.take().ok_or(StreamError::MalformedEvent)?;
-        let object = message.as_object_mut().ok_or(StreamError::MalformedEvent)?;
-        object.insert(
-            "content".to_owned(),
-            Value::Array(std::mem::take(&mut self.round.content)),
-        );
-        if let Some(stop_reason) = &self.round.stop_reason {
-            object.insert("stop_reason".to_owned(), Value::from(stop_reason.as_str()));
-        }
-        match object.get_mut("usage").and_then(Value::as_object_mut) {
-            Some(usage) => {
-                usage.insert("output_tokens".to_owned(), Value::from(self.round.round_output_tokens));
-            },
-            None => {
-                object.insert(
-                    "usage".to_owned(),
-                    json!({ "output_tokens": self.round.round_output_tokens }),
-                );
-            },
-        }
-        let bytes = serde_json::to_vec(&message).map_err(|_serialization_failed| StreamError::MalformedEvent)?;
-        if bytes.len() > self.max_body_bytes {
-            return Err(StreamError::Oversized);
-        }
-        Ok(bytes)
-    }
-
-    /// Materialize any text/thinking/tool-input fragments still pending at reconstruct.
-    fn flush_pending_fragments(&mut self) {
-        flush_string_fragments(&mut self.round.content, "text", &mut self.round.partial_text);
-        flush_string_fragments(&mut self.round.content, "thinking", &mut self.round.partial_thinking);
-        flush_string_fragments(&mut self.round.content, "signature", &mut self.round.partial_signature);
-        for (index, fragment) in std::mem::take(&mut self.round.partial_json) {
-            if let Ok(input) = serde_json::from_str::<Value>(&fragment)
-                && let Some(block) = self.round.content.get_mut(index)
-            {
-                block["input"] = input;
-            }
-        }
-    }
-
-    /// Reconstruct the round's message, classify it, and select the loop action.
-    ///
-    /// A managed `WebSearch` call yields [`RoundAction::Loop`] with no terminal
-    /// bytes; a final answer yields [`RoundAction::Done`] with the terminal
-    /// `message_delta` / `message_stop` lifecycle.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StreamError`] when the reconstructed message is malformed or
-    /// carries an invalid managed call, so the caller can fail closed.
+    /// Classify the reconstructed message and close or continue the stream.
     pub(super) fn finish_round(&mut self) -> Result<FinishOutcome, StreamError> {
-        // A forwarded upstream `error` already reached the client: end the loop
-        // without reconstructing or fabricating a synthetic success terminal.
-        if self.failed {
+        if self.has_failed() {
             return Ok(FinishOutcome {
                 action: RoundAction::Done,
                 terminal: Vec::new(),
             });
         }
-        let bytes = self.reconstruct_round_message()?;
-        self.output_tokens_total = self.output_tokens_total.saturating_add(self.round.round_output_tokens);
-        self.aggregate_round_usage();
+        let message = self.messages.reconstruct_message()?;
+        let bytes = self.messages.serialize_round(&message)?;
         match super::classify_response(&bytes, self.max_query_bytes) {
-            super::ResponseDecision::Managed(_) => self.finish_managed_round(bytes),
-            // A suppressed WebSearch block on a non-managed round would silently
-            // drop a tool call from the client-visible stream: fail closed.
-            super::ResponseDecision::Done if self.round.suppressed_web_search.is_some() => {
-                Err(StreamError::SuppressionMismatch)
+            super::ResponseDecision::Managed(_) => {
+                self.messages.require_complete_lifecycle()?;
+                self.messages.begin_round();
+                self.reconstructed = Some(bytes);
+                Ok(FinishOutcome {
+                    action: RoundAction::Loop,
+                    terminal: Vec::new(),
+                })
             },
-            super::ResponseDecision::Done => self.finish_terminal_round(),
+            super::ResponseDecision::Done if self.suppressed => Err(StreamError::SuppressionMismatch),
+            super::ResponseDecision::Done => Ok(FinishOutcome {
+                action: RoundAction::Done,
+                terminal: self.messages.terminal()?,
+            }),
             super::ResponseDecision::InvalidManagedCall => Err(StreamError::InvalidManagedCall),
             super::ResponseDecision::QueryTooLong => Err(StreamError::QueryTooLong {
                 max_bytes: self.max_query_bytes,
             }),
         }
-    }
-
-    /// Complete a managed round: verify the full lifecycle arrived, then retain
-    /// the reconstruction so re-entry can recover the pending search (the
-    /// streamed round leaves the IRR response body empty). A managed round is a
-    /// complete Messages response too, so re-entering on a truncated one would
-    /// replay a partial assistant turn.
-    fn finish_managed_round(&mut self, bytes: Vec<u8>) -> Result<FinishOutcome, StreamError> {
-        self.require_complete_lifecycle()?;
-        self.reconstructed = Some(bytes);
-        Ok(FinishOutcome {
-            action: RoundAction::Loop,
-            terminal: Vec::new(),
-        })
-    }
-
-    /// Complete the terminal round: verify the full lifecycle arrived (stop
-    /// reason, every block closed, and `message_stop`), then emit the aggregated
-    /// terminal `message_delta` / `message_stop`. A premature EOF that skips any
-    /// of these must not fabricate a successful `end_turn` and misreport a
-    /// truncated round as complete.
-    fn finish_terminal_round(&self) -> Result<FinishOutcome, StreamError> {
-        self.require_complete_lifecycle()?;
-        let stop_reason = self.round.stop_reason.clone().ok_or(StreamError::IncompleteStream)?;
-        Ok(FinishOutcome {
-            action: RoundAction::Done,
-            terminal: self.build_terminal(&stop_reason),
-        })
-    }
-
-    /// Fail closed unless this round delivered a complete Messages lifecycle.
-    ///
-    /// A clean round carries a stop reason (from `message_delta`), closes every
-    /// content block with `content_block_stop`, and ends with `message_stop`. A
-    /// clean transport EOF can still leave any of these missing; such a round is
-    /// truncated and must not be reconstructed into a successful terminal or
-    /// re-entered as if complete.
-    fn require_complete_lifecycle(&self) -> Result<(), StreamError> {
-        if self.round.stop_reason.is_some() && self.round.message_stopped && self.round.open_blocks.is_empty() {
-            Ok(())
-        } else {
-            Err(StreamError::IncompleteStream)
-        }
-    }
-
-    /// Fold this round's input and cache-read tokens into the running totals.
-    fn aggregate_round_usage(&mut self) {
-        if let Some(input) = self.round.round_input_tokens {
-            self.input_tokens_total = Some(self.input_tokens_total.unwrap_or(0).saturating_add(input));
-        }
-        if let Some(cache_read) = self.round.round_cache_read {
-            self.cache_read_total = Some(self.cache_read_total.unwrap_or(0).saturating_add(cache_read));
-        }
-        if let Some(cache_creation) = self.round.round_cache_creation {
-            self.cache_creation_total = Some(self.cache_creation_total.unwrap_or(0).saturating_add(cache_creation));
-        }
-        aggregate_usage_value(
-            &mut self.output_tokens_details_total,
-            self.round.round_output_tokens_details.take(),
-        );
-        aggregate_usage_value(&mut self.server_tool_use_total, self.round.round_server_tool_use.take());
-    }
-
-    /// Build the terminal `message_delta` and `message_stop` frames.
-    ///
-    /// The delta and its usage are serialized through the shared Anthropic wire
-    /// types so the schema (container, stop details, and every usage field) is
-    /// identical to the non-streaming translator, and usage is aggregated across
-    /// every IRR round rather than reporting only the final round's output.
-    fn build_terminal(&self, stop_reason: &str) -> Vec<u8> {
-        let usage = super::super::wire::MessageDeltaUsage {
-            cache_creation_input_tokens: self.cache_creation_total,
-            cache_read_input_tokens: self.cache_read_total,
-            input_tokens: self.input_tokens_total,
-            output_tokens: self.output_tokens_total,
-            output_tokens_details: self.output_tokens_details_total.clone(),
-            server_tool_use: self.server_tool_use_total.clone(),
-        };
-        let mut out = Vec::new();
-        emit_event(
-            &mut out,
-            "message_delta",
-            &json!({
-                "type": "message_delta",
-                "delta": {
-                    "container": self.round.container.clone().unwrap_or(Value::Null),
-                    "stop_details": self.round.stop_details.clone().unwrap_or(Value::Null),
-                    "stop_reason": stop_reason,
-                    "stop_sequence": self.round.stop_sequence
-                },
-                "usage": usage
-            }),
-        );
-        emit_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
-        out
-    }
-}
-
-/// Aggregate a usage object whose fields are cumulative counters.
-fn aggregate_usage_value(total: &mut Option<Value>, incoming: Option<Value>) {
-    let Some(incoming) = incoming else {
-        return;
-    };
-    if incoming.is_null() {
-        return;
-    }
-    let Value::Object(incoming_object) = incoming else {
-        *total = Some(incoming);
-        return;
-    };
-    let Some(Value::Object(total_object)) = total.as_mut() else {
-        *total = Some(Value::Object(incoming_object));
-        return;
-    };
-    for (key, value) in incoming_object {
-        let Some(incoming_number) = value.as_u64() else {
-            total_object.insert(key, value);
-            continue;
-        };
-        let current_number = total_object.get(&key).and_then(Value::as_u64).unwrap_or(0);
-        total_object.insert(key, Value::from(current_number.saturating_add(incoming_number)));
-    }
-}
-
-/// Whether a `content_block_start` payload begins a managed `WebSearch` call.
-fn is_web_search_tool_use(data: &Value) -> bool {
-    let block = &data["content_block"];
-    block.get("type").and_then(Value::as_str) == Some("tool_use")
-        && block.get("name").and_then(Value::as_str) == Some("WebSearch")
-}
-
-/// Materialize one index's pending string fragment into a content-block field.
-///
-/// `content` and `buffer` are passed as disjoint borrows so the caller keeps a
-/// single mutable borrow of the surrounding round state.
-fn materialize_string_field(content: &mut [Value], index: usize, field: &str, buffer: &mut HashMap<usize, String>) {
-    if let Some(value) = buffer.remove(&index)
-        && let Some(block) = content.get_mut(index)
-    {
-        block[field] = Value::from(value);
-    }
-}
-
-/// Materialize every remaining pending string fragment into its content block.
-fn flush_string_fragments(content: &mut [Value], field: &str, buffer: &mut HashMap<usize, String>) {
-    for (index, value) in std::mem::take(buffer) {
-        if let Some(block) = content.get_mut(index) {
-            block[field] = Value::from(value);
-        }
-    }
-}
-
-/// Read the backend content-block `index` from an SSE event payload.
-fn block_index(data: &Value) -> Result<usize, StreamError> {
-    data.get("index")
-        .and_then(Value::as_u64)
-        .and_then(|index| usize::try_from(index).ok())
-        .ok_or(StreamError::MalformedEvent)
-}
-
-/// Payload discriminator for Anthropic SSE events.
-#[derive(Clone, Copy)]
-enum EventKind {
-    /// `message_start`.
-    MessageStart,
-    /// `content_block_start`.
-    ContentBlockStart,
-    /// `content_block_delta`.
-    ContentBlockDelta,
-    /// `content_block_stop`.
-    ContentBlockStop,
-    /// `message_delta`.
-    MessageDelta,
-    /// `ping` keepalive.
-    Ping,
-    /// Upstream `error`.
-    Error,
-    /// `message_stop`.
-    MessageStop,
-    /// Any other event type.
-    Other,
-}
-
-/// Classify a payload by its JSON `type` field.
-fn event_kind(data: &Value) -> EventKind {
-    match data.get("type").and_then(Value::as_str) {
-        Some("message_start") => EventKind::MessageStart,
-        Some("content_block_start") => EventKind::ContentBlockStart,
-        Some("content_block_delta") => EventKind::ContentBlockDelta,
-        Some("content_block_stop") => EventKind::ContentBlockStop,
-        Some("message_delta") => EventKind::MessageDelta,
-        Some("ping") => EventKind::Ping,
-        Some("error") => EventKind::Error,
-        Some("message_stop") => EventKind::MessageStop,
-        _ => EventKind::Other,
-    }
-}
-
-/// Emit an SSE event with its content-block `index` remapped to the client index.
-fn emit_remapped(output: &mut Vec<u8>, event_type: &str, mut data: Value, output_index: u64) {
-    remap_index(&mut data, output_index);
-    emit_event(output, event_type, &data);
-}
-
-/// Replace the payload `index` with the client-visible output index.
-fn remap_index(data: &mut Value, output_index: u64) {
-    let Some(object) = data.as_object_mut() else {
-        return;
-    };
-    match object.get_mut("index") {
-        Some(index) => *index = Value::from(output_index),
-        None => {
-            object.insert("index".to_owned(), Value::from(output_index));
-        },
     }
 }
 
@@ -1151,39 +186,6 @@ fn anthropic_error(error: &StreamError) -> (super::super::wire::ErrorType, Cow<'
     }
 }
 
-/// Encode one canonical single-line Anthropic SSE event.
-fn emit_event(output: &mut Vec<u8>, event_type: &str, data: &Value) {
-    emit_framed_event(output, event_type, |out| serde_json::to_writer(out, data));
-}
-
-/// Write `event:` / `data:` framing, rolling back on payload failure.
-fn emit_framed_event<E>(
-    output: &mut Vec<u8>,
-    event_type: &str,
-    write_payload: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
-) {
-    let start = output.len();
-    output.extend_from_slice(b"event: ");
-    output.extend_from_slice(event_type.as_bytes());
-    output.extend_from_slice(b"\ndata: ");
-    if write_json_or_rollback(output, write_payload).is_err() {
-        output.truncate(start);
-        return;
-    }
-    output.extend_from_slice(b"\n\n");
-}
-
-/// Write into `output`, restoring the pre-write length on failure.
-fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>) -> Result<(), E>) -> Result<(), E> {
-    let json_start = output.len();
-    match write(output) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            output.truncate(json_start);
-            Err(error)
-        },
-    }
-}
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -1195,9 +197,7 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
     reason = "tests"
 )]
 mod tests {
-    use std::borrow::Cow;
-
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -1300,215 +300,6 @@ mod tests {
             }),
         ));
         bytes
-    }
-
-    #[test]
-    fn parses_one_complete_event() {
-        let mut parser = SseParser::default();
-        let chunk = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
-
-        let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["type"], "message_start");
-    }
-
-    #[test]
-    fn buffers_partial_event_across_chunks() {
-        let mut parser = SseParser::default();
-
-        let first = parser
-            .push(
-                b"event: content_block_delta\ndata: {\"type\":\"conten",
-                false,
-                MAX_PARTIAL,
-            )
-            .unwrap();
-        assert!(first.is_empty(), "an incomplete event must yield nothing yet");
-
-        let second = parser
-            .push(b"t_block_delta\",\"index\":0}\n\n", false, MAX_PARTIAL)
-            .unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].data["type"], "content_block_delta");
-        assert_eq!(second[0].data["index"], 0);
-    }
-
-    #[test]
-    fn buffers_incomplete_utf8_across_chunks() {
-        let mut parser = SseParser::default();
-        // "é" is 0xC3 0xA9; split the two bytes across chunks inside the JSON.
-        let mut first_chunk = b"data: {\"type\":\"x\",\"t\":\"".to_vec();
-        first_chunk.push(0xC3);
-
-        let first = parser.push(&first_chunk, false, MAX_PARTIAL).unwrap();
-        assert!(first.is_empty());
-
-        let mut second_chunk = vec![0xA9];
-        second_chunk.extend_from_slice(b"\"}\n\n");
-        let second = parser.push(&second_chunk, false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].data["t"], "é");
-    }
-
-    #[test]
-    fn buffers_four_byte_utf8_split_one_byte_per_chunk() {
-        // A 4-byte code point (😀 = 0xF0 0x9F 0x98 0x80) delivered one byte per
-        // chunk exercises the retained-tail path re-stashing a *still-incomplete*
-        // sequence across successive chunks, not just a single 2-byte split: the
-        // first byte stashes with an empty tail, the second and third re-stash a
-        // non-empty tail that is not yet a full code point, and the fourth
-        // completes it.
-        let mut parser = SseParser::default();
-        let prefix = b"data: {\"type\":\"x\",\"t\":\"";
-        let suffix = b"\"}\n\n";
-
-        assert!(parser.push(prefix, false, MAX_PARTIAL).unwrap().is_empty());
-        for byte in "😀".as_bytes() {
-            assert!(
-                parser.push(&[*byte], false, MAX_PARTIAL).unwrap().is_empty(),
-                "an incomplete code point yields no event until its final byte arrives",
-            );
-        }
-        let events = parser.push(suffix, false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["t"], "😀");
-    }
-
-    #[test]
-    fn rejects_invalid_utf8() {
-        let mut parser = SseParser::default();
-        // 0xFF is never valid in UTF-8 (a genuine error, not a truncation).
-        let error = parser.push(&[0xFF, 0xFE], false, MAX_PARTIAL).unwrap_err();
-        assert_eq!(error, StreamError::MalformedUtf8);
-    }
-
-    #[test]
-    fn rejects_incomplete_utf8_at_end_of_stream() {
-        let mut parser = SseParser::default();
-        let error = parser.push(&[0xC3], true, MAX_PARTIAL).unwrap_err();
-        assert_eq!(error, StreamError::MalformedUtf8);
-    }
-
-    #[test]
-    fn parses_crlf_line_endings() {
-        let mut parser = SseParser::default();
-        let chunk = b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
-
-        let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["type"], "message_stop");
-    }
-
-    #[test]
-    fn parses_crlf_terminator_split_across_chunks() {
-        let mut parser = SseParser::default();
-        // The event terminator "\r\n\r\n" is split so the first chunk ends on a
-        // lone "\r": the parser must reassemble it across the chunk boundary
-        // without emitting or dropping the event.
-        let first = parser
-            .push(
-                b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r",
-                false,
-                MAX_PARTIAL,
-            )
-            .unwrap();
-        assert!(first.is_empty(), "the event is incomplete until its terminator arrives");
-
-        let second = parser.push(b"\n", false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].data["type"], "message_stop");
-    }
-
-    #[test]
-    fn parses_text_split_across_many_chunks() {
-        let mut parser = SseParser::default();
-        // A single event delivered one byte at a time must reassemble exactly,
-        // exercising the incremental append path used for the O(n) buffering.
-        let event = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0}\n\n";
-        let mut events = Vec::new();
-        for (offset, byte) in event.iter().enumerate() {
-            let end_of_stream = offset + 1 == event.len();
-            events.extend(parser.push(&[*byte], end_of_stream, MAX_PARTIAL).unwrap());
-        }
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["type"], "content_block_delta");
-        assert_eq!(events[0].data["index"], 0);
-    }
-
-    #[test]
-    fn rejects_oversized_partial_event() {
-        let mut parser = SseParser::default();
-        let chunk = b"data: {\"type\":\"content_block_delta\"";
-
-        let error = parser.push(chunk, false, 8).unwrap_err();
-
-        assert_eq!(error, StreamError::OversizedPartialEvent);
-    }
-
-    #[test]
-    fn rejects_oversized_complete_event() {
-        let mut parser = SseParser::default();
-        // A single *complete* event whose size exceeds the cap must fail closed,
-        // not just the retained partial: a huge complete frame would otherwise be
-        // materialized in full, bypassing the body-size bound.
-        let big = format!("data: {{\"type\":\"x\",\"t\":\"{}\"}}\n\n", "a".repeat(100));
-
-        let error = parser.push(big.as_bytes(), false, 8).unwrap_err();
-
-        assert_eq!(error, StreamError::OversizedPartialEvent);
-    }
-
-    #[test]
-    fn ignores_blocks_without_json_data() {
-        let mut parser = SseParser::default();
-        // A comment-only block and the OpenAI-style [DONE] sentinel carry no
-        // Anthropic JSON `data`; both are dropped rather than surfaced.
-        let events = parser
-            .push(b": keep-alive\n\ndata: [DONE]\n\n", false, MAX_PARTIAL)
-            .unwrap();
-
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn fails_closed_on_invalid_json_data() {
-        let mut parser = SseParser::default();
-        // A complete event block whose `data` is present but not valid JSON is
-        // malformed framing. Silently dropping it would truncate the
-        // client-visible stream, so it must fail closed instead.
-        let error = parser
-            .push(b"data: {oops not json}\n\n", false, MAX_PARTIAL)
-            .unwrap_err();
-
-        assert_eq!(error, StreamError::MalformedEvent);
-    }
-
-    #[test]
-    fn fails_closed_on_data_without_type() {
-        let mut parser = SseParser::default();
-        // Valid JSON with no string `type` cannot be reconstructed as a Messages
-        // event; dropping it silently would truncate the stream, so fail closed.
-        let error = parser.push(b"data: {\"index\":0}\n\n", false, MAX_PARTIAL).unwrap_err();
-
-        assert_eq!(error, StreamError::MalformedEvent);
-    }
-
-    #[test]
-    fn parses_two_events_in_one_chunk() {
-        let mut parser = SseParser::default();
-        let chunk = b"data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"message_stop\"}\n\n";
-
-        let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].data["type"], "ping");
-        assert_eq!(events[1].data["type"], "message_stop");
     }
 
     #[test]
@@ -2039,13 +830,15 @@ mod tests {
     #[test]
     fn finish_round_saturates_output_token_aggregate_on_overflow() {
         let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
-        text_output(&mut stream, &message_start("msg_1"), false);
-        text_output(&mut stream, &text_block(0, "Hi"), false);
+        text_output(&mut stream, &message_start("msg_prior"), false);
+        text_output(&mut stream, &web_search_block(0, "toolu_prior", "rust"), false);
+        text_output(&mut stream, &message_delta("tool_use", u64::MAX - 1), false);
+        text_output(&mut stream, &message_stop(), false);
+        stream.finish_round().unwrap();
+        stream.begin_round();
+        text_output(&mut stream, &message_start("msg_final"), false);
         text_output(&mut stream, &message_delta("end_turn", 5), false);
         text_output(&mut stream, &message_stop(), false);
-        // Pre-load the aggregate one below the ceiling so this round's output
-        // tokens would overflow a plain add.
-        stream.output_tokens_total = u64::MAX - 1;
 
         let terminal = String::from_utf8(stream.finish_round().unwrap().terminal).unwrap();
 
@@ -2432,82 +1225,12 @@ mod tests {
     }
 
     #[test]
-    fn collect_data_field_single_line_borrows_input() {
-        let block = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0}";
-        let collected = collect_data_field(block).expect("data line present");
-        assert!(
-            matches!(collected, Cow::Borrowed(_)),
-            "a single data line must borrow the input block"
-        );
-        let expected = "{\"type\":\"content_block_delta\",\"index\":0}";
-        assert_eq!(&*collected, expected);
-        let data_line = block.split_once("data: ").expect("data prefix").1;
-        assert!(
-            std::ptr::eq(collected.as_ptr(), data_line.as_ptr()),
-            "borrowed data must retain the caller's buffer"
-        );
-    }
-
-    #[test]
-    fn collect_data_field_borrows_data_value_without_space() {
-        let block = "data:{\"type\":\"ping\"}";
-        let collected = collect_data_field(block).expect("data line present");
-        assert!(
-            matches!(collected, Cow::Borrowed(_)),
-            "the data:value form must borrow the input block"
-        );
-        assert_eq!(&*collected, "{\"type\":\"ping\"}");
-        let data_line = block.strip_prefix("data:").expect("data prefix");
-        assert!(
-            std::ptr::eq(collected.as_ptr(), data_line.as_ptr()),
-            "borrowed data:value payload must retain the caller's buffer"
-        );
-    }
-
-    #[test]
-    fn collect_data_field_joins_multiline_data() {
-        let block = "data: {\"type\":\"x\",\ndata: \"i\":1}";
-        let collected = collect_data_field(block).expect("data lines present");
-        assert!(
-            matches!(collected, Cow::Owned(_)),
-            "multiple data lines must allocate a joined payload"
-        );
-        assert_eq!(&*collected, "{\"type\":\"x\",\n\"i\":1}");
-    }
-
-    #[test]
-    fn parses_multiline_data_payload() {
-        let mut parser = SseParser::default();
-        let chunk = b"data: {\"type\":\"ping\",\ndata: \"k\":1}\n\n";
-
-        let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["type"], "ping");
-        assert_eq!(events[0].data["k"], 1);
-    }
-
-    #[test]
-    fn fails_closed_on_malformed_multiline_json() {
-        let mut parser = SseParser::default();
-        let error = parser
-            .push(b"data: {\"type\":\"ping\",\ndata: not-json}\n\n", false, MAX_PARTIAL)
-            .unwrap_err();
-        assert_eq!(
-            error,
-            StreamError::MalformedEvent,
-            "joined multiline data that is not JSON fails closed"
-        );
-    }
-
-    #[test]
     fn forwarded_ping_bytes_match_canonical_sse() {
         let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         let payload = json!({"type": "ping"});
         let out = stream.on_chunk(&sse("ping", &payload), false).unwrap();
-        let mut expected = Vec::new();
-        emit_event(&mut expected, "ping", &payload);
+        let expected = sse("ping", &payload);
         assert_eq!(out, expected, "forwarded ping bytes must match canonical SSE framing");
         assert!(
             out.ends_with(b"\n\n"),
@@ -2577,216 +1300,6 @@ mod tests {
         assert!(
             std::str::from_utf8(&delta_out).unwrap().ends_with("\n\n"),
             "remapped delta keeps the SSE delimiter"
-        );
-    }
-
-    #[test]
-    fn emit_event_matches_legacy_to_string_format_bytes() {
-        let data = json!({
-            "type": "content_block_delta",
-            "index": 1,
-            "delta": {"type": "text_delta", "text": "hello"}
-        });
-        let mut output = Vec::new();
-        emit_event(&mut output, "content_block_delta", &data);
-        let data_str = serde_json::to_string(&data).unwrap_or_default();
-        let expected = format!("event: content_block_delta\ndata: {data_str}\n\n");
-        assert_eq!(
-            output,
-            expected.as_bytes(),
-            "direct Vec writes must match to_string SSE bytes"
-        );
-    }
-
-    #[test]
-    fn write_json_or_rollback_discards_partial_bytes_on_failure() {
-        let mut output = b"event: content_block_delta\ndata: ".to_vec();
-        let prefix = output.clone();
-        let result = write_json_or_rollback(&mut output, |out| {
-            out.extend_from_slice(br#"{"type":"content_block_delta""#);
-            Err(std::io::Error::other("injected write failure"))
-        });
-        assert!(
-            result.is_err(),
-            "injected failure must surface so emit_event can roll back"
-        );
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::Other,
-            "rollback must preserve the original write error"
-        );
-        assert_eq!(
-            output, prefix,
-            "a failed payload write must not leave partial JSON in the SSE buffer"
-        );
-    }
-
-    #[test]
-    fn emit_event_rolls_back_entire_event_on_serialization_failure() {
-        let mut output = b"event: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec();
-        let prefix = output.clone();
-        emit_framed_event(&mut output, "content_block_delta", |out| {
-            out.extend_from_slice(br#"{"type":"content_block_delta""#);
-            Err(std::io::Error::other("injected write failure"))
-        });
-        assert_eq!(
-            output, prefix,
-            "serialization failure must roll back the event prefix and skip the delimiter"
-        );
-    }
-
-    fn emit_event_legacy(output: &mut Vec<u8>, event_type: &str, data: &Value) {
-        output.extend_from_slice(b"event: ");
-        output.extend_from_slice(event_type.as_bytes());
-        output.extend_from_slice(b"\ndata: ");
-        output.extend_from_slice(data.to_string().as_bytes());
-        output.extend_from_slice(b"\n\n");
-    }
-
-    fn collect_data_field_legacy(block: &str) -> Option<String> {
-        let mut data: Option<String> = None;
-        for line in block.lines() {
-            let field = if line == "data" {
-                Some("")
-            } else {
-                line.strip_prefix("data:")
-                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
-            };
-            if let Some(field) = field {
-                match &mut data {
-                    Some(existing) => {
-                        existing.push('\n');
-                        existing.push_str(field);
-                    },
-                    None => data = Some(field.to_owned()),
-                }
-            }
-        }
-        data
-    }
-
-    fn emit_remapped_legacy(output: &mut Vec<u8>, event_type: &str, data: &Value, output_index: u64) {
-        let mut data = data.clone();
-        if let Some(object) = data.as_object_mut() {
-            object.insert("index".to_owned(), Value::from(output_index));
-        }
-        emit_event_legacy(output, event_type, &data);
-    }
-
-    fn representative_delta(text: &str, index: u64) -> Value {
-        json!({
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "text_delta", "text": text}
-        })
-    }
-
-    #[test]
-    fn emit_event_allocates_less_than_legacy_to_string() {
-        let payload = representative_delta(&"x".repeat(4096), 0);
-        let capacity = serde_json::to_vec(&payload).unwrap().len() + 64;
-        let mut via_writer = Vec::with_capacity(capacity);
-        let mut via_string = Vec::with_capacity(capacity);
-        let writer = allocation_counter::measure(|| {
-            emit_event(&mut via_writer, "content_block_delta", &payload);
-        });
-        let string = allocation_counter::measure(|| {
-            emit_event_legacy(&mut via_string, "content_block_delta", &payload);
-        });
-        assert_eq!(
-            via_writer, via_string,
-            "content_block_delta SSE bytes must stay equivalent while measuring allocations"
-        );
-        assert!(
-            writer.bytes_total < string.bytes_total,
-            "to_writer must allocate fewer bytes than to_string: writer={} string={}",
-            writer.bytes_total,
-            string.bytes_total
-        );
-    }
-
-    #[test]
-    fn collect_data_field_single_line_allocates_less_than_legacy_to_owned() {
-        let block = concat!(
-            "data: {\"type\":\"content_block_delta\",\"index\":0,",
-            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}",
-        );
-        let optimized = allocation_counter::measure(|| {
-            std::hint::black_box(collect_data_field(block));
-        });
-        let legacy = allocation_counter::measure(|| {
-            std::hint::black_box(collect_data_field_legacy(block));
-        });
-        assert_eq!(
-            collect_data_field(block).as_deref(),
-            collect_data_field_legacy(block).as_deref(),
-            "borrowed and owned collection must yield the same payload"
-        );
-        assert!(
-            optimized.bytes_total < legacy.bytes_total,
-            "single-line collect must allocate fewer bytes than always-to_owned: optimized={} legacy={}",
-            optimized.bytes_total,
-            legacy.bytes_total
-        );
-    }
-
-    #[test]
-    fn remap_index_avoids_deep_clone_of_delta_payload() {
-        let payload = representative_delta(&"x".repeat(8192), 0);
-
-        let clone_source = payload.clone();
-        let cloned = allocation_counter::measure(|| {
-            let mut data = clone_source.clone();
-            if let Some(object) = data.as_object_mut() {
-                object.insert("index".to_owned(), Value::from(1_u64));
-            }
-            std::hint::black_box(data);
-        });
-
-        let mut owned = payload.clone();
-        let mutated = allocation_counter::measure(|| {
-            remap_index(&mut owned, 1);
-            std::hint::black_box(&owned);
-        });
-
-        assert_eq!(owned["index"], 1, "in-place remap must rewrite the client index");
-        assert_eq!(owned["delta"]["text"], payload["delta"]["text"]);
-        assert!(
-            cloned.bytes_total >= 8192,
-            "deep-cloning a delta payload must copy the text, allocated {}",
-            cloned.bytes_total
-        );
-        assert!(
-            mutated.bytes_total < cloned.bytes_total,
-            "in-place remap must allocate fewer bytes than cloning: mutate={} clone={}",
-            mutated.bytes_total,
-            cloned.bytes_total
-        );
-    }
-
-    #[test]
-    fn remapped_delta_emit_allocates_less_than_legacy_clone() {
-        let payload = representative_delta(&"x".repeat(4096), 0);
-        let capacity = serde_json::to_vec(&payload).unwrap().len() + 64;
-        let mut optimized_out = Vec::with_capacity(capacity);
-        let mut legacy_out = Vec::with_capacity(capacity);
-
-        let owned = payload.clone();
-        let optimized = allocation_counter::measure(|| {
-            emit_remapped(&mut optimized_out, "content_block_delta", owned, 1);
-        });
-        let legacy = allocation_counter::measure(|| {
-            emit_remapped_legacy(&mut legacy_out, "content_block_delta", &payload, 1);
-        });
-        assert_eq!(
-            optimized_out, legacy_out,
-            "in-place remap must emit the same SSE bytes as the clone baseline"
-        );
-        assert!(
-            optimized.bytes_total < legacy.bytes_total,
-            "owned remap+to_writer must allocate fewer bytes than clone+to_string: optimized={} legacy={}",
-            optimized.bytes_total,
-            legacy.bytes_total
         );
     }
 }

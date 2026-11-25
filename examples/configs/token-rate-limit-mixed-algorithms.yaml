@@ -36,6 +36,8 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        backend:
+          kind: memory
         default_weights:
           cached_input: 0.1
           cache_write: 1.25

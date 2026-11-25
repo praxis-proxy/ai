@@ -435,7 +435,9 @@ where
 
 /// Match one path against a template with `{param}` placeholders.
 ///
-/// Each parameter matches exactly one non-empty segment.
+/// Each parameter matches exactly one non-empty segment, either the whole
+/// segment (`{name}`) or the segment prefix before a literal suffix
+/// (`{name}suffix`).
 fn match_path_template<'a>(template: &'static str, path: &'a str) -> Option<RouteParams<'a>> {
     let mut template_segments = template.split('/');
     let mut path_segments = path.split('/');
@@ -453,6 +455,16 @@ fn match_path_template<'a>(template: &'static str, path: &'a str) -> Option<Rout
                         return None;
                     }
                     params.insert(name, path_segment)?;
+                } else if let Some((name, suffix)) = split_parameter_suffix_segment(template_segment) {
+                    // `{name}suffix`, e.g. `{model}:generateContent`: the
+                    // Google API convention puts the action verb in the model
+                    // segment after a colon. The suffix is literal, and the
+                    // parameter is the non-empty prefix before it.
+                    let value = path_segment.strip_suffix(suffix)?;
+                    if value.is_empty() {
+                        return None;
+                    }
+                    params.insert(name, value)?;
                 } else if template_segment != path_segment {
                     return None;
                 }
@@ -460,6 +472,18 @@ fn match_path_template<'a>(template: &'static str, path: &'a str) -> Option<Rout
             _ => return None,
         }
     }
+}
+
+/// Split a template segment of the form `{name}suffix` into its parameter name
+/// and literal suffix. Returns `None` for segments that are not parameter
+/// declarations, including whole-segment `{name}`.
+fn split_parameter_suffix_segment(segment: &str) -> Option<(&str, &str)> {
+    let after_brace = segment.strip_prefix('{')?;
+    let (name, suffix) = after_brace.split_once('}')?;
+    if name.is_empty() || suffix.is_empty() || name.contains('{') || suffix.contains('{') {
+        return None;
+    }
+    Some((name, suffix))
 }
 
 #[cfg(test)]
@@ -556,6 +580,78 @@ mod tests {
             None,
             "offset recovery must fail closed when the source path is unavailable"
         );
+    }
+
+    #[test]
+    fn a_parameter_with_a_literal_suffix_captures_the_segment_prefix() {
+        // The Google API convention puts the action verb in the model segment
+        // after a colon, so the template needs a parameter with a suffix.
+        let params = match_path_template(
+            "/v1/models/{model}:generateContent",
+            "/v1/models/gemini-2.0-flash:generateContent",
+        )
+        .unwrap();
+        assert_eq!(params.get("model"), Some("gemini-2.0-flash"));
+
+        let offsets = params
+            .offsets_in("/v1/models/gemini-2.0-flash:generateContent")
+            .unwrap();
+        assert_eq!(
+            offsets.get("/v1/models/gemini-2.0-flash:generateContent", "model"),
+            Some("gemini-2.0-flash")
+        );
+    }
+
+    #[test]
+    fn a_wrong_literal_suffix_fails_the_match() {
+        assert!(
+            match_path_template(
+                "/v1/models/{model}:countTokens",
+                "/v1/models/gemini-2.0-flash:generateContent"
+            )
+            .is_none()
+        );
+        assert!(match_path_template("/v1/models/{model}:generateContent", "/v1/models/gemini-2.0-flash").is_none());
+    }
+
+    #[test]
+    fn an_empty_parameter_prefix_fails_the_match() {
+        assert!(match_path_template("/v1/models/{model}:generateContent", "/v1/models/:generateContent").is_none());
+    }
+
+    #[test]
+    fn a_suffix_segment_outranks_a_whole_segment_parameter() {
+        // `{model}:generateContent` counts as a literal segment for ranking,
+        // so it must win over a bare `{value}` parameter for the same path.
+        const SUFFIX_SPECS: &[OperationSpec] = &[
+            OperationSpec {
+                application_protocol: OPENAI_RESPONSES,
+                operation_id: "anyModel",
+                method: HttpMethod::Post,
+                transport: Transport::Http,
+                runtime_path: "/v1/models/{value}",
+                mode: HandlingMode::Passthrough,
+                request_body: RequestBody::Json { required: true },
+            },
+            OperationSpec {
+                application_protocol: OPENAI_RESPONSES,
+                operation_id: "generateContent",
+                method: HttpMethod::Post,
+                transport: Transport::Http,
+                runtime_path: "/v1/models/{model}:generateContent",
+                mode: HandlingMode::Passthrough,
+                request_body: RequestBody::Json { required: true },
+            },
+        ];
+
+        let matched = match_operation(
+            SUFFIX_SPECS,
+            "POST",
+            "/v1/models/gemini-2.0-flash:generateContent",
+            Transport::Http,
+        )
+        .unwrap();
+        assert_eq!(matched.spec.operation_id, "generateContent");
     }
 
     #[test]

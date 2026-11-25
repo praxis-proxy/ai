@@ -12,6 +12,26 @@ routing, protocol translation, stateful OpenAI APIs, and agent traffic into a
 configurable proxy. Clients keep their API shape while the gateway selects
 backends and applies policy.
 
+<!-- Dynamic badge queries select index 0 (Conversations) in each report section.
+     Keep these queries aligned if the generated report area order changes. -->
+[![OpenAI Conversations routes](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.capability_coverage.by_area%5B0%5D.coverage_percent&label=OpenAI+Conversations+routes&color=blue&suffix=%25)](docs/conformance/README.md#reading-the-report)
+[![OpenAI Conversations contracts](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.owned_contract_conformance.areas%5B0%5D.operation_contracts.exact_percent&label=OpenAI+Conversations+contracts&color=blue&suffix=%25)](docs/conformance/README.md#reading-the-report)
+[![OpenAI Conversations runtime](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.runtime_verification.areas%5B0%5D.status&label=OpenAI+Conversations+runtime&color=blue)](docs/conformance/README.md#reading-the-report)
+
+Conversations badges reflect the checked-in conformance report on `main`: route
+coverage, exact owned contracts after documented upstream-spec exceptions, and
+focused runtime verification against the pinned OpenAI reference. Authentication
+is deployment-owned. See the [conformance scope and evidence](docs/conformance/README.md).
+
+[![OpenAI Responses persistence](docs/conformance/badges/responses-persistence.svg)](docs/conformance/README.md#responses-state-verification)
+[![OpenAI Responses rehydration](docs/conformance/badges/responses-rehydration.svg)](docs/conformance/README.md#responses-state-verification)
+[![OpenAI Responses lifecycle](docs/conformance/badges/responses-lifecycle.svg)](docs/conformance/README.md#responses-state-verification)
+
+Responses badges track focused checks of Praxis-owned persistence, rehydration,
+and stored-response lifecycle behavior in the native Responses pipeline. The
+backend (such as vLLM) owns generation compatibility. See the
+[state conformance boundary](docs/conformance/openai-responses-state-conformance.md).
+
 ## What can it do?
 
 - **Route by what a request contains.** Classify OpenAI Responses, Chat
@@ -81,7 +101,12 @@ development practices.
 
 ## Quick start
 
-Build and start the gateway with its built-in configuration:
+The fastest path is the published container image. The
+[Quickstart](docs/getting-started/quickstart.md) runs `ghcr.io/praxis-proxy/ai`
+with a minimal configuration and forwards a first OpenAI Responses request.
+
+To build from source instead, build and start the gateway with its built-in
+configuration:
 
 ```console
 make release
@@ -103,7 +128,7 @@ curl http://127.0.0.1:8080/
 {"status": "ok", "server": "praxis-ai"}
 ```
 
-Ready to connect a backend? Follow the [quickstart](docs/quickstart.md), or
+Ready to connect a backend? Follow [Build from source](docs/getting-started/build-from-source.md), or
 choose from the [example configurations](examples/README.md) for OpenAI,
 Anthropic, MCP, A2A, routing, guardrails, token usage, and more.
 
@@ -111,10 +136,13 @@ Anthropic, MCP, A2A, routing, guardrails, token usage, and more.
 
 | If you want to… | Start here |
 | --- | --- |
-| Run Praxis AI locally | [Quickstart](docs/quickstart.md) |
-| Browse supported capabilities | [Feature overview](docs/features.md) |
-| Configure a filter | [Filter reference](docs/filters/README.md) |
-| Understand the design | [Architecture docs](docs/README.md#architecture) |
+| Run Praxis AI locally | [Quickstart](docs/getting-started/quickstart.md) |
+| Choose an API and provider | [Choose a client and provider](docs/getting-started/choose-client-and-provider.md) |
+| Follow a task guide | [Guides](docs/guides/README.md) |
+| Browse supported capabilities | [Capability overview](docs/filters/README.md) |
+| Configure a filter | [Generated filter reference](docs/filters/reference.md) |
+| Deploy or troubleshoot | [Operations guide](docs/operations/README.md) |
+| Understand the design | [Architecture docs](docs/README.md#concepts-and-architecture) |
 | Build or test the workspace | [Development guide](docs/developing/getting-started.md) |
 | Add a new filter | [Adding filters](docs/developing/adding-filters.md) |
 
@@ -135,14 +163,14 @@ development instructions are in the [development guide].
 docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
-Podman can pull the same OCI image. See the [quickstart] for a source build
+Podman can pull the same OCI image. See the [quickstart] to run it
 and the [release documentation] for image contents and tagging. An image
 with the experimental OpenAI Responses filters and SQLite and PostgreSQL
 stores is published with an `-experimental` suffix (for example
 `nightly-experimental`). A FIPS 140-3
 build for Red Hat Enterprise Linux hosts is published under the same tags
 with a `-fips` suffix (for example `latest-fips`); see
-[FIPS 140-3](docs/fips.md).
+[FIPS 140-3](docs/operations/fips.md).
 
 ## Contributing
 
@@ -162,8 +190,8 @@ For larger changes, open a [feature request] and follow the
 [container images]: https://github.com/praxis-proxy/ai/pkgs/container/ai
 [development guide]: docs/developing/getting-started.md
 [feature request]: https://github.com/praxis-proxy/ai/issues/new?template=feature-request.yml
-[quickstart]: docs/quickstart.md
-[release documentation]: docs/release.md
+[quickstart]: docs/getting-started/quickstart.md
+[release documentation]: docs/developing/release.md
 [security policy]: .github/SECURITY.md
 
 ## Community

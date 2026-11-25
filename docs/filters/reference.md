@@ -3,175 +3,117 @@
 
 # Filter Reference
 
-AI filters provided by Praxis AI. For base proxy
-filters (router, load balancer, headers, CORS, etc.),
+AI filters provided by Praxis AI, grouped by the task they serve.
+For base proxy filters (router, load balancer, headers, CORS, etc.),
 see the [Praxis core filter reference][core-ref].
 
 [core-ref]: https://github.com/praxis-proxy/praxis/blob/main/docs/filters/reference.md
 
-## Provider APIs (praxis-ai-apis)
+## Client APIs and translation
 
-### Anthropic
-
-| Filter | Description |
-|--------|-------------|
-| [`anthropic_messages_protocol`](anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
-| [`anthropic_messages_request`](anthropic_messages_request.md) | Processes an Anthropic create-message body once and publishes its facts. |
-| [`anthropic_messages_to_chat_completions`](anthropic_messages_to_chat_completions.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI. |
-| [`anthropic_messages_to_chat_completions_stream`](anthropic_messages_to_chat_completions_stream.md) | Transforms streaming SSE responses between the Chat Completions and Anthropic Messages formats, processing each chunk as it arrives. |
-| [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
-| [`openai_chat_completions_to_anthropic`](openai_chat_completions_to_anthropic.md) | Translates OpenAI Chat Completions requests only when the selected `ExternalModel` candidate uses Anthropic Messages; OpenAI candidates pass through with their configured path and model. |
-| [`openai_chat_completions_to_anthropic_stream`](openai_chat_completions_to_anthropic_stream.md) | Converts the selected Anthropic provider's event stream incrementally. OpenAI-compatible candidates are left byte-for-byte unchanged. |
-
-### Azure
+Parse client request bodies, publish protocol facts, and translate between OpenAI and Anthropic request and stream formats.
 
 | Filter | Description |
 |--------|-------------|
-| [`openai_chat_completions_to_azureai_chat_completions`](openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
+| [`anthropic_messages_protocol`](apis/anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
+| [`anthropic_messages_request`](apis/anthropic_messages_request.md) | Processes an Anthropic create-message body once and publishes its facts. |
+| [`anthropic_messages_to_chat_completions`](apis/anthropic_messages_to_chat_completions.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI. |
+| [`anthropic_messages_to_chat_completions_stream`](apis/anthropic_messages_to_chat_completions_stream.md) | Transforms streaming SSE responses between the Chat Completions and Anthropic Messages formats, processing each chunk as it arrives. |
+| [`openai_chat_completions_request`](apis/openai_chat_completions_request.md) | Publishes body facts for native Chat Completions create requests to durable metadata and filter results. |
+| [`openai_chat_completions_streaming_selector`](apis/openai_chat_completions_streaming_selector.md) | Selects the typed IRR response transport from an OpenAI Chat Completions request's effective `stream` bit. |
+| [`openai_chat_completions_to_anthropic`](apis/openai_chat_completions_to_anthropic.md) | Translates OpenAI Chat Completions requests only when the selected `ExternalModel` candidate uses Anthropic Messages; OpenAI candidates pass through with their configured path and model. |
+| [`openai_chat_completions_to_anthropic_stream`](apis/openai_chat_completions_to_anthropic_stream.md) | Converts the selected Anthropic provider's event stream incrementally. OpenAI-compatible candidates are left byte-for-byte unchanged. |
+| [`openai_client_tool_compat`](apis/openai_client_tool_compat.md) | Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back. |
+| [`openai_responses_model_rewrite`](apis/openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
+| [`openai_responses_request`](apis/openai_responses_request.md) | Processes a Responses request body once and initializes state. |
+| [`openai_responses_to_chat_completions`](apis/openai_responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
+| [`openai_stream_events`](apis/openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
+| [`openai_tool_parse`](apis/openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
 
-### General
+## Provider adapters and credentials
 
-| Filter | Description |
-|--------|-------------|
-| [`callout_credentials`](callout_credentials.md) | Establishing filter that captures typed per-user callout secrets from ingress headers. |
-| [`project_state_owner_headers`](project_state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
-| [`state_owner`](state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |
-
-### OpenAI
-
-| Filter | Description |
-|--------|-------------|
-| [`openai_agentic_loop`](openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
-| [`openai_chat_completions_request`](openai_chat_completions_request.md) | Publishes body facts for native Chat Completions create requests to durable metadata and filter results. |
-| [`openai_chat_completions_streaming_selector`](openai_chat_completions_streaming_selector.md) | Selects the typed IRR response transport from an OpenAI Chat Completions request's effective `stream` bit. |
-| [`openai_client_tool_compat`](openai_client_tool_compat.md) | Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back. |
-| [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
-| [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
-| [`openai_file_resolve`](openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |
-| [`openai_file_search_dispatch`](openai_file_search_dispatch.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
-| [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
-| [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
-| [`openai_responses_compact`](openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
-| [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
-| [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
-| [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
-| [`openai_responses_request`](openai_responses_request.md) | Processes a Responses request body once and initializes state. |
-| [`openai_responses_store`](openai_responses_store.md) | Persists Responses API responses to the configured response store backend. |
-| [`openai_responses_to_chat_completions`](openai_responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
-| [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
-| [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
-| [`openai_web_search_dispatch`](openai_web_search_dispatch.md) | Web search filter for model-driven `web_search_call` dispatch. |
-
-### Operation Classifier
+Adapt requests to cloud provider dialects and attach provider, cloud identity, or callout credentials.
 
 | Filter | Description |
 |--------|-------------|
-| [`ai_operation`](ai_operation.md) | Classifies supported AI operations from the request head. |
+| [`anthropic_messages_to_vertexai_anthropic`](providers/anthropic_messages_to_vertexai_anthropic.md) | Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex responses back to the Anthropic dialect. |
+| [`aws_sigv4_sign`](providers/aws_sigv4_sign.md) | Signs outbound requests to AWS services using `SigV4`. |
+| [`azure_ad`](providers/azure_ad.md) | Injects an Azure AD (Entra ID) bearer token into outbound requests. |
+| [`callout_credentials`](providers/callout_credentials.md) | Establishing filter that captures typed per-user callout secrets from ingress headers. |
+| [`credential_inject`](providers/credential_inject.md) | Replaces caller credentials with the upstream credential selected by `intelligent_route` or `provider_route`. |
+| [`gcp_adc`](providers/gcp_adc.md) | Injects a GCP `OAuth2` access token into outbound requests. |
+| [`openai_chat_completions_to_azureai_chat_completions`](providers/openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
+| [`openai_chat_completions_to_vertexai_gemini`](providers/openai_chat_completions_to_vertexai_gemini.md) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini `generateContent` format and translates responses back. |
 
-### Vertex
+## Routing
 
-| Filter | Description |
-|--------|-------------|
-| [`anthropic_messages_to_vertexai_anthropic`](anthropic_messages_to_vertexai_anthropic.md) | Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex responses back to the Anthropic dialect. |
-| [`openai_chat_completions_to_vertexai_gemini`](openai_chat_completions_to_vertexai_gemini.md) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini `generateContent` format and translates responses back. |
-
-## Cross-Provider Filters (praxis-ai-filters)
-
-### Agentic
-
-| Filter | Description |
-|--------|-------------|
-| [`a2a`](a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
-| [`mcp`](mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
-
-### AWS
+Promote model names and select upstream clusters or provider-local backends.
 
 | Filter | Description |
 |--------|-------------|
-| [`aws_sigv4_sign`](aws_sigv4_sign.md) | Signs outbound requests to AWS services using `SigV4`. |
+| [`intelligent_route`](routing/intelligent_route.md) | Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name. |
+| [`llmisvc_model_provider_resolver`](routing/llmisvc_model_provider_resolver.md) | Rewrites publisher-ID body `model` values to the short model name for `LLMISvc` / `KServe` routing; the routing header is left unchanged. |
+| [`model_to_header`](routing/model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
+| [`model_to_provider`](routing/model_to_provider.md) | Maps stable client-facing model IDs to existing upstream clusters and provider-specific target models. |
+| [`provider_route`](routing/provider_route.md) | Exact provider-local mapping from an authenticated intelligent routing selection to a private backend cluster. |
 
-### Azure
+## Guardrails, limits, and metering
 
-| Filter | Description |
-|--------|-------------|
-| [`azure_ad`](azure_ad.md) | Injects an Azure AD (Entra ID) bearer token into outbound requests. |
-
-### Callout
-
-| Filter | Description |
-|--------|-------------|
-| [`http_callout`](http_callout.md) | Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation. |
-
-### GCP
+Screen content, guard identity headers, bound token use, track in-flight work, and check balances.
 
 | Filter | Description |
 |--------|-------------|
-| [`gcp_adc`](gcp_adc.md) | Injects a GCP `OAuth2` access token into outbound requests. |
+| [`ai_guardrails`](control/ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted. |
+| [`external_metering`](control/external_metering.md) | Integrates with an external metering service for pre-request balance checks and post-response token usage reporting. |
+| [`identity_header_guard`](control/identity_header_guard.md) | Captures request headers matching a configured prefix into `filter_metadata` and removes them from the upstream request. |
+| [`inflight_tracker`](control/inflight_tracker.md) | Tracks live request counts and reserved tokens per model. |
+| [`token_ceiling`](control/token_ceiling.md) | Rejects provider-bound requests whose estimated serialized request body or requested output exceeds configured limits. Missing output-limit fields are rejected when `max_output_tokens` is configured; this strict behavior prevents providers from applying an unbounded model default. At least one of `max_input_tokens` or `max_output_tokens` is required, and `max_body_bytes` defaults to 2 MiB. |
+| [`token_rate_limit`](control/token_rate_limit.md) | Token-denominated rate limiter: reserves an estimated cost at admission, reconciles against actual usage after the response completes. Evaluates an ordered list of rules, each with its own optional match condition, algorithm choice, and budget. |
 
-### Guardrails
+## Agents, tools, and state
 
-| Filter | Description |
-|--------|-------------|
-| [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted. |
-
-### Identity Guard
-
-| Filter | Description |
-|--------|-------------|
-| [`identity_header_guard`](identity_header_guard.md) | Captures request headers matching a configured prefix into `filter_metadata` and removes them from the upstream request. |
-
-### Inference
+Route MCP and A2A traffic, manage Responses and Conversations state, and execute gateway-owned tools.
 
 | Filter | Description |
 |--------|-------------|
-| [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Rewrites publisher-ID body `model` values to the short model name for `LLMISvc` / `KServe` routing; the routing header is left unchanged. |
-| [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
-| [`model_to_provider`](model_to_provider.md) | Maps stable client-facing model IDs to existing upstream clusters and provider-specific target models. |
+| [`a2a`](agents/a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
+| [`anthropic_mcp_connector`](agents/anthropic_mcp_connector.md) | Executes the Anthropic Messages MCP connector for non-Anthropic backends. |
+| [`anthropic_web_search`](agents/anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
+| [`mcp`](agents/mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
+| [`mcp_broker_backend`](agents/mcp_broker_backend.md) | Selects the broker-staged backend cluster for an MCP handshake subrequest. |
+| [`openai_agentic_loop`](agents/openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
+| [`openai_conversations`](agents/openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
+| [`openai_doc_extract`](agents/openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
+| [`openai_file_resolve`](agents/openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |
+| [`openai_file_search_dispatch`](agents/openai_file_search_dispatch.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
+| [`openai_mcp_dispatch`](agents/openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
+| [`openai_mcp_tool_resolve`](agents/openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
+| [`openai_responses_compact`](agents/openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
+| [`openai_responses_proxy`](agents/openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
+| [`openai_responses_rehydrate`](agents/openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
+| [`openai_responses_store`](agents/openai_responses_store.md) | Persists Responses API responses to the configured response store backend. |
+| [`openai_web_search_dispatch`](agents/openai_web_search_dispatch.md) | Web search filter for model-driven `web_search_call` dispatch. |
 
-### Inflight
+## Observability and usage
 
-| Filter | Description |
-|--------|-------------|
-| [`inflight_tracker`](inflight_tracker.md) | Tracks live request counts and reserved tokens per model. |
-
-### Metering
-
-| Filter | Description |
-|--------|-------------|
-| [`external_metering`](external_metering.md) | Integrates with an external metering service for pre-request balance checks and post-response token usage reporting. |
-
-### Prompt Enrich
-
-| Filter | Description |
-|--------|-------------|
-| [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
-
-### Routing
+Extract token usage and emit usage headers, usage metrics, and latency signals.
 
 | Filter | Description |
 |--------|-------------|
-| [`credential_inject`](credential_inject.md) | Replaces caller credentials with the upstream credential selected by `intelligent_route` or `provider_route`. |
-| [`intelligent_route`](intelligent_route.md) | Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name. |
-| [`provider_route`](provider_route.md) | Exact provider-local mapping from an authenticated intelligent routing selection to a private backend cluster. |
+| [`stream_usage_inject`](observability/stream_usage_inject.md) | Injects `stream_options.include_usage = true` into streaming OpenAI chat-completions requests so the upstream response contains token usage. |
+| [`time_to_first_token`](observability/time_to_first_token.md) | Measures time-to-first-token for streaming AI responses. |
+| [`token_count`](observability/token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
+| [`token_usage_headers`](observability/token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. Also injects `Praxis-Token-Status` when usage capture failed (e.g. overflow), so an unavailable count is never silently indistinguishable from a genuine zero. |
+| [`token_usage_metrics`](observability/token_usage_metrics.md) | Emits bounded per-tenant Prometheus token counters from `token.*` metadata. |
 
-### Time To First Token
+## Core building blocks
 
-| Filter | Description |
-|--------|-------------|
-| [`time_to_first_token`](time_to_first_token.md) | Measures time-to-first-token for streaming AI responses. |
-
-### Token Rate Limit
+Classify operations, call external services, change prompts, and establish state ownership.
 
 | Filter | Description |
 |--------|-------------|
-| [`token_rate_limit`](token_rate_limit.md) | Token-denominated rate limiter: reserves an estimated cost at admission, reconciles against actual usage after the response completes. Evaluates an ordered list of rules, each with its own optional match condition, algorithm choice, and budget. |
-
-### Token Usage
-
-| Filter | Description |
-|--------|-------------|
-| [`stream_usage_inject`](stream_usage_inject.md) | Injects `stream_options.include_usage = true` into streaming OpenAI chat-completions requests so the upstream response contains token usage. |
-| [`token_ceiling`](token_ceiling.md) | Rejects provider-bound requests whose estimated serialized request body or requested output exceeds configured limits. Missing output-limit fields are rejected when `max_output_tokens` is configured; this strict behavior prevents providers from applying an unbounded model default. At least one of `max_input_tokens` or `max_output_tokens` is required, and `max_body_bytes` defaults to 2 MiB. |
-| [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
-| [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. Also injects `Praxis-Token-Status` when usage capture failed (e.g. overflow), so an unavailable count is never silently indistinguishable from a genuine zero. |
-| [`token_usage_metrics`](token_usage_metrics.md) | Emits bounded per-tenant Prometheus token counters from `token.*` metadata. |
+| [`ai_operation`](core/ai_operation.md) | Classifies supported AI operations from the request head. |
+| [`http_callout`](core/http_callout.md) | Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation. |
+| [`project_state_owner_headers`](core/project_state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
+| [`prompt_enrich`](core/prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
+| [`state_owner`](core/state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |

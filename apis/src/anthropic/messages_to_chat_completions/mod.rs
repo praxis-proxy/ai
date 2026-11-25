@@ -17,6 +17,8 @@ mod config;
 pub(crate) mod request;
 pub(crate) mod response;
 
+use std::sync::{Arc, LazyLock};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::counter;
@@ -27,7 +29,7 @@ use praxis_filter::{
 use tracing::{debug, warn};
 
 use self::config::{AnthropicMessagesToChatCompletionsConfig, build_config};
-use crate::anthropic::wire;
+use crate::{RecordAiMetadata as _, anthropic::wire};
 
 /// Metadata key selecting success or error response transformation.
 const RESPONSE_TRANSFORM_KEY: &str = "anthropic_messages_to_chat_completions.response_transform";
@@ -78,6 +80,16 @@ struct StreamingErrorBuffer {
 /// report it back truthfully as `stop_reason: stop_sequence`.
 pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completions.stop_sequences";
 
+/// Request-scoped client stop sequences used by both translation phases.
+///
+/// This is stored in typed extensions rather than bounded routing metadata:
+/// Anthropic does not impose the metadata value limit on stop sequences.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ClientStopSequences(pub(crate) Arc<[String]>);
+
+/// Shared empty list for requests that do not carry client stop sequences.
+static EMPTY_CLIENT_STOP_SEQUENCES: LazyLock<Arc<[String]>> = LazyLock::new(Arc::default);
+
 /// Metadata key carrying the comma-separated degraded-feature labels from the
 /// request-body phase to the response-header phase.
 const DEGRADED_FEATURES_KEY: &str = "anthropic_messages_to_chat_completions.degraded_features";
@@ -112,9 +124,12 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// represent it faithfully.
 ///
 /// `allow_lossy_features` opts specific Anthropic-only features into
-/// operator-approved degradation instead of that 400. A listed feature's wire
-/// markers are validated and then stripped so an unmodified client (for example
-/// Claude Code, which always sends `cache_control` and `thinking`) can still
+/// operator-approved degradation instead of that 400. Each listed feature is
+/// validated and then degraded as the feature requires — most have their wire
+/// markers stripped, while `mid_conversation_system` folds mid-conversation
+/// `system` messages into the leading system message — so an unmodified
+/// client (for example Claude Code, which always sends `cache_control` and
+/// `thinking`) can still
 /// drive a Chat Completions backend. Each degradation is reported to the
 /// operator — one `WARN` log per request, a
 /// `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
@@ -123,9 +138,26 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// removes `cache_control` markers (prompt and tool content are preserved, but
 /// explicit cache breakpoints are not honored, so cost and latency may differ);
 /// `extended_thinking` removes `thinking` and thinking-only `context_management`
-/// edits (the translated response carries no thinking blocks). Features absent
-/// from the allowlist, malformed markers, and other `context_management` edits
-/// are still rejected with a 400.
+/// edits (the translated response carries no thinking blocks);
+/// `mid_conversation_system` folds each eligible text-only `system` message
+/// with exactly `role` and `content` fields that appears after the first
+/// non-system turn into the single leading system message; other message or
+/// content shapes remain subject to strict validation and can be rejected
+/// with a 400.
+/// Features absent from the allowlist, malformed markers, and other
+/// `context_management` edits are still rejected with a 400 — except that
+/// without `mid_conversation_system` the translator does not reject
+/// in-array `system` messages itself: it preserves them in their original
+/// positions (Chat Completions represents them directly) and the backend
+/// decides whether to accept that ordering.
+///
+/// Translation ends the Anthropic wire contract, so the filter removes
+/// `anthropic-version` and both Anthropic credential forms (`x-api-key` from
+/// SDK v1 and `authorization: Bearer` from SDK v2) before the request reaches
+/// the Chat Completions backend. Use `credential_injection` to add the
+/// backend's own token. The caller's API version does not change translation:
+/// `temperature`, `top_p`, and `top_k` are forwarded under either version, and
+/// `document` blocks and non-empty citations are rejected under either version.
 ///
 /// # YAML
 ///
@@ -206,7 +238,7 @@ impl AnthropicMessagesToChatCompletionsFilter {
             return FilterAction::Continue;
         }
 
-        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY).map(str::to_owned);
+        let request_id = ctx.filter_metadata.get(RESPONSE_REQUEST_ID_KEY).map(str::to_owned);
         let buffer = ctx.extensions.remove::<StreamingErrorBuffer>().unwrap_or_default();
         if buffer.overflowed {
             *body = Some(Bytes::from(wire::error_body(
@@ -234,7 +266,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -244,7 +276,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -260,16 +292,16 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
+        ctx.record_ai_metadata(RESPONSE_TRANSFORM_KEY, transform);
         if transform == RESPONSE_TRANSFORM_ERROR {
             let status = ctx
                 .response_header
                 .as_ref()
                 .map_or(500, |response| response.status.as_u16());
-            ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
+            ctx.record_ai_metadata(RESPONSE_STATUS_KEY, status.to_string());
         }
         if let Some(request_id) = request_id {
-            ctx.set_metadata(RESPONSE_REQUEST_ID_KEY, request_id);
+            ctx.record_ai_metadata(RESPONSE_REQUEST_ID_KEY, request_id);
         }
 
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -337,7 +369,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        let transform_error = match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
+        let transform_error = match ctx.filter_metadata.get(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_ERROR) => true,
             Some(RESPONSE_TRANSFORM_SUCCESS) => false,
             _ => return Ok(FilterAction::Continue),
@@ -367,7 +399,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         // translation on the response path) can enforce its own byte ceiling on the
         // untransformed size rather than on the smaller body it observes.
         let raw_len = body.as_ref().map_or(0, Bytes::len);
-        ctx.set_metadata(RESPONSE_RAW_BYTES_KEY, raw_len.to_string());
+        ctx.record_ai_metadata(RESPONSE_RAW_BYTES_KEY, raw_len.to_string());
 
         // Enforce the response byte ceiling on the RAW upstream body before any
         // transform can shrink it below a downstream size check. A
@@ -397,18 +429,20 @@ fn transform_buffered_response(
 ) -> FilterAction {
     if transform_error {
         let status = error_status(ctx);
-        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+        let request_id = ctx.filter_metadata.get(RESPONSE_REQUEST_ID_KEY);
         transform_error_body(body, status, request_id);
         FilterAction::Continue
     } else {
         let request_model = ctx
             .filter_metadata
             .get("anthropic_messages_to_chat_completions.model")
-            .map_or("", String::as_str);
-        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+            .unwrap_or_default();
+        let request_id = ctx.filter_metadata.get(RESPONSE_REQUEST_ID_KEY);
         let stop_sequences = client_stop_sequences(ctx);
-        if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences) {
-            ctx.set_metadata("openai.finish_reason", finish_reason);
+        if let Some(finish_reason) =
+            transform_non_streaming_body(body, request_model, request_id, stop_sequences.as_ref())
+        {
+            ctx.record_ai_metadata("openai.finish_reason", finish_reason);
             FilterAction::Continue
         } else {
             // Reject the invalid success. If the upstream 200 headers have
@@ -426,7 +460,7 @@ fn transform_buffered_response(
 /// Extract streaming and model metadata from the parsed request body.
 fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serde_json::Value>) {
     let Some(value) = value else {
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         return;
     };
 
@@ -434,7 +468,7 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    ctx.set_metadata(
+    ctx.record_ai_metadata(
         "anthropic_messages_to_chat_completions.streaming",
         if is_streaming { "true" } else { "false" },
     );
@@ -444,13 +478,18 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .unwrap_or_default();
-    ctx.set_metadata("anthropic_messages_to_chat_completions.model", model);
+    ctx.record_ai_metadata("anthropic_messages_to_chat_completions.model", model);
 
     if let Some(stop_sequences) = value
         .get("stop_sequences")
-        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        .and_then(serde_json::Value::as_array)
+        .filter(|stop_sequences| !stop_sequences.is_empty())
+        && let Some(stop_sequences) = stop_sequences
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
     {
-        ctx.set_metadata(STOP_SEQUENCES_KEY, stop_sequences.to_string());
+        ctx.extensions.insert(ClientStopSequences(stop_sequences.into()));
     }
 }
 
@@ -459,11 +498,16 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 /// A list that is not all strings is invalid Anthropic input the backend
 /// rejects on its own; treating it as empty keeps the response at
 /// `end_turn` rather than failing the translation.
-pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> {
+pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Arc<[String]> {
+    if let Some(stop_sequences) = ctx.extensions.get::<ClientStopSequences>() {
+        return Arc::clone(&stop_sequences.0);
+    }
+
     ctx.filter_metadata
         .get(STOP_SEQUENCES_KEY)
-        .and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_default()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .filter(|stop_sequences| !stop_sequences.is_empty())
+        .map_or_else(|| Arc::clone(&EMPTY_CLIENT_STOP_SEQUENCES), Arc::from)
 }
 
 /// Record degraded features as operator signals.
@@ -482,6 +526,9 @@ fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::
     if degraded.extended_thinking {
         features.push("extended_thinking");
     }
+    if degraded.mid_conversation_system {
+        features.push("mid_conversation_system");
+    }
     for feature in &features {
         counter!(
             "praxis_anthropic_messages_to_chat_completions_degraded_total",
@@ -494,7 +541,7 @@ fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::
         degraded_features = joined.as_str(),
         "degraded unsupported Anthropic features to complete the Chat Completions translation"
     );
-    ctx.set_metadata(DEGRADED_FEATURES_KEY, joined);
+    ctx.record_ai_metadata(DEGRADED_FEATURES_KEY, joined);
 }
 
 /// Reconcile the degraded-feature response header with the proxy's own record.
@@ -504,7 +551,7 @@ fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::
 /// a false Praxis signal, then re-inserts the header only when the proxy itself
 /// recorded a degradation.
 fn apply_degraded_features_header(ctx: &mut HttpFilterContext<'_>) {
-    let recorded = ctx.get_metadata(DEGRADED_FEATURES_KEY).map(str::to_owned);
+    let recorded = ctx.filter_metadata.get(DEGRADED_FEATURES_KEY).map(str::to_owned);
     let Some(response) = &mut ctx.response_header else {
         return;
     };
@@ -598,7 +645,8 @@ fn should_transform_response(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Recover the upstream error status recorded in the response-header phase.
 fn error_status(ctx: &HttpFilterContext<'_>) -> http::StatusCode {
-    ctx.get_metadata(RESPONSE_STATUS_KEY)
+    ctx.filter_metadata
+        .get(RESPONSE_STATUS_KEY)
         .and_then(|value| value.parse::<u16>().ok())
         .and_then(|value| http::StatusCode::from_u16(value).ok())
         .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -753,8 +801,8 @@ mod tests {
             .headers
             .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("72"));
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
-        ctx.set_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
         let action = filter.on_response(&mut ctx).await.unwrap();
 
         assert!(matches!(action, FilterAction::Continue), "filter should continue");
@@ -801,7 +849,7 @@ mod tests {
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true");
         // The managed IRR selected the streaming subrequest transport, so the error
         // round arrives as raw `Stream` chunks that this filter must accumulate.
         ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -859,7 +907,7 @@ mod tests {
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true");
         drop(filter.on_response(&mut ctx).await.unwrap());
         ctx.response_header = None;
 
@@ -900,7 +948,7 @@ mod tests {
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         drop(filter.on_response(&mut ctx).await.unwrap());
         ctx.response_header = None;
 
@@ -934,7 +982,7 @@ mod tests {
         response.status = StatusCode::TOO_MANY_REQUESTS;
         response.headers.insert("x-request-id", "req_over".parse().unwrap());
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true");
         // The managed IRR selected the streaming subrequest transport, so the error
         // round arrives as raw `Stream` chunks that this filter must accumulate.
         ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1096,9 +1144,39 @@ mod tests {
         extract_request_metadata(&mut ctx, value.as_ref());
 
         assert_eq!(
-            ctx.filter_metadata.get(STOP_SEQUENCES_KEY).unwrap(),
-            r#"[",","END"]"#,
+            client_stop_sequences(&ctx).as_ref(),
+            &[",".to_owned(), "END".to_owned()],
             "client stop sequences are retained for the response phase"
+        );
+        let first = client_stop_sequences(&ctx);
+        let second = client_stop_sequences(&ctx);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "extension reads should share the retained stop-sequence allocation"
+        );
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "typed stop-sequence storage should not use routing metadata"
+        );
+    }
+
+    #[test]
+    fn extract_request_metadata_retains_stop_sequences_longer_than_metadata_limit() {
+        let sequence = "s".repeat(300);
+        let value = serde_json::json!({"model": "gpt-4", "stop_sequences": [sequence]});
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        extract_request_metadata(&mut ctx, Some(&value));
+
+        assert_eq!(
+            client_stop_sequences(&ctx).as_ref(),
+            &[sequence],
+            "typed stop-sequence storage should preserve values above the metadata limit"
+        );
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "long stop sequences should not use size-limited routing metadata"
         );
     }
 
@@ -1114,13 +1192,19 @@ mod tests {
             !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
             "empty stop_sequences should not be retained"
         );
+        let first = client_stop_sequences(&ctx);
+        let second = client_stop_sequences(&ctx);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "empty stop-sequence reads should share the process-wide allocation"
+        );
     }
 
     #[test]
     fn client_stop_sequences_ignores_non_string_entries() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(STOP_SEQUENCES_KEY, r#"[1,","]"#);
+        ctx.record_ai_metadata(STOP_SEQUENCES_KEY, r#"[1,","]"#);
 
         assert!(
             client_stop_sequences(&ctx).is_empty(),
@@ -1234,7 +1318,7 @@ mod tests {
     fn should_transform_response_streaming_returns_false() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true");
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
@@ -1248,7 +1332,7 @@ mod tests {
     fn should_transform_response_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
@@ -1269,7 +1353,7 @@ mod tests {
         ] {
             let request = make_request(Method::POST, "/v1/messages");
             let mut ctx = make_filter_context(&request);
-            ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+            ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
             let mut response = make_response();
             response
                 .headers
@@ -1284,7 +1368,7 @@ mod tests {
     fn should_not_transform_encoded_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response
             .headers
@@ -1303,7 +1387,7 @@ mod tests {
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response
             .headers
@@ -1333,7 +1417,7 @@ mod tests {
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response
             .headers
@@ -1364,7 +1448,7 @@ mod tests {
             let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
             let request = make_request(Method::POST, "/v1/messages");
             let mut ctx = make_filter_context(&request);
-            ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
+            ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
             let mut response = make_response();
             response.headers.insert("x-request-id", "req_success".parse().unwrap());
             ctx.response_header = Some(&mut response);
@@ -1386,7 +1470,7 @@ mod tests {
     fn should_not_transform_partial_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response.status = StatusCode::PARTIAL_CONTENT;
         response.headers.insert(
@@ -1407,7 +1491,7 @@ mod tests {
             for status in [StatusCode::BAD_REQUEST, StatusCode::INTERNAL_SERVER_ERROR] {
                 let request = make_request(Method::POST, "/v1/messages");
                 let mut ctx = make_filter_context(&request);
-                ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
+                ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
                 let mut response = make_response();
                 response.status = status;
                 ctx.response_header = Some(&mut response);
@@ -1424,7 +1508,7 @@ mod tests {
     fn should_not_transform_redirect_response() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response.status = StatusCode::FOUND;
         ctx.response_header = Some(&mut response);
@@ -1479,8 +1563,8 @@ mod tests {
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
-        ctx.set_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
         let mut response = make_response();
         response
             .headers
@@ -1566,7 +1650,7 @@ mod tests {
 
                 // Both features are recorded for the response-header phase.
                 assert_eq!(
-                    ctx.get_metadata(DEGRADED_FEATURES_KEY),
+                    ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
                     Some("prompt_caching,extended_thinking"),
                     "both degraded features should be recorded in metadata"
                 );
@@ -1622,6 +1706,103 @@ mod tests {
         );
     }
 
+    /// An allowlisted mid-conversation system message drives the same operator
+    /// signal path as the other degradable features: the moved text lands in
+    /// the single leading system message of the forwarded body, the
+    /// per-feature counter fires, and the response header advertises it.
+    #[test]
+    fn mid_conversation_system_degradation_emits_counter_metadata_and_response_header() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str("allow_lossy_features:\n  - mid_conversation_system").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let anthropic_body = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 2048,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "# Environment\nworking directory: /tmp"},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let mut body = Some(Bytes::from(serde_json::to_vec(&anthropic_body).unwrap()));
+        let mut response = make_response();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let outcome = filter
+                    .on_selected_upstream_request_body(&mut ctx, &mut body)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(outcome, SelectedUpstreamBodyOutcome::Continue),
+                    "a degraded-but-translatable request continues with a rewritten body"
+                );
+
+                // The forwarded Chat Completions body has exactly one system
+                // message, in the leading position.
+                let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+                let messages = translated["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 3, "no system message may remain in history");
+                assert_eq!(messages[0]["role"], "system");
+                assert_eq!(
+                    messages[0]["content"],
+                    "You are helpful.\n\n# Environment\nworking directory: /tmp"
+                );
+                assert_eq!(messages[1]["role"], "user");
+                assert_eq!(messages[2]["role"], "user");
+
+                assert_eq!(
+                    ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
+                    Some("mid_conversation_system"),
+                    "the moved system message should be recorded in metadata"
+                );
+
+                ctx.response_header = Some(&mut response);
+                let action = filter.on_response(&mut ctx).await.unwrap();
+                assert!(
+                    matches!(action, FilterAction::Continue),
+                    "response phase should continue"
+                );
+            });
+        });
+
+        assert_eq!(
+            response
+                .headers
+                .get(DEGRADED_FEATURES_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("mid_conversation_system"),
+            "the forwarded response should advertise the degraded feature"
+        );
+
+        let snapshot: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key, value))
+            .collect();
+        let fired = snapshot.iter().any(|(key, value)| {
+            key.key().name() == "praxis_anthropic_messages_to_chat_completions_degraded_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "feature" && label.value() == "mid_conversation_system")
+                && matches!(value, metrics_util::debugging::DebugValue::Counter(1))
+        });
+        assert!(fired, "the mid_conversation_system counter must fire once");
+    }
+
     /// Without an allowlist the filter keeps the strict #1584 behavior: a request
     /// that uses an Anthropic-only feature is rejected before any backend call,
     /// and no degradation signal is produced.
@@ -1661,7 +1842,7 @@ mod tests {
         });
 
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             None,
             "strict mode records no degradation"
         );
@@ -1707,7 +1888,7 @@ mod tests {
         });
 
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             None,
             "no degradation is recorded for a clean request"
         );
@@ -1724,6 +1905,7 @@ mod tests {
         let degraded = request::DegradedFeatures {
             prompt_caching: true,
             extended_thinking: true,
+            mid_conversation_system: false,
         };
 
         let events = capture_warn_events(|| record_degraded_features(&mut ctx, degraded));
@@ -1744,7 +1926,7 @@ mod tests {
             "WARN must name every degraded feature as a structured field"
         );
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             Some("prompt_caching,extended_thinking"),
             "degraded features must be stashed for the response-header phase"
         );
@@ -1761,7 +1943,7 @@ mod tests {
 
         assert!(events.is_empty(), "no degradation must emit no WARN; got {events:?}");
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             None,
             "no degradation must not stash metadata"
         );

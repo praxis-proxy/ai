@@ -4,7 +4,7 @@
 # process limit, shed requests with 503 before descriptors run out, cap
 # concurrent requests and metering callouts, and close idle keep-alive
 # clients and pooled upstream connections so they cannot pin descriptors.
-# See docs/capacity-planning.md.
+# See docs/operations/capacity-planning.md.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/file-descriptor-limits.yaml

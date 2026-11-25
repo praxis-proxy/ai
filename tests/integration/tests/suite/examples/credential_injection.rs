@@ -111,3 +111,116 @@ fn credential_injection_internal_cluster() {
         "upstream should receive x-api-key for internal cluster: {body}"
     );
 }
+
+fn tenant_config(
+    (tenant_a_port, tenant_b_port): (u16, u16),
+    backend_port: u16,
+    path: &str,
+    header: &str,
+    prefix: &str,
+) -> praxis_core::config::Config {
+    let chains: String = ["alpha", "beta"]
+        .into_iter()
+        .map(|tenant| {
+            format!(
+                r#"
+  - name: {tenant}
+    filters:
+      - filter: basic_auth
+        strip_authorization: true
+        credentials:
+          - username: {tenant}
+            password: fixture
+      - filter: router
+        routes:
+          - path: {path}
+            cluster: {tenant}
+      - filter: load_balancer
+        clusters:
+          - name: {tenant}
+            endpoints: ["127.0.0.1:{backend_port}"]
+      - filter: credential_injection
+        clusters:
+          - name: {tenant}
+            header: {header}
+            value: upstream-{tenant}
+            header_prefix: "{prefix}"
+"#
+            )
+        })
+        .collect();
+
+    praxis_core::config::Config::from_yaml(&format!(
+        r#"
+listeners:
+  - name: alpha
+    address: "127.0.0.1:{tenant_a_port}"
+    filter_chains: [alpha]
+  - name: beta
+    address: "127.0.0.1:{tenant_b_port}"
+    filter_chains: [beta]
+filter_chains:
+{chains}
+insecure_options:
+  allow_private_endpoints: true
+"#
+    ))
+    .expect("tenant fixture should parse")
+}
+
+#[test]
+fn chat_completions_requires_tenant_credentials_before_injecting_upstream_key() {
+    assert_tenant_credentials("/v1/chat/completions", "Authorization", "Bearer ");
+}
+
+#[test]
+fn messages_requires_tenant_credentials_before_injecting_upstream_key() {
+    assert_tenant_credentials("/v1/messages", "x-api-key", "");
+}
+
+fn assert_tenant_credentials(path: &str, header: &str, prefix: &str) {
+    const ALPHA: &str = "Authorization: Basic YWxwaGE6Zml4dHVyZQ==\r\n";
+    const BETA: &str = "Authorization: Basic YmV0YTpmaXh0dXJl\r\n";
+    let backend = start_header_echo_backend();
+    let tenant_a_port = free_port();
+    let tenant_b_port = free_port();
+    let config = tenant_config((tenant_a_port, tenant_b_port), backend.port(), path, header, prefix);
+    let _proxy = praxis_test_utils::start_proxy(&config);
+    let send = |port, authorization| {
+        http_send(
+            &format!("127.0.0.1:{port}"),
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+                 {authorization}x-api-key: client-supplied-test-key\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\n{{}}"
+            ),
+        )
+    };
+
+    for (port, allowed, other, key) in [
+        (tenant_a_port, ALPHA, BETA, "upstream-alpha"),
+        (tenant_b_port, BETA, ALPHA, "upstream-beta"),
+    ] {
+        for rejected in ["", "Authorization: Basic aW52YWxpZA==\r\n", other] {
+            assert_eq!(
+                parse_status(&send(port, rejected)),
+                401,
+                "{path} must reject invalid tenant credentials"
+            );
+        }
+        let response = send(port, allowed);
+        assert_eq!(parse_status(&response), 200, "{path} must accept the matching tenant");
+        let headers = parse_body(&response);
+        let injected = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter_map(|(name, value)| name.eq_ignore_ascii_case(header).then_some(value.trim()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            injected,
+            [format!("{prefix}{key}")],
+            "{path} must forward exactly one tenant upstream credential"
+        );
+        assert!(!headers.contains("Basic "), "{path} must strip ingress Basic Auth");
+    }
+}

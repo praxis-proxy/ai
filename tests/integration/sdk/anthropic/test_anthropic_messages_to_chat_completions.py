@@ -80,11 +80,16 @@ class RecordingBackend(BaseHTTPRequestHandler):
     response_content_type = "application/json"
     send_tool_reply_once = False
     tool_call_arguments = "{}"
+    many_tool_calls_stream_once = False
+    matched_stop_stream_once: str | None = None
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
+    fragmented_stream_once = False
     error_response_once = False
+    named_tool_finish_gate = threading.Event()
 
     def do_POST(self):
+        """Record a request and return the configured Chat Completions response."""
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
@@ -105,11 +110,37 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(reply)
             return
+        if body.get("stream") and RecordingBackend.fragmented_stream_once:
+            RecordingBackend.fragmented_stream_once = False
+            text = "é🌍" * 2048
+            event = {"id": "chatcmpl-stub", "model": MODEL,
+                     "choices": [{"index": 0, "delta": {"content": text},
+                                  "finish_reason": "stop"}]}
+            payload = ("data: " + json.dumps(event, ensure_ascii=False)
+                       + "\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            for offset in range(0, len(payload), 127):
+                self.wfile.write(payload[offset:offset + 127])
+                self.wfile.flush()
+            return
         if body.get("stream"):
-            if RecordingBackend.untranslatable_stream_once:
+            if RecordingBackend.matched_stop_stream_once is not None:
+                stop_sequence = RecordingBackend.matched_stop_stream_once
+                RecordingBackend.matched_stop_stream_once = None
+                self._send_matched_stop_stream(stop_sequence)
+            elif RecordingBackend.untranslatable_stream_once:
                 kind = RecordingBackend.untranslatable_stream_once
                 RecordingBackend.untranslatable_stream_once = None
-                self._send_untranslatable_stream(kind)
+                if kind == "tool_use_stop":
+                    self._send_named_tool_stop_stream()
+                else:
+                    self._send_untranslatable_stream(kind)
+            elif RecordingBackend.many_tool_calls_stream_once:
+                RecordingBackend.many_tool_calls_stream_once = False
+                self._send_many_tool_calls_stream()
             else:
                 self._send_invalid_tool_id_stream()
             return
@@ -248,6 +279,103 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.wfile.write(wire)
         self.wfile.flush()
 
+    def _send_named_tool_stop_stream(self):
+        """Return a named tool call followed by a stop finish reason."""
+        chunks = [
+            {
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }]
+                },
+                "finish_reason": None,
+            },
+            {"delta": {}, "finish_reason": "stop"},
+        ]
+        wire_chunks = []
+        for chunk in chunks:
+            payload = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, **chunk}],
+            }
+            wire_chunks.append(f"data: {json.dumps(payload)}\n\n")
+        terminal = (wire_chunks[1] + "data: [DONE]\n\n").encode()
+        tool_call = wire_chunks[0].encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(len(tool_call) + len(terminal)))
+        self.end_headers()
+        self.wfile.write(tool_call)
+        self.wfile.flush()
+        if not RecordingBackend.named_tool_finish_gate.wait(timeout=10):
+            return
+        self.wfile.write(terminal)
+        self.wfile.flush()
+
+    def _send_many_tool_calls_stream(self):
+        tool_calls = [
+            {
+                "index": index,
+                "id": f"call_{index}",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+            for index in range(64)
+        ]
+        chunks = [
+            {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            },
+        ]
+        wire = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        wire += "data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire.encode())))
+        self.end_headers()
+        self.wfile.write(wire.encode())
+        self.wfile.flush()
+
+    def _send_matched_stop_stream(self, stop_sequence: str):
+        """Send a terminal stream chunk reporting the supplied matched sequence."""
+        chunk = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "partial"},
+                "finish_reason": "stop",
+                "stop_reason": stop_sequence,
+            }],
+        }
+        wire = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
+
     def log_message(self, format, *args):
         pass
 
@@ -271,6 +399,7 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
             + "        allow_lossy_features:\n"
             + "          - prompt_caching\n"
             + "          - extended_thinking\n"
+            + "          - mid_conversation_system\n"
         )
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
@@ -438,6 +567,86 @@ class TestRequestFieldHandling:
         assert "thinking" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
+    def test_cache_control_rejection_names_the_offending_field(self, anthropic_client):
+        """The 400 must name `cache_control`, not the block's overall shape."""
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                system=[{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "cache_control" in str(excinfo.value)
+        assert "not supported by this endpoint" in str(excinfo.value)
+        assert "Remove the caching markers" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
+    def test_deferred_tool_placeholder_is_accepted(self, anthropic_client):
+        """Claude Code's first session request carries `defer_loading: true`.
+
+        Rejecting it costs the client two failed round-trips per session
+        while it falls back to the flattened tool list.
+        """
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+            extra_body={
+                "tools": [
+                    {
+                        "name": "DeferredToolPlaceholder",
+                        "description": "placeholder",
+                        "input_schema": {"type": "object"},
+                        "defer_loading": True,
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "input_schema": {"type": "object"},
+                    },
+                ]
+            },
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tools = upstream["tools"]
+        assert len(tools) == 2, "both tools must be forwarded"
+        assert tools[0]["function"]["name"] == "DeferredToolPlaceholder"
+        for tool in tools:
+            assert "defer_loading" not in tool["function"], (
+                f"the deferred-loading marker is dropped: {tool}"
+            )
+
+    def test_unsupported_tool_field_rejection_names_the_field(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call lookup"}],
+                extra_body={
+                    "tools": [
+                        {
+                            "name": "lookup",
+                            "input_schema": {"type": "object"},
+                            "signed": "no",
+                        }
+                    ]
+                },
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "signed" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
     def test_default_valued_rejected_field_is_dropped(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -486,6 +695,488 @@ class TestRequestFieldHandling:
         upstream = RecordingBackend.bodies[-1]
         assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
         assert upstream["messages"][2]["content"] == ""
+
+    def test_errored_tool_result_is_translated_not_rejected(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "cat: missing.txt: No such file or directory",
+                        "is_error": True,
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["tool_call_id"] == "toolu_1"
+        assert tool_message["content"] == (
+            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory"
+        )
+
+    def test_tool_result_image_content_is_promoted_to_user_message(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "chart"},
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": "https://example.com/chart.png"},
+                            },
+                        ],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == "chart"
+        image_message = upstream["messages"][3]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["type"] == "image_url"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
+    def test_parallel_tool_result_images_follow_all_tool_messages(self, anthropic_client):
+        # Chat Completions requires every tool reply to follow the assistant
+        # `tool_calls` message directly, so an image promoted out of the first
+        # of two parallel tool results may only appear as a user message after
+        # the last tool message — never between two tool messages.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "chart"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/chart.png"},
+                                },
+                            ],
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "content": "ready",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "tool", "user"], upstream["messages"]
+        assert upstream["messages"][2]["tool_call_id"] == "toolu_1"
+        assert upstream["messages"][3]["tool_call_id"] == "toolu_2"
+        image_message = upstream["messages"][4]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
+    def test_tool_result_search_result_part_is_flattened(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "search_result",
+                            "source": "kb://timeouts",
+                            "title": "Timeout KB",
+                            "content": [{"type": "text", "text": "Timeouts default to 30 seconds."}],
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Search result: "Timeout KB"\nSource: "kb://timeouts"\nContent:\nTimeouts default to 30 seconds.'
+        )
+
+    def test_tool_result_document_part_is_flattened(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "document",
+                            "title": "Nested Doc",
+                            "source": {"type": "content", "content": [{"type": "text", "text": "Nested document fact."}]},
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Document: "Nested Doc"\nContent:\nNested document fact.'
+        )
+
+    def test_tool_result_document_string_content_is_flattened(self, anthropic_client):
+        # The ContentBlockSource schema allows `source.content` to be a
+        # string as well as an array of text blocks; the string form is
+        # valid client output and must translate, not fail closed.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "document",
+                            "title": "Contract",
+                            "source": {"type": "content", "content": "The full contract text."},
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Document: "Contract"\nContent:\nThe full contract text.'
+        )
+
+    def test_tool_result_empty_document_part_is_rejected(self, anthropic_client):
+        # A document part whose source carries nothing extractable flattens
+        # to nothing; it must fail closed instead of silently disappearing
+        # from the tool message.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "document", "source": {"type": "url", "url": ""}}],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_document_base64_source_is_rejected(self, anthropic_client):
+        # A base64 document source keeps only its media type when flattened,
+        # dropping the encoded payload, so the part must fail closed instead
+        # of forwarding a document label with no content.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "document",
+                                "title": "Contract",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "JVBERi0xLjcK",
+                                },
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_search_result_non_array_content_is_rejected(self, anthropic_client):
+        # A string `content` carries text the flattener would silently drop
+        # while keeping the title, so a present, non-null `content` must be
+        # an array of text blocks.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": "Timeouts default to 30 seconds.",
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "search_result" in str(excinfo.value), "error message must name the search_result part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_document_source_field_is_rejected(self, anthropic_client):
+        # A source-level field outside the variant's schema — a cache_control
+        # marker, for example — is dropped by the flattener without the
+        # prompt-caching allowlist ever seeing it, so it fails closed even
+        # when the source otherwise carries valid text.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "document",
+                                "title": "Contract",
+                                "source": {
+                                    "type": "content",
+                                    "content": [{"type": "text", "text": "Valid fact."}],
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_parallel_tool_result_images_across_consecutive_user_messages(self, anthropic_client):
+        # Anthropic combines consecutive user messages into one turn, so a
+        # client may return parallel tool results in two separate user
+        # messages. The image promoted out of the first result may only
+        # appear as a user message after the last tool reply of the group.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "chart"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/chart.png"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "content": "ready",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "tool", "user"], upstream["messages"]
+        assert upstream["messages"][2]["tool_call_id"] == "toolu_1"
+        assert upstream["messages"][3]["tool_call_id"] == "toolu_2"
+        image_message = upstream["messages"][4]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
+    def test_tool_result_image_keeps_backend_order_with_trailing_content(self, anthropic_client):
+        # Ordinary content emitted in place would overtake the deferred image:
+        # for [tool_result(image A), text, image B] the backend must receive
+        # A, then the text, then B, so "first image" keeps its Anthropic
+        # meaning.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/a.png"},
+                                },
+                            ],
+                        },
+                        {"type": "text", "text": "meanwhile"},
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": "https://example.com/b.png"},
+                        },
+                    ],
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "user", "assistant"], upstream["messages"]
+        deferred = upstream["messages"][3]["content"]
+        assert deferred[0]["image_url"]["url"] == "https://example.com/a.png"
+        assert deferred[1] == {"type": "text", "text": "meanwhile"}
+        assert deferred[2]["image_url"]["url"] == "https://example.com/b.png"
 
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -552,6 +1243,22 @@ class TestRequestFieldHandling:
         assert upstream["stop"] == [","]
         assert response.stop_reason == "stop_sequence"
         assert response.stop_sequence == ","
+
+    def test_long_stop_sequence_is_retained_end_to_end(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        stop_sequence = "s" * 253
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            stop_sequences=[stop_sequence],
+            messages=[{"role": "user", "content": "Stop after the marker"}],
+        )
+
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stop"] == [stop_sequence]
+        assert response.stop_reason == "stop_sequence"
+        assert response.stop_sequence == stop_sequence
 
     def test_stop_without_matched_sequence_is_end_turn(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -654,6 +1361,163 @@ class TestResponseValidation:
 
 
 class TestStreamingResponseValidation:
+    def test_fragmented_utf8_crlf_stream(self, anthropic_client):
+        RecordingBackend.fragmented_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=8192,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                text = "".join(stream.text_stream)
+                message = stream.get_final_message()
+            assert text == "é🌍" * 2048
+            assert message.stop_reason == "end_turn"
+        finally:
+            RecordingBackend.fragmented_stream_once = False
+
+    def test_long_matched_stop_sequence_is_reported(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        stop_sequence = "s" * 300
+        RecordingBackend.matched_stop_stream_once = stop_sequence
+
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                stop_sequences=[stop_sequence],
+                messages=[{"role": "user", "content": "Stop after the marker"}],
+            ) as stream:
+                message = stream.get_final_message()
+        finally:
+            RecordingBackend.matched_stop_stream_once = None
+
+        assert message.stop_reason == "stop_sequence"
+        assert message.stop_sequence == stop_sequence
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stop"] == [stop_sequence], (
+            "the streaming request must forward the client stop sequence upstream"
+        )
+
+    def test_named_tool_with_stop_finish_reason_reports_tool_use(
+        self, anthropic_client
+    ):
+        """Preserve named-tool semantics when the upstream terminates with stop."""
+        RecordingBackend.bodies.clear()
+        RecordingBackend.named_tool_finish_gate.clear()
+        RecordingBackend.untranslatable_stream_once = "tool_use_stop"
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Use the weather tool"}],
+                tools=[{
+                    "name": "get_weather",
+                    "description": "Get the weather for a city.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }],
+                tool_choice={"type": "tool", "name": "get_weather"},
+            ) as stream:
+                events = []
+                tool_received = threading.Event()
+
+                def collect_stream() -> None:
+                    """Collect SDK events and signal when the tool block arrives."""
+                    for event in stream:
+                        events.append(event)
+                        if (
+                            event.type == "content_block_start"
+                            and event.content_block.type == "tool_use"
+                        ):
+                            tool_received.set()
+
+                consumer = threading.Thread(target=collect_stream, daemon=True)
+                consumer.start()
+                delivered_before_finish = tool_received.wait(timeout=5)
+                RecordingBackend.named_tool_finish_gate.set()
+                consumer.join(timeout=5)
+
+                assert delivered_before_finish, (
+                    "the SDK must receive the tool block before upstream completion"
+                )
+                assert not consumer.is_alive(), (
+                    "the SDK stream must complete after the terminal events are released"
+                )
+        finally:
+            RecordingBackend.named_tool_finish_gate.set()
+            RecordingBackend.untranslatable_stream_once = None
+
+        tool_use = next(
+            event.content_block
+            for event in events
+            if event.type == "content_block_start"
+            and event.content_block.type == "tool_use"
+        )
+        assert tool_use.name == "get_weather", "the named tool must be preserved in the response"
+        [upstream] = RecordingBackend.bodies
+        assert upstream["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }, "the named Anthropic tool choice must be translated to Chat Completions"
+        message_delta = next(event for event in events if event.type == "message_delta")
+        assert message_delta.delta.stop_reason == "tool_use", (
+            "a tool call with an upstream stop finish reason must report tool_use"
+        )
+        assert any(event.type == "message_stop" for event in events), (
+            "a completed streaming response must emit message_stop"
+        )
+
+    def test_many_tool_calls_preserve_all_content_block_stops(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.many_tool_calls_stream_once = True
+
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call the tools"}],
+            ) as stream:
+                events = list(stream)
+        finally:
+            RecordingBackend.many_tool_calls_stream_once = False
+
+        start_events = [
+            event for event in events if event.type == "content_block_start"
+        ]
+        start_indices = [event.index for event in start_events]
+        stop_indices = [
+            event.index for event in events if event.type == "content_block_stop"
+        ]
+        expected_indices = list(range(64))
+        assert start_indices == expected_indices, (
+            "all 64 tool blocks must start once in block-index order"
+        )
+        assert all(event.content_block.type == "tool_use" for event in start_events), (
+            "all 64 started content blocks must be tool_use blocks"
+        )
+        assert stop_indices == expected_indices, (
+            "all 64 tool blocks must stop once in block-index order"
+        )
+        block_stop_positions = [
+            index for index, event in enumerate(events)
+            if event.type == "content_block_stop"
+        ]
+        message_stop_positions = [
+            index for index, event in enumerate(events) if event.type == "message_stop"
+        ]
+        message_delta_positions = [
+            index for index, event in enumerate(events) if event.type == "message_delta"
+        ]
+        assert len(message_stop_positions) == 1, (
+            "a completed stream must emit exactly one message_stop"
+        )
+        assert message_delta_positions, "a completed stream must emit message_delta"
+        assert max(block_stop_positions) < message_delta_positions[0], (
+            "every content_block_stop must precede the first message_delta"
+        )
+        assert message_delta_positions[-1] < message_stop_positions[0], (
+            "message_stop must follow the last message_delta"
+        )
+
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
         events = []
@@ -744,6 +1608,101 @@ class TestOperatorApprovedDegradation:
         # The prompt content survives the degradation.
         assert any(m["role"] == "system" and m["content"] == "Be brief" for m in upstream["messages"])
 
+    def test_tool_result_nested_cache_markers_are_degraded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": [
+                                    {"type": "text", "text": "Timeouts default to 30 seconds.", "cache_control": {"type": "ephemeral"}},
+                                ],
+                            },
+                            {
+                                "type": "document",
+                                "title": "Nested Doc",
+                                "source": {
+                                    "type": "content",
+                                    "content": [
+                                        {"type": "text", "text": "Nested fact.", "cache_control": {"type": "ephemeral"}},
+                                    ],
+                                },
+                            },
+                        ],
+                    }],
+                },
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "prompt_caching" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        serialized = json.dumps(upstream)
+        assert "cache_control" not in serialized, f"nested markers must be stripped: {serialized}"
+        tool_message = upstream["messages"][2]
+        assert tool_message["content"] == (
+            'Search result: "Timeout KB"\nContent:\nTimeouts default to 30 seconds.\n'
+            'Document: "Nested Doc"\nContent:\nNested fact.'
+        )
+
+    def test_tool_result_nested_block_citations_are_rejected(self, anthropic_client):
+        # A citations config on a nested search_result text block is dropped
+        # by the flattener, so it must fail closed instead.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": [
+                                    {"type": "text", "text": "Timeouts default to 30 seconds.", "citations": []},
+                                    {
+                                        "type": "text",
+                                        "text": "Cited fact.",
+                                        "citations": [{"type": "char_location", "cited_text": "t", "start_index": 0, "end_index": 1}],
+                                    },
+                                ],
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "search_result" in str(excinfo.value), "error message must name the search_result part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
     def test_extended_thinking_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()
 
@@ -776,6 +1735,43 @@ class TestOperatorApprovedDegradation:
         assert raw.http_response.status_code == 200
         reported = raw.http_response.headers.get(DEGRADED_HEADER, "")
         assert "prompt_caching" in reported and "extended_thinking" in reported, reported
+
+    @pytest.mark.parametrize("leading", [False, True])
+    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client, leading):
+        RecordingBackend.bodies.clear()
+
+        # Claude Code sends a text-only `system` message after the first user
+        # turn; vLLM chat templates reject it ("System message must be at the
+        # beginning"), so the allowlisted fold moves it into the single
+        # leading system message.
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            system="Be brief",
+            messages=[
+                *([{"role": "system", "content": "Keep instruction order."}] if leading else []),
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "system", "content": "Answer tersely."},
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "mid_conversation_system" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        system_messages = [m for m in upstream["messages"] if m["role"] == "system"]
+        assert system_messages == [
+            {
+                "role": "system",
+                "content": (
+                    "Be brief\n\n"
+                    + ("Keep instruction order.\n\n" if leading else "")
+                    + "Answer tersely."
+                ),
+            }
+        ], f"the fold must merge into one leading system message: {upstream['messages']}"
 
     def test_streaming_request_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()

@@ -11,6 +11,7 @@ use super::{
     BOUND_PREFIX, CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY,
     OpenaiChatCompletionsToAnthropicFilter, RESPONSE_ARMED, request::translate_request, response,
 };
+use crate::RecordAiMetadata as _;
 
 const INPUT: &str = r#"{
       "model":"client-model",
@@ -64,7 +65,7 @@ fn supported_sampling_values_are_preserved() {
 #[tokio::test]
 async fn configured_version_overrides_caller_version() {
     for version in ["2023-06-01", "2026-10-21"] {
-        let config = serde_yaml::from_str(&format!("api_translation_enabled: true\napi_version: '{version}'")).unwrap();
+        let config = serde_yaml::from_str(&format!("api_version: '{version}'")).unwrap();
         let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
         let mut request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         request
@@ -479,7 +480,7 @@ fn maps_anthropic_errors_to_openai_error_envelope() {
 
 #[tokio::test]
 async fn preserves_upstream_error_status_across_response_callbacks() {
-    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -510,8 +511,7 @@ async fn preserves_upstream_error_status_across_response_callbacks() {
 
 #[tokio::test]
 async fn request_profile_stays_pinned_through_response_after_route_metadata_changes() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_body_bytes: 4096").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 4096").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions?trace=1");
     let mut response = Response {
@@ -551,14 +551,14 @@ async fn request_profile_stays_pinned_through_response_after_route_metadata_chan
     assert_eq!(upstream["model"], "claude-test");
 
     // Simulate a later overlay selection. The bound profile is the response authority.
-    ctx.set_metadata("intelligent_route.api_format", "openai-chat");
-    ctx.set_metadata("intelligent_route.overlay_revision", "a".repeat(64));
+    ctx.record_ai_metadata("intelligent_route.api_format", "openai-chat");
+    ctx.record_ai_metadata("intelligent_route.overlay_revision", "a".repeat(64));
     ctx.response_header = Some(&mut response);
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    assert_eq!(ctx.get_metadata(RESPONSE_ARMED), Some("true"));
+    assert_eq!(ctx.filter_metadata.get(RESPONSE_ARMED), Some("true"));
     let anthropic = Bytes::from_static(br#"{"type":"message","id":"msg_1","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#);
     let mut response_body = Some(anthropic);
     assert!(matches!(
@@ -568,31 +568,38 @@ async fn request_profile_stays_pinned_through_response_after_route_metadata_chan
     let downstream: Value = serde_json::from_slice(response_body.as_ref().unwrap()).unwrap();
     assert_eq!(downstream["model"], "client-model");
     assert_eq!(downstream["choices"][0]["message"]["content"], "ok");
-    assert_eq!(ctx.get_metadata(&format!("{BOUND_PREFIX}revision")).unwrap().len(), 64);
+    assert_eq!(
+        ctx.filter_metadata
+            .get(&format!("{BOUND_PREFIX}revision"))
+            .unwrap()
+            .len(),
+        64
+    );
 }
 
 #[tokio::test]
-async fn stale_anthropic_profile_fails_closed_when_tenant_permission_is_off() {
+async fn default_config_translates_selected_anthropic_request() {
     let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     selected_profile_metadata(&mut ctx);
 
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(&action, FilterAction::Reject(_)),
-        "disabled tenant permission must reject a stale Anthropic profile"
-    );
-    let FilterAction::Reject(rejection) = action else {
-        return;
-    };
-    assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        String::from_utf8_lossy(rejection.body.as_deref().unwrap())
-            .contains("platform administrator has forbidden translation")
-    );
-    assert!(ctx.request_headers_to_set.is_empty());
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"client-model","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#,
+    ));
+    let outcome = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SelectedUpstreamBodyOutcome::Continue));
+    let translated: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(translated["messages"][0]["content"][0]["text"], "hi");
+    assert_eq!(translated["max_tokens"], 20);
 }
 
 #[tokio::test]
@@ -624,8 +631,7 @@ async fn openai_candidate_rewrites_only_the_selected_target_model() {
 #[tokio::test]
 #[expect(clippy::panic, reason = "tests assert that unsupported requests are rejected")]
 async fn selected_request_body_limit_rejects_before_json_parsing() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_request_body_bytes: 1").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_request_body_bytes: 1").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&request);
@@ -658,9 +664,7 @@ async fn selected_request_body_limit_rejects_before_json_parsing() {
 async fn split_request_limit_accepts_boundary_and_rejects_one_byte_over() {
     let valid = br#"{"model":"client-model","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#;
     let max_request_body_bytes = valid.len() + 2;
-    let yaml = format!(
-        "api_translation_enabled: true\nmax_request_body_bytes: {max_request_body_bytes}\nmax_response_body_bytes: 1"
-    );
+    let yaml = format!("max_request_body_bytes: {max_request_body_bytes}\nmax_response_body_bytes: 1");
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
 
@@ -705,8 +709,7 @@ async fn split_request_limit_accepts_boundary_and_rejects_one_byte_over() {
 
 #[tokio::test]
 async fn translates_json_response_split_across_streamed_chunks() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_body_bytes: 4096").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 4096").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -756,8 +759,7 @@ async fn translates_json_response_split_across_streamed_chunks() {
     reason = "tests assert that over-limit provider responses are rejected"
 )]
 async fn rejects_json_response_that_exceeds_accumulation_limit() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_response_body_bytes: 128").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_response_body_bytes: 128").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -805,9 +807,7 @@ async fn rejects_json_response_that_exceeds_accumulation_limit() {
 async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts() {
     let upstream = anthropic_json_response();
     let response_limit = upstream.len();
-    let yaml = format!(
-        "api_translation_enabled: true\nmax_request_body_bytes: 4096\nmax_response_body_bytes: {response_limit}"
-    );
+    let yaml = format!("max_request_body_bytes: 4096\nmax_response_body_bytes: {response_limit}");
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
 
@@ -834,7 +834,7 @@ async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts()
     assert!(serde_json::from_slice::<Value>(body.as_ref().unwrap()).is_ok());
 
     let yaml = format!(
-        "api_translation_enabled: true\nmax_request_body_bytes: 4096\nmax_response_body_bytes: {}",
+        "max_request_body_bytes: 4096\nmax_response_body_bytes: {}",
         response_limit - 1
     );
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -866,7 +866,7 @@ async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts()
 #[tokio::test]
 #[expect(clippy::panic, reason = "tests assert that invalid provider JSON is rejected")]
 async fn rejects_invalid_provider_json_with_a_downstream_502() {
-    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -923,7 +923,7 @@ async fn openai_candidate_json_response_remains_chunked_passthrough() {
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    assert_eq!(ctx.get_metadata(RESPONSE_ARMED), None);
+    assert_eq!(ctx.filter_metadata.get(RESPONSE_ARMED), None);
 
     for (chunk, eos) in [(b"{\"choices\":".as_slice(), false), (b"[]}".as_slice(), true)] {
         let original = Bytes::copy_from_slice(chunk);
@@ -967,18 +967,18 @@ fn anthropic_json_response() -> &'static [u8] {
 
 fn selected_profile_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
     selected_profile_metadata_with_format(ctx, "messages");
-    ctx.set_metadata(CREDENTIAL_STRATEGY, "apikey");
-    ctx.set_metadata(CREDENTIAL_NAME, "anthropic-key");
-    ctx.set_metadata(CREDENTIAL_NAMESPACE, "tenant-a");
-    ctx.set_metadata(CREDENTIAL_KEY, "api-key");
+    ctx.record_ai_metadata(CREDENTIAL_STRATEGY, "apikey");
+    ctx.record_ai_metadata(CREDENTIAL_NAME, "anthropic-key");
+    ctx.record_ai_metadata(CREDENTIAL_NAMESPACE, "tenant-a");
+    ctx.record_ai_metadata(CREDENTIAL_KEY, "api-key");
 }
 
 fn selected_profile_metadata_with_format(ctx: &mut praxis_filter::HttpFilterContext<'_>, format: &str) {
-    ctx.set_metadata("intelligent_route.outcome", "routed");
-    ctx.set_metadata("intelligent_route.stable_id", "model/provider");
-    ctx.set_metadata("intelligent_route.overlay_revision", "b".repeat(64));
-    ctx.set_metadata("intelligent_route.api_format", format);
-    ctx.set_metadata("intelligent_route.path", "/v1/messages");
-    ctx.set_metadata("intelligent_route.target_model", "claude-test");
-    ctx.set_metadata("intelligent_route.name", "client-model");
+    ctx.record_ai_metadata("intelligent_route.outcome", "routed");
+    ctx.record_ai_metadata("intelligent_route.stable_id", "model/provider");
+    ctx.record_ai_metadata("intelligent_route.overlay_revision", "b".repeat(64));
+    ctx.record_ai_metadata("intelligent_route.api_format", format);
+    ctx.record_ai_metadata("intelligent_route.path", "/v1/messages");
+    ctx.record_ai_metadata("intelligent_route.target_model", "claude-test");
+    ctx.record_ai_metadata("intelligent_route.name", "client-model");
 }

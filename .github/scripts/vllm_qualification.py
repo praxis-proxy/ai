@@ -180,10 +180,12 @@ def capture(args):
     # working tree. The suite reuses the build vllm-gpu-container.yaml published
     # whenever it matches this checkout, so "what the image was built from" is
     # the honest claim; hashing the checked-out Containerfile would describe a
-    # build that may never have happened on this runner. A registry digest is
-    # present only when the image was pulled, absent when it was built here.
-    registry_digest = image_inspect(
-        runtime, image, "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}")
+    # build that may never have happened on this runner. The registry digest
+    # comes from resolve-vllm-gpu-image, which reports one only when it reused
+    # the pulled image. The image's own RepoDigests cannot decide this: podman
+    # records a manifest digest for a local build too, which would label a
+    # build that was never pushed as a registry pull.
+    registry_digest = os.environ.get("VLLM_GPU_IMAGE_DIGEST") or None
     containerfile_sha256 = (image_label(runtime, image, "praxis.vllm.containerfile-sha256")
                             or file_hash("vllm/Containerfile"))
     base_image = image_label(runtime, image, "praxis.vllm.base-image")
@@ -246,6 +248,25 @@ def capture(args):
     write_json(args.output, report)
 
 
+def capture_codex(output):
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    cases = []
+    checkpoint = os.environ.get("CODEX_MODEL") or os.environ.get("VLLM_GPU_MODEL")
+    revision = os.environ.get("CODEX_MODEL_REVISION") or model_revision(os.environ.get("CONTAINER_RUNTIME", "docker"), checkpoint)
+    for name in ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION"):
+        case = {"id": name.lower(), "status": os.environ.get(name) or "unexecuted"}
+        evidence = read_json(os.environ.get(name + "_EVIDENCE"))
+        if isinstance(evidence, dict):
+            evidence.update(checkpoint=checkpoint, resolved_revision=revision,
+                            served_model=os.environ.get("CODEX_VLLM_MODEL"), image=os.environ.get("VLLM_GPU_IMAGE"),
+                            tool_parser=os.environ.get("CODEX_TOOL_CALL_PARSER"),
+                            reasoning_parser=os.environ.get("CODEX_REASONING_PARSER"))
+            case["capabilities"] = evidence
+        cases.append(case)
+    write_json(output, {"run_id": int(os.environ["GITHUB_RUN_ID"]),
+                        "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "checkout_sha": sha, "cases": cases})
+
+
 def acceptance(path, job_result, run_id, attempt, sha, scope):
     raw = read_json(path)
     if (not isinstance(raw, dict) or raw.get("run_id") != run_id
@@ -255,8 +276,11 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
                 "job_status": job_result, "scope": scope,
                 "reason": "per-scenario result artifact unavailable or provenance mismatch",
                 "cases": []}
-    return {"status": job_result, "job_status": job_result, "scope": scope,
-            "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    result = {"status": job_result, "job_status": job_result, "scope": scope,
+              "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    if isinstance(raw.get("provenance"), dict):
+        result["provenance"] = raw["provenance"]
+    return result
 
 
 def passing_suite_problem(report):
@@ -604,6 +628,52 @@ def release_evidence(args):
     (destination / "qualification-section.md").write_text(render(report), encoding="utf-8")
 
 
+def exact_evidence(args):
+    """Select a GPU qualification artifact produced at the release commit.
+
+    Ancestor evidence answers whether the suite passed on related code; only a
+    run at the release SHA answers whether this commit was validated. A
+    maintainer obtains that run by dispatching vllm-integration.yaml at the
+    release tag with run_live_vllm enabled, so this lookup accepts every
+    trigger instead of the schedule-only selection ancestor evidence uses.
+
+    Writes nothing when no verified run exists at the release commit, leaving
+    the caller free to render the gap as "not validated".
+    """
+    destination = Path(args.output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    output = destination / "qualification.json"
+    if output.exists():
+        output.unlink()
+    data = gh_json(
+        f"repos/{args.repo}/actions/workflows/vllm-integration.yaml/runs?per_page=100")
+    if not isinstance(data, dict) or not isinstance(data.get("workflow_runs"), list):
+        write_json(output, unavailable(args.sha, "vLLM Integration run lookup failed"))
+        return
+    candidates = sorted(
+        (run for run in data["workflow_runs"]
+         if run.get("head_sha") == args.sha and run.get("status") == "completed"),
+        key=lambda run: run["created_at"], reverse=True)
+    for run in candidates:
+        download_dir = destination / "download" / str(run["id"])
+        try:
+            downloaded = subprocess.run(
+                ["gh", "run", "download", str(run["id"]), "--repo", args.repo,
+                 "--name", ARTIFACT, "--dir", str(download_dir)],
+                capture_output=True, text=True, check=False, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            downloaded = None
+        raw = read_json(download_dir / "qualification.json") if downloaded and downloaded.returncode == 0 else None
+        if verify(raw, run, args.sha):
+            continue
+        raw["release_context"] = {
+            "release_sha": args.sha, "tested_at": run["created_at"],
+            "selection": "exact release commit", "newer_runs": [],
+        }
+        write_json(output, raw)
+        return
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -612,6 +682,7 @@ def main():
     cap.add_argument("--credentialed", required=True)
     cap.add_argument("--setup", choices=("passed", "failed"), required=True)
     cap.add_argument("--output", required=True)
+    sub.add_parser("capture-codex").add_argument("--output", required=True)
     fin = sub.add_parser("finish")
     fin.add_argument("--raw", required=True)
     fin.add_argument("--requested", choices=("true", "false"), required=True)
@@ -626,12 +697,17 @@ def main():
     rel = sub.add_parser("release-evidence")
     for field in ("repo", "sha", "output-dir"):
         rel.add_argument("--" + field, required=True)
+    exact = sub.add_parser("exact-evidence")
+    for field in ("repo", "sha", "output-dir"):
+        exact.add_argument("--" + field, required=True)
     notes = sub.add_parser("compose")
     for field in ("existing", "section", "output"):
         notes.add_argument("--" + field, required=True)
     args = parser.parse_args()
     if args.command == "capture":
         capture(args)
+    elif args.command == "capture-codex":
+        capture_codex(args.output)
     elif args.command == "finish":
         report = finish(args.raw, args.requested == "true", args.start_result, args.suite_result,
                         args.claude_result, args.codex_result, int(args.run_id), int(args.attempt), args.url, args.sha,
@@ -641,6 +717,8 @@ def main():
         Path(args.markdown).write_text(render(report, detailed=True), encoding="utf-8")
     elif args.command == "release-evidence":
         release_evidence(args)
+    elif args.command == "exact-evidence":
+        exact_evidence(args)
     elif args.command == "compose":
         Path(args.output).write_text(compose_notes(Path(args.existing).read_text(encoding="utf-8"),
                                                   Path(args.section).read_text(encoding="utf-8")), encoding="utf-8")

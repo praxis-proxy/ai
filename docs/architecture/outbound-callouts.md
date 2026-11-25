@@ -36,6 +36,7 @@ loopback test stubs) only after its authority has been independently restricted.
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
 | `external_metering` balance check and usage report | Configured `metering_url` via `SubRequestClient` | `allow_private_endpoint` | No-follow | Anonymous; no downstream headers |
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |
+| `mcp` broker `backend_sessions` handshake (`initialize`, `notifications/initialized`, session `DELETE`) | Operator-configured server `cluster`, declared in top-level `clusters:` and dialed through the generated outbound chain's `load_balancer` | Literal private endpoints need global `allow_private_endpoints`; hostnames that resolve to private ranges need `allow_private_upstreams` or the cluster's `trusted_private_endpoints` | No-follow | Client headers named by `backend_sessions.forward_headers` (default `authorization`) plus `outbound_filters` mutations |
 | `azure_ad` token fetch | Configured authority plus tenant via `SubRequestClient` | `allow_private_authority` | No-follow | Client secret in the token POST body |
 | `gcp_adc` metadata fetch | Protocol-owned metadata endpoint via `SubRequestClient` | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
 | `gcp_adc` key-file token exchange | Key file `token_uri`, which must be exactly `https://oauth2.googleapis.com/token`, via `SubRequestClient` | None (public-only) | No-follow | Signed `RS256` assertion in the token POST body |
@@ -59,6 +60,15 @@ A new filter that opens an outbound HTTP connection must:
 
 1. Classify the target as operator-configured, request-derived, or
    protocol-owned.
+   An operator-configured target is a `cluster` name resolved against
+   top-level `clusters:`, never a URL field: the cluster supplies endpoints,
+   load balancing, TLS (pinned CA, client certificate, SNI), timeouts,
+   private-address policy, and `credential_injection`. A filtered subrequest
+   reaches it through a `load_balancer` in its outbound chain, as the IRR
+   inference step does. Request-derived and protocol-owned targets stay URLs
+   and follow the steps below. Operator URL fields in the inventory above
+   predate this rule and are being migrated
+   ([#2014](https://github.com/praxis-proxy/ai/issues/2014)).
 2. Reuse the shared target/address policy, or document why a stricter dedicated
    policy is required.
 3. Default to public addresses and expose a narrowly named private-address

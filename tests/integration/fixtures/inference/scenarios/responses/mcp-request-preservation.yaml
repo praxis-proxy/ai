@@ -1,0 +1,58 @@
+version: 1
+id: responses/mcp-request-preservation
+description: Controlled mcp mutation retains unrelated request members and tool schema
+  order.
+protocol: openai_responses
+example_config: openai/responses/agentic-loop-deferred-mcp-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+- responses.agentic.mcp_rewrite_preservation
+turns:
+- name: initial
+  request:
+    method: POST
+    path: /v1/responses
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        tools:
+        - type: tool_search
+        - type: function
+          name: zebra
+          parameters:
+            type: object
+            properties:
+              z:
+                type: string
+              a:
+                type: number
+        - type: mcp
+          server_label: drive
+          connector_id: corp_drive
+          defer_loading: true
+          require_approval: never
+        model: ${MODEL}
+        input:
+        - content:
+          - text: hello
+            type: input_text
+          role: user
+          type: message
+        metadata:
+          z: last
+          a: first
+        store: false
+        stream: false
+        extra:
+          z: 1
+          a: 2
+  expect:
+    client_status: 200
+    client_body_kind: json
+    upstream_path: /v1/responses
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []

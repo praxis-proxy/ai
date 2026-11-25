@@ -11,7 +11,7 @@ The release workflow attaches its chosen report to the GitHub Release for
 longer term access.
 
 This is the GPU-specific report. Releases also publish a broader
-[CI evidence report](../release.md#changelog) with exact-commit workflow, job,
+[CI evidence report](release.md#changelog) with exact-commit workflow, job,
 and step outcomes in `release-qualification.md` and `release-qualification.json`.
 An unavailable GPU result does not hide successful unit, integration, SDK,
 security, or other CI results. The CI report never counts simulator or CPU
@@ -87,6 +87,11 @@ append is tracked by
 [#410](https://github.com/praxis-proxy/ai/issues/410); background,
 WebSockets, and multimodal models are excluded.
 
+The report's top-level backend, model, and configuration describe the Responses
+suite. To reproduce a client acceptance case, use the run in `workflow.url` and
+consult the [GPU job and pin guide](gpu-nightly-suite.md#jobs-in-the-main-suite-vllm-integrationyaml)
+at the workflow revision recorded in `workflow.run_sha`.
+
 ## Local reproduction
 
 On a GPU host with the same vLLM image, PostgreSQL, OGX, and configuration as
@@ -141,3 +146,13 @@ A synthetic, reviewable notes fixture lives in
 section and idempotent composition; it is not real GPU qualification evidence.
 The broader CI summary has a separate synthetic fixture at
 `tests/qualification/release-ci-notes.fixture.md`.
+
+## CPU embeddings
+
+The [vLLM Embeddings Qualification workflow](../../.github/workflows/vllm-embeddings.yaml)
+serves a pinned Granite embedding model in pooling mode on a standard runner.
+The OpenAI SDK calls `/v1/embeddings` through Praxis and checks batch order
+against individual requests, 768-dimensional finite vectors, token usage, and
+unknown-model handling. The workflow records the image and model revision in
+its summary and publishes JUnit results. Release qualification lists the latest
+eligible run for the release commit.

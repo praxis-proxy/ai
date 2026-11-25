@@ -1337,6 +1337,8 @@ class TestOpenAIConversations:
                 OWNER_HEADER: _owner_assertion("alice"),
                 "Connection": "Upgrade",
                 "Upgrade": "websocket",
+                "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                "Sec-WebSocket-Version": "13",
             },
             timeout=10,
         )
@@ -2797,6 +2799,38 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
     assert len(captured) == 5, "each of the five turns must reach the backend once"
 
 
+def test_rehydration_preserves_unrelated_parameter_order(conversation_backend):
+    """Moving input into history must not reorder the remaining parameters."""
+    client, captured, _, translated = conversation_backend
+    if translated:
+        pytest.skip("Parameter order applies to native Responses forwarding")
+    conversation = client.conversations.create(
+        items=[{"type": "configuration_update", "reasoning": {"effort": "low"}}]
+    )
+    sent = []
+
+    def capture_request(request):
+        sent.append(json.loads(request.content))
+
+    with httpx.Client(event_hooks={"request": [capture_request]}) as transport:
+        response = client.with_options(http_client=transport).responses.create(
+            model="test-model", conversation=conversation.id,
+            input=[{"role": "user", "content": "hello"}],
+            metadata={"z": "last", "a": "first"}, store=False,
+            extra_body={"extra": {"z": 1, "a": 2}},
+        )
+    assert response.status == "completed"
+    assert len(sent) == len(captured) == 1
+    before, (_, after) = sent[0], captured[0]
+    retained = set(before) - {"input", "conversation", "reasoning"}
+    assert [key for key in before if key in retained] == [
+        key for key in after if key in retained
+    ]
+    assert after["reasoning"] == {"effort": "low"}
+    assert list(after["metadata"]) == ["z", "a"]
+    assert list(after["extra"]) == ["z", "a"]
+
+
 @pytest.fixture(params=["/reasoning", "/reasoning/effort"], ids=["member", "effort"])
 def conversation_backend_reasoning_strip(request, tmp_path):
     """Native-lane proxy with a post-rehydrate filter removing reasoning."""
@@ -3394,9 +3428,12 @@ def rate_limited_conversation_clients(request):
             config = json.load(config_file)
         control_chain = json.loads(json.dumps(config["filter_chains"][0]))
         control_chain["name"] = "control"
-        config["filter_chains"][0]["filters"][-1]["rate_limit"] = {
-            "mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1,
-        }
+        rate_limit = {"mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1}
+        # The recovery test uses explicit Core scope. The contract matrix
+        # exercises older configurations that omit it.
+        if hasattr(request, "param"):
+            rate_limit["scope"] = "local"
+        config["filter_chains"][0]["filters"][-1]["rate_limit"] = rate_limit
         config["filter_chains"].append(control_chain)
         config["listeners"].append({
             "name": "control", "address": f"127.0.0.1:{control_port}",
@@ -3613,3 +3650,43 @@ def test_conversations_database_error_rolls_back_mutation(legacy_sqlite_record_c
         database.execute("DROP TRIGGER fail_mutation")
     assert client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
     assert [row.id for row in client.conversations.items.list(conversation.id).data] == [item.id]
+
+
+@pytest.fixture(params=[False, True], ids=["native", "translated"])
+def conversation_backend_doc_extract_capped(request, tmp_path):
+    yield from _run_conversation_proxy(tmp_path, request.param, [{
+        "filter": "openai_doc_extract",
+        "allow_pre_security_callout": True,
+        "max_rewritten_body_bytes": 1024,
+    }])
+
+
+def test_document_extraction_rejects_json_escaping_expansion(conversation_backend_doc_extract_capped):
+    import base64
+
+    client, captured, _, _ = conversation_backend_doc_extract_capped
+    # The decoded text and base64 input fit the cap, but JSON escapes each NUL
+    # into six bytes. The rejection must happen before forwarding to inference.
+    with pytest.raises(openai.APIStatusError) as exc_info:
+        client.responses.create(model="test-model", input=[{
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "filename": "notes.txt",
+                "file_data": "data:text/plain;base64," + base64.b64encode(b"\0" * 256).decode(),
+            }],
+        }])
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.body["type"] == "invalid_request_error"
+    assert not captured, "oversized document must never reach the backend"
+    response = client.responses.create(model="test-model", input=[{
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(b"small document").decode(),
+        }],
+    }])
+    assert response.status == "completed"
+    assert "small document" in json.dumps(captured[-1][1])
+    assert "file_data" not in json.dumps(captured[-1][1])

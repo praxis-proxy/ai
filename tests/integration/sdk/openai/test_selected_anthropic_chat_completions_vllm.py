@@ -160,7 +160,6 @@ def _build_config(proxy_port: int, overlay_path: Path, authority: str) -> dict:
                     },
                     {
                         "filter": "openai_chat_completions_to_anthropic",
-                        "api_translation_enabled": True,
                         "max_body_bytes": 1048576,
                     },
                     {

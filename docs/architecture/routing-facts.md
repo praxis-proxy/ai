@@ -85,5 +85,5 @@ Router work (praxis-proxy/ai#74, praxis-proxy/ai#1282).
 
 - [AI inference](ai-inference.md) — how format filters classify
   bodies and promote facts.
-- [intelligent_route](../filters/intelligent_route.md) — the
+- [intelligent_route](../filters/routing/intelligent_route.md) — the
   decision record and metrics the router writes from these facts.

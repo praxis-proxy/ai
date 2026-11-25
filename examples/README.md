@@ -58,6 +58,7 @@ for how these are authored and regenerated.
 | [llmd-ext-proc-routing.yaml](configs/llmd-ext-proc-routing.yaml) | A real llm-d EPP or test processor returns the trusted x-gateway-destination-endpoint header |
 | [llmisvc-model-provider-resolver.yaml](configs/llmisvc-model-provider-resolver.yaml) | Rewrites publisher-ID body `model` values to the short model name for LLMISvc / KServe routing; the routing header (default `X-Model`) is left unchanged so routing can still use the publisher ID |
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
+| [mcp-session-broker.yaml](configs/mcp-session-broker.yaml) | Static-catalog MCP broker for stateful backends |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
 | [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
@@ -76,6 +77,7 @@ for how these are authored and regenerated.
 | [time-to-first-token.yaml](configs/time-to-first-token.yaml) | Measures the elapsed time from request receipt to the first non-empty SSE body chunk and records a praxis_ai_ttft_seconds Prometheus histogram labeled by model |
 | [token-ceiling.yaml](configs/token-ceiling.yaml) | Place token_ceiling after any request translation or prompt enrichment so it evaluates the final provider-bound JSON body |
 | [token-counting.yaml](configs/token-counting.yaml) | Extracts token usage from AI inference responses (streaming and non-streaming) and makes counts available to downstream filters via filter metadata as token.input, token.output, and token.total |
+| [token-quota.yaml](configs/token-quota.yaml) | PPE evaluates a weighted quota over the final normalized token usage snapshot. `token_count` supplies trusted usage; the policy document selects the quota plugin and formula; downstream filters consume PPE output |
 | [token-rate-limit-header-keys.yaml](configs/token-rate-limit-header-keys.yaml) | Extends token-rate-limit.yaml with M5 header dimensions (ai#123 / ai#129): each distinct `x-tenant-id` value gets its own token budget under the same catch-all rule |
 | [token-rate-limit-hierarchy.yaml](configs/token-rate-limit-hierarchy.yaml) | Optional org, then team, then user budgets on one token_rate_limit admission (ai#125) |
 | [token-rate-limit-ip-keys.yaml](configs/token-rate-limit-ip-keys.yaml) | Honor X-Forwarded-For for the IP budget only when a trusted proxy sanitizes it and direct access is blocked; otherwise omit `header` to key on the TCP peer |
@@ -93,9 +95,10 @@ for how these are authored and regenerated.
 | File | Description |
 | ------ | ------------- |
 | [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR), serves BOTH streaming and buffered clients from one pipeline, and adapts to BOTH backend wire formats from one config |
+| [mcp-connector.yaml](configs/anthropic/mcp-connector.yaml) | Anthropic's MCP connector (`mcp_servers` plus `mcp_toolset` tools, beta `mcp-client-2025-11-20`) is normally run by Anthropic's servers, so a vLLM or Chat Completions backend cannot honor it. `anthropic_mcp_connector` runs it inside Praxis instead, for both backend wire formats from one config |
 | [messages-native-vllm.yaml](configs/anthropic/messages-native-vllm.yaml) | Routes native Anthropic Messages API traffic (`/v1/messages` and `/v1/messages/count_tokens`) to a vLLM backend that natively serves the Anthropic Messages API, WITHOUT any request or response body translation |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
-| [messages-to-openai-degrade-fixture.yaml](configs/anthropic/messages-to-openai-degrade-fixture.yaml) | Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching and extended thinking into operator-approved degradation |
+| [messages-to-openai-degrade-fixture.yaml](configs/anthropic/messages-to-openai-degrade-fixture.yaml) | Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching, extended thinking, and mid-conversation system instructions into approved degradation |
 | [messages-to-openai-vllm.yaml](configs/anthropic/messages-to-openai-vllm.yaml) | Translates native Anthropic Messages API traffic into OpenAI Chat Completions for a vLLM backend that serves `/v1/chat/completions`, with the same three-boundary credential isolation as the native passthrough config |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
@@ -156,6 +159,7 @@ for how these are authored and regenerated.
 | [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
 | [mcp-approval-floor.yaml](configs/openai/responses/mcp-approval-floor.yaml) | Demonstrates the openai_mcp_dispatch operator approval floor on a complete persisted agentic Responses pipeline |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
+| [mcp-kuadrant-gateway.yaml](configs/openai/responses/mcp-kuadrant-gateway.yaml) | This is the reference config for the issue #1673 acceptance: per-user MCP tool authorization enforced by a real Kuadrant MCP Gateway (discovery filtering + per-call authorization), proven end-to-end through the Responses agentic loop |
 | [mcp-outbound-chain.yaml](configs/openai/responses/mcp-outbound-chain.yaml) | Demonstrates binding an operator `outbound_chain` onto the outbound MCP callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery request) |
 | [mcp-streaming.yaml](configs/openai/responses/mcp-streaming.yaml) | Demonstrates MCP tool calls over the filtered-subrequest transport with SSE streaming support |
 | [mcp-tool-admission.yaml](configs/openai/responses/mcp-tool-admission.yaml) | Demonstrates operator-owned metadata admission and read-only enforcement for the `openai_mcp_tool_resolve` filter (issue #1724) |

@@ -104,12 +104,12 @@ fn unavailable_backend_token_rate_limit_config(
     let backend = format!(
         "        backend:\n          kind: valkey\n          url: redis://127.0.0.1:1\n          on_failure: {on_failure}\n          operation_timeout: 20ms\n"
     );
-    let anchor = "        key: global\n";
+    let memory_backend = "        backend:\n          kind: memory\n";
     assert!(
-        yaml.contains(anchor),
-        "token-rate-limit.yaml must contain the backend insertion anchor"
+        yaml.contains(memory_backend),
+        "token-rate-limit.yaml must explicitly select the memory backend"
     );
-    let yaml = yaml.replacen(anchor, &format!("{anchor}{backend}"), 1);
+    let yaml = yaml.replacen(memory_backend, &backend, 1);
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
     praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
 }
@@ -656,6 +656,8 @@ fn token_bucket_exhaustion_returns_429_with_rate_limit_headers() {
          \x20         - path: \"/v1/chat/completions\"\n\
          \x20           cluster: backend\n\
          \x20     - filter: token_rate_limit\n\
+         \x20       backend:\n\
+         \x20         kind: memory\n\
          \x20       rules:\n\
          \x20         - name: bucket\n\
          \x20           algorithm: token_bucket\n\
@@ -914,14 +916,17 @@ fn authenticated_quota_config(
 ) -> String {
     let (subject_a_credential, subject_b_credential) = subject_credentials;
     let key_line = key.map_or_else(String::new, |value| format!("        key: {value}\n"));
-    let backend_block = backend.map_or_else(String::new, |(url, namespace)| {
-        format!(
-            "        backend:\n\
-             \x20         kind: valkey\n\
-             \x20         url: \"{url}\"\n\
-             \x20         namespace: \"{namespace}\"\n"
-        )
-    });
+    let backend_block = backend.map_or_else(
+        || "        backend:\n          kind: memory\n".to_owned(),
+        |(url, namespace)| {
+            format!(
+                "        backend:\n\
+                 \x20         kind: valkey\n\
+                 \x20         url: \"{url}\"\n\
+                 \x20         namespace: \"{namespace}\"\n"
+            )
+        },
+    );
     format!(
         "listeners:\n\
          \x20 - name: default\n\
@@ -1377,6 +1382,8 @@ fn hierarchy_quota_config(
          \x20         - username: subject-b\n\
          \x20           password: \"{subject_b_credential}\"\n\
          \x20     - filter: token_rate_limit\n\
+         \x20       backend:\n\
+         \x20         kind: memory\n\
          \x20       hierarchy:\n\
          \x20         - level: org\n\
          \x20           identity_header: x-org-id\n\

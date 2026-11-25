@@ -57,7 +57,10 @@ fn unknown_fields_rejected() {
 #[test]
 fn declares_read_only_buffering() {
     let filter = make_filter("{}");
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
     assert!(
         matches!(
             filter.request_body_mode(),
@@ -83,23 +86,17 @@ async fn create_request_publishes_routing_facts() {
     assert!(matches!(action, FilterAction::Release), "create should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_chat_completions_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_chat_completions_request.format"),
         Some("openai_chat_completions"),
         "format fact comes from the authoritative head"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_chat_completions_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_chat_completions_request.model"),
         Some("gpt-4"),
         "model fact comes from the buffered body"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_chat_completions_request.stream")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_chat_completions_request.stream"),
         Some("true"),
         "stream flag comes from the buffered body"
     );
@@ -130,9 +127,7 @@ async fn create_request_without_model_publishes_format_only() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_chat_completions_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_chat_completions_request.format"),
         Some("openai_chat_completions"),
     );
     assert!(

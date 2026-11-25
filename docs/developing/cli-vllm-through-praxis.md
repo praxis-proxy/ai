@@ -470,7 +470,7 @@ example to PostgreSQL is a single filter edit:
 - `allow_private_database_url` is required for a loopback or other
   local-sensitive target; the URL validator rejects those by default. It is
   intended for local development; see
-  [`openai_responses_store`](../filters/openai_responses_store.md) for the full
+  [`openai_responses_store`](../filters/agents/openai_responses_store.md) for the full
   field reference.
 - `ssl_mode` defaults to `verify-full`, which a local server without TLS can
   never satisfy. `disable` is honest only when the connection never leaves the
@@ -489,7 +489,7 @@ example to PostgreSQL is a single filter edit:
 - Schema upgrades are recreate-only: a Praxis release that requires a newer
   schema refuses to start against the old tables, so treat stored responses as
   disposable and recreate the database. See
-  [Responses store schema upgrade](../store/schema-migration.md).
+  [Responses store schema upgrade](../operations/store/schema-migration.md).
 
 ## 3. Connect Codex
 
@@ -625,21 +625,41 @@ claude --model "$VLLM_MODEL"
 the Praxis process. The other variables configure Claude Code.
 
 The translated `messages-to-openai-vllm.yaml` route enables
-`allow_lossy_features: [prompt_caching, extended_thinking]`, so you do **not**
-need to disable Anthropic thinking or prompt caching in Claude Code. Chat
-Completions cannot represent either feature, so Praxis strips the wire markers an
-unmodified client sends and reports the loss (a `WARN` log, the
+`allow_lossy_features: [prompt_caching, extended_thinking,
+mid_conversation_system]`, so you do **not** need to disable Anthropic thinking
+or prompt caching in Claude Code. Chat Completions cannot represent those
+features, so Praxis strips the thinking and cache markers an unmodified client
+sends and reports the loss (a `WARN` log, the
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter, and an
 `x-degraded-features` response header) instead of rejecting the request.
+Claude Code also sends a `system` message after its first user turn (the
+environment block); real OpenAI accepts that shape. Whether a Chat Completions
+backend rejects it depends on the model's chat template: some vLLM-hosted
+templates fail with "System message must be at the beginning" when a system
+message follows a non-system one, while others — including this guide's default
+Qwen3-8B template — render it in place. The same allowlist entry folds it into
+the leading system message, so the translated request no longer depends on the
+template's tolerance for that ordering.
 
-To see the strict behavior instead — a 400 when either feature appears — use the
-`messages-to-openai.yaml` route (empty allowlist) and disable both features in
-Claude Code:
+To see the strict behavior instead — a 400 when a thinking or prompt-caching
+marker appears — remove the `allow_lossy_features` block from the
+`anthropic_messages_to_chat_completions` filter in your copy of
+`messages-to-openai-vllm.yaml` and disable both of those features in Claude
+Code. Stay on this route rather than switching to the plain
+`messages-to-openai.yaml` example: that example injects no backend credential,
+so against the keyed vLLM server above it fails with a 401 before any strict
+rejection:
 
 ```console
 export CLAUDE_CODE_DISABLE_THINKING=1
 export DISABLE_PROMPT_CACHING=1
 ```
+
+Claude Code cannot disable the mid-conversation `system` message — it always
+sends the environment block — and the strict route passes it through in its
+original position, so whether the request survives is up to the model's chat
+template: some reject it there ("System message must be at the beginning"),
+while this guide's default Qwen3-8B template renders it in place.
 
 Claude Code does not know the served model's real window, so it sends the
 default `max_tokens` for the Anthropic model name it believes it is calling,
@@ -698,7 +718,7 @@ the way the environment variable does.
 ## 5. Connect OpenCode
 
 OpenCode 1.x and 2.x need different setups. Check your version with
-`opencode --version`: 1.x prints a bare version such as `1.19.3`, and 2.x
+`opencode --version`: 1.x prints a bare version such as `1.19.6`, and 2.x
 prints `opencode v2.1.2`. The two majors ship as different npm packages
 (`opencode-ai` for 1.x, `@opencode/cli` for 2.x) and use different
 configuration schemas, so a 1.x configuration does not carry over to 2.x.
@@ -1041,9 +1061,9 @@ host. The `headers` map has no such check and sends the token wherever
 
 ## 6. Connect pi
 
-These steps are verified against pi 1.4.0. Install that version from the
-[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.4.0),
-or with `npm install -g @earendil-works/pi-coding-agent@1.4.0` (Node 22.19 or
+These steps are verified against pi 1.5.2. Install that version from the
+[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.5.2),
+or with `npm install -g @earendil-works/pi-coding-agent@1.5.2` (Node 22.19 or
 later), and check it with `pi --version`.
 
 pi reaches custom endpoints through providers declared in
@@ -1091,7 +1111,7 @@ Then launch pi from that shell. pi does not need `VLLM_API_KEY`:
 pi --model "praxis/$VLLM_MODEL"
 ```
 
-Notes on this configuration, verified against pi 1.4.0:
+Notes on this configuration, verified against pi 1.5.2:
 
 - **`apiKey` is a placeholder, but it must be set.** With no `apiKey`, pi
   reports `No API key found for praxis.` and sends nothing. The configured
@@ -1296,9 +1316,13 @@ cargo xtask bump-pins             # or: --pin opencode --pin vllm ...
 ```
 
 It rewrites every mechanical site, swaps the checksum fixtures, and validates
-the result before writing. It never changes behavioral pins: tool lists,
-exit-code semantics, version-conditioned test expectations, replay recordings,
-and "verified against" claims in this guide. Its report lists those as a
+the result before writing. It also updates claims that an acceptance lane
+re-proves on every pull request, so the bump cannot merge until that lane
+passes against the new version: the pi "verified against" lines in this guide,
+and the Codex WebSocket recording, whose wire shapes it carries forward
+unchanged with metadata naming the version they came from. It never changes
+other behavioral pins: tool lists, exit-code semantics, version-conditioned
+test expectations, and claims no lane exercises. Its report lists those as a
 re-validation checklist, together with every line that still names the old
 version. The weekly `Bump Pins` workflow runs it and opens a draft pull request
 with that checklist; the GPU acceptance lanes (`vllm-full-suite` label) gate it

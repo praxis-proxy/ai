@@ -1,0 +1,44 @@
+version: 1
+id: responses/mcp-structured-result-projection
+description: Controlled native-boundary preservation of the projected MCP result string. This replay starts
+  after MCP execution; the full wire/dispatch loop is covered independently by the OpenAI SDK structured-result
+  tests.
+protocol: openai_responses
+example_config: openai/responses/responses-proxy.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+- responses.native.mcp_structured_result_projection
+turns:
+- name: projected-result
+  request:
+    method: POST
+    path: /v1/responses
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        model: ${MODEL}
+        input:
+        - content: Temperature?
+          role: user
+          type: message
+        - arguments: '{}'
+          call_id: call_recorded_0001
+          id: fc_weather
+          name: get_weather
+          status: completed
+          type: function_call
+        - call_id: call_recorded_0001
+          output: '{"content":[],"structuredContent":{"temperature":22.5}}'
+          type: function_call_output
+        store: false
+        stream: false
+  expect:
+    client_status: 200
+    client_body_kind: json
+    upstream_path: /v1/responses
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []

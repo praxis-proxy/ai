@@ -405,7 +405,10 @@ mod filter_tests {
         .unwrap();
 
         let filter = test_filter(&yaml).unwrap();
-        assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+        assert_eq!(
+            filter.request_body_access(),
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+        );
         assert!(
             matches!(
                 filter.request_body_mode(),

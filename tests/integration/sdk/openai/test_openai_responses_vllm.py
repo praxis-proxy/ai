@@ -681,6 +681,8 @@ class MCPHandler(BaseHTTPRequestHandler):
     assertion_headers: ClassVar[list[str | None]] = []
     # Attached as ``structuredContent`` to text tool results when set.
     structured_content: ClassVar[dict | None] = None
+    result_content: ClassVar[list[dict] | None] = None
+    mcp_protocol_version: ClassVar[str] = "2025-03-26"
 
     _request_count = 0
     _request_count_lock = threading.Lock()
@@ -713,7 +715,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             self._json_rpc(
                 rid,
                 {
-                    "protocolVersion": "2025-03-26",
+                    "protocolVersion": self.mcp_protocol_version,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "weather-mock", "version": "0.1.0"},
                 },
@@ -794,6 +796,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                     else f"72F and sunny in {city}"
                 )
                 tool_result = {"content": [{"type": "text", "text": result}]}
+                if self.result_content is not None:
+                    tool_result["content"] = self.result_content
                 if self.structured_content is not None:
                     tool_result["structuredContent"] = self.structured_content
                 self._json_rpc(rid, tool_result)
@@ -863,11 +867,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
             for item in items
         )
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
-        request_body = json.loads(body) if body else {}
-
+    def _output(self, request_body):
         if self._already_rejected(request_body):
             output = [
                 {
@@ -890,18 +890,46 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
                 }
             ]
 
-        payload = json.dumps(
-            {
-                "id": f"resp_mcp_invalid_{time.time_ns()}",
-                "object": "response",
-                "created_at": int(time.time()),
-                "model": request_body.get("model", VLLM_MODEL),
-                "status": "completed",
-                "output": output,
-            }
-        ).encode()
+        return output
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body) if body else {}
+
+        output = self._output(request_body)
+        response = {
+            "id": f"resp_mcp_invalid_{time.time_ns()}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body.get("model", VLLM_MODEL),
+            "status": "completed",
+            "output": output,
+        }
+        if request_body.get("stream"):
+            events = [
+                {"type": "response.created", "sequence_number": 0,
+                 "response": {**response, "status": "in_progress", "output": []}},
+            ]
+            for index, item in enumerate(output):
+                events.extend([
+                    {"type": "response.output_item.added", "sequence_number": len(events),
+                     "output_index": index, "item": item},
+                    {"type": "response.output_item.done", "sequence_number": len(events) + 1,
+                     "output_index": index, "item": item},
+                ])
+            events.append({"type": "response.completed", "sequence_number": len(events),
+                           "response": response})
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            )
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -911,10 +939,50 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
         pass
 
 
+class McpSequentialBackendHandler(McpInvalidArgsBackendHandler):
+    """Emit one advertised MCP tool per round after receiving the prior result."""
+
+    final_text = "Both tools completed."
+
+    def _output(self, request_body):
+        assert request_body["parallel_tool_calls"] is False
+        inputs = request_body["input"]
+        if isinstance(inputs, str):
+            inputs = []
+        results = {
+            item["call_id"]: item["output"]
+            for item in inputs
+            if item["type"] == "function_call_output"
+        }
+        if "call_get_time" in results:
+            assert "12:00 PM" in results["call_get_time"]
+            return super()._output(request_body)
+        tool_name = "get_weather"
+        if "call_get_weather" in results:
+            assert "72F and sunny" in results["call_get_weather"]
+            tool_name = "get_time"
+        advertised_name = next(
+            tool["name"]
+            for tool in request_body["tools"]
+            if tool["type"] == "function" and tool["name"].endswith(tool_name)
+        )
+        return [
+            {
+                "id": f"fc_{tool_name}",
+                "type": "function_call",
+                "call_id": f"call_{tool_name}",
+                "name": advertised_name,
+                "arguments": json.dumps({"city": "Paris"}),
+                "status": "completed",
+            }
+        ]
+
+
 class StructuredMCPHandler(MCPHandler):
     """MCP mock whose text tool results carry a Kubernetes-shaped
     ``structuredContent`` of ~5 KiB and ~550 JSON nodes (issue #1847)."""
 
+    mcp_protocol_version = "2025-06-18"
     structured_content: ClassVar[dict | None] = {
         "kind": "Deployment",
         "containers": [
@@ -929,12 +997,46 @@ class StructuredMCPHandler(MCPHandler):
     }
 
 
+class StructuredOnlyMCPHandler(StructuredMCPHandler):
+    """Valid MCP 2025-06-18 result with no duplicate text (issue #1899)."""
+
+    result_content: ClassVar[list[dict] | None] = []
+    structured_content: ClassVar[dict | None] = {"temperature": 22.5}
+
+
+class StructuredMixedMCPHandler(StructuredOnlyMCPHandler):
+    """Structured content and distinct ordered text/resource-link blocks."""
+
+    result_content: ClassVar[list[dict] | None] = [
+        {"type": "text", "text": "Weather fetched"},
+        {"type": "resource_link", "uri": "file:///weather/map.png", "name": "map"},
+    ]
+
+
+class OversizedStructuredMCPHandler(StructuredOnlyMCPHandler):
+    """A structured-only result that exceeds the full-flow dispatch allowance."""
+
+    structured_content: ClassVar[dict | None] = {"payload": "x" * 2_097_152}
+
+    def _json_rpc(self, rid, result, error=None):
+        try:
+            super()._json_rpc(rid, result, error)
+        except (BrokenPipeError, ConnectionResetError):
+            # The proxy can close the callout as soon as its byte cap is exceeded.
+            pass
+
+
 class McpStructuredResultBackendHandler(McpInvalidArgsBackendHandler):
     """Scripts one valid ``get_weather`` call, then a final message."""
 
     call_arguments: ClassVar[dict] = {"city": "Paris"}
     final_text: ClassVar[str] = "done"
     request_count = 0
+    captured_requests: ClassVar[list[dict]] = []
+
+    def _output(self, request_body):
+        type(self).captured_requests.append(request_body)
+        return super()._output(request_body)
 
     def do_POST(self):
         type(self).request_count += 1
@@ -945,25 +1047,35 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
     """Mock Brave Search API returning canned results.
 
     Counts every dispatched query so tests can assert the web-search
-    provider is invoked exactly once per agentic round.
+    provider is invoked exactly once per agentic round. Captures request
+    headers so country-forwarding tests can assert ``X-Loc-Country``.
     """
 
     #: Total queries served across all instances since the last reset.
     request_count = 0
     response_code = 200
     successful_requests_remaining: ClassVar[int | None] = None
+    #: Results served after the canned result, e.g. off-domain URLs.
+    extra_results: ClassVar[list[dict[str, str]]] = []
 
     @classmethod
     def reset(cls):
         cls.request_count = 0
         cls.response_code = 200
         cls.successful_requests_remaining = None
+        cls.extra_results = []
         cls.request_paths.clear()
+        cls.request_headers.clear()
 
     request_paths: ClassVar[list[str]] = []
+    #: Lower-cased header maps for each dispatched query (issue #1769).
+    request_headers: ClassVar[list[dict[str, str]]] = []
 
     def do_GET(self):
         type(self).request_paths.append(self.path)
+        type(self).request_headers.append(
+            {key.lower(): value for key, value in self.headers.items()}
+        )
         BraveSearchHandler.request_count += 1
         response_code = BraveSearchHandler.response_code
         if (
@@ -986,7 +1098,8 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
                             "title": "Mock Search Result",
                             "url": "https://example.com/mock",
                             "description": "A mock search result for testing",
-                        }
+                        },
+                        *BraveSearchHandler.extra_results,
                     ]
                 }
             }
@@ -1077,6 +1190,7 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
 
     captured_bodies: ClassVar[list[dict]] = []
     stream_deltas: ClassVar[list[dict]] = []
+    raw_stream: ClassVar[bytes | None] = None
     # When set, replaces the default single-choice array of the finite
     # (non-streaming) response so a test can script alternative shapes.
     finite_choices: ClassVar[list[dict] | None] = None
@@ -1094,6 +1208,10 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
             self.end_headers()
+            if type(self).raw_stream is not None:
+                self.wfile.write(type(self).raw_stream)
+                self.wfile.flush()
+                return
             for delta in type(self).stream_deltas:
                 chunk = {
                     "id": "chatcmpl_reasoning_capture", "object": "chat.completion.chunk",
@@ -1174,6 +1292,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             return
         if request_body and (
             request_body.get("prompt") is not None
+            or request_body.get("previous_input_messages")
             or "access_programs" in request_body
             or any(tool.get("type") == "code_interpreter" for tool in (request_body.get("tools") or []))
         ):
@@ -2364,6 +2483,7 @@ def _reasoning_capture_session(
     ChatCaptureHandler.captured_bodies = []
     ChatCaptureHandler.stream_deltas = [{"reasoning": "I picked "}, {"reasoning_content": "42."}]
     ChatCaptureHandler.finite_choices = None
+    ChatCaptureHandler.raw_stream = None
     captured = ChatCaptureHandler.captured_bodies
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
@@ -2461,6 +2581,27 @@ def _reasoning_capture_session(
 def reasoning_capture_client(tmp_path_factory, request):
     """Function-scoped reasoning proxy with a capturing mock Chat backend."""
     yield from _reasoning_capture_session(tmp_path_factory, request)
+
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r", b"\r\n"], ids=["lf", "cr", "crlf"])
+def test_colonless_data_frame_fails_closed_through_sdk(reasoning_capture_client, ending):
+    """An empty data frame is decoded, then rejected as non-JSON, not discarded."""
+    client, _ = reasoning_capture_client
+    chunk = json.dumps({
+        "id": "chatcmpl_colonless", "object": "chat.completion.chunk",
+        "model": VLLM_MODEL,
+        "choices": [{"index": 0, "delta": {"content": "hello"}}],
+    }).encode()
+    ChatCaptureHandler.raw_stream = ending.join([
+        b"data: " + chunk, b"", b"data", b"", b"data: [DONE]", b"", b"",
+    ])
+    events = _collect_stream(client.responses.create(
+        model=CHAT_TRANSLATION_MODEL, input="Hello", stream=True, store=False,
+    ))
+    assert events[-1].type == "response.failed"
+    assert events[-1].response.error.code == "server_error"
+    assert "malformed streaming chunk" in events[-1].response.error.message
+    assert not any(event.type == "response.completed" for event in events)
 
 
 @pytest.fixture()
@@ -2809,12 +2950,13 @@ class TestOpenAIResponsesVLLM:
             openai_client.responses.retrieve(response.id)
         assert exc_info.value.status_code == 404, "store=false response must not be retrievable"
 
-    def test_store_and_retrieve(self, openai_client):
+    @pytest.mark.parametrize("store_options", [{}, {"store": True}], ids=["default", "explicit"])
+    def test_store_and_retrieve(self, openai_client, store_options):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STORED-OK /no_think",
             temperature=0,
-            store=True,
+            **store_options,
             max_output_tokens=128,
         )
 
@@ -3374,6 +3516,285 @@ class TestOpenAIResponsesVLLM:
         finally:
             client.conversations.delete(conversation.id)
 
+    def test_hosted_web_search_enforces_allowed_domains(self, witness_tool_client):
+        """Native hosted search drops provider results outside ``allowed_domains`` (#1768).
+
+        The Brave mock returns one result inside and one outside the allow-list.
+        Only the allowed result may reach the model re-entry or the public
+        ``action.sources``; the provider cannot be trusted to apply the filter.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Outside Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result outside the allowed domains",
+            }
+        ]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-1768",
+                tools=[{"type": "web_search", "filters": {"allowed_domains": ["example.com"]}}],
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "the filtered response should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert [item.type for item in response.output] == ["web_search_call", "message"], (
+                "a filtered search should still produce a call and a message"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            sources = response.output[0].model_dump()["action"]["sources"]
+            assert [source["url"] for source in sources] == ["https://example.com/mock"], (
+                "only allowed-domain results may be public sources"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            assert "Mock Search Result" in reentry, (
+                "the allowed result must reach the model"
+            )
+            assert "outside.example" not in reentry, (
+                "an off-domain result must not reach the model"
+            )
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_enforces_blocked_domains(self, witness_tool_client):
+        """Native hosted search drops provider results on ``blocked_domains`` (#1768).
+
+        The Brave mock returns a result on a blocked host and one on a blocked
+        subdomain of an allowed domain. Only the result inside the allow-list
+        and outside the block-list may reach the model re-entry or the public
+        ``action.sources``.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Blocked Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result on a blocked domain",
+            },
+            {
+                "title": "Blocked Subdomain Result",
+                "url": "https://docs.example.com/private",
+                "description": "A result on a blocked subdomain",
+            },
+        ]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-BLOCKED-1768",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "filters": {
+                            "allowed_domains": ["example.com"],
+                            "blocked_domains": ["outside.example", "docs.example.com"],
+                        },
+                    }
+                ],
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "the filtered response should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            sources = response.output[0].model_dump()["action"]["sources"]
+            assert [source["url"] for source in sources] == ["https://example.com/mock"], (
+                "blocked domains must not be public sources"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            assert "Mock Search Result" in reentry, (
+                "the permitted result must reach the model"
+            )
+            assert "outside.example" not in reentry, (
+                "a blocked-domain result must not reach the model"
+            )
+            assert "docs.example.com" not in reentry, (
+                "a blocked subdomain result must not reach the model"
+            )
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_rejects_unenforceable_filters(self, witness_tool_client):
+        """Unenforceable web-search ``filters`` fail closed before any round (#1768)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        cases = [
+            ({"search_domain_filter": ["example.com"]}, "unsupported_parameter"),
+            ({"allowed_domains": ["example.com/path"]}, "invalid_value"),
+            ({"allowed_domains": ["*.example.com"]}, "invalid_value"),
+            ({"allowed_domains": ["%2a.example.com"]}, "invalid_value"),
+            ({"allowed_domains": ["example.com.."]}, "invalid_value"),
+            ({"blocked_domains": ["https://example.com/path"]}, "invalid_value"),
+            ({"blocked_domains": ["*.example.com"]}, "invalid_value"),
+        ]
+        for filters, code in cases:
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-tool-stream",
+                    input="DOMAIN-FILTER-REJECT-1768",
+                    tools=[{"type": "web_search", "filters": filters}],
+                    store=False,
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            assert exc_info.value.status_code == 400, (
+                f"preflight should reject {filters} with 400"
+            )
+            assert exc_info.value.body["code"] == code, (
+                f"preflight should reject {filters} with {code}: {exc_info.value.body}"
+            )
+        assert BraveSearchHandler.request_count == 0, "preflight must precede any callout"
+        assert forwarded == [], "preflight must precede any inference round"
+
+    def test_hosted_web_search_skips_null_location_for_later_country(
+        self, witness_tool_client,
+    ):
+        """An earlier ``user_location: null`` must not mask a later country (#1769).
+
+        Chat Completions translation rejects more than one web-search tool, so
+        this covers the native Responses full-flow path. Dispatch must forward
+        ``FR`` as Brave's ``X-Loc-Country`` header rather than inventing a US
+        default for the unset earlier tool.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        ResponsesWitnessHandler.tool_round_count = 0
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="COUNTRY-PICK-NULL-LOCATION-1769",
+                tools=[
+                    {"type": "web_search", "user_location": None},
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": "FR",
+                        },
+                    },
+                ],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "null-then-FR country pick should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == "FR", (
+                "first real country must reach Brave as X-Loc-Country; "
+                f"headers={BraveSearchHandler.request_headers[-1]!r}"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_skips_null_country_for_later_country(
+        self, witness_tool_client,
+    ):
+        """An earlier ``country: null`` must not mask a later country (#1769)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        ResponsesWitnessHandler.tool_round_count = 0
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="COUNTRY-PICK-NULL-COUNTRY-1769",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": None,
+                        },
+                    },
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": "FR",
+                        },
+                    },
+                ],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "null-country-then-FR pick should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == "FR", (
+                "first real country must reach Brave as X-Loc-Country; "
+                f"headers={BraveSearchHandler.request_headers[-1]!r}"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_omits_country_when_every_location_is_unset(
+        self, witness_tool_client,
+    ):
+        """All-unset locations must leave ``X-Loc-Country`` off the callout (#1769)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        ResponsesWitnessHandler.tool_round_count = 0
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="COUNTRY-PICK-ALL-UNSET-1769",
+                tools=[
+                    {"type": "web_search", "user_location": None},
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": None,
+                        },
+                    },
+                ],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "all-unset country pick should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            assert "x-loc-country" not in BraveSearchHandler.request_headers[-1], (
+                "unset locations must not invent a country header; "
+                f"headers={BraveSearchHandler.request_headers[-1]!r}"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+        finally:
+            BraveSearchHandler.reset()
+
     @qualification_profile("supporting")
     @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])
     def test_failed_irr_stream_does_not_append_completed_upstream_snapshot(
@@ -3541,8 +3962,12 @@ class TestOpenAIResponsesVLLM:
             if stream is not None:
                 stream.close()
 
+    @pytest.mark.parametrize("continuation", [
+        "Continue after provider compaction.",
+        'Continue: café 東京 🦀 \n\t "quoted" \\ path',
+    ])
     def test_sdk_replays_provider_compaction_on_previous_response_id(
-        self, provider_compaction_client
+        self, provider_compaction_client, continuation
     ):
         """Native provider compaction survives SDK-driven local rehydration."""
         client, forwarded = provider_compaction_client
@@ -3553,7 +3978,7 @@ class TestOpenAIResponsesVLLM:
         )
         second = client.responses.create(
             model=VLLM_MODEL,
-            input="Continue after provider compaction.",
+            input=continuation,
             previous_response_id=first.id,
             store=True,
         )
@@ -3561,6 +3986,15 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert len(forwarded) == 2, forwarded
         replayed = forwarded[1]
+        assert any(
+            item.get("content") == continuation
+            or any(
+                part.get("text") == continuation
+                for part in item.get("content", [])
+                if isinstance(part, dict)
+            )
+            for item in replayed.get("input", [])
+        ), replayed
         assert replayed.get("previous_response_id") is None, replayed
         assert any(
             item.get("type") == "compaction"
@@ -3785,15 +4219,23 @@ class TestOpenAIResponsesVLLM:
                 # or rejects the already-forwarded prompt: a clean 400 when it
                 # validates up front, a bare 502 when it raises post-prefill and
                 # drops the connection, or a 504 when the prefill outruns an IRR
-                # deadline. All are legitimate backend outcomes; #532 only
-                # requires Praxis to forward the complete history, which the
-                # assertions below verify regardless of the backend's verdict.
+                # deadline. Since vLLM 0.32 the truncated prompt can also leave
+                # room for a single output token, so the turn ends `incomplete`
+                # on max_output_tokens with no output items. All are legitimate
+                # backend outcomes; #532 only requires Praxis to forward the
+                # complete history, which the assertions below verify
+                # regardless of the backend's verdict.
                 try:
                     response = client.with_options(timeout=720).responses.create(
                         **options
                     )
                     assert response.status in {"completed", "incomplete"}
-                    assert response.output, response
+                    output_budget_exhausted = (
+                        response.status == "incomplete"
+                        and response.incomplete_details is not None
+                        and response.incomplete_details.reason == "max_output_tokens"
+                    )
+                    assert response.output or output_budget_exhausted, response
                     if response.status == "completed":
                         # A successful managed turn must append only its new
                         # input/output items. Existing over-context history is
@@ -4066,6 +4508,7 @@ class TestOpenAIResponsesVLLM:
         # rewrite never touches, so before the fix the stored response echoed the
         # backend's null even though the streamed terminal carried first.id.
         retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.model == final_response.model
         assert retrieved.previous_response_id == first.id, (
             "the stored streaming response must persist the caller's "
             "previous_response_id, matching the terminal frame the client saw; "
@@ -4389,6 +4832,100 @@ class TestOpenAIResponsesVLLM:
         }
         assert all(body["model"] == "gpt-5" for body in prompt_creates)
         assert all(body["prompt"] == prompt for body in prompt_creates)
+
+    def test_previous_input_messages_policy_follows_provider_binding(
+        self, witness_backend_client
+    ):
+        """Managed routes own inference history (#2078).
+
+        A non-empty vLLM ``previous_input_messages`` would put caller-supplied
+        history in front of the history Praxis rehydrates, so managed routes
+        reject it before inference on first turns and continuations in both
+        store modes. Absent, null, and empty values pass. OpenAI-owned routes
+        forward the extension unchanged.
+        """
+        client, forwarded = witness_backend_client
+        injected = [{"role": "user", "content": "INJECTED-NEVER-PERSISTED"}]
+
+        stored = client.responses.create(
+            model="sdk-conversation-stream",
+            input="PRAXIS-PERSISTED-TURN",
+            store=True,
+        )
+        assert stored.status == "completed"
+
+        forwarded.clear()
+        for stream in (False, True):
+            for store in (True, False):
+                for previous_response_id in (None, stored.id):
+                    kwargs = {"previous_response_id": previous_response_id} if previous_response_id else {}
+                    with pytest.raises(BadRequestError) as exc_info:
+                        client.responses.create(
+                            model="sdk-conversation-stream",
+                            input="follow up",
+                            store=store,
+                            stream=stream,
+                            extra_body={"previous_input_messages": injected},
+                            **kwargs,
+                        )
+                    error = exc_info.value
+                    assert error.status_code == 400
+                    assert error.body["type"] == "invalid_request_error"
+                    assert error.body["code"] == "unsupported_parameter"
+                    assert error.body["param"] == "previous_input_messages"
+                    assert error.body["message"] == (
+                        "previous_input_messages is not supported on gateway-managed routes; "
+                        "include earlier messages in input, or resume stored history with "
+                        "previous_response_id or conversation."
+                    )
+        assert forwarded == [], "rejected requests must not reach inference"
+
+        for value in (None, []):
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="follow up",
+                previous_response_id=stored.id,
+                extra_body={"previous_input_messages": value},
+            )
+            assert response.status == "completed"
+        continuation = client.responses.create(
+            model="sdk-conversation-stream",
+            input="follow up",
+            previous_response_id=stored.id,
+        )
+        assert continuation.status == "completed"
+        assert len(forwarded) == 3
+        assert all(not body.get("previous_input_messages") for body in forwarded)
+        assert all(
+            "INJECTED-NEVER-PERSISTED" not in json.dumps(body) for body in forwarded
+        )
+        for body in forwarded:
+            items = body["input"]
+            assert isinstance(items, list), "continuations must carry rehydrated history"
+            serialized = [json.dumps(item) for item in items]
+            seeded = [i for i, item in enumerate(serialized) if "PRAXIS-PERSISTED-TURN" in item]
+            follow_up = [i for i, item in enumerate(serialized) if "follow up" in item]
+            assert seeded, "the stored turn must reach inference"
+            assert follow_up, "the new turn must reach inference"
+            assert seeded[0] < follow_up[-1], "stored history must precede the new turn"
+
+        forwarded.clear()
+        for stream in (False, True):
+            response = client.responses.create(
+                model="gpt-5",
+                input="OpenAI-owned history extension.",
+                store=False,
+                stream=stream,
+                extra_body={"previous_input_messages": injected},
+            )
+            if stream:
+                events = list(response)
+                assert events[-1].type == "response.completed"
+            else:
+                assert response.status == "completed"
+        assert len(forwarded) == 2
+        assert all(body["model"] == "gpt-5" for body in forwarded)
+        assert all(body["previous_input_messages"] == injected for body in forwarded)
 
     @pytest.mark.critical_vllm
     @requires_real_inference
@@ -7035,6 +7572,65 @@ class TestClientToolCompatVLLM:
         echoed = [getattr(t, "name", None) for t in response.tools]
         assert "mcp__codex_tui" in echoed, response.tools
 
+    @pytest.mark.parametrize(
+        "description",
+        ["", "   "],
+        ids=["empty", "whitespace"],
+    )
+    def test_blank_namespace_description_is_accepted(
+        self, client_tool_compat_client, description
+    ):
+        """Pinned ``NamespaceToolParam.description`` is a required string with no
+        ``minLength``, so empty and whitespace-only values must round-trip through
+        ``openai_client_tool_compat`` rather than failing closed with HTTP 400.
+
+        Asserts only filter-guaranteed, model-independent invariants: reaching a
+        completed response (no BadRequestError) and echoing the original namespace
+        without leaking a private lowered wire name.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say hi. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "utils",
+                    "description": description,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "ping",
+                            "description": "Return ok.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=2048,
+        )
+
+        assert response.status == "completed", (
+            "blank namespace descriptions must be accepted; got "
+            f"{response.status}: {response}"
+        )
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "utils" in echoed, (
+            "original utils namespace must be echoed in response.tools; "
+            f"got {response.tools}"
+        )
+
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
     ):
@@ -7485,10 +8081,11 @@ class TestClientToolCompatChatVLLM:
 
 
 @pytest.fixture(scope="session")
-def mcp_invalid_args_backend():
-    """Start the deterministic schema-invalid MCP backend for the session."""
+def scripted_mcp_backend(request):
+    """Start a scripted native Responses backend for MCP tests."""
     port = _free_port()
-    server = HTTPServer(("127.0.0.1", port), McpInvalidArgsBackendHandler)
+    handler = getattr(request, "param", McpInvalidArgsBackendHandler)
+    server = HTTPServer(("127.0.0.1", port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield port
@@ -7496,22 +8093,17 @@ def mcp_invalid_args_backend():
 
 
 @pytest.fixture(scope="session")
-def mcp_invalid_args_proxy(
-    tmp_path_factory, request, mcp_server, nemo_guardrails_server, mcp_invalid_args_backend
+def scripted_mcp_proxy(
+    tmp_path_factory, request, mcp_server, nemo_guardrails_server, scripted_mcp_backend
 ):
-    """Start the full-flow agentic proxy against the deterministic backend.
-
-    This drives MCP argument validation through the real OpenAI client without a
-    live model: the backend scripts one schema-invalid tool call and a recovery
-    message, so the outcome is deterministic in every lane (issue #1125).
-    """
+    """Start the full-flow agentic proxy against a scripted Responses backend."""
     port = _free_port()
-    db_dir = tmp_path_factory.mktemp("mcp-invalid-args-responses")
+    db_dir = tmp_path_factory.mktemp("scripted-mcp-responses")
     db_path = str(db_dir / "responses.db")
     config_path = _write_full_flow_config(
         port,
         db_path,
-        backend_endpoint=f"127.0.0.1:{mcp_invalid_args_backend}",
+        backend_endpoint=f"127.0.0.1:{scripted_mcp_backend}",
         mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         nemo_port=nemo_guardrails_server,
     )
@@ -7540,25 +8132,72 @@ def mcp_invalid_args_proxy(
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
-                    f"\n=== MCP invalid-args Praxis logs ===\n{f.read()}",
+                    f"\n=== Scripted MCP Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
         os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
-def mcp_invalid_args_client(mcp_invalid_args_proxy):
+def scripted_mcp_client(scripted_mcp_proxy):
     """Return an OpenAI client pointed at the deterministic MCP proxy."""
-    proxy_port = mcp_invalid_args_proxy
+    proxy_port = scripted_mcp_proxy
     return _make_openai_client(
         proxy_port,
         default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
     )
 
 
+def _request_paired_mcp_tools(client, *, parallel):
+    return client.responses.create(
+        model=VLLM_MODEL,
+        input=(
+            "You MUST call both get_weather and get_time for Paris "
+            "in the same turn before answering. Do not omit either "
+            "function. /no_think"
+        ),
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "utilities",
+                "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "never",
+            }
+        ],
+        parallel_tool_calls=parallel,
+        store=False,
+        max_output_tokens=512,
+    )
+
+
+def _assert_mcp_results_paired(response):
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 2, (
+        "both calls must execute exactly once; "
+        f"got: {[item.type for item in response.output]}"
+    )
+    outputs = {item.name: item.output or "" for item in mcp_calls}
+    assert set(outputs) == {"get_weather", "get_time"}
+    assert "72F and sunny" in outputs["get_weather"], (
+        "get_weather must carry its own result"
+    )
+    assert "12:00 PM" in outputs["get_time"], "get_time must carry its own result"
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize(
+    "scripted_mcp_backend", [McpSequentialBackendHandler], indirect=True, ids=["sequential"]
+)
+def test_sequential_mcp_tool_results_stay_paired(scripted_mcp_client):
+    response = _request_paired_mcp_tools(scripted_mcp_client, parallel=False)
+    _assert_mcp_results_paired(response)
+    assert any(item.type == "message" for item in response.output)
+
+
 @qualification_profile("supporting")
 def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
-    mcp_invalid_args_client,
+    scripted_mcp_client,
 ):
     """Schema-invalid MCP arguments are rejected at the gateway (issue #1125).
 
@@ -7578,7 +8217,7 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
     ]
     calls_before = MCPHandler.tool_call_count()
 
-    response = mcp_invalid_args_client.responses.create(
+    response = scripted_mcp_client.responses.create(
         model=VLLM_MODEL,
         input="What is the weather in Paris?",
         tools=tools,
@@ -7622,7 +8261,8 @@ def structured_mcp_client(tmp_path_factory, request, nemo_guardrails_server):
     """Full-flow agentic proxy with a 10 MiB retained budget, a scripted model,
     and an MCP server returning ``structuredContent``."""
     servers = []
-    for handler in (StructuredMCPHandler, McpStructuredResultBackendHandler):
+    mcp_handler = getattr(request, "param", StructuredMCPHandler)
+    for handler in (mcp_handler, McpStructuredResultBackendHandler):
         server = HTTPServer(("127.0.0.1", _free_port()), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
@@ -7705,6 +8345,76 @@ def test_retained_budget_admits_structured_mcp_result(structured_mcp_client):
     assert StructuredMCPHandler.tool_call_count() == calls_before + 1
     assert McpStructuredResultBackendHandler.request_count == model_requests_before + 2
     assert response.output_text == "done"
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize(
+    ("structured_mcp_client", "expected_output"),
+    [
+        (StructuredOnlyMCPHandler, {"content": [], "structuredContent": {"temperature": 22.5}}),
+        (StructuredMCPHandler, {
+            "content": [{"type": "text", "text": "72F and sunny in Paris"}],
+            "structuredContent": StructuredMCPHandler.structured_content,
+        }),
+        (StructuredMixedMCPHandler, {
+            "content": StructuredMixedMCPHandler.result_content,
+            "structuredContent": {"temperature": 22.5},
+        }),
+        (MCPHandler, "72F and sunny in Paris"),
+    ],
+    indirect=["structured_mcp_client"],
+    ids=["structured-only", "text-and-structured", "mixed-and-structured", "text-only-control"],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
+def test_structured_mcp_result_is_preserved_in_model_and_public_output(
+    structured_mcp_client, expected_output, stream
+):
+    """Issue #1899: the real proxy preserves both MCP result representations."""
+    requests_before = len(McpStructuredResultBackendHandler.captured_requests)
+    response = structured_mcp_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=[{"type": "mcp", "server_label": "weather", "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather"], "require_approval": "never"}],
+        store=False, stream=stream,
+    )
+    if stream:
+        events = list(response)
+        completed = [event for event in events if event.type == "response.completed"]
+        assert len(completed) == 1, [event.type for event in events]
+        assert sum(event.type == "response.created" for event in events) == 1
+        assert not any(event.type in {"error", "response.failed"} for event in events)
+        response = completed[0].response
+    assert response.status == "completed", response
+    assert response.output_text == "done", response
+    calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(calls) == 1, response.output
+    assert calls[0].error is None, calls[0]
+    if isinstance(expected_output, str):
+        assert calls[0].output == expected_output
+    else:
+        assert json.loads(calls[0].output) == expected_output
+    requests = McpStructuredResultBackendHandler.captured_requests[requests_before:]
+    assert len(requests) == 2, requests
+    model_outputs = [item for item in requests[1]["input"] if item["type"] == "function_call_output"]
+    assert len(model_outputs) == 1, requests[1]
+    assert model_outputs[0]["output"] == calls[0].output
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize("structured_mcp_client", [OversizedStructuredMCPHandler], indirect=True)
+def test_oversized_structured_mcp_result_still_stops_before_model_continuation(structured_mcp_client):
+    """Preserving structured content must not bypass existing dispatch limits."""
+    requests_before = len(McpStructuredResultBackendHandler.captured_requests)
+    with pytest.raises(APIStatusError) as error:
+        structured_mcp_client.responses.create(
+            model=VLLM_MODEL, input="Weather?", store=False,
+            tools=[{"type": "mcp", "server_label": "weather", "connector_id": "trusted-mcp",
+                    "allowed_tools": ["get_weather"], "require_approval": "never"}],
+        )
+    assert error.value.status_code == 502, error.value
+    assert "processing limit" in error.value.response.json()["error"]["message"]
+    assert len(McpStructuredResultBackendHandler.captured_requests) == requests_before + 1
 
 
 class TestAgenticLoopVLLM:
@@ -8868,40 +9578,9 @@ class TestAgenticLoopVLLM:
         assert len(BraveSearchHandler.request_paths) == request_count + 1
 
     @requires_vllm_compat
-    def test_batched_mcp_tools_honor_parallel_tool_calls(
-        self,
-        agentic_client,
-        agentic_proxy,
-    ):
-        """Two MCP calls emitted in one model round both complete."""
-
-        response = agentic_client.responses.create(
-            model=VLLM_MODEL,
-            input=(
-                "You MUST call both get_weather and get_time for Paris "
-                "in the same turn before answering. Do not omit either "
-                "function. /no_think"
-            ),
-            tools=[
-                {
-                    "type": "mcp",
-                    "server_label": "utilities",
-                    "connector_id": "trusted-mcp",
-                    "allowed_tools": ["get_weather", "get_time"],
-                    "require_approval": "never",
-                }
-            ],
-            parallel_tool_calls=True,
-            store=False,
-            max_output_tokens=512,
-        )
-
-        mcp_calls = [item for item in response.output if item.type == "mcp_call"]
-        assert len(mcp_calls) == 2, (
-            "both calls from the batched model round must execute exactly "
-            f"once; got: {[item.type for item in response.output]}"
-        )
-        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
+    def test_batched_mcp_tools_honor_parallel_tool_calls(self, agentic_client):
+        """Live vLLM can emit a batch whose MCP results stay paired."""
+        _assert_mcp_results_paired(_request_paired_mcp_tools(agentic_client, parallel=True))
 
     @requires_vllm_compat
     def test_mcp_approval_batch_resume_executes_multiple_approved_tools(
@@ -9593,16 +10272,18 @@ class TestAgenticLoopVLLM:
         output_item.added -> web_search_call.in_progress -> searching ->
         completed -> output_item.done sequence exactly once per call (no
         re-emission across IRR rounds), with ids and output indices that agree
-        with the terminal snapshot. The live model may make multiple searches.
+        with the terminal snapshot. The assertions expect exactly one search item
+        because the request sets max_tool_calls=1.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
             input=(
-                "Search the web for the latest Rust release, then answer. "
-                "You MUST use the web search tool. Do not answer directly. "
+                "Search the web once for the latest Rust release, then report the result title. "
                 "/no_think"
             ),
-            tools=[{"type": "web_search_preview"}],
+            tools=[{"type": "web_search"}],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
@@ -9622,10 +10303,26 @@ class TestAgenticLoopVLLM:
         # narration the model streams before it calls the tool.
         text_deltas = []
         final_response = None
+        terminal_events = []
+        event_types = []
 
         for position, event in enumerate(stream):
             sequence_numbers.append(event.sequence_number)
             etype = event.type
+            event_types.append(etype)
+            # Keep terminal status/error evidence without retaining text deltas
+            # or request headers. An incomplete/failed response is different
+            # from a stream that closed without any terminal event.
+            if etype in ("response.completed", "response.incomplete", "response.failed"):
+                response = event.response
+                terminal_events.append({
+                    "type": etype,
+                    "status": response.status,
+                    "error": response.error,
+                    "incomplete_details": response.incomplete_details,
+                })
+            elif etype == "error":
+                terminal_events.append(event.model_dump())
             if etype == "response.output_item.added":
                 item = event.item.model_dump()
                 added.append(
@@ -9654,7 +10351,9 @@ class TestAgenticLoopVLLM:
                 final_response = event.response
 
         assert final_response is not None, (
-            "stream must terminate with a response.completed event"
+            "stream must terminate with a response.completed event; "
+            f"terminal_events={terminal_events!r}, event_types={event_types!r}, "
+            f"added={added!r}, done={done!r}, web_search_progress={ws_progress!r}"
         )
         assert all(isinstance(number, int) for number in sequence_numbers), sequence_numbers
         assert sequence_numbers == sorted(set(sequence_numbers)), sequence_numbers
@@ -9663,16 +10362,12 @@ class TestAgenticLoopVLLM:
         # one incremental output_item.added. Without the synthesis they appear
         # only in the terminal snapshot and never here.
         ws_added = [a for a in added if a[1] == "web_search_call"]
-        assert ws_added, (
-            "locally executed web_search_calls should surface as incremental "
-            f"response.output_item.added; got incremental added items: {added}"
+        assert len(ws_added) == 1, (
+            "expected exactly one incremental web_search_call with "
+            f"max_tool_calls=1; got {len(ws_added)}: {ws_added}"
         )
         ws_ids = [item_id for _, _, item_id, _ in ws_added]
         assert all(ws_ids), f"every synthesized web_search_call must carry an id; got: {ws_added}"
-        assert len(ws_ids) == len(set(ws_ids)), (
-            "each locally executed search must be announced once with a unique id; "
-            f"got: {ws_ids}"
-        )
 
         # Each id must have exactly one matching output_item.done, proving the
         # item is not re-emitted across IRR rounds and that every pair closes.
@@ -10624,6 +11319,78 @@ class TestFileSearchChatCompletionsVLLM:
                 tool_name="file_search",
             )
 
+    @requires_simulator
+    def test_file_search_result_survives_previous_response_id_continuation(
+        self, file_search_chat_client, vector_store
+    ):
+        """Issue #2036: a stored continuation replays the private search result.
+
+        The gateway feeds the retrieved passage to the next round as a private
+        tool call/result pair. A ``previous_response_id`` follow-up must replay
+        that exact pair from the store, not just the public file_search_call.
+        """
+        store_id, marker = vector_store
+        tools = [{"type": "file_search", "vector_store_ids": [store_id]}]
+        recorded_start = len(SimulatorBackendHandler.recorded_requests)
+        first = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="Find the Praxis marker with file_search. /no_think",
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert first.status == "completed", f"first turn: {first.status}"
+        assert any(item.type == "file_search_call" for item in first.output)
+
+        continuation_start = len(SimulatorBackendHandler.recorded_requests)
+        second = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What else does the report say? /no_think",
+            previous_response_id=first.id,
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert second.status == "completed", f"continuation: {second.status}"
+        continuation_end = len(SimulatorBackendHandler.recorded_requests)
+
+        def search_pairs(start: int, end: int):
+            """Return (assistant tool_calls, tool results) per Chat request."""
+            pairs = []
+            for path, body in SimulatorBackendHandler.recorded_requests[start:end]:
+                if not path.rstrip("/").endswith("/v1/chat/completions"):
+                    continue
+                messages = body.get("messages", [])
+                calls = [
+                    call
+                    for message in messages
+                    if message.get("role") == "assistant"
+                    for call in message.get("tool_calls") or []
+                    if call.get("function", {}).get("name") == "file_search"
+                ]
+                results = [
+                    message for message in messages if message.get("role") == "tool"
+                ]
+                pairs.append((calls, results))
+            return pairs
+
+        live = [pair for pair in search_pairs(recorded_start, continuation_start) if pair[1]]
+        assert len(live) == 1, f"one live re-entry carries the search result: {live}"
+        replayed = search_pairs(continuation_start, continuation_end)
+        assert len(replayed) == 1, f"one continuation inference: {replayed}"
+        live_calls, live_results = live[0]
+        replayed_calls, replayed_results = replayed[0]
+        assert replayed_calls == live_calls, (
+            "the continuation must replay the live private file_search call"
+        )
+        assert replayed_results == live_results, (
+            "the continuation must replay the live private file_search result"
+        )
+        assert any(marker in (result.get("content") or "") for result in replayed_results), (
+            "the replayed tool result must carry the retrieved passage"
+        )
+        assert {result.get("tool_call_id") for result in replayed_results} == {
+            call.get("id") for call in replayed_calls
+        }, "replayed call and result must keep their correlation id"
+
 
 # ---------------------------------------------------------------------------
 # Streaming hosted file search (issue #313)
@@ -11449,6 +12216,54 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
 
 @pytest.mark.skipif(
     VLLM_TEST_BACKEND != "simulator",
+    reason="uses the simulator's scripted Chat stream",
+)
+@pytest.mark.parametrize("include_obfuscation", [None, True, False])
+def test_translated_stream_obfuscation(chat_streaming_client, include_obfuscation):
+    options = (
+        {} if include_obfuscation is None
+        else {"stream_options": {"include_obfuscation": include_obfuscation}}
+    )
+    with chat_streaming_client.responses.with_streaming_response.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="STREAM-SERVICE-TIER-1549",
+        store=False,
+        stream=True,
+        **options,
+    ) as stream:
+        wire = b"".join(stream.iter_bytes())
+
+    events = []
+    for frame in wire.split(b"\n\n"):
+        for line in frame.splitlines():
+            if line.startswith(b"data: "):
+                events.append((json.loads(line.removeprefix(b"data: ")), len(frame) + 2))
+
+    assert events[-1][0]["type"] == "response.completed"
+    deltas = [(event, size) for event, size in events if event["type"] == "response.output_text.delta"]
+    assert deltas
+    for event, size in deltas:
+        if include_obfuscation is False:
+            assert "obfuscation" not in event
+        else:
+            assert 1 <= len(event["obfuscation"]) <= 64
+            assert size % 64 == 0
+    assert all("obfuscation" not in event for event, _ in events if not event["type"].endswith(".delta"))
+
+
+def test_translated_stream_rejects_non_boolean_obfuscation(chat_streaming_client):
+    with pytest.raises(openai.BadRequestError, match=r"stream_options\.include_obfuscation"):
+        chat_streaming_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            store=False,
+            stream=True,
+            extra_body={"stream_options": {"include_obfuscation": "false"}},
+        )
+
+
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
     reason="the service-tier provider response is deterministically scripted",
 )
 def test_streaming_service_tier_snapshot_uses_provider_value(chat_streaming_client):
@@ -11722,6 +12537,8 @@ class _FileUrlStubHandler(BaseHTTPRequestHandler):
                 "x-user-id",
                 "authorization",
                 "x-user-ogx-key",
+                "x-user-mcp-key",
+                "x-mcp-authorized",
             )
             if self.headers.get(name) is not None
         ]
@@ -11763,7 +12580,7 @@ class _FileResolveBackendHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture()
-def file_resolve_stub_env(tmp_path_factory, request):
+def file_resolve_stub_env(tmp_path_factory, request, mcp_server):
     """Function-scoped file-resolve proxy with fully stubbed upstreams.
 
     Needs only the compiled binary — no vLLM and no OGX — so it exercises the
@@ -11804,6 +12621,7 @@ def file_resolve_stub_env(tmp_path_factory, request):
         backend_endpoint=f"127.0.0.1:{backend_port}",
         ogx_endpoint=f"127.0.0.1:{files_port}",
         file_url_origin=f"http://127.0.0.1:{file_url_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
     )
     started = False
     proc = subprocess.Popen(
@@ -11818,6 +12636,7 @@ def file_resolve_stub_env(tmp_path_factory, request):
             port,
             default_headers={
                 **TRUSTED_OWNER_HEADERS,
+                **TRUSTED_MCP_HEADERS,
                 "x-user-ogx-key": "Bearer test",
             },
             timeout=60,
@@ -11941,6 +12760,98 @@ class TestFileResolveOutboundChain:
         assert _FileUrlStubHandler.requests == 1, (
             "repeated file_url parts should share one fetch"
         )
+
+    @pytest.mark.parametrize("reference", ["file_id", "file_url"])
+    def test_file_resolution_preserves_member_order(
+        self, file_resolve_stub_env, reference
+    ):
+        client, _, backend, file_url = file_resolve_stub_env
+        part = {
+            reference: _FILE_RESOLVE_ID if reference == "file_id" else file_url,
+            "type": "input_file",
+            "filename": "client.pdf",
+            "opaque": {"z": 1, "a": 2},
+        }
+        response = client.responses.create(
+            model="gpt-4.1",
+            input=[{"content": [part], "role": "user", "type": "message"}],
+            store=False,
+        )
+        assert response.status == "completed"
+        assert len(backend.captured) == 1
+        actual = backend.captured[0]["input"][0]["content"][0]
+        assert list(actual) == ["type", "filename", "opaque", "file_data"]
+        assert actual["filename"] == "client.pdf"
+        assert list(actual["opaque"]) == ["z", "a"]
+        assert actual["file_data"].endswith(_FILE_RESOLVE_B64)
+
+    def test_mcp_resolution_preserves_request_and_tool_order(
+        self, file_resolve_stub_env
+    ):
+        client, _, backend, _ = file_resolve_stub_env
+        sent = []
+
+        def capture_request(request):
+            sent.append(json.loads(request.content))
+
+        tools = [
+            {
+                "type": "function", "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"z": {"type": "string"}, "a": {"type": "number"}},
+                },
+            }
+            for name in ["zebra", "alpha"]
+        ]
+        tools.append({
+            "type": "mcp", "server_label": "weather",
+            "connector_id": "trusted-mcp", "require_approval": "never",
+        })
+        with httpx.Client(event_hooks={"request": [capture_request]}) as transport:
+            response = client.with_options(http_client=transport).responses.create(
+                model="gpt-4.1", input="hello", tools=tools, store=False,
+                tool_choice={"type": "mcp", "server_label": "weather", "name": "get_weather"},
+                metadata={"z": "last", "a": "first"},
+                extra_body={"extra": {"z": 1, "a": 2}},
+            )
+        assert response.status == "completed"
+        assert len(sent) == len(backend.captured) == 1
+        before, after = sent[0], backend.captured[0]
+        assert [key for key in before if key in after] == [
+            key for key in after if key in before
+        ]
+        assert after["tools"][:2] == tools[:2]
+        assert [tool["name"] for tool in after["tools"][:2]] == ["zebra", "alpha"]
+        for tool in after["tools"][:2]:
+            assert list(tool["parameters"]["properties"]) == ["z", "a"]
+        assert list(after["metadata"]) == ["z", "a"]
+        assert list(after["extra"]) == ["z", "a"]
+        assert after["tool_choice"] == {"type": "function", "name": "weather__get_weather"}
+        assert any(
+            tool.get("type") == "function" and tool.get("name") == "weather__get_weather"
+            for tool in after["tools"]
+        ), "the selected MCP function definition must reach the backend"
+
+    def test_deferred_mcp_sanitization_preserves_public_member_order(
+        self, file_resolve_stub_env
+    ):
+        client, _, backend, _ = file_resolve_stub_env
+        tool = {
+            "type": "mcp", "connector_id": "trusted-mcp",
+            "server_label": "weather", "defer_loading": True,
+            "server_description": "weather lookup", "allowed_callers": ["assistant"],
+            "allowed_tools": ["get_weather"], "require_approval": "never",
+        }
+        response = client.responses.create(
+            model="gpt-4.1", input="hello", store=False,
+            tools=[{"type": "tool_search"}, tool],
+        )
+        assert response.status == "completed"
+        assert len(backend.captured) == 1
+        actual = backend.captured[0]["tools"][1]
+        assert list(actual) == [key for key in tool if key != "connector_id"]
+        assert actual == {key: value for key, value in tool.items() if key != "connector_id"}
 
     def test_file_url_rejects_cloud_metadata(self, file_resolve_stub_env):
         """Private-origin opt-ins must not grant access to metadata services."""

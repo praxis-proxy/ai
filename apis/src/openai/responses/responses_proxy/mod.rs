@@ -51,7 +51,9 @@ use super::{
     error::responses_error_rejection,
     state::{ResponsesState, normalize_input_owned},
 };
-use crate::json_body::{MAX_JSON_BODY_BYTES, SerializedJson};
+use crate::json_body::{
+    BoundedJsonBody, MAX_JSON_BODY_BYTES, SerializedJson, serialize_json_body_within, serialized_len,
+};
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyFilter
@@ -128,28 +130,54 @@ impl ResponsesProxyFilter {
         &self,
         state: &ResponsesState,
         preserve_native_compaction: bool,
-    ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let serialized = serialize_outbound_body(state, preserve_native_compaction)
-            .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
-        if serialized.len() > self.config.max_rewritten_body_bytes {
-            debug!(
-                body_bytes = serialized.len(),
-                max_bytes = self.config.max_rewritten_body_bytes,
-                "rebuilt request body exceeds maximum size"
-            );
-            return Ok(Err(reject_rewritten_body_too_large(
-                serialized.len(),
-                self.config.max_rewritten_body_bytes,
-            )));
+    ) -> Result<Result<SerializedJson, FilterAction>, FilterError> {
+        let outbound = OutboundBody {
+            state,
+            preserve_native_compaction,
+            provider_compaction_ids: &state.provider_compaction_ids,
+        };
+        let limit = self.config.max_rewritten_body_bytes;
+        match serialize_json_body_within(&outbound, limit)
+            .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?
+        {
+            BoundedJsonBody::Fits(serialized) => {
+                debug!(
+                    messages = state.messages.len(),
+                    body_bytes = serialized.len(),
+                    "rebuilt request body from ResponsesState"
+                );
+                Ok(Ok(serialized))
+            },
+            BoundedJsonBody::TooLarge { actual } => {
+                debug!(
+                    body_bytes = actual,
+                    max_bytes = limit,
+                    "rebuilt request body exceeds maximum size"
+                );
+                Ok(Err(reject_rewritten_body_too_large(actual, limit)))
+            },
         }
+    }
 
+    /// Reject a measured selected body over the rewrite or transport limit.
+    fn reject_selected_len(&self, len: usize, transport_limit: Option<usize>) -> Option<FilterAction> {
+        if len > self.config.max_rewritten_body_bytes {
+            return Some(reject_rewritten_body_too_large(
+                len,
+                self.config.max_rewritten_body_bytes,
+            ));
+        }
+        let limit = transport_limit.filter(|limit| len > *limit)?;
         debug!(
-            messages = state.messages.len(),
-            body_bytes = serialized.len(),
-            "rebuilt request body from ResponsesState"
+            body_bytes = len,
+            max_bytes = limit,
+            "selected rebuilt request body exceeds effective body limit"
         );
-
-        Ok(Ok(serialized))
+        Some(FilterAction::Reject(responses_error_rejection(
+            413,
+            "invalid_request_error",
+            &format!("selected request body ({len} bytes) exceeds maximum ({limit} bytes)"),
+        )))
     }
 
     /// Reconcile the selected backend's compaction projection with the body
@@ -159,53 +187,114 @@ impl ResponsesProxyFilter {
     /// that live body as the source so downstream changes, such as a model
     /// rewrite, are retained instead of rebuilding from the older
     /// [`ResponsesState`] snapshot.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "streaming splice keeps the large body out of serde_json::Value"
-    )]
     fn serialize_selected_body(
         &self,
         body: &Bytes,
         state: &ResponsesState,
         preserve_native_compaction: bool,
+        transport_limit: Option<usize>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let members = scan_top_level_object(body).map_err(|error| -> FilterError {
             format!("openai_responses_proxy: invalid selected request body: {error}").into()
         })?;
         let messages = selected_input::reconcile(body, &members, state, preserve_native_compaction)?;
-        let discovered =
-            ResponsesState::provider_compaction_ids_from_messages(messages.iter().filter_map(|item| match item {
-                Cow::Owned(item) => Some(item),
-                Cow::Borrowed(_) => None,
-            }));
-        let provider_compaction_ids = if discovered.is_subset(&state.provider_compaction_ids) {
-            Cow::Borrowed(&state.provider_compaction_ids)
-        } else {
-            let mut ids = state.provider_compaction_ids.clone();
-            ids.extend(discovered);
-            Cow::Owned(ids)
-        };
-        let input_replacement = serde_json::to_vec(&SelectedMessages {
+        let provider_compaction_ids = selected_provider_compaction_ids(state, &messages);
+        let input_replacement = SelectedMessages {
             messages: &messages,
             preserve_native_compaction,
             provider_compaction_ids: provider_compaction_ids.as_ref(),
-        })
-        .map_err(|error| -> FilterError { format!("openai_responses_proxy: {error}").into() })?;
-        let stream_replacement = state
-            .request_body
-            .get("stream")
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|error| -> FilterError { format!("openai_responses_proxy: {error}").into() })?;
+        };
+        let splice = SelectedBodySplice {
+            body,
+            members: &members,
+            state,
+            input: &input_replacement,
+            stream: state.request_body.get("stream"),
+        };
+        // Measure the complete assembly first so neither limit is crossed by
+        // the output buffer, then write it once into exact capacity. The input
+        // replacement is measured once even when `input` repeats in the body.
+        let mut measured = SelectedBodyLen::new(&input_replacement)?;
+        splice.write_to(&mut measured)?;
+        let len = measured.len;
+        if let Some(rejection) = self.reject_selected_len(len, transport_limit) {
+            return Ok(Err(rejection));
+        }
+        let mut output = Vec::with_capacity(len);
+        splice.write_to(&mut output)?;
+        if output.len() != len {
+            return Err("openai_responses_proxy: selected body length changed during serialization".into());
+        }
+        Ok(Ok(output))
+    }
+}
 
-        let mut serialized = Vec::with_capacity(body.len());
-        serialized.push(b'{');
-        let mut wrote_member = false;
-        let mut wrote_input = false;
-        let mut wrote_tools = false;
-        let mut wrote_tool_choice = false;
-        for member in members {
-            if state.history_rehydrated
+/// Known provider compaction IDs plus any discovered in live-edited messages.
+fn selected_provider_compaction_ids<'a>(
+    state: &'a ResponsesState,
+    messages: &[Cow<'_, serde_json::Value>],
+) -> Cow<'a, HashSet<String>> {
+    let discovered =
+        ResponsesState::provider_compaction_ids_from_messages(messages.iter().filter_map(|item| match item {
+            Cow::Owned(item) => Some(item),
+            Cow::Borrowed(_) => None,
+        }));
+    if discovered.is_subset(&state.provider_compaction_ids) {
+        Cow::Borrowed(&state.provider_compaction_ids)
+    } else {
+        let mut ids = state.provider_compaction_ids.clone();
+        ids.extend(discovered);
+        Cow::Owned(ids)
+    }
+}
+
+/// Inputs to the selected-body splice: preserved raw spans plus state-owned replacements.
+struct SelectedBodySplice<'a> {
+    /// Live request body produced by earlier request-body filters.
+    body: &'a [u8],
+    /// Top-level members scanned from `body`.
+    members: &'a [TopLevelMember],
+    /// Request state owning replacement fields.
+    state: &'a ResponsesState,
+    /// Reconciled `input` replacement.
+    input: &'a SelectedMessages<'a>,
+    /// Effective `stream` flag, when state owns one.
+    stream: Option<&'a serde_json::Value>,
+}
+
+impl SelectedBodySplice<'_> {
+    /// Emit the spliced object, preserving member order and raw bytes.
+    fn write_to<S: SelectedBodySink>(&self, sink: &mut S) -> Result<(), FilterError> {
+        sink.raw(b"{")?;
+        let mut written = self.write_members(sink)?;
+        if !written.input {
+            written.separate(sink)?;
+            sink.raw(br#""input":"#)?;
+            sink.input(self.input)?;
+        }
+        let state_fields: [(TopLevelField, bool, &[u8]); 2] = [
+            (TopLevelField::Tools, written.tools, br#""tools":"#),
+            (TopLevelField::ToolChoice, written.tool_choice, br#""tool_choice":"#),
+        ];
+        for (field, wrote, key) in state_fields {
+            if wrote {
+                continue;
+            }
+            let Some(replacement) = selected_state_field(self.state, field) else {
+                continue;
+            };
+            written.separate(sink)?;
+            sink.raw(key)?;
+            sink.json(replacement)?;
+        }
+        sink.raw(b"}")
+    }
+
+    /// Emit retained body members, replacing state-owned values in place.
+    fn write_members<S: SelectedBodySink>(&self, sink: &mut S) -> Result<WrittenMembers, FilterError> {
+        let mut written = WrittenMembers::default();
+        for member in self.members {
+            if self.state.history_rehydrated
                 && matches!(
                     member.name,
                     TopLevelField::PreviousResponseId | TopLevelField::Conversation
@@ -213,63 +302,113 @@ impl ResponsesProxyFilter {
             {
                 continue;
             }
-            let state_replacement = selected_state_field(state, member.name)?;
-            if wrote_member {
-                serialized.push(b',');
-            }
-            serialized.extend_from_slice(selected_body_slice(body, member.key_start, member.value_start)?);
+            written.separate(sink)?;
+            sink.raw(selected_body_slice(self.body, member.key_start, member.value_start)?)?;
             if member.name == TopLevelField::Input {
-                serialized.extend_from_slice(&input_replacement);
-                wrote_input = true;
-            } else if let Some(replacement) = state_replacement {
-                serialized.extend_from_slice(&replacement);
-                wrote_tools |= member.name == TopLevelField::Tools;
-                wrote_tool_choice |= member.name == TopLevelField::ToolChoice;
-            } else if member.name == TopLevelField::Stream {
-                if let Some(replacement) = &stream_replacement {
-                    serialized.extend_from_slice(replacement);
-                } else {
-                    serialized.extend_from_slice(selected_body_slice(body, member.value_start, member.value_end)?);
-                }
+                sink.input(self.input)?;
+                written.input = true;
+            } else if let Some(replacement) = selected_state_field(self.state, member.name) {
+                sink.json(replacement)?;
+                written.tools |= member.name == TopLevelField::Tools;
+                written.tool_choice |= member.name == TopLevelField::ToolChoice;
+            } else if let (TopLevelField::Stream, Some(replacement)) = (member.name, self.stream) {
+                sink.json(replacement)?;
             } else {
-                serialized.extend_from_slice(selected_body_slice(body, member.value_start, member.value_end)?);
+                sink.raw(selected_body_slice(self.body, member.value_start, member.value_end)?)?;
             }
-            wrote_member = true;
         }
-        if !wrote_input {
-            if wrote_member {
-                serialized.push(b',');
-            }
-            serialized.extend_from_slice(br#""input":"#);
-            serialized.extend_from_slice(&input_replacement);
-            wrote_member = true;
+        Ok(written)
+    }
+}
+
+/// Members already emitted by [`SelectedBodySplice::write_members`].
+#[derive(Default)]
+#[expect(clippy::struct_excessive_bools, reason = "independent splice progress flags")]
+struct WrittenMembers {
+    /// Whether any member was emitted.
+    any: bool,
+    /// Whether `input` was replaced in place.
+    input: bool,
+    /// Whether `tools` was replaced in place.
+    tools: bool,
+    /// Whether `tool_choice` was replaced in place.
+    tool_choice: bool,
+}
+
+impl WrittenMembers {
+    /// Emit a separator before every member except the first.
+    fn separate<S: SelectedBodySink>(&mut self, sink: &mut S) -> Result<(), FilterError> {
+        if self.any {
+            sink.raw(b",")?;
         }
-        let state_fields: [(TopLevelField, bool, &[u8]); 2] = [
-            (TopLevelField::Tools, wrote_tools, br#""tools":"#),
-            (TopLevelField::ToolChoice, wrote_tool_choice, br#""tool_choice":"#),
-        ];
-        for (field, wrote, key) in state_fields {
-            if wrote {
-                continue;
-            }
-            let Some(replacement) = selected_state_field(state, field)? else {
-                continue;
-            };
-            if wrote_member {
-                serialized.push(b',');
-            }
-            serialized.extend_from_slice(key);
-            serialized.extend_from_slice(&replacement);
-            wrote_member = true;
-        }
-        serialized.push(b'}');
-        if serialized.len() > self.config.max_rewritten_body_bytes {
-            return Ok(Err(reject_rewritten_body_too_large(
-                serialized.len(),
-                self.config.max_rewritten_body_bytes,
-            )));
-        }
-        Ok(Ok(serialized))
+        self.any = true;
+        Ok(())
+    }
+}
+
+/// Destination for [`SelectedBodySplice::write_to`].
+trait SelectedBodySink {
+    /// Append preserved bytes.
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), FilterError>;
+    /// Append a compact JSON replacement.
+    fn json<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), FilterError>;
+    /// Append the reconciled `input` replacement, which may repeat.
+    fn input(&mut self, input: &SelectedMessages<'_>) -> Result<(), FilterError> {
+        self.json(input)
+    }
+}
+
+/// Exact selected-body length with checked arithmetic and no retained output.
+struct SelectedBodyLen {
+    /// Bytes accounted so far.
+    len: usize,
+    /// Serialized length of the input replacement, measured once.
+    input_len: usize,
+}
+
+impl SelectedBodyLen {
+    /// Start an empty count with the input replacement measured once.
+    fn new(input: &SelectedMessages<'_>) -> Result<Self, FilterError> {
+        let input_len =
+            serialized_len(input).map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
+        Ok(Self { len: 0, input_len })
+    }
+
+    /// Add `additional` bytes, rejecting `usize` overflow.
+    fn add(&mut self, additional: usize) -> Result<(), FilterError> {
+        self.len = self
+            .len
+            .checked_add(additional)
+            .ok_or("openai_responses_proxy: selected body length overflow")?;
+        Ok(())
+    }
+}
+
+impl SelectedBodySink for SelectedBodyLen {
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), FilterError> {
+        self.add(bytes.len())
+    }
+
+    fn json<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), FilterError> {
+        let len =
+            serialized_len(value).map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
+        self.add(len)
+    }
+
+    fn input(&mut self, _input: &SelectedMessages<'_>) -> Result<(), FilterError> {
+        self.add(self.input_len)
+    }
+}
+
+/// Output pre-sized to the measured length, so serialization writes in place.
+impl SelectedBodySink for Vec<u8> {
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), FilterError> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn json<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), FilterError> {
+        serde_json::to_writer(self, value).map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })
     }
 }
 
@@ -306,21 +445,16 @@ struct TopLevelMember {
 
 /// Return the state-owned replacement for a selected-body member, if one is
 /// required by the current rebuild.
-fn selected_state_field(state: &ResponsesState, field: TopLevelField) -> Result<Option<Vec<u8>>, FilterError> {
+fn selected_state_field(state: &ResponsesState, field: TopLevelField) -> Option<&serde_json::Value> {
     let key = match field {
         TopLevelField::Tools => "tools",
         TopLevelField::ToolChoice => "tool_choice",
-        _ => return Ok(None),
+        _ => return None,
     };
     if !state.request_body_requires_rebuild() {
-        return Ok(None);
+        return None;
     }
-    let Some(value) = state.request_body.get(key) else {
-        return Ok(None);
-    };
-    serde_json::to_vec(value)
-        .map(Some)
-        .map_err(|error| format!("openai_responses_proxy: {error}").into())
+    state.request_body.get(key)
 }
 
 /// Borrow a validated byte range from the selected request body.
@@ -498,7 +632,7 @@ impl HttpFilter for ResponsesProxyFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -544,10 +678,10 @@ impl HttpFilter for ResponsesProxyFilter {
         }
 
         let serialized = match self.serialize_body(state, true)? {
-            Ok(bytes) => bytes,
+            Ok(serialized) => serialized,
             Err(action) => return Ok(action),
         };
-        SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
+        serialized.commit(body, self.name(), "body");
         select_terminal_response_mode(ctx, body);
         Ok(FilterAction::Continue)
     }
@@ -583,30 +717,16 @@ impl HttpFilter for ResponsesProxyFilter {
         let Some(current_body) = body.as_ref() else {
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
-        let serialized = match self.serialize_selected_body(current_body, state, preserve_native_compaction)? {
+        let serialized = match self.serialize_selected_body(
+            current_body,
+            state,
+            preserve_native_compaction,
+            effective_request_body_limit(ctx),
+        )? {
             Ok(bytes) => bytes,
             Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
             Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
         };
-
-        if let Some(limit) = effective_request_body_limit(ctx)
-            && serialized.len() > limit
-        {
-            debug!(
-                body_bytes = serialized.len(),
-                max_bytes = limit,
-                "selected rebuilt request body exceeds effective body limit"
-            );
-            return Ok(SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                &format!(
-                    "selected request body ({} bytes) exceeds maximum ({} bytes)",
-                    serialized.len(),
-                    limit
-                ),
-            )));
-        }
 
         SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
         select_terminal_response_mode(ctx, body);
@@ -738,6 +858,7 @@ fn provider_owns_conversation(state: &ResponsesState) -> bool {
 }
 
 /// Serialize the outbound body without cloning request state.
+#[cfg(test)]
 fn serialize_outbound_body(
     state: &ResponsesState,
     preserve_native_compaction: bool,
@@ -870,34 +991,11 @@ fn serialized_outbound_body_len_for(
     state: &ResponsesState,
     preserve_native_compaction: bool,
 ) -> Result<usize, serde_json::Error> {
-    let mut counter = ByteCounter::default();
-    serde_json::to_writer(
-        &mut counter,
-        &OutboundBody {
-            state,
-            preserve_native_compaction,
-            provider_compaction_ids: &state.provider_compaction_ids,
-        },
-    )?;
-    Ok(counter.bytes)
-}
-
-/// Writer that counts serialized bytes without allocating a second body.
-#[derive(Default)]
-struct ByteCounter {
-    /// Number of bytes written by the serializer.
-    bytes: usize,
-}
-
-impl std::io::Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.bytes = self.bytes.saturating_add(buf.len());
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    serialized_len(&OutboundBody {
+        state,
+        preserve_native_compaction,
+        provider_compaction_ids: &state.provider_compaction_ids,
+    })
 }
 
 /// Return whether state requires parsing and rebuilding the outbound body.

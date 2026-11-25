@@ -243,7 +243,7 @@ impl HttpFilter for CalloutCredentialsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -416,7 +416,7 @@ impl CalloutCredentials {
     }
 
     /// Look up the authorization assertion staged for `slot`, if any.
-    #[cfg(any(test, feature = "openai-mcp-tools"))]
+    #[cfg(any(test, feature = "mcp"))]
     pub(crate) fn get_assertion(&self, slot: &str) -> Option<&SecretString> {
         self.assertion_slots.get(slot)
     }

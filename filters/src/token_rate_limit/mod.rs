@@ -33,7 +33,7 @@
 //!   reserve/reconcile split this filter needs.
 //!
 //! Both sit behind the same pluggable [`backend`] trait, so either
-//! algorithm runs in-process (default) or against a shared Redis/Valkey
+//! algorithm runs in-process (`backend: {kind: memory}`) or against a shared Redis/Valkey
 //! backend (`backend: {kind: redis}` or `{kind: valkey}`) for state shared across gateway
 //! instances/replicas -- see `praxis-proxy/grid#83` for the fuller
 //! shared-backend spec this milestone is a narrower slice of.
@@ -98,7 +98,12 @@
     clippy::too_many_lines,
     reason = "tests"
 )]
-mod tests;
+pub(crate) mod tests;
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::too_many_lines, reason = "tests")]
+mod hierarchy_tests;
 
 mod backend;
 mod config;
@@ -118,6 +123,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::{counter, gauge};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     TrustedHeaderMutation, parse_filter_config,
@@ -141,35 +147,19 @@ use self::{
         ValkeyConnection, ValkeySlidingWindowBackend, ValkeySlidingWindowConfig, ValkeyTokenBucketBackend,
         ValkeyTokenBucketConfig,
     },
-    weights::{TokenWeights, UsageCounts, parse_u64_meta, weighted_cost},
+    weights::{TokenWeights, UsageCounts, weighted_cost},
 };
+#[cfg(feature = "token-quota-filter")]
+use crate::token_quota::TokenQuotaResultStatus;
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Metadata key stashing this request's reservation ID, read back during
-/// response-phase reconciliation.
-const META_RESERVATION_ID: &str = "token_rate_limit.reservation_id";
-
-/// Metadata key stashing the resolved bucket key, read back in
-/// reconciliation so it operates on the same budget `on_request` reserved
-/// from.
-const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
-
-/// Metadata key stashing the index of the [`CompiledRule`] that admitted
-/// this request, so reconciliation settles against the same rule's
-/// backend/estimate even when other rules exist.
-const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
-
 /// Metadata key exposing this request's computed estimate for the rest of
 /// the exchange. Settlement does not read it: every backend settles
 /// against the estimate it stored with the reservation.
 const META_ESTIMATE: &str = "token_rate_limit.estimate";
-
-/// Marker for an explicit fail-open admission. It never contains a
-/// reservation handle and is cleared at the end of the exchange.
-const META_FAIL_OPEN: &str = "token_rate_limit.fail_open";
 
 /// The budget key used by the backward-compatible global key mode.
 pub(super) const FALLBACK_KEY: &str = "__fallback__";
@@ -209,26 +199,6 @@ const DEFAULT_USED_QUOTA_HEADER: &str = "X-Token-Quota-Used";
 /// here instead of wrapping or reporting backend-dependent precision loss.
 const MAX_REPORTED_REMAINING: u64 = 9_007_199_254_740_991;
 
-/// Metadata: org-level hierarchy reservation ID.
-const META_HIERARCHY_ORG_RESERVATION_ID: &str = "trl.hierarchy.org.reservation_id";
-/// Metadata: org-level hierarchy bucket key.
-const META_HIERARCHY_ORG_BUCKET_KEY: &str = "trl.hierarchy.org.bucket_key";
-/// Metadata: team-level hierarchy reservation ID.
-const META_HIERARCHY_TEAM_RESERVATION_ID: &str = "trl.hierarchy.team.reservation_id";
-/// Metadata: team-level hierarchy bucket key.
-const META_HIERARCHY_TEAM_BUCKET_KEY: &str = "trl.hierarchy.team.bucket_key";
-/// Metadata: user-level hierarchy reservation ID.
-const META_HIERARCHY_USER_RESERVATION_ID: &str = "trl.hierarchy.user.reservation_id";
-/// Metadata: user-level hierarchy bucket key.
-const META_HIERARCHY_USER_BUCKET_KEY: &str = "trl.hierarchy.user.bucket_key";
-
-/// Ordered metadata key pairs for hierarchy levels (org, team, user).
-const HIERARCHY_META_KEYS: [(&str, &str); 3] = [
-    (META_HIERARCHY_ORG_RESERVATION_ID, META_HIERARCHY_ORG_BUCKET_KEY),
-    (META_HIERARCHY_TEAM_RESERVATION_ID, META_HIERARCHY_TEAM_BUCKET_KEY),
-    (META_HIERARCHY_USER_RESERVATION_ID, META_HIERARCHY_USER_BUCKET_KEY),
-];
-
 /// Maximum request body bytes buffered for body-dependent estimation
 /// strategies. 2 MiB -- generous enough for the largest realistic
 /// inference request body, small enough not to materially affect
@@ -254,7 +224,7 @@ const HEADER_RATELIMIT_RESET: &str = "X-RateLimit-Reset-Tokens";
 /// lazily connected Redis/Valkey transport (see [`ValkeyConnection`]'s doc
 /// comment for why this is built once and `Clone`d, not once per rule).
 enum BackendResource {
-    /// Every rule gets its own in-process ledger (the default).
+    /// Every rule gets its own explicitly selected in-process ledger.
     Memory,
     /// Every rule shares this one Redis/Valkey connection, differentiated by
     /// `namespace`/rule-name key hashing. Boxed: `ValkeyConnection` embeds
@@ -914,17 +884,11 @@ fn rollback_hierarchy_sync(hierarchy: &[CompiledHierarchyLevel], stashed: &[(u64
 /// Reconcile all admitted hierarchy levels with the same actual usage.
 fn reconcile_hierarchy(
     hierarchy: &[CompiledHierarchyLevel],
-    ctx: &HttpFilterContext<'_>,
+    held: Vec<(u64, String)>,
     actual: Option<u64>,
     now_ms: u64,
 ) {
-    for (level, &(meta_rid, meta_key)) in hierarchy.iter().zip(HIERARCHY_META_KEYS.iter()) {
-        let Some(reservation_id) = parse_u64_meta(ctx, meta_rid) else {
-            continue;
-        };
-        let Some(key) = ctx.get_metadata(meta_key).map(str::to_owned) else {
-            continue;
-        };
+    for (level, (reservation_id, key)) in hierarchy.iter().zip(held) {
         let request = ReconcileRequest {
             key,
             reservation_id,
@@ -937,15 +901,6 @@ fn reconcile_hierarchy(
             record_backend_error_metric(level.metric_rule, level.backend.backend_name(), &e);
             tracing::error!(%e, level = level.name, "token_rate_limit: hierarchy reconciliation enqueue failed");
         }
-    }
-}
-
-/// Stash hierarchy reservation metadata into the filter context for
-/// later reconciliation.
-fn stash_hierarchy_metadata(ctx: &mut HttpFilterContext<'_>, stashed: &[(u64, String)]) {
-    for ((reservation_id, key), &(meta_rid, meta_key)) in stashed.iter().zip(HIERARCHY_META_KEYS.iter()) {
-        ctx.set_metadata(meta_rid, reservation_id.to_string());
-        ctx.set_metadata(meta_key, key.clone());
     }
 }
 
@@ -1076,6 +1031,15 @@ struct AccountingPolicy {
     weights: TokenWeights,
     /// Stable digest of the filter-wide budget-key policy.
     key_fingerprint: String,
+}
+
+/// Source of the final response-phase reconciliation charge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationSource {
+    /// Preserve the legacy filter/rule token-weight calculation.
+    LegacyWeights,
+    /// Consume the shared PPE token-quota result.
+    SharedQuota,
 }
 
 /// Extract `max_tokens` (preferred) or `max_completion_tokens` from a
@@ -2086,16 +2050,18 @@ fn compile_rule(
 /// #   header: x-tenant-id
 /// #   missing: fallback
 /// max_keys: 100000                   # optional: per-rule cap on distinct budget keys
-/// backend:                           # optional: defaults to in-process state, shared by every rule
-///   kind: valkey                      # memory (default) | redis | valkey
-///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
-///   namespace: praxis:token_rate_limit
+/// backend:                           # required; one explicit backend shared by every rule
+///   kind: valkey                      # memory | redis | valkey
+///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}" # redis/valkey only
+///   namespace: praxis:token_rate_limit    # redis/valkey only
 /// default_weights:                   # optional: omitted types default to 1.0
 ///   input: 1.0
 ///   output: 1.0
 ///   cached_input: 0.1                # prompt-cache hits (token.cache_read)
 ///   cache_write: 1.25                # prompt-cache writes (token.cache_write)
 ///   reasoning: 0.9                   # thinking tokens (token.reasoning)
+/// # use_token_quota: true            # alternatively consume PPE quota output;
+///                                    # mutually exclusive with all weights
 /// rules:
 ///   - name: team-alpha                 # human-readable, unique per filter instance
 ///     match:                           # optional: omit for a catch-all rule
@@ -2147,6 +2113,9 @@ pub struct TokenRateLimitFilter {
     /// Optional compiled hierarchy levels (org, team, user).
     hierarchy: Option<Vec<CompiledHierarchyLevel>>,
 
+    /// Authoritative source for the response-phase reconciliation charge.
+    reconciliation_source: ReconciliationSource,
+
     /// Expected shared-backend failure behavior for admission.
     on_failure: BackendOnFailure,
 }
@@ -2174,6 +2143,16 @@ impl TokenRateLimitFilter {
                 return Err(format!("token_rate_limit: duplicate rule name '{}'", rule.name).into());
             }
         }
+        if cfg.use_token_quota
+            && (!cfg.default_weights.is_empty() || cfg.rules.iter().any(|rule| !rule.weights.is_empty()))
+        {
+            return Err(
+                "token_rate_limit: use_token_quota cannot be combined with default_weights or per-rule weights".into(),
+            );
+        }
+        if cfg.use_token_quota && !cfg!(feature = "token-quota-filter") {
+            return Err("token_rate_limit: use_token_quota requires the token-quota-filter feature".into());
+        }
 
         let backend = build_backend_resource(&cfg.backend)?;
         let filter_defaults = TokenWeights::UNITY.overlay(&cfg.default_weights, "default_weights")?;
@@ -2186,7 +2165,10 @@ impl TokenRateLimitFilter {
             validate_rule_estimates_fit_hierarchy(&cfg.rules, levels)?;
         }
         let key_spec = compile_key_spec(cfg.key)?;
-        let key_fingerprint = key_spec.config_fingerprint();
+        let mut key_fingerprint = key_spec.config_fingerprint();
+        if cfg.use_token_quota {
+            key_fingerprint.push_str(":quota");
+        }
         let rules = cfg
             .rules
             .into_iter()
@@ -2208,6 +2190,11 @@ impl TokenRateLimitFilter {
             epoch: Instant::now(),
             valkey_clock: matches!(backend, BackendResource::Shared { .. }),
             hierarchy,
+            reconciliation_source: if cfg.use_token_quota {
+                ReconciliationSource::SharedQuota
+            } else {
+                ReconciliationSource::LegacyWeights
+            },
             on_failure: cfg.backend.on_failure,
         }))
     }
@@ -2233,6 +2220,19 @@ impl TokenRateLimitFilter {
     /// by `headers`, alongside its index for reconciliation.
     fn matching_rule(&self, headers: &http::HeaderMap) -> Option<(usize, &CompiledRule)> {
         self.rules.iter().enumerate().find(|(_, rule)| rule.matches(headers))
+    }
+
+    /// Resolve the final per-request quota charge from the configured source.
+    fn actual_cost(&self, ctx: &HttpFilterContext<'_>, rule: &CompiledRule) -> Option<u64> {
+        if self.reconciliation_source == ReconciliationSource::SharedQuota {
+            #[cfg(feature = "token-quota-filter")]
+            {
+                return crate::token_quota::decision(ctx).and_then(shared_quota_cost);
+            }
+            #[cfg(not(feature = "token-quota-filter"))]
+            return None;
+        }
+        weighted_cost(UsageCounts::from_context(ctx), rule.weights)
     }
 
     /// Resolve an opaque backend bucket key from request state.
@@ -2316,8 +2316,10 @@ impl TokenRateLimitFilter {
             return Err(FilterAction::Reject(Rejection::status(400)));
         }
         match admit_hierarchy(hierarchy, &keys, estimate, now_ms, ctx, self.on_failure).await {
-            Ok(Some(stashed)) => {
-                stash_hierarchy_metadata(ctx, &stashed);
+            Ok(Some(held)) => {
+                if let Some(holds) = ExchangeHolds::of(ctx) {
+                    holds.hierarchy = held;
+                }
                 Ok(true)
             },
             Ok(None) => Ok(false),
@@ -2330,9 +2332,11 @@ impl TokenRateLimitFilter {
         let Some(hierarchy) = &self.hierarchy else {
             return;
         };
-        let stashed = Self::collect_hierarchy_stash(ctx);
-        rollback_hierarchy_sync(hierarchy, &stashed, now_ms);
-        Self::clear_hierarchy_metadata(ctx);
+        let held = ctx
+            .get_filter_state_mut::<ExchangeHolds>()
+            .map(|holds| std::mem::take(&mut holds.hierarchy))
+            .unwrap_or_default();
+        rollback_hierarchy_sync(hierarchy, &held, now_ms);
     }
 
     /// Drop hierarchy holds on a rule denial. A soft forward keeps them and
@@ -2355,15 +2359,18 @@ impl TokenRateLimitFilter {
         if self.hierarchy.is_none() {
             return;
         }
-        if ctx.get_metadata(META_FAIL_OPEN).is_some() {
+        if ctx
+            .get_filter_state::<ExchangeHolds>()
+            .is_some_and(|holds| holds.fail_open.is_some())
+        {
             self.release_hierarchy(ctx, now_ms);
             return;
         }
         match action {
             FilterAction::Reject(_) => self.release_hierarchy(ctx, now_ms),
             FilterAction::Continue => {
-                if ctx.get_metadata(META_RULE_INDEX).is_none() {
-                    ctx.set_metadata(META_RULE_INDEX, rule_index.to_string());
+                if let Some(holds) = ExchangeHolds::of(ctx) {
+                    holds.rule_index.get_or_insert(rule_index);
                 }
                 if let Some(hierarchy) = &self.hierarchy {
                     for level in hierarchy {
@@ -2446,25 +2453,6 @@ impl TokenRateLimitFilter {
         action
     }
 
-    /// Collect stashed hierarchy reservation metadata from the context.
-    fn collect_hierarchy_stash(ctx: &HttpFilterContext<'_>) -> Vec<(u64, String)> {
-        let mut stashed = Vec::new();
-        for &(meta_rid, meta_key) in &HIERARCHY_META_KEYS {
-            if let (Some(rid), Some(key)) = (parse_u64_meta(ctx, meta_rid), ctx.get_metadata(meta_key)) {
-                stashed.push((rid, key.to_owned()));
-            }
-        }
-        stashed
-    }
-
-    /// Clear hierarchy metadata from the filter context.
-    fn clear_hierarchy_metadata(ctx: &mut HttpFilterContext<'_>) {
-        for &(meta_rid, meta_key) in &HIERARCHY_META_KEYS {
-            ctx.filter_metadata.remove(meta_rid);
-            ctx.filter_metadata.remove(meta_key);
-        }
-    }
-
     /// Reclaim idle/orphaned in-process state for one rule and publish
     /// its gauges.
     ///
@@ -2492,7 +2480,7 @@ impl TokenRateLimitFilter {
         }
     }
 
-    /// Record metrics/metadata for an admitted reservation.
+    /// Record metrics and holds for an admitted reservation.
     fn record_admission(
         ctx: &mut HttpFilterContext<'_>,
         rule_index: usize,
@@ -2505,9 +2493,10 @@ impl TokenRateLimitFilter {
         record_accounting_admission(rule, "admitted", admitted.estimate, "reserved");
         // Spoofable inject / over_quota names are stripped once at match time
         // in `on_request` / `on_request_body` before estimation can return early.
-        ctx.set_metadata(META_RESERVATION_ID, admitted.reservation_id.to_string());
-        ctx.set_metadata(META_BUCKET_KEY, admitted.key);
-        ctx.set_metadata(META_RULE_INDEX, rule_index.to_string());
+        if let Some(holds) = ExchangeHolds::of(ctx) {
+            holds.reservation = Some((admitted.reservation_id, admitted.key));
+            holds.rule_index = Some(rule_index);
+        }
     }
 
     /// Build the 429 rejection for a denied reservation, including the
@@ -2593,7 +2582,7 @@ impl TokenRateLimitFilter {
                 estimate,
             },
         );
-        ctx.set_metadata(META_ESTIMATE, request_estimate.to_string());
+        ctx.record_ai_metadata(META_ESTIMATE, request_estimate.to_string());
         Self::evaluate_tiers(ctx, rule, usage_after);
         record_admission_span(ctx, rule, request_estimate, "admitted");
         FilterAction::Continue
@@ -2614,7 +2603,9 @@ impl TokenRateLimitFilter {
             record_fail_open_metric(rule, outcome);
             record_fail_open_accounting(rule, estimate, outcome, error);
             record_admission_span(ctx, rule, estimate, outcome);
-            ctx.set_metadata(META_FAIL_OPEN, outcome);
+            if let Some(holds) = ExchangeHolds::of(ctx) {
+                holds.fail_open = Some(outcome);
+            }
             tracing::warn!(
                 rule = rule.name,
                 outcome,
@@ -2799,17 +2790,17 @@ impl TokenRateLimitFilter {
         }
     }
 
-    /// Look up the reservation/key/rule metadata `on_request` stashed for
-    /// this exchange, if all three are present and the rule index still
-    /// resolves -- the shared precondition for [`Self::reconcile`].
-    fn reconciliation_context(&self, ctx: &HttpFilterContext<'_>) -> Option<(ReconcileRequest, &CompiledRule)> {
-        let reservation_id = parse_u64_meta(ctx, META_RESERVATION_ID)?;
-        let key = ctx.get_metadata(META_BUCKET_KEY).map(str::to_owned)?;
-        let rule = ctx
-            .get_metadata(META_RULE_INDEX)
-            .and_then(|v| v.parse::<usize>().ok())
-            .and_then(|index| self.rules.get(index))?;
-        let actual = weighted_cost(UsageCounts::from_context(ctx), rule.weights);
+    /// Build the settlement for the rule reservation `on_request` held for
+    /// this exchange, if there is one and its rule index still resolves --
+    /// the shared precondition for [`Self::reconcile`].
+    fn reconciliation_context(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        holds: ExchangeHolds,
+    ) -> Option<(ReconcileRequest, &CompiledRule)> {
+        let (reservation_id, key) = holds.reservation?;
+        let rule = holds.rule_index.and_then(|index| self.rules.get(index))?;
+        let actual = self.actual_cost(ctx, rule);
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
         }
@@ -2822,11 +2813,37 @@ impl TokenRateLimitFilter {
         Some((request, rule))
     }
 
+    /// Record a missing shared-quota decision once for any response that has
+    /// a rule or hierarchy reservation to reconcile. Soft rule denials can
+    /// retain hierarchy reservations without retaining a rule reservation, so
+    /// this check must run before [`Self::reconciliation_context`] returns.
+    #[cfg(feature = "token-quota-filter")]
+    fn record_missing_quota_decision(&self, ctx: &HttpFilterContext<'_>, holds: &ExchangeHolds) {
+        if self.reconciliation_source != ReconciliationSource::SharedQuota
+            || crate::token_quota::decision(ctx).is_some()
+        {
+            return;
+        }
+        let has_rule_reservation = holds.reservation.is_some();
+        let has_hierarchy_reservation = !holds.hierarchy.is_empty();
+        if !has_rule_reservation && !has_hierarchy_reservation {
+            return;
+        }
+        let rule_name = holds
+            .rule_index
+            .and_then(|index| self.rules.get(index))
+            .map_or("unknown", |rule| rule.name.as_str());
+        tracing::warn!(
+            rule = rule_name,
+            "token_rate_limit: token quota policy produced no decision"
+        );
+        counter!("praxis_trl_quota_source_missing_total", "rule" => rule_name.to_owned()).increment(1);
+    }
+
     /// Reconcile a prior reservation against actual usage, if known.
     ///
-    /// No-ops if the reservation, bucket key, or originating rule index
-    /// metadata is absent -- reservation stands as final rather than
-    /// guessing.
+    /// No-ops if `holds` has no reservation or originating rule index --
+    /// reservation stands as final rather than guessing.
     ///
     /// In-process state reconciles synchronously and immediately (cheap,
     /// no I/O). A Valkey backend instead enqueues the reconciliation onto
@@ -2834,8 +2851,8 @@ impl TokenRateLimitFilter {
     /// `valkey::ValkeyTokenBucketBackend`) so the response is never held
     /// up on a network round-trip that has no bearing on whether *this*
     /// request was admitted.
-    fn reconcile(&self, ctx: &HttpFilterContext<'_>) {
-        let Some((request, rule)) = self.reconciliation_context(ctx) else {
+    fn reconcile(&self, ctx: &HttpFilterContext<'_>, holds: ExchangeHolds) {
+        let Some((request, rule)) = self.reconciliation_context(ctx, holds) else {
             return;
         };
         if let Some(actual) = request.actual {
@@ -2859,6 +2876,20 @@ impl TokenRateLimitFilter {
             tracing::error!(%error, rule = rule.name, "token_rate_limit: failed to enqueue reconciliation");
         }
     }
+}
+
+/// Accept only successfully evaluated PPE quota decisions.
+#[cfg(feature = "token-quota-filter")]
+fn shared_quota_cost(decision: crate::token_quota::TokenQuotaDecision) -> Option<u64> {
+    if decision.status != TokenQuotaResultStatus::Evaluated {
+        tracing::trace!(
+            status = decision.status.as_str(),
+            "token_rate_limit: token quota decision was not evaluated"
+        );
+    }
+    (decision.status == TokenQuotaResultStatus::Evaluated)
+        .then_some(decision.value)
+        .flatten()
 }
 
 /// Denial details from a completed `reserve()`, bundled so
@@ -2896,6 +2927,37 @@ struct AdmittedReservation {
     /// Tokens reserved at admission (the rule's computed estimate, echoed
     /// back by the backend).
     estimate: u64,
+}
+
+/// What this filter instance holds for the current exchange, kept in
+/// `filter_state` from admission until the response completes, when it is
+/// settled and dropped.
+#[derive(Debug, Default)]
+struct ExchangeHolds {
+    /// The admitting rule's reservation, as (reservation ID, bucket key).
+    reservation: Option<(u64, String)>,
+    /// Index into the filter's rules of the rule that admitted the request,
+    /// whose weights price actual usage for every hold. Also set without a
+    /// reservation when a request forwarded without one keeps its hierarchy
+    /// holds.
+    rule_index: Option<usize>,
+    /// Hierarchy reservations, as (reservation ID, bucket key), in level
+    /// order (org, team, user).
+    hierarchy: Vec<(u64, String)>,
+    /// Outcome of an explicit fail-open admission (`bypassed` or
+    /// `unconfirmed`), which holds no reservation.
+    fail_open: Option<&'static str>,
+}
+
+impl ExchangeHolds {
+    /// This exchange's holds, created empty on first use. `None` only
+    /// outside a pipeline, where the context has no filter ID to key state by.
+    fn of<'a>(ctx: &'a mut HttpFilterContext<'_>) -> Option<&'a mut Self> {
+        if ctx.get_filter_state::<Self>().is_none() {
+            ctx.insert_filter_state(Self::default());
+        }
+        ctx.get_filter_state_mut::<Self>()
+    }
 }
 
 /// Count an admission outcome using the issue #883 bounded label contract.
@@ -3189,7 +3251,7 @@ impl HttpFilter for TokenRateLimitFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         if self.needs_body {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -3206,7 +3268,7 @@ impl HttpFilter for TokenRateLimitFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -3268,21 +3330,17 @@ impl HttpFilter for TokenRateLimitFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
-            if let Some(hierarchy) = &self.hierarchy {
-                let rule = ctx
-                    .get_metadata(META_RULE_INDEX)
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .and_then(|index| self.rules.get(index));
-                let actual = rule.and_then(|r| weighted_cost(UsageCounts::from_context(ctx), r.weights));
-                reconcile_hierarchy(hierarchy, ctx, actual, self.now_ms());
-                Self::clear_hierarchy_metadata(ctx);
+            if let Some(mut holds) = ctx.remove_filter_state::<ExchangeHolds>() {
+                #[cfg(feature = "token-quota-filter")]
+                self.record_missing_quota_decision(ctx, &holds);
+                if let Some(hierarchy) = &self.hierarchy {
+                    let rule = holds.rule_index.and_then(|index| self.rules.get(index));
+                    let actual = rule.and_then(|rule| self.actual_cost(ctx, rule));
+                    reconcile_hierarchy(hierarchy, std::mem::take(&mut holds.hierarchy), actual, self.now_ms());
+                }
+                self.reconcile(ctx, holds);
             }
-            self.reconcile(ctx);
-            ctx.filter_metadata.remove(META_RESERVATION_ID);
-            ctx.filter_metadata.remove(META_BUCKET_KEY);
-            ctx.filter_metadata.remove(META_RULE_INDEX);
             ctx.filter_metadata.remove(META_ESTIMATE);
-            ctx.filter_metadata.remove(META_FAIL_OPEN);
             #[cfg(feature = "opentelemetry")]
             ctx.extensions.remove::<crate::opentelemetry::TokenRateLimitSpan>();
         }
@@ -3411,6 +3469,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
             valkey_clock: false,
             hierarchy: None,
+            reconciliation_source: super::ReconciliationSource::LegacyWeights,
             on_failure: super::config::BackendOnFailure::Closed,
         };
         assert!(
@@ -3529,11 +3588,14 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now(),
             valkey_clock: false,
             hierarchy: None,
+            reconciliation_source: super::ReconciliationSource::LegacyWeights,
             on_failure: super::config::BackendOnFailure::Closed,
         };
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        // As in a pipeline, so the reservation held in `filter_state` reaches settlement.
+        ctx.current_filter_id = Some(0);
         drop(filter.on_request(&mut ctx).await.unwrap());
 
         #[cfg(feature = "opentelemetry")]
