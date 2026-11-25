@@ -1478,12 +1478,10 @@ fn build_list_tools_failure_response(
         .is_some_and(|state| state.logical_stream_response_id.is_some());
     let mut body = if continuing_stream {
         let Some(body) = super::stream_events::prepare_local_terminal_events(ctx) else {
-            return TerminalResponse::new(200)
-                .with_headers(discovery_failure_headers())
-                .with_body(
-                    super::stream_events::encode_local_error(ctx, "server_error", "response payload limit exceeded")
-                        .unwrap_or_default(),
-                );
+            return discovery_failure_terminal(
+                super::stream_events::encode_local_error(ctx, "server_error", "response payload limit exceeded")
+                    .unwrap_or_default(),
+            );
         };
         body
     } else {
@@ -1642,9 +1640,7 @@ fn build_list_tools_failure_response(
             {
                 body.extend_from_slice(&error_body);
             }
-            return TerminalResponse::new(200)
-                .with_headers(discovery_failure_headers())
-                .with_body(Bytes::from(body));
+            return discovery_failure_terminal(Bytes::from(body));
         }
         state.logical_stream_sequence = sequence.saturating_add(5);
         state.local_stream_terminal_emitted = true;
@@ -1659,9 +1655,7 @@ fn build_list_tools_failure_response(
         &mut body,
     );
 
-    TerminalResponse::new(200)
-        .with_headers(discovery_failure_headers())
-        .with_body(Bytes::from(body))
+    discovery_failure_terminal(Bytes::from(body))
 }
 
 /// Borrow the persisted snapshot when serializing the terminal SSE event.
@@ -1675,14 +1669,14 @@ struct DiscoveryFailedEvent<'a> {
     response: &'a serde_json::Value,
 }
 
-/// Build the content-type header for a local discovery failure stream.
-fn discovery_failure_headers() -> http::HeaderMap {
+/// Wrap a local discovery failure stream in an HTTP terminal response.
+fn discovery_failure_terminal(body: Bytes) -> TerminalResponse {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("text/event-stream"),
     );
-    headers
+    TerminalResponse::new(200).with_headers(headers).with_body(body)
 }
 
 /// Lifecycle stage a discovery-failure response snapshot represents.
