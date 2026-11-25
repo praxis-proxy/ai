@@ -18,7 +18,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod commands;
 mod dump;
 
+use std::path::Path;
+
 use clap::Parser;
+use praxis_core::config::{Config, ConfigFile, DeprecationWarnings};
 use tracing::info;
 
 // -----------------------------------------------------------------------------
@@ -75,10 +78,26 @@ fn main() {
     }
 
     let config_path = praxis_ai::resolve_config_path(explicit.as_deref());
-    let config = praxis_ai::load_config(explicit.as_deref()).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    let (config, warnings) = load_serving_config(config_path.as_deref());
     let _tracing_guard = praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    warnings.emit();
     info!("starting server");
     praxis_ai::run_server(config, config_path)
+}
+
+/// Load the serving config and retain deprecations for the configured subscriber.
+fn load_serving_config(path: Option<&Path>) -> (Config, DeprecationWarnings) {
+    let file = path
+        .map(ConfigFile::read)
+        .transpose()
+        .unwrap_or_else(|e| praxis_ai::fatal(&e));
+    praxis_core::logging::with_bootstrap_logging(|| {
+        let yaml = file
+            .as_ref()
+            .map_or(include_str!("default.yaml"), |file| file.content.as_str());
+        Config::from_yaml_with_deprecations(yaml)
+    })
+    .unwrap_or_else(|e| praxis_ai::fatal(&e))
 }
 
 // -----------------------------------------------------------------------------

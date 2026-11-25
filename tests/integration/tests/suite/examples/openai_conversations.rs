@@ -449,7 +449,7 @@ fn websocket_upgrade_on_conversations_route_fails_closed() {
 
     let raw = http_send(
         proxy.addr(),
-        "GET /v1/conversations/conv_upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        "GET /v1/conversations/conv_upgrade HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
     );
 
     assert_eq!(
