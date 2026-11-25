@@ -269,55 +269,87 @@ fn preserve_active_store_configs(
     Ok(())
 }
 
-/// Build a per-listener store plan for every listener whose chains configure a
-/// response or conversations store. All reachable filters are retained here so
-/// their effective configurations can be checked before duplicate registry
-/// names are collapsed.
-fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
-    let chains: HashMap<&str, &[FilterEntry]> = config
+/// Chain index used by store discovery helpers.
+fn store_filter_chains(config: &Config) -> HashMap<&str, &[FilterEntry]> {
+    config
         .filter_chains
         .iter()
         .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+        .collect()
+}
+
+/// Build a per-listener store plan for every listener whose chains configure a
+/// response or conversations store. All reachable filters are retained here so
+/// their effective configurations can be checked before duplicate registry
+/// names are collapsed. Each declaration's reaper policy is paired at discovery
+/// time; within-listener retention disagreements are rejected before refs are
+/// returned.
+///
+/// # Errors
+///
+/// Returns [`ProvisionError`] when a discoverable store filter has a malformed
+/// reaper field, or when repeated declarations of the same store name on one
+/// listener disagree on retention (including enabled vs unset `ttl`).
+fn build_listener_store_plans(config: &Config) -> Result<Vec<ListenerStorePlan>, ProvisionError> {
+    let chains = store_filter_chains(config);
 
     let mut plans = Vec::new();
     for listener in &config.listeners {
-        let refs = plan::discover_store_refs_permissive(&listener.filter_chains, &chains);
-        if !refs.is_empty() {
-            let reaper_bindings = plan::discover_reaper_bindings_permissive(&listener.filter_chains, &chains);
-            plans.push(ListenerStorePlan {
-                listener: listener.name.clone(),
-                registry: StoreRegistry::new(),
-                refs,
-                reaper_bindings,
-            });
+        let declarations = plan::discover_store_declarations_permissive(&listener.filter_chains, &chains)?;
+        if declarations.is_empty() {
+            continue;
         }
+        validate_within_listener_declarations(&listener.name, &declarations)?;
+        let mut refs = Vec::with_capacity(declarations.len());
+        let mut reaper_bindings = Vec::new();
+        for (store_ref, policy) in declarations {
+            if let Some(policy) = policy {
+                reaper_bindings.push((Arc::clone(&store_ref.name), policy));
+            }
+            refs.push(store_ref);
+        }
+        plans.push(ListenerStorePlan {
+            listener: listener.name.clone(),
+            registry: StoreRegistry::new(),
+            refs,
+            reaper_bindings,
+        });
     }
-    plans
+    Ok(plans)
 }
 
 /// Whether any listener reaches a persisted-state store filter.
+///
+/// Uses ref-only permissive discovery so presence checks stay available even
+/// when a kept declaration's reaper fields fail to parse (wiring then surfaces
+/// that parse error).
 pub(crate) fn config_uses_store(config: &Config) -> bool {
-    !build_listener_store_plans(config).is_empty()
+    let chains = store_filter_chains(config);
+    config
+        .listeners
+        .iter()
+        .any(|listener| !plan::discover_store_refs_permissive(&listener.filter_chains, &chains).is_empty())
 }
 
 /// Listener names whose live pipelines can hold references to a store
 /// generation built from `config`.
 pub(crate) fn store_listener_names(config: &Config) -> Vec<String> {
-    build_listener_store_plans(config)
-        .into_iter()
-        .map(|plan| plan.listener)
+    let chains = store_filter_chains(config);
+    config
+        .listeners
+        .iter()
+        .filter(|listener| !plan::discover_store_refs_permissive(&listener.filter_chains, &chains).is_empty())
+        .map(|listener| listener.name.clone())
         .collect()
 }
 
 /// Reject one listener binding a registry name to different effective backend
-/// configurations or disagreeing retention discovery, then collapse repeated
-/// references to the same backend.
+/// configurations, then collapse repeated references to the same backend.
 ///
-/// Within-listener reaper discovery consistency runs before
-/// [`plan::deduplicate_refs`]: TTL fields are stripped from [`StoreRef`] configs,
-/// so collapsing same-name refs would otherwise hide conflicting or partially
-/// unset policies that only existed on the pre-dedup declarations.
+/// Within-listener retention consistency is checked earlier in
+/// [`build_listener_store_plans`], while each declaration still has its paired
+/// reaper policy. After [`plan::deduplicate_refs`], same-name refs collapse to
+/// one identity, so that check must not wait until here.
 fn validate_and_deduplicate_refs(
     plans: &mut [ListenerStorePlan],
     factories: &[Arc<dyn StoreBackendFactory>],
@@ -353,7 +385,6 @@ fn validate_and_deduplicate_refs(
         validate_cross_store_collisions(plans, &factories)?;
     }
 
-    validate_within_listener_reaper_discovery(plans)?;
     for plan in plans.iter_mut() {
         plan::deduplicate_refs(&format!("listener '{}'", plan.listener), &mut plan.refs, &factories)?;
     }
@@ -361,65 +392,48 @@ fn validate_and_deduplicate_refs(
     Ok(())
 }
 
-/// Reject one listener whose store filters disagree on retention for the same
-/// registry name before duplicate refs are collapsed.
+/// Reject one listener whose paired store declarations disagree on retention for
+/// the same registry name before duplicate refs are collapsed.
 ///
-/// Discovery records one [`StoreRef`] per filter declaration and one
-/// `reaper_bindings` entry only when that filter sets `ttl`. After
-/// [`plan::deduplicate_refs`], same-name refs collapse to one identity and
-/// [`validate_reaper_policy_conflicts`] can see at most the first binding per
-/// name — so conflicting TTLs or an enabled-vs-unset mix must be caught here.
-/// The same policy repeated on multiple identical filters is allowed.
-fn validate_within_listener_reaper_discovery(plans: &[ListenerStorePlan]) -> Result<(), ProvisionError> {
-    for plan in plans {
-        validate_plan_reaper_discovery(plan)?;
-    }
-    Ok(())
-}
-
-/// Check one listener's pre-dedup refs against its discovered reaper bindings.
-fn validate_plan_reaper_discovery(plan: &ListenerStorePlan) -> Result<(), ProvisionError> {
-    let mut ref_counts: HashMap<&str, usize> = HashMap::new();
-    for store_ref in &plan.refs {
-        *ref_counts.entry(store_ref.name.as_ref()).or_insert(0) += 1;
-    }
-    let mut policies_by_name: HashMap<&str, Vec<ReaperPolicy>> = HashMap::new();
-    for (name, policy) in &plan.reaper_bindings {
-        policies_by_name.entry(name.as_ref()).or_default().push(*policy);
-    }
-    for (store_name, &ref_count) in &ref_counts {
-        let policies = policies_by_name.get(store_name).map_or(&[][..], Vec::as_slice);
-        check_store_reaper_discovery(plan, store_name, ref_count, policies)?;
-    }
-    Ok(())
-}
-
-/// Reject distinct TTLs or an enabled-vs-unset mix for one registry name.
-fn check_store_reaper_discovery(
-    plan: &ListenerStorePlan,
-    store_name: &str,
-    ref_count: usize,
-    policies: &[ReaperPolicy],
+/// Each declaration carries its own `Option<ReaperPolicy>` from discovery, so
+/// enabled-vs-unset is a concrete `Some`/`None` mix — never inferred from
+/// binding counts. After [`plan::deduplicate_refs`], same-name refs collapse to
+/// one identity and [`validate_reaper_policy_conflicts`] can see at most the
+/// first binding per name. The same policy repeated on multiple identical
+/// filters is allowed.
+fn validate_within_listener_declarations(
+    listener: &str,
+    declarations: &[plan::StoreDeclaration],
 ) -> Result<(), ProvisionError> {
-    let distinct = distinct_reaper_policies(policies);
-    if let [first, second, ..] = distinct.as_slice() {
-        return Err(within_listener_reaper_conflict(
-            plan,
-            store_name,
-            Some(*first),
-            Some(*second),
-        ));
+    let mut policies_by_name: HashMap<&Arc<str>, Vec<Option<ReaperPolicy>>> = HashMap::new();
+    for (store_ref, policy) in declarations {
+        policies_by_name.entry(&store_ref.name).or_default().push(*policy);
     }
-    if let Some(&enabled) = policies.first()
-        && policies.len() < ref_count
-    {
-        return Err(within_listener_reaper_conflict(plan, store_name, Some(enabled), None));
+    for (store_name, policies) in policies_by_name {
+        check_store_reaper_discovery(listener, store_name, &policies)?;
     }
     Ok(())
 }
 
-/// Unique policies in declaration order.
-fn distinct_reaper_policies(policies: &[ReaperPolicy]) -> Vec<ReaperPolicy> {
+/// Reject distinct policies (including enabled vs unset) for one registry name.
+fn check_store_reaper_discovery(
+    listener: &str,
+    store_name: &Arc<str>,
+    policies: &[Option<ReaperPolicy>],
+) -> Result<(), ProvisionError> {
+    let distinct = distinct_optional_reaper_policies(policies);
+    if distinct.len() <= 1 {
+        return Ok(());
+    }
+    if distinct.iter().any(Option::is_none) {
+        Err(within_listener_enabled_vs_unset(listener, store_name))
+    } else {
+        Err(within_listener_conflicting_policies(listener, store_name))
+    }
+}
+
+/// Unique optional policies in declaration order.
+fn distinct_optional_reaper_policies(policies: &[Option<ReaperPolicy>]) -> Vec<Option<ReaperPolicy>> {
     let mut distinct = Vec::new();
     for policy in policies {
         if !distinct.contains(policy) {
@@ -429,43 +443,27 @@ fn distinct_reaper_policies(policies: &[ReaperPolicy]) -> Vec<ReaperPolicy> {
     distinct
 }
 
-/// Build a [`ProvisionError`] for disagreeing retention on one registry name.
-///
-/// Unlike [`reaper_policy_conflict_message`], this describes multiple filter
-/// declarations of the **same** store name on one listener — so the message
-/// names the listener once and does not invent a second store identity.
-fn within_listener_reaper_conflict(
-    plan: &ListenerStorePlan,
-    store_name: &str,
-    existing: Option<ReaperPolicy>,
-    conflicting: Option<ReaperPolicy>,
-) -> ProvisionError {
-    let name = plan
-        .refs
-        .iter()
-        .find(|store_ref| store_ref.name.as_ref() == store_name)
-        .map_or_else(|| Arc::<str>::from(store_name), |store_ref| Arc::clone(&store_ref.name));
-    let message = match (existing, conflicting) {
-        (Some(_), Some(_)) => format!(
-            "listener '{}' has conflicting reaper policies on store '{name}' \
-             (filter declarations disagree on ttl); configure one \
-             ttl/sweep_interval/sweep_batch_size for every declaration of that store",
-            plan.listener
-        ),
-        (Some(_), None) | (None, Some(_)) => format!(
-            "listener '{}' store '{name}' enables a ttl reaper on some filter declarations \
-             while other declarations of the same store set no ttl and must retain their rows; \
-             give every declaration the same ttl or stop omitting it",
-            plan.listener
-        ),
-        (None, None) => format!(
-            "listener '{}' store '{name}' has inconsistent reaper discovery",
-            plan.listener
-        ),
-    };
+/// Conflicting non-empty reaper policies on repeated same-name declarations.
+fn within_listener_conflicting_policies(listener: &str, store_name: &Arc<str>) -> ProvisionError {
     ProvisionError::Backend {
-        name,
-        source: BackendError::Config(message),
+        name: Arc::clone(store_name),
+        source: BackendError::Config(format!(
+            "listener '{listener}' has conflicting reaper policies on store '{store_name}' \
+             (filter declarations disagree on ttl/sweep_interval/sweep_batch_size); configure one \
+             ttl/sweep_interval/sweep_batch_size for every declaration of that store"
+        )),
+    }
+}
+
+/// Some declarations enable a ttl reaper while others of the same name omit it.
+fn within_listener_enabled_vs_unset(listener: &str, store_name: &Arc<str>) -> ProvisionError {
+    ProvisionError::Backend {
+        name: Arc::clone(store_name),
+        source: BackendError::Config(format!(
+            "listener '{listener}' store '{store_name}' enables a ttl reaper on some filter declarations \
+             while other declarations of the same store set no ttl and must retain their rows; \
+             give every declaration the same ttl or stop omitting it"
+        )),
     }
 }
 
@@ -501,9 +499,9 @@ const EVENTS_SUFFIX: &str = "_events";
 ///
 /// Within-listener discovery consistency (conflicting or partially unset TTLs on
 /// the same registry name before refs collapse) is checked earlier by
-/// [`validate_within_listener_reaper_discovery`]. This function runs after
-/// [`plan::deduplicate_refs`] and catches cross-listener / cross-name physical
-/// overlap.
+/// [`validate_within_listener_declarations`] during [`build_listener_store_plans`].
+/// This function runs after [`plan::deduplicate_refs`] and catches cross-listener
+/// / cross-name physical overlap.
 ///
 /// The loop walks **every** provisioned store (`plan.refs`), not just the
 /// TTL-enabled ones in `plan.reaper_bindings`. A store without a `ttl` is recorded
@@ -762,7 +760,7 @@ pub type StoreWiring = (
 /// Returns [`ProvisionError`] when a configured store names an unknown backend
 /// or its configuration is rejected.
 pub fn build_store_wiring(config: &Config) -> Result<StoreWiring, ProvisionError> {
-    let mut plans = build_listener_store_plans(config);
+    let mut plans = build_listener_store_plans(config)?;
     let factories = store_backend_factories();
     validate_and_deduplicate_refs(&mut plans, &factories, None, None)?;
     let registries = registries_map(&plans);
@@ -918,7 +916,7 @@ impl StoreProvisionService {
         config: &Config,
         active_plans: &[ListenerStorePlan],
     ) -> Result<Vec<ListenerStorePlan>, ProvisionError> {
-        let mut plans = build_listener_store_plans(config);
+        let mut plans = build_listener_store_plans(config)?;
         validate_and_deduplicate_refs(&mut plans, &self.factories, Some(&self.cache), Some(active_plans))?;
         let refs: Vec<StoreRef> = plans.iter().flat_map(|p| p.refs.iter().cloned()).collect();
         self.cache.validate(&refs)?;
@@ -1641,7 +1639,7 @@ filter_chains:
         config.filter_chains.first_mut().expect("main chain").filters = serde_yaml::from_str(
             "- filter: openai_responses_store\n  backend: 7\n- filter: iterative_request_router\n  steps:\n    - filters: malformed\n    - filters: [7, {filter: openai_responses_store, backend: sqlite, database_url: 'sqlite::memory:'}]",
         ).expect("mixed filter entries");
-        let plans = build_listener_store_plans(&config);
+        let plans = build_listener_store_plans(&config).expect("listener store plans");
         assert_eq!(plans.len(), 1);
         let refs = &plans.first().expect("listener plan").refs;
         assert_eq!(refs.len(), 1, "valid nested sibling must survive malformed entries");
@@ -1793,7 +1791,7 @@ filter_chains:
             "real backend factories must receive one combined config"
         );
 
-        let mut plans = build_listener_store_plans(&config);
+        let mut plans = build_listener_store_plans(&config).expect("listener store plans");
         validate_and_deduplicate_refs(&mut plans, &[Arc::clone(&factory)], None, None)
             .expect("compatible filter stores");
         let plan = plans.first().expect("listener plan");
@@ -1919,7 +1917,7 @@ filter_chains:
             builds: Arc::new(AtomicUsize::new(0)),
             retires: Arc::new(AtomicUsize::new(0)),
         });
-        let mut plans = build_listener_store_plans(&ambiguous_combined_config());
+        let mut plans = build_listener_store_plans(&ambiguous_combined_config()).expect("listener store plans");
 
         validate_and_deduplicate_refs(&mut plans, &[factory], None, None).expect("valid ambiguous stores");
 
@@ -2262,7 +2260,7 @@ filter_chains:
         let factories = vec![Arc::clone(&factory)];
         let mut initial = responses_and_conversations_config_for(backend_id, &database_url);
         initial.listeners.first_mut().expect("combined listener").filter_chains = vec!["responses".to_owned()];
-        let mut initial_plans = build_listener_store_plans(&initial);
+        let mut initial_plans = build_listener_store_plans(&initial).expect("listener store plans");
         validate_and_deduplicate_refs(&mut initial_plans, &factories, None, None).expect("initial stores");
         let cache = BackendCache::new(factories.clone());
         let mut initial_leases = Vec::new();
@@ -2277,7 +2275,7 @@ filter_chains:
         assert_eq!(builds.load(Ordering::SeqCst), 1);
 
         let replacement = responses_and_conversations_config_for(backend_id, &database_url);
-        let mut replacement_plans = build_listener_store_plans(&replacement);
+        let mut replacement_plans = build_listener_store_plans(&replacement).expect("listener store plans");
         validate_and_deduplicate_refs(&mut replacement_plans, &factories, Some(&cache), Some(&initial_plans))
             .expect("replacement stores");
         let combined = replacement_plans.first().expect("combined listener");
@@ -2346,7 +2344,7 @@ filter_chains:
         let factories = vec![Arc::clone(&factory)];
         let mut initial = responses_and_conversations_config_for("sqlite", database_url);
         initial.listeners.first_mut().expect("combined listener").filter_chains = vec!["responses".to_owned()];
-        let mut initial_plans = build_listener_store_plans(&initial);
+        let mut initial_plans = build_listener_store_plans(&initial).expect("listener store plans");
         validate_and_deduplicate_refs(&mut initial_plans, &factories, None, None).expect("initial stores");
         for plan in &mut initial_plans {
             plan.listener = format!("old-{}", plan.listener);
@@ -2364,7 +2362,7 @@ filter_chains:
         assert_eq!(builds.load(Ordering::SeqCst), 1);
 
         let replacement = responses_and_conversations_config_for("sqlite", database_url);
-        let mut replacement_plans = build_listener_store_plans(&replacement);
+        let mut replacement_plans = build_listener_store_plans(&replacement).expect("listener store plans");
         let error =
             validate_and_deduplicate_refs(&mut replacement_plans, &factories, Some(&cache), Some(&initial_plans))
                 .expect_err("an in-memory pool cannot be replaced without losing state");
@@ -2409,7 +2407,7 @@ filter_chains:
         config.filter_chains.push(other);
         config.listeners.get_mut(1).expect("second listener").filter_chains = vec!["other-responses".to_owned()];
 
-        let mut active_plans = build_listener_store_plans(&config);
+        let mut active_plans = build_listener_store_plans(&config).expect("listener store plans");
         validate_and_deduplicate_refs(&mut active_plans, &factories, None, None).expect("active stores");
         let cache = BackendCache::new(factories.clone());
         let mut leases = Vec::new();
@@ -2427,7 +2425,7 @@ filter_chains:
             "distinct table sets need distinct pools"
         );
 
-        let mut replacement_plans = build_listener_store_plans(&config);
+        let mut replacement_plans = build_listener_store_plans(&config).expect("listener store plans");
         validate_and_deduplicate_refs(&mut replacement_plans, &factories, Some(&cache), Some(&active_plans))
             .expect("an unchanged reload must reuse each listener's exact pool");
 
@@ -2442,7 +2440,7 @@ filter_chains:
         *mapping
             .get_mut(serde_yaml::Value::String("items_table".to_owned()))
             .expect("items table") = serde_yaml::Value::String("items_v2".to_owned());
-        let mut changed_plans = build_listener_store_plans(&changed);
+        let mut changed_plans = build_listener_store_plans(&changed).expect("listener store plans");
         let error = validate_and_deduplicate_refs(&mut changed_plans, &factories, Some(&cache), Some(&active_plans))
             .expect_err("changing an in-memory combined table set requires a restart");
         assert!(error.to_string().contains("requires a restart"));
@@ -2736,7 +2734,8 @@ filter_chains:
             retires: Arc::clone(&retires),
         });
         let factories = vec![Arc::clone(&factory)];
-        let mut plans = build_listener_store_plans(&single_store_config("reload", "initial"));
+        let mut plans =
+            build_listener_store_plans(&single_store_config("reload", "initial")).expect("listener store plans");
         validate_and_deduplicate_refs(&mut plans, &factories, None, None).expect("initial plans");
         let (readiness, mut readiness_rx) = watch::channel(StoreReadiness::Pending);
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -2804,7 +2803,7 @@ filter_chains:
         });
         let factories = vec![Arc::clone(&factory)];
         let initial_config = single_store_config("reload", "initial");
-        let mut plans = build_listener_store_plans(&initial_config);
+        let mut plans = build_listener_store_plans(&initial_config).expect("listener store plans");
         validate_and_deduplicate_refs(&mut plans, &factories, None, None).expect("initial plans");
         let cache = Arc::new(BackendCache::new(factories.clone()));
         let (readiness, mut readiness_rx) = watch::channel(StoreReadiness::Pending);
@@ -3451,7 +3450,7 @@ filter_chains:
         watch::Receiver<StoreReadiness>,
     ) {
         let factories = vec![factory];
-        let mut plans = build_listener_store_plans(config);
+        let mut plans = build_listener_store_plans(config).expect("listener store plans");
         validate_and_deduplicate_refs(&mut plans, &factories, None, None).expect("initial plans");
         let (readiness, readiness_rx) = watch::channel(StoreReadiness::Pending);
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -3732,7 +3731,7 @@ filter_chains:
         .expect("two stores sharing one database with distinct table sets");
 
         let factories = vec![Arc::clone(&factory)];
-        let mut plans = build_listener_store_plans(&config);
+        let mut plans = build_listener_store_plans(&config).expect("listener store plans");
         // Different table sets → different effective keys → not a policy conflict.
         validate_and_deduplicate_refs(&mut plans, &factories, None, None)
             .expect("distinct table sets are independent and must not conflict");
@@ -4003,8 +4002,28 @@ filter_chains:
         first_ttl: Option<&str>,
         second_ttl: Option<&str>,
     ) -> Config {
-        let first_ttl_line = first_ttl.map_or(String::new(), |ttl| format!("\n        ttl: {ttl}"));
-        let second_ttl_line = second_ttl.map_or(String::new(), |ttl| format!("\n        ttl: {ttl}"));
+        within_listener_dual_store_config_with_sweeps(database_url, first_ttl, None, second_ttl, None)
+    }
+
+    /// Like [`within_listener_dual_store_config`], with optional per-declaration
+    /// `sweep_interval` YAML duration strings.
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_dual_store_config_with_sweeps(
+        database_url: &str,
+        first_ttl: Option<&str>,
+        first_sweep: Option<&str>,
+        second_ttl: Option<&str>,
+        second_sweep: Option<&str>,
+    ) -> Config {
+        let retention_lines = |ttl: Option<&str>, sweep: Option<&str>| {
+            format!(
+                "{}{}",
+                ttl.map_or(String::new(), |ttl| format!("\n        ttl: {ttl}")),
+                sweep.map_or(String::new(), |sweep| format!("\n        sweep_interval: {sweep}")),
+            )
+        };
+        let first = retention_lines(first_ttl, first_sweep);
+        let second = retention_lines(second_ttl, second_sweep);
         Config::from_yaml(&format!(
             r#"
 listeners:
@@ -4018,12 +4037,12 @@ filter_chains:
         backend: sqlite
         database_url: "{database_url}"
         responses_table: responses
-        conversations_table: conversations{first_ttl_line}
+        conversations_table: conversations{first}
       - filter: openai_responses_store
         backend: sqlite
         database_url: "{database_url}"
         responses_table: responses
-        conversations_table: conversations{second_ttl_line}
+        conversations_table: conversations{second}
 "#
         ))
         .expect("within-listener dual store config")
@@ -4040,7 +4059,9 @@ filter_chains:
             .expect("1h then 7d on the same listener store must fail");
         let text = error.to_string();
         assert!(
-            text.contains("conflicting reaper policies") && text.contains("listener 'a'"),
+            text.contains("conflicting reaper policies")
+                && text.contains("listener 'a'")
+                && text.contains("ttl/sweep_interval/sweep_batch_size"),
             "actionable within-listener conflict error: {error}"
         );
     }
@@ -4056,8 +4077,55 @@ filter_chains:
             .expect("7d then 1h on the same listener store must fail");
         let text = error.to_string();
         assert!(
-            text.contains("conflicting reaper policies") && text.contains("listener 'a'"),
+            text.contains("conflicting reaper policies")
+                && text.contains("listener 'a'")
+                && text.contains("ttl/sweep_interval/sweep_batch_size"),
             "actionable within-listener conflict error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_same_ttl_different_sweep_interval_fail_validation() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config_with_sweeps(
+            &database_url,
+            Some("1h"),
+            Some("5m"),
+            Some("1h"),
+            Some("10m"),
+        );
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("same ttl with different sweep_interval must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("conflicting reaper policies")
+                && text.contains("listener 'a'")
+                && text.contains("ttl/sweep_interval/sweep_batch_size")
+                && !text.contains("must retain their rows"),
+            "sweep_interval mismatch must name policy fields, not enabled-vs-unset: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_malformed_ttl_is_not_enabled_vs_unset() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, Some("1h"), Some("1hr30"));
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("malformed ttl on a kept store declaration must fail");
+        let text = error.to_string();
+        assert!(
+            !text.contains("must retain their rows"),
+            "malformed ttl must not be misclassified as enabled-vs-unset: {error}"
+        );
+        assert!(
+            text.contains("ttl") || text.contains("duration") || text.contains("1hr30"),
+            "parse/config error expected for malformed ttl: {error}"
         );
     }
 
@@ -4118,6 +4186,51 @@ filter_chains:
             result.is_ok(),
             "duplicate same-table filters with no ttl should succeed: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    fn within_listener_conversations_conflicting_ttl_fail_validation() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("within-conversations.db").display()
+        );
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "{database_url}"
+        conversations_table: conversations
+        items_table: items
+        ttl: 1h
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "{database_url}"
+        conversations_table: conversations
+        items_table: items
+        ttl: 7d
+"#
+        ))
+        .expect("within-listener dual conversations store config");
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("conflicting conversations ttl on one listener must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("conflicting reaper policies")
+                && text.contains("listener 'a'")
+                && text.contains(CONVERSATIONS_STORE_NAME)
+                && text.contains("ttl/sweep_interval/sweep_batch_size"),
+            "conversations same-name retention conflict must name the store: {error}"
         );
     }
 
@@ -4251,7 +4364,7 @@ filter_chains:
         ))
         .expect("two stores sharing one conversations table");
 
-        let mut plans = build_listener_store_plans(&config);
+        let mut plans = build_listener_store_plans(&config).expect("listener store plans");
         let error = validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
             .expect_err("a shared physical table with conflicting ttls must be rejected");
         let message = error.to_string();
@@ -4305,7 +4418,7 @@ filter_chains:
         ))
         .expect("two stores with disjoint table sets");
 
-        let mut plans = build_listener_store_plans(&config);
+        let mut plans = build_listener_store_plans(&config).expect("listener store plans");
         validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
             .expect("disjoint table sets on one database may set independent retention policies");
     }
@@ -4352,7 +4465,7 @@ filter_chains:
         ))
         .expect("one ttl store sharing a conversations table with a ttl-less store");
 
-        let mut plans = build_listener_store_plans(&config);
+        let mut plans = build_listener_store_plans(&config).expect("listener store plans");
         let error = validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
             .expect_err("a ttl reaper sharing a physical table with a ttl-less store must be rejected");
         let message = error.to_string();

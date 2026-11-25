@@ -424,7 +424,10 @@ that shared table. To keep a shorter TTL from deleting rows a longer retention â
 with no `ttl` at all â€” still needs, provisioning validates physical-table ownership: within
 one database, no two stores may assign different policies (including TTL-enabled vs.
 TTL-disabled) to the same physical table, and such a configuration is rejected before serving
-starts. The same policy on a shared table is allowed. To run independent retention policies
+starts. The same policy on a shared table is allowed. The same check also applies when one
+listener repeats the same store declaration (same registry name) more than once: every
+declaration must agree on `ttl` / `sweep_interval` / `sweep_batch_size`, including whether
+`ttl` is set at all, before duplicate refs collapse. To run independent retention policies
 on one database, give each store a fully disjoint table set or its own database.
 
 Future quota accounting (#1626) must credit storage released by TTL purges at the same

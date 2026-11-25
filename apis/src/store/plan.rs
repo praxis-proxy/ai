@@ -99,39 +99,153 @@ fn permissive_conversations_ref(config: &serde_yaml::Value) -> Option<StoreRef> 
     }
 }
 
+/// One store filter declaration: its provisioned [`StoreRef`] and optional reaper
+/// policy (`None` when the filter sets no `ttl`).
+pub type StoreDeclaration = (StoreRef, Option<ReaperPolicy>);
+
+/// Registry name paired with a TTL-enabled reaper policy.
+pub type ReaperBinding = (Arc<str>, ReaperPolicy);
+
+/// YAML keys that select reaper retention on a store filter.
+const REAPER_FILTER_FIELDS: [&str; 3] = ["ttl", "sweep_interval", "sweep_batch_size"];
+
+/// Whether the filter YAML sets any reaper retention field.
+fn filter_sets_reaper_fields(filter_config: &serde_yaml::Value) -> bool {
+    REAPER_FILTER_FIELDS
+        .iter()
+        .any(|field| filter_config.get(field).is_some())
+}
+
+/// Pair a kept [`StoreRef`] with its reaper policy, failing closed only when the
+/// operator set reaper fields and those fields (or the surrounding store config
+/// needed to parse them) cannot be decoded. Incomplete filters with no reaper
+/// keys stay permissive: the ref is kept with `None` and pipeline/factory
+/// validation rejects them later.
+fn pair_reaper_policy<E>(
+    store_name: &str,
+    filter_config: &serde_yaml::Value,
+    store_ref: StoreRef,
+    parse: impl FnOnce(&serde_yaml::Value) -> Result<Option<ReaperPolicy>, E>,
+) -> Result<StoreDeclaration, ProvisionError>
+where
+    E: std::fmt::Display,
+{
+    match parse(filter_config) {
+        Ok(policy) => Ok((store_ref, policy)),
+        Err(error) if filter_sets_reaper_fields(filter_config) => {
+            Err(backend_error(store_name, BackendError::Config(error.to_string())))
+        },
+        Err(_) => Ok((store_ref, None)),
+    }
+}
+
+/// Discover response-store declarations with paired reaper policies.
+///
+/// # Errors
+///
+/// Returns [`ProvisionError`] when a kept declaration sets reaper fields that
+/// fail to parse.
+fn discover_response_declarations_permissive(
+    roots: &[String],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Result<Vec<StoreDeclaration>, ProvisionError> {
+    let mut declarations = Vec::new();
+    for config in find_store_configs(roots, chains, RESPONSE_STORE_FILTER_NAME)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let Ok(store_ref) = response_store_ref(&config) else {
+            continue;
+        };
+        declarations.push(pair_reaper_policy(
+            DEFAULT_STORE_NAME,
+            &config,
+            store_ref,
+            reaper_policy_from_response_store,
+        )?);
+    }
+    Ok(declarations)
+}
+
+/// Discover conversations-store declarations with paired reaper policies.
+///
+/// # Errors
+///
+/// Returns [`ProvisionError`] when a kept declaration sets reaper fields that
+/// fail to parse.
+#[cfg(feature = "openai-conversations")]
+fn discover_conversations_declarations_permissive(
+    roots: &[String],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Result<Vec<StoreDeclaration>, ProvisionError> {
+    let mut declarations = Vec::new();
+    for config in find_store_configs(roots, chains, CONVERSATIONS_STORE_FILTER_NAME)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let Some(store_ref) = permissive_conversations_ref(&config) else {
+            continue;
+        };
+        declarations.push(pair_reaper_policy(
+            CONVERSATIONS_STORE_NAME,
+            &config,
+            store_ref,
+            reaper_policy_from_conversations,
+        )?);
+    }
+    Ok(declarations)
+}
+
+/// Discover store declarations with a reaper policy paired to each ref.
+///
+/// Walks the same filters as [`discover_store_refs_permissive`]. For every
+/// declaration that yields a [`StoreRef`], also parses the reaper policy from
+/// that filter's YAML. When the operator set `ttl` / `sweep_interval` /
+/// `sweep_batch_size` and those fields fail to parse, the error is returned —
+/// it is not treated as an unset `ttl`. Nested or response-store entries that
+/// cannot produce a store ref are still skipped. Incomplete filters that set no
+/// reaper keys keep their ref with `None` so permissive sibling discovery is
+/// unchanged. The raw filter YAML is parsed here before ttl fields are stripped
+/// from the forwarded [`StoreRef`] config.
+///
+/// # Errors
+///
+/// Returns [`ProvisionError`] when a discoverable store filter sets reaper
+/// fields that fail to parse (for example a malformed `ttl` duration).
+pub fn discover_store_declarations_permissive(
+    roots: &[String],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Result<Vec<StoreDeclaration>, ProvisionError> {
+    let mut declarations = discover_response_declarations_permissive(roots, chains)?;
+    #[cfg(feature = "openai-conversations")]
+    {
+        declarations.extend(discover_conversations_declarations_permissive(roots, chains)?);
+    }
+    Ok(declarations)
+}
+
 /// Discover reaper policy bindings reachable from the selected root chains.
 ///
-/// Returns one `(store_name, policy)` for each store filter that declares a
-/// `ttl`, keyed by the registry name the backend is provisioned under
+/// Returns one [`ReaperBinding`] for each store filter that declares a `ttl`,
+/// keyed by the registry name the backend is provisioned under
 /// ([`DEFAULT_STORE_NAME`] or [`CONVERSATIONS_STORE_NAME`]). Store filters
-/// without a `ttl` contribute nothing. Mirrors
-/// [`discover_store_refs_permissive`]: a malformed filter config is skipped
-/// rather than rejected, because such a config fails separately at pipeline
-/// construction. The raw filter YAML is parsed here, before the ttl fields are
-/// stripped from the forwarded [`StoreRef`] config.
-#[must_use]
+/// without a `ttl` contribute nothing. Derived from
+/// [`discover_store_declarations_permissive`] so each binding pairs with a
+/// kept store ref; a malformed reaper field on a discoverable filter fails
+/// rather than being counted as unset.
+///
+/// # Errors
+///
+/// Returns [`ProvisionError`] when a discoverable store filter sets reaper
+/// fields that fail to parse.
 pub fn discover_reaper_bindings_permissive(
     roots: &[String],
     chains: &HashMap<&str, &[FilterEntry]>,
-) -> Vec<(Arc<str>, ReaperPolicy)> {
-    let responses = find_store_configs(roots, chains, RESPONSE_STORE_FILTER_NAME)
+) -> Result<Vec<ReaperBinding>, ProvisionError> {
+    Ok(discover_store_declarations_permissive(roots, chains)?
         .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|config| reaper_policy_from_response_store(&config).ok().flatten())
-        .map(|policy| (Arc::<str>::from(DEFAULT_STORE_NAME), policy));
-    #[cfg(feature = "openai-conversations")]
-    {
-        let conversations = find_store_configs(roots, chains, CONVERSATIONS_STORE_FILTER_NAME)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(|config| reaper_policy_from_conversations(&config).ok().flatten())
-            .map(|policy| (Arc::<str>::from(CONVERSATIONS_STORE_NAME), policy));
-        responses.chain(conversations).collect()
-    }
-    #[cfg(not(feature = "openai-conversations"))]
-    {
-        responses.collect()
-    }
+        .filter_map(|(store_ref, policy)| policy.map(|policy| (store_ref.name, policy)))
+        .collect())
 }
 
 /// Extract reaper policy from a response-store filter configuration.
@@ -678,6 +792,47 @@ mod tests {
         let roots = ["main".to_owned()];
         assert!(discover_store_refs_permissive(&roots, &chains).is_empty());
         assert!(discover_store_refs(&roots, &chains).is_err());
+    }
+
+    #[test]
+    fn paired_discovery_rejects_malformed_ttl_on_kept_ref() {
+        let filters: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: openai_responses_store\n  backend: sqlite\n  database_url: 'sqlite::memory:'\n  \
+             responses_table: responses\n  conversations_table: conversations\n  ttl: 1h\n\
+             - filter: openai_responses_store\n  backend: sqlite\n  database_url: 'sqlite::memory:'\n  \
+             responses_table: responses\n  conversations_table: conversations\n  ttl: 1hr30",
+        )
+        .expect("filter chain");
+        let chains = HashMap::from([("main", filters.as_slice())]);
+        let roots = ["main".to_owned()];
+        let error = discover_store_declarations_permissive(&roots, &chains)
+            .expect_err("malformed ttl on a kept store ref must fail paired discovery");
+        let text = error.to_string();
+        assert!(
+            !text.contains("must retain their rows"),
+            "malformed ttl must not look like enabled-vs-unset: {error}"
+        );
+        assert!(
+            text.contains("ttl") || text.contains("duration") || text.contains("1hr30"),
+            "parse-related error expected: {error}"
+        );
+    }
+
+    #[test]
+    fn paired_discovery_pairs_unset_and_enabled_ttl() {
+        let filters: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: openai_responses_store\n  backend: sqlite\n  database_url: 'sqlite::memory:'\n  \
+             responses_table: responses\n  conversations_table: conversations\n\
+             - filter: openai_responses_store\n  backend: sqlite\n  database_url: 'sqlite::memory:'\n  \
+             responses_table: responses\n  conversations_table: conversations\n  ttl: 1h",
+        )
+        .expect("filter chain");
+        let chains = HashMap::from([("main", filters.as_slice())]);
+        let roots = ["main".to_owned()];
+        let declarations = discover_store_declarations_permissive(&roots, &chains).expect("valid configs");
+        assert_eq!(declarations.len(), 2);
+        assert!(declarations[0].1.is_none());
+        assert!(declarations[1].1.is_some());
     }
 
     #[cfg(feature = "openai-conversations")]
