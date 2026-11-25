@@ -1280,19 +1280,15 @@ fn assert_previous_input_messages_rejection(action: FilterAction) {
     assert_eq!(rejection.status, 400, "the rejection must be a client error");
     let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(
-        body.pointer("/error/type").and_then(serde_json::Value::as_str),
-        Some("invalid_request_error"),
-        "the rejection must use the OpenAI invalid-request error type"
-    );
-    assert_eq!(
-        body.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("unsupported_parameter"),
-        "the rejection must report an unsupported parameter"
-    );
-    assert_eq!(
-        body.pointer("/error/param").and_then(serde_json::Value::as_str),
-        Some("previous_input_messages"),
-        "the rejection must name the offending member"
+        body,
+        json!({"error": {
+            "type": "invalid_request_error",
+            "code": "unsupported_parameter",
+            "param": "previous_input_messages",
+            "message": "previous_input_messages is not supported on gateway-managed routes; include earlier \
+                        messages in input, or resume stored history with previous_response_id or conversation.",
+        }}),
+        "the rejection must name the member and point callers at input and the stored-history selectors"
     );
 }
 
@@ -1342,6 +1338,34 @@ async fn non_empty_previous_input_messages_is_rejected_by_the_managed_owner() {
             assert_managed_owner_rejects_caller_history(extra, pre_routing).await;
         }
     }
+}
+
+/// The create endpoint, not the body shape, decides the protocol. A Chat-shaped
+/// body on `POST /v1/responses` still gets managed state and rehydration, so
+/// caller-supplied history is rejected there too.
+#[tokio::test]
+async fn previous_input_messages_is_rejected_on_a_chat_shaped_create_body() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "previous_input_messages": [{"role": "user", "content": "never persisted"}],
+        }))
+        .unwrap(),
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert_previous_input_messages_rejection(action);
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rejected caller history must not initialize managed state"
+    );
 }
 
 /// Any non-null value other than an empty array is caller-supplied history.

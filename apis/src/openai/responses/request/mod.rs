@@ -71,6 +71,9 @@ use crate::{
 /// Filter name as configured in a pipeline.
 const FILTER_NAME: &str = "openai_responses_request";
 
+/// Request member naming vLLM's caller-supplied history extension.
+const PREVIOUS_INPUT_MESSAGES: &str = "previous_input_messages";
+
 /// Processes a Responses request body once and initializes state.
 ///
 /// Enable Cargo feature `openai-responses` to compile and register this
@@ -747,10 +750,10 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
 /// the field alongside `previous_response_id`, but Praxis strips that selector
 /// before forwarding, so the guard never fires and the model could see messages
 /// Praxis never persisted. Praxis cannot tell which rendering path a backend
-/// uses, so it rejects the field on every managed route. Absent, `null`, and `[]` carry no history and
-/// are accepted; any other value is rejected before inference. The pre-routing
-/// fact publisher never reaches this check, so provider-owned passthrough keeps
-/// the field intact.
+/// uses, so it rejects the field on every managed route. Absent, `null`, and
+/// `[]` carry no history and are accepted; any other value is rejected before
+/// inference. The pre-routing fact publisher never reaches this check, so
+/// provider-owned passthrough keeps the field intact.
 fn reject_caller_supplied_history(body: &serde_json::Value) -> Option<FilterAction> {
     let supplied = body
         .get(PREVIOUS_INPUT_MESSAGES)
@@ -762,13 +765,11 @@ fn reject_caller_supplied_history(body: &serde_json::Value) -> Option<FilterActi
             "unsupported_parameter",
             Some(PREVIOUS_INPUT_MESSAGES),
             "previous_input_messages is not supported on gateway-managed routes; \
-             history comes from previous_response_id or conversation.",
+             include earlier messages in input, or resume stored history with \
+             previous_response_id or conversation.",
         ))
     })
 }
-
-/// Request member naming vLLM's caller-supplied history extension.
-const PREVIOUS_INPUT_MESSAGES: &str = "previous_input_messages";
 
 /// Reject Responses hosted tools the gateway cannot execute on managed paths.
 fn reject_unsupported_responses_tools(body: &serde_json::Value) -> Option<FilterAction> {

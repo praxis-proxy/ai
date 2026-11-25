@@ -4852,6 +4852,11 @@ class TestOpenAIResponsesVLLM:
                     assert error.body["type"] == "invalid_request_error"
                     assert error.body["code"] == "unsupported_parameter"
                     assert error.body["param"] == "previous_input_messages"
+                    assert error.body["message"] == (
+                        "previous_input_messages is not supported on gateway-managed routes; "
+                        "include earlier messages in input, or resume stored history with "
+                        "previous_response_id or conversation."
+                    )
         assert forwarded == [], "rejected requests must not reach inference"
 
         for value in (None, []):
