@@ -1129,6 +1129,55 @@ class TestRequestFieldHandling:
         assert image_message["role"] == "user"
         assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
 
+    def test_tool_result_image_keeps_backend_order_with_trailing_content(self, anthropic_client):
+        # Ordinary content emitted in place would overtake the deferred image:
+        # for [tool_result(image A), text, image B] the backend must receive
+        # A, then the text, then B, so "first image" keeps its Anthropic
+        # meaning.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/a.png"},
+                                },
+                            ],
+                        },
+                        {"type": "text", "text": "meanwhile"},
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": "https://example.com/b.png"},
+                        },
+                    ],
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "user", "assistant"], upstream["messages"]
+        deferred = upstream["messages"][3]["content"]
+        assert deferred[0]["image_url"]["url"] == "https://example.com/a.png"
+        assert deferred[1] == {"type": "text", "text": "meanwhile"}
+        assert deferred[2]["image_url"]["url"] == "https://example.com/b.png"
+
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True

@@ -1430,13 +1430,18 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
         return;
     };
 
-    // Images promoted out of `tool_result` parts are held until no further
-    // tool reply can arrive: Anthropic combines consecutive user messages
-    // into one turn, so parallel tool results may span several of them, and
-    // Chat Completions requires every tool reply to follow the assistant
-    // `tool_calls` message directly — a user message may only appear after
-    // the last tool message of the group, never between two of them.
-    let mut pending_images = Vec::new();
+    // Content deferred out of a tool-reply group: images promoted out of
+    // `tool_result` parts, plus the ordinary parts that follow them in the
+    // same message. Both are held until no further tool reply can arrive:
+    // Anthropic combines consecutive user messages into one turn, so parallel
+    // tool results may span several of them, and Chat Completions requires
+    // every tool reply to follow the assistant `tool_calls` message directly —
+    // a user message may only appear after the last tool message of the
+    // group, never between two of them. Deferring the trailing ordinary parts
+    // with the images keeps the backend-visible order intact: for
+    // `[tool_result(image A), text, image B]` the backend receives A, the
+    // text, then B, so "first image" keeps its Anthropic meaning.
+    let mut deferred_parts = Vec::new();
 
     for msg in anthropic_messages {
         let Value::Object(mut msg) = msg else {
@@ -1448,26 +1453,26 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
 
         match msg.remove("content") {
             Some(Value::String(text)) => {
-                flush_pending_images(messages, &mut pending_images);
+                flush_deferred_parts(messages, &mut deferred_parts);
                 messages.push(text_message(role, text));
             },
             Some(Value::Array(blocks)) => {
                 // A user message carrying a `tool_result` may extend the
-                // ongoing tool-reply group, so the promoted images must be
+                // ongoing tool-reply group, so the deferred content must be
                 // held back past it; anything else ends the group.
                 if !adds_tool_replies(&role, &blocks) {
-                    flush_pending_images(messages, &mut pending_images);
+                    flush_deferred_parts(messages, &mut deferred_parts);
                 }
-                convert_content_blocks(messages, &role, blocks, &mut pending_images);
+                convert_content_blocks(messages, &role, blocks, &mut deferred_parts);
             },
             _ => {
-                flush_pending_images(messages, &mut pending_images);
+                flush_deferred_parts(messages, &mut deferred_parts);
                 messages.push(text_message(role, String::new()));
             },
         }
     }
 
-    flush_pending_images(messages, &mut pending_images);
+    flush_deferred_parts(messages, &mut deferred_parts);
 }
 
 /// Whether converting this message can append tool replies to the ongoing
@@ -1479,24 +1484,29 @@ fn adds_tool_replies(role: &str, blocks: &[Value]) -> bool {
             .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
 }
 
-/// Emit the deferred `tool_result` images as one user message.
-fn flush_pending_images(messages: &mut Vec<Value>, pending_images: &mut Vec<Value>) {
-    if pending_images.is_empty() {
+/// Emit the deferred content of a tool-reply group as one user message.
+fn flush_deferred_parts(messages: &mut Vec<Value>, deferred_parts: &mut Vec<Value>) {
+    if deferred_parts.is_empty() {
         return;
     }
     let mut image_message = Map::new();
     image_message.insert("role".to_owned(), Value::String("user".to_owned()));
-    image_message.insert("content".to_owned(), Value::Array(std::mem::take(pending_images)));
+    image_message.insert("content".to_owned(), Value::Array(std::mem::take(deferred_parts)));
     messages.push(Value::Object(image_message));
 }
 
 /// Convert typed content blocks to Chat Completions-compatible format.
 /// Consumes the blocks to move their payloads into the translated message.
-/// Images promoted out of `tool_result` parts accumulate in `pending_images`
-/// for the caller to flush once the whole tool-reply group has been emitted.
-fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>, pending_images: &mut Vec<Value>) {
+/// Images promoted out of `tool_result` parts and the ordinary parts that
+/// follow them accumulate in `deferred_parts` for the caller to flush once
+/// the whole tool-reply group has been emitted.
+fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>, deferred_parts: &mut Vec<Value>) {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    // Once a `tool_result` block has been seen, ordinary parts can no longer
+    // be emitted in place: they would overtake the deferred images and could
+    // split the tool-reply group, so they join `deferred_parts` instead.
+    let mut after_tool_result = false;
 
     for block in blocks {
         let mut block = match block {
@@ -1504,33 +1514,29 @@ fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Val
             _ => Map::new(),
         };
         let block_type = take_string(&mut block, "type").unwrap_or_default();
-        convert_single_block(
-            block,
-            &block_type,
-            messages,
-            role,
-            &mut content_parts,
-            &mut tool_calls,
-            pending_images,
-        );
+        if block_type == "tool_result" {
+            after_tool_result = true;
+            flush_content_parts(messages, &mut content_parts, role);
+            convert_tool_result_block(block, messages, deferred_parts);
+        } else {
+            let parts = if after_tool_result {
+                &mut *deferred_parts
+            } else {
+                &mut content_parts
+            };
+            convert_single_block(block, &block_type, parts, &mut tool_calls);
+        }
     }
 
     finalize_content_blocks(messages, role, &mut content_parts, tool_calls);
 }
 
-/// Process a single content block within a message.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "accumulator pattern requires passing all state"
-)]
+/// Process a single non-`tool_result` content block within a message.
 fn convert_single_block(
     block: Map<String, Value>,
     block_type: &str,
-    messages: &mut Vec<Value>,
-    role: &str,
     content_parts: &mut Vec<Value>,
     tool_calls: &mut Vec<Value>,
-    promoted_images: &mut Vec<Value>,
 ) {
     match block_type {
         "text" => convert_text_block(block, content_parts),
@@ -1538,10 +1544,6 @@ fn convert_single_block(
         "search_result" => convert_search_result_block(block, content_parts),
         "document" => convert_document_block(block, content_parts),
         "tool_use" => convert_tool_use_block(block, tool_calls),
-        "tool_result" => {
-            flush_content_parts(messages, content_parts, role);
-            convert_tool_result_block(block, messages, promoted_images);
-        },
         "thinking" | "redacted_thinking" => {
             warn!(block_type, "dropping unsupported Anthropic content block");
         },
@@ -1629,12 +1631,12 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
 /// Convert a `tool_result` content block to a Chat Completions tool message.
 ///
 /// Image parts cannot live in a tool message, so they are handed to
-/// `promoted_images` and emitted as one follow-up user message after every
-/// tool message of this Anthropic message (see [`convert_content_blocks`]).
+/// `deferred_parts` and emitted as one follow-up user message after every
+/// tool message of the tool-reply group (see [`convert_content_blocks`]).
 fn convert_tool_result_block(
     mut block: Map<String, Value>,
     messages: &mut Vec<Value>,
-    promoted_images: &mut Vec<Value>,
+    deferred_parts: &mut Vec<Value>,
 ) {
     let tool_call_id = take_string(&mut block, "tool_use_id").unwrap_or_default();
     let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
@@ -1651,7 +1653,7 @@ fn convert_tool_result_block(
     tool_message.insert("content".to_owned(), Value::String(result_content));
     messages.push(Value::Object(tool_message));
 
-    promoted_images.extend(image_content);
+    deferred_parts.extend(image_content);
 }
 
 /// Emit the final message for accumulated content and tool calls.
@@ -1726,7 +1728,7 @@ fn convert_image_source(source: Value) -> Option<String> {
 
 /// Split a `tool_result` block's `content` into its flattened text and the
 /// image parts promoted to a follow-up user message emitted after every tool
-/// message of the containing Anthropic message.
+/// message of the tool-reply group.
 fn split_tool_result_content(content: Option<Value>) -> (String, Vec<Value>) {
     match content {
         Some(Value::String(text)) => (text, Vec::new()),
@@ -3070,6 +3072,63 @@ mod tests {
             parsed["messages"][3]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
             "promoted image follows the last tool reply of the group"
         );
+    }
+
+    #[test]
+    fn tool_result_image_keeps_backend_order_with_trailing_content() {
+        // Ordinary content emitted in place would overtake the deferred image:
+        // for [tool_result(image A), text, image B] the backend must receive
+        // A, then the text, then B, so "first image" keeps its meaning.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]},{"type":"text","text":"meanwhile"},{"type":"image","source":{"type":"url","url":"https://example.com/b.png"}}]},{"role":"assistant","content":"done"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "user", "assistant"], "message order");
+
+        let deferred = &parsed["messages"][2]["content"];
+        assert_eq!(
+            deferred[0]["image_url"]["url"], "https://example.com/a.png",
+            "tool_result image stays first"
+        );
+        assert_eq!(deferred[1]["type"], "text", "trailing text follows the image");
+        assert_eq!(deferred[1]["text"], "meanwhile", "trailing text content");
+        assert_eq!(
+            deferred[2]["image_url"]["url"], "https://example.com/b.png",
+            "trailing image stays last"
+        );
+    }
+
+    #[test]
+    fn trailing_content_is_deferred_across_the_whole_tool_reply_group() {
+        // A user message may extend the group after ordinary content was
+        // deferred; that content may not split the tool replies.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}},{"type":"tool_use","id":"call_2","name":"get_status","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]},{"type":"text","text":"meanwhile"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"ready"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "user"],
+            "both tool replies precede the deferred content: {roles:?}"
+        );
+        let deferred = &parsed["messages"][3]["content"];
+        assert_eq!(
+            deferred[0]["image_url"]["url"], "https://example.com/chart.png",
+            "deferred image keeps its place before the trailing text"
+        );
+        assert_eq!(deferred[1]["text"], "meanwhile", "trailing text stays after the image");
     }
 
     #[test]
