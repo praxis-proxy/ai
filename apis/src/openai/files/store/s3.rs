@@ -19,6 +19,11 @@ use crate::openai::files::FileStream;
 /// The caller configures the bucket, credentials, endpoint, and HTTP transport
 /// on an [`AmazonS3Builder`]. This adapter configures OpenSSL signing. Object keys
 /// are the trusted, globally unique storage keys supplied by the file registry.
+///
+/// The bucket must be unversioned and stay unversioned while the store uses it.
+/// [`FileStore::delete`] deletes by key. Buckets with versioning enabled or
+/// suspended can retain file bytes after a successful delete.
+///
 /// For recovery after a process crash, configure an S3 lifecycle rule to abort
 /// incomplete multipart uploads. An abandoned upload has no completed object
 /// for the Files reaper to delete.

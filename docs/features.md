@@ -117,6 +117,11 @@ groups need a backend at runtime, so pair them with
 features, are opt-in as before. A configuration that names a filter the binary
 was built without fails at startup with an unknown filter type error.
 
+The S3 byte store (`openai-files-s3`) requires an unversioned bucket. Use a
+bucket that has never had versioning enabled and keep it unversioned. The
+store deletes objects by key, which can leave versions behind in buckets with
+versioning enabled or suspended. See [S3 object deletion][s3-delete-object].
+
 ## Extensibility
 
 Custom Rust filters implement the `HttpFilter` trait from `praxis-filter` and
@@ -128,3 +133,4 @@ Start with the [example configurations](../examples/README.md), then use the
 
 [praxis]: https://github.com/praxis-proxy/praxis
 [Responses retained-payload budget]: architecture/responses-retained-payload.md
+[s3-delete-object]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
