@@ -1532,7 +1532,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 101, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 102, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
