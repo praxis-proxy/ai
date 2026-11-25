@@ -72,10 +72,13 @@ pub(crate) type ResolvedMcpTools = HashMap<String, ((String, String), serde_json
 /// already rejected encoded-name collisions when building the model's tools.
 #[cfg(feature = "anthropic-mcp-connector")]
 pub(crate) fn index_resolved_tools(tools: HashMap<(String, String), serde_json::Value>) -> ResolvedMcpTools {
-    tools
+    let count = tools.len();
+    let indexed: ResolvedMcpTools = tools
         .into_iter()
         .map(|(key, entry)| (encode_function_name(&key.0, &key.1), (key, entry)))
-        .collect()
+        .collect();
+    debug_assert_eq!(indexed.len(), count, "resolved tool names were checked for collisions");
+    indexed
 }
 
 /// Resolution state for one encoded MCP function name.

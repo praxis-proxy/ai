@@ -106,7 +106,7 @@ pub(super) struct AnthropicMcpConnectorConfig {
     #[serde(default = "default_max_tools")]
     pub max_tools: usize,
 
-    /// Maximum bytes per request or inference response, including streamed Messages events.
+    /// Maximum bytes per request, inference response, or partial Messages SSE event.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 

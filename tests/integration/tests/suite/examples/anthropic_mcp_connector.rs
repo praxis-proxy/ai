@@ -380,7 +380,15 @@ fn event_stream(frames: &[Value]) -> String {
 }
 
 fn fixture_round(side: &str) -> String {
-    let mut stream = event_stream(&fixture_frames(side));
+    let frames = fixture_frames(side);
+    let mut stream = if side == "client" {
+        frames
+            .iter()
+            .map(|frame| format!("event: {}\ndata: {frame}\n\n", frame["type"].as_str().unwrap()))
+            .collect()
+    } else {
+        event_stream(&frames)
+    };
     if side == "upstream" {
         stream.push_str("data: [DONE]\n\n");
     }

@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! Per-step Messages streaming and the handoff to the next MCP inference round.
+//!
+//! The retained-state probes are migration debt for the router lifecycle in
+//! <https://github.com/praxis-proxy/praxis/issues/984>. Replace the empty
+//! emissions and snapshot swaps when core exposes a retained-state check.
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
@@ -68,8 +72,10 @@ impl CompletedRound {
 impl StreamRound {
     /// Start the first inference round.
     pub(super) fn new(limit: usize) -> Self {
+        let mut messages = MessagesStream::new(limit, limit);
+        messages.set_round_limit(limit);
         Self {
-            messages: MessagesStream::new(limit, limit),
+            messages,
             results: Vec::new(),
             received: 0,
             transformable: true,
@@ -132,7 +138,7 @@ impl StreamRound {
             );
             let mixed = response::has_client_tool_use(response::content_blocks(&previous), index, &connector.admission);
             let terminal = mixed
-                .then(|| self.messages.terminal())
+                .then(|| self.messages.client_tool_terminal())
                 .transpose()
                 .map_err(|error| stream_error(&error))?
                 .map(Bytes::from);
@@ -196,7 +202,8 @@ impl Drop for ReentryGuard<'_, '_> {
 }
 
 /// Queue the results ahead of the next response and install its per-instance parser.
-pub(super) fn resume(ctx: &mut HttpFilterContext<'_>, mut round: Box<StreamRound>) -> FilterAction {
+pub(super) fn resume(ctx: &mut HttpFilterContext<'_>, mut round: Box<StreamRound>, limit: usize) -> FilterAction {
+    round.messages.set_round_limit(limit);
     // IRR owns the FIFO and checks the queued output together with the
     // rebuilt request against its retained-state budget.
     if ctx
@@ -267,7 +274,7 @@ pub(super) fn on_headers(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
             "MCP connector upstream returned an unusable streaming response",
         );
         return finish(ctx, error);
-    } else if header.status.is_success() || !header.headers.contains_key(CONTENT_TYPE) {
+    } else if header.status.is_success() || !is_json_response(header) {
         return unusable_response(header.status);
     }
     let response = response_snapshot(header);
@@ -279,6 +286,16 @@ pub(super) fn on_headers(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         round.committed |= transformable;
     }
     FilterAction::Continue
+}
+
+/// Whether the first upstream HTTP error has a JSON representation.
+fn is_json_response(header: &praxis_filter::Response) -> bool {
+    header
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// The body hook cannot borrow response headers. Share their values until

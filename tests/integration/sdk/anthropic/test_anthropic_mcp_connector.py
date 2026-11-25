@@ -129,6 +129,17 @@ class _ModelHandler(BaseHTTPRequestHandler):
             {"body": request, "headers": {key.lower(): value for key, value in self.headers.items()}}
         )
         prompt = request["messages"][0]["content"]
+        if prompt in ("HTML upstream error", "Messages upstream error"):
+            payload = (
+                b"<html>upstream unavailable</html>" if prompt.startswith("HTML")
+                else b'{"type":"error","error":{"type":"overloaded_error","message":"provider detail"}}'
+            )
+            self.send_response(503)
+            self.send_header("Content-Type", "text/html" if prompt.startswith("HTML") else "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if prompt in ("truncated HTTP error", "oversized HTTP error"):
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
@@ -221,12 +232,15 @@ class _ModelHandler(BaseHTTPRequestHandler):
                 event("content_block_start", index=4, content_block={
                     "type": "tool_use", "id": "client_1", "name": "local", "input": {}
                 })
+                event("content_block_delta", index=4, delta={"type": "input_json_delta", "partial_json": ""})
                 event("content_block_stop", index=4)
         metadata = {"context_management": {"applied_edits": []}, "input_transformations": []} if answer else {}
         usage = {"output_tokens": 5}
         if answer:
             usage["iterations"] = [{"type": "message", "input_tokens": 10, "output_tokens": 5}]
-        event("message_delta", delta={"stop_reason": "end_turn" if answer else "tool_use", "stop_sequence": None},
+            event("message_delta", delta={}, usage=usage, **metadata)
+            metadata["context_management"] = None
+        event("message_delta", delta={"stop_reason": "end_turn" if answer or prompt == "mixed end turn" else "tool_use", "stop_sequence": None},
               usage=usage, **metadata)
         event("message_stop")
         if prompt == "hold after message stop":
@@ -542,6 +556,45 @@ class TestAnthropicMcpConnector:
         calls = stack["mcp"].calls("tools/call")
         assert sorted(call["params"]["arguments"]["city"] for call in calls) == ["Lyon", "Nice", "Paris"]
 
+    def test_mixed_stream_replays_in_the_next_request(self, client, stack):
+        params = _connector_kwargs(stack)
+        params["messages"][0]["content"] = "mixed end turn"
+        params["tools"].append({"name": "local", "input_schema": {"type": "object"}})
+        stack["model"].release_first_round.set()
+
+        with client.beta.messages.stream(**params) as stream:
+            mixed = stream.get_final_message()
+        assert mixed.stop_reason == "tool_use"
+        client_tool = next(block for block in mixed.content if block.type == "tool_use")
+        params["messages"].extend([
+            {"role": "assistant", "content": [block.model_dump(exclude_none=True) for block in mixed.content]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": client_tool.id,
+                                          "content": "client result"}]},
+        ])
+        client.beta.messages.create(**params)
+        replay = stack["model"].requests[1]["body"]["messages"]
+        use_ids = [b["id"] for m in replay if isinstance(m["content"], list)
+                   for b in m["content"] if b["type"] == "tool_use"]
+        result_ids = [b["tool_use_id"] for m in replay if isinstance(m["content"], list)
+                      for b in m["content"] if b["type"] == "tool_result"]
+        assert set(use_ids) == set(result_ids)
+        assert len(use_ids) == 3 and client_tool.id in result_ids
+
+    @pytest.mark.parametrize("prompt", ["HTML upstream error", "Messages upstream error"])
+    def test_first_http_error_uses_messages_envelope(self, client, stack, prompt):
+        params = _connector_kwargs(stack)
+        params["messages"][0]["content"] = prompt
+        with pytest.raises(APIStatusError) as failure:
+            with client.beta.messages.stream(**params) as stream:
+                list(stream)
+        assert failure.value.status_code == 503
+        error = failure.value.response.json()
+        assert error["type"] == "error"
+        if prompt == "Messages upstream error":
+            assert error["error"]["message"] == "provider detail"
+        else:
+            assert "<html>" not in failure.value.response.text
+
     def test_sdk_receives_translated_call_before_arguments_finish(self, client, stack):
         model = stack["model"]
         model.release_first_round.clear()
@@ -605,6 +658,10 @@ class TestAnthropicMcpConnector:
     @pytest.mark.parametrize("stack", [{"connector_max_body_bytes": 2048}], indirect=True)
     @pytest.mark.parametrize("prompt", ["truncated HTTP error", "oversized HTTP error"])
     def test_partial_http_error_ends_as_a_transport_failure(self, stack, prompt):
+        """Preserve incomplete chunked responses under RFC 9112 Sections 7.1 and 8.
+
+        https://datatracker.ietf.org/doc/html/rfc9112#section-8
+        """
         params = _connector_kwargs(stack)
         params.pop("betas")
         params["stream"] = True

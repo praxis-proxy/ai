@@ -113,6 +113,14 @@ of an `iterative_request_router`. Praxis then runs the connector itself:
   ID, consecutive block indices, and one terminal usage delta and stop.
   A complete model `message_stop` lets Praxis dispatch the next round or
   finish the client response even if the backend keeps its HTTP body open.
+  MCP and web search share the Messages SSE parser. It recognizes CR line
+  endings immediately, rejects deltas for unopened blocks and malformed
+  lifecycle fields, preserves citations and compaction data for replay, and
+  carries provider metadata into the terminal delta.
+  Streamed MCP results follow the round's model blocks. Buffered responses
+  place each result immediately after its call. Both orders can be replayed.
+  If a later request filter rejects a resumed step after HTTP 200 is committed,
+  the stream can end without an Anthropic terminal event.
   If a model round is truncated or exceeds the connector’s size limit after
   streaming starts, the connector emits one SSE `error` and stops.
 - A toolset's `defer_loading: true` and pinned tool lists return HTTP 400.

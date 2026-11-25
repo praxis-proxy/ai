@@ -39,7 +39,9 @@ fn has_identity_encoding(headers: &http::HeaderMap) -> bool {
     headers.get_all(http::header::CONTENT_ENCODING).iter().all(|value| {
         value.to_str().is_ok_and(|list| {
             list.split(',')
-                .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+                .map(str::trim)
+                .filter(|coding| !coding.is_empty())
+                .all(|coding| coding.eq_ignore_ascii_case("identity"))
         })
     })
 }

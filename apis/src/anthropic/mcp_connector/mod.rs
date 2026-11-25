@@ -675,6 +675,7 @@ impl AnthropicMcpConnectorFilter {
             let mut earlier = std::mem::take(&mut state.earlier);
             earlier.extend(client_blocks);
             previous.remove("content");
+            previous.insert("stop_reason".to_owned(), Value::from("tool_use"));
             let synthesized = response::final_response(previous, earlier, state.usage);
             return Ok(FilterAction::Reject(synthesized_response(&synthesized)));
         }
@@ -690,7 +691,7 @@ impl AnthropicMcpConnectorFilter {
             };
         commit_request(ctx, body, Bytes::from(rebuilt), true);
         if let Some(round) = stream {
-            return Ok(streaming::resume(ctx, round));
+            return Ok(streaming::resume(ctx, round, self.config.max_body_bytes));
         }
         Ok(FilterAction::Continue)
     }

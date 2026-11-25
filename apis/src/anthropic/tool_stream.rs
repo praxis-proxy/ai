@@ -85,6 +85,8 @@ pub(super) struct SseParser {
     line_buffer: String,
     /// The preceding CR already ended a line. Consume an optional following LF.
     after_cr: bool,
+    /// Whether the first decoded character has been examined for a BOM.
+    started: bool,
 }
 
 impl SseParser {
@@ -108,12 +110,18 @@ impl SseParser {
         max_partial_event_bytes: usize,
     ) -> Result<Vec<SseEvent>, StreamError> {
         let text = self.decode_utf8(chunk, end_of_stream)?;
+        let text = if !self.started && !text.is_empty() {
+            self.started = true;
+            text.strip_prefix('\u{feff}').unwrap_or(&text)
+        } else {
+            &text
+        };
 
         // Append the newly decoded text onto the retained partial in place,
         // normalizing line endings as it goes, instead of rebuilding the whole
         // buffer each chunk (which was quadratic across a long fragmented event).
         let prev_len = self.line_buffer.len();
-        self.normalize_into_buffer(&text);
+        self.normalize_into_buffer(text);
 
         // A `\n\n` terminator can only straddle the old/new boundary when the
         // last retained byte was already a `\n`; every other complete event lies
@@ -143,7 +151,15 @@ impl SseParser {
         }
 
         // Bound the retained partial as well as complete events.
-        if self.line_buffer.len() - consumed > max_partial_event_bytes {
+        if self.line_buffer.len()
+            - consumed
+            - usize::from(
+                self.line_buffer
+                    .get(consumed..)
+                    .is_some_and(|tail| tail.ends_with('\n')),
+            )
+            > max_partial_event_bytes
+        {
             return Err(StreamError::OversizedPartialEvent);
         }
         self.line_buffer.drain(..consumed);
@@ -252,9 +268,8 @@ impl SseParser {
 /// Parse one SSE event block into an [`SseEvent`], reading the JSON `data`.
 ///
 /// Returns `Ok(None)` for a block that carries no `data` field (for example a
-/// bare comment or keep-alive) or whose sole `data` payload is the `[DONE]`
-/// sentinel, matching the SSE specification's handling of `data`, `data:value`,
-/// and `data: value` field forms.
+/// bare comment or keep-alive). Accepts `data`, `data:value`, and `data: value`
+/// field forms.
 ///
 /// # Errors
 ///
@@ -267,11 +282,6 @@ fn parse_event_block(block: &str) -> Result<Option<SseEvent>, StreamError> {
     let Some(data) = collect_data_field(block) else {
         return Ok(None);
     };
-    // The OpenAI-style `[DONE]` sentinel is not Anthropic JSON; skip it rather
-    // than fail so a backend that emits it does not poison the stream.
-    if data == "[DONE]" {
-        return Ok(None);
-    }
     let data: Value = serde_json::from_str(&data).map_err(|_invalid_json| StreamError::MalformedEvent)?;
     if data.get("type").and_then(Value::as_str).is_none() {
         return Err(StreamError::MalformedEvent);
@@ -403,6 +413,8 @@ pub(super) struct MessagesStream {
     server_tool_use_total: Option<Value>,
     /// Whether the stream has failed closed; once set, no more bytes are forwarded.
     failed: bool,
+    /// Validate the message when the backend emits its stop event.
+    validate_stop: bool,
     /// Current round reconstruction and forwarding state.
     round: RoundState,
 }
@@ -423,6 +435,7 @@ impl MessagesStream {
             output_tokens_details_total: None,
             server_tool_use_total: None,
             failed: false,
+            validate_stop: false,
             round: RoundState::default(),
         }
     }
@@ -492,7 +505,7 @@ impl MessagesStream {
         for event in events {
             self.process_event(event, output, &mut present)
                 .inspect_err(|_| self.fail())?;
-            if self.failed {
+            if self.failed || (self.validate_stop && self.round.message_stopped) {
                 break;
             }
         }
@@ -532,6 +545,9 @@ impl MessagesStream {
             // arrives fails closed instead of fabricating a successful terminal.
             EventKind::MessageStop => {
                 self.round.message_stopped = true;
+                if self.validate_stop {
+                    self.require_complete_lifecycle()?;
+                }
                 Ok(())
             },
             // Every other unmodeled event is deferred without forwarding.
@@ -548,8 +564,8 @@ impl MessagesStream {
             self.message_started = true;
             emit_event(output, "message_start", &data);
         }
-        let message = data.get_mut("message").ok_or(StreamError::MalformedEvent)?.take();
-        if let Some(usage) = message.get("usage") {
+        let mut message = data.get_mut("message").ok_or(StreamError::MalformedEvent)?.take();
+        if let Some(usage) = message.get_mut("usage") {
             self.capture_round_usage(usage);
         }
         self.round.message = Some(message);
@@ -560,7 +576,7 @@ impl MessagesStream {
     ///
     /// The final `message_delta` may repeat these fields; the last value seen
     /// wins for the round, and rounds are summed in [`Self::reconstruct_message`].
-    fn capture_round_usage(&mut self, usage: &Value) {
+    fn capture_round_usage(&mut self, usage: &mut Value) {
         if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
             self.round.round_input_tokens = Some(input);
         }
@@ -570,11 +586,11 @@ impl MessagesStream {
         if let Some(cache_creation) = usage.get("cache_creation_input_tokens").and_then(Value::as_u64) {
             self.round.round_cache_creation = Some(cache_creation);
         }
-        if let Some(output_tokens_details) = usage.get("output_tokens_details") {
-            self.round.round_output_tokens_details = Some(output_tokens_details.clone());
+        if let Some(output_tokens_details) = usage.get_mut("output_tokens_details").filter(|value| !value.is_null()) {
+            self.round.round_output_tokens_details = Some(output_tokens_details.take());
         }
-        if let Some(server_tool_use) = usage.get("server_tool_use") {
-            self.round.round_server_tool_use = Some(server_tool_use.clone());
+        if let Some(server_tool_use) = usage.get_mut("server_tool_use").filter(|value| !value.is_null()) {
+            self.round.round_server_tool_use = Some(server_tool_use.take());
         }
     }
 
@@ -679,20 +695,20 @@ impl MessagesStream {
             if let Some(stop_sequence) = delta.get("stop_sequence") {
                 self.round.stop_sequence = stop_sequence.as_str().map(ToOwned::to_owned);
             }
-            if let Some(container) = delta.get_mut("container") {
+            if let Some(container) = delta.get_mut("container").filter(|value| !value.is_null()) {
                 self.round.container = Some(container.take());
             }
-            if let Some(stop_details) = delta.get_mut("stop_details") {
+            if let Some(stop_details) = delta.get_mut("stop_details").filter(|value| !value.is_null()) {
                 self.round.stop_details = Some(stop_details.take());
             }
         }
-        if let Some(usage) = data.get("usage") {
+        if let Some(usage) = data.get_mut("usage") {
             if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
                 self.round.round_output_tokens = tokens;
             }
             self.capture_round_usage(usage);
         }
-        self.round.terminal_event = data;
+        merge_delta_metadata(&mut self.round.terminal_event, data);
         Ok(())
     }
 
@@ -730,7 +746,9 @@ impl MessagesStream {
             .ok_or(StreamError::MalformedEvent)?;
         self.charge_fragment_bytes(fragment.len())?;
         if field == "partial_json" {
-            self.round.partial_json.entry(index).or_default().push_str(fragment);
+            if !fragment.is_empty() {
+                self.round.partial_json.entry(index).or_default().push_str(fragment);
+            }
         } else {
             let block = self.round.content.get_mut(index).ok_or(StreamError::MalformedEvent)?;
             if block[field].is_null() {
@@ -835,6 +853,22 @@ impl MessagesStream {
         self.build_terminal()
     }
 
+    /// Apply the receiving step's bound without resetting the logical message.
+    #[cfg(feature = "anthropic-mcp-connector")]
+    pub(super) fn set_round_limit(&mut self, limit: usize) {
+        self.validate_stop = true;
+        self.max_body_bytes = limit;
+        self.max_partial_event_bytes = limit;
+    }
+
+    /// Emit a terminal pair that signals a pending client tool.
+    #[cfg(feature = "anthropic-mcp-connector")]
+    pub(super) fn client_tool_terminal(&mut self) -> Result<Vec<u8>, StreamError> {
+        self.require_complete_lifecycle()?;
+        self.round.stop_reason = Some("tool_use".to_owned());
+        self.build_terminal()
+    }
+
     /// Append a proxy-produced block to the same index sequence as model blocks.
     #[cfg(feature = "anthropic-mcp-connector")]
     pub(super) fn emit_block(&mut self, block: Value, output: &mut Vec<u8>) {
@@ -912,6 +946,27 @@ impl MessagesStream {
         emit_event(&mut out, "message_delta", &event);
         emit_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
         Ok(out)
+    }
+}
+
+/// Retain optional terminal fields across cumulative deltas in one round.
+fn merge_delta_metadata(previous: &mut Value, incoming: Value) {
+    let Value::Object(incoming) = incoming else {
+        return;
+    };
+    let Value::Object(previous) = previous else {
+        *previous = Value::Object(incoming);
+        return;
+    };
+    for (key, value) in incoming {
+        if matches!(key.as_str(), "delta" | "usage")
+            && let Some(Value::Object(fields)) = previous.get_mut(&key)
+            && let Value::Object(update) = value
+        {
+            fields.extend(update.into_iter().filter(|(_, value)| !value.is_null()));
+        } else if !value.is_null() {
+            previous.insert(key, value);
+        }
     }
 }
 
@@ -1041,13 +1096,11 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::panic,
-    reason = "tests"
+    reason = "parser test assertions"
 )]
 mod tests {
     use super::*;
@@ -1217,13 +1270,43 @@ mod tests {
     #[test]
     fn ignores_blocks_without_json_data() {
         let mut parser = SseParser::default();
-        // A comment-only block and the OpenAI-style [DONE] sentinel carry no
-        // Anthropic JSON `data`; both are dropped rather than surfaced.
-        let events = parser
-            .push(b": keep-alive\n\ndata: [DONE]\n\n", false, MAX_PARTIAL)
-            .unwrap();
+        let events = parser.push(b": keep-alive\n\n", false, MAX_PARTIAL).unwrap();
+        assert!(events.is_empty(), "SSE comments carry no event data");
+    }
 
-        assert!(events.is_empty());
+    #[test]
+    fn rejects_chat_done_sentinel() {
+        let error = SseParser::default()
+            .push(b"data: [DONE]\n\n", false, MAX_PARTIAL)
+            .unwrap_err();
+        assert_eq!(error, StreamError::MalformedEvent, "Messages data must be a JSON event");
+    }
+
+    #[test]
+    fn accepts_split_bom_and_exact_size_event() {
+        let data = br#"data: {"type":"ping"}"#;
+        let mut parser = SseParser::default();
+        assert!(
+            parser.push(&[0xEF], false, data.len()).unwrap().is_empty(),
+            "partial BOM emits nothing"
+        );
+        assert!(
+            parser.push(&[0xBB, 0xBF], false, data.len()).unwrap().is_empty(),
+            "BOM carries no event data"
+        );
+        assert!(
+            parser.push(data, false, data.len()).unwrap().is_empty(),
+            "event needs a delimiter"
+        );
+        assert!(
+            parser.push(b"\n", false, data.len()).unwrap().is_empty(),
+            "first delimiter byte fits"
+        );
+        assert_eq!(
+            parser.push(b"\n", false, data.len()).unwrap().len(),
+            1,
+            "complete event fits the same limit"
+        );
     }
 
     #[test]

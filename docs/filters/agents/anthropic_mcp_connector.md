@@ -31,7 +31,7 @@ A client server is matched to an operator connector by URL. Unmatched URLs are r
 | `timeout_ms` | integer | no | Timeout for one MCP `tools/list` or `tools/call`, in milliseconds. |
 | `max_servers` | integer | no | Maximum number of MCP servers one request may declare. |
 | `max_tools` | integer | no | Maximum number of tools accepted from one MCP server. |
-| `max_body_bytes` | integer | no | Maximum bytes per request or inference response, including streamed Messages events. |
+| `max_body_bytes` | integer | no | Maximum bytes per request, inference response, or partial Messages SSE event. |
 | `max_parallel_calls` | integer | no | Maximum number of MCP calls running at once. |
 | `max_result_bytes` | integer | no | Maximum bytes retained for one MCP result. |
 | `max_total_result_bytes` | integer | no | Maximum bytes retained for all results of one model round. |

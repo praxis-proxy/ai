@@ -752,19 +752,30 @@ async fn streaming_connector_resolves_and_delivers_message_start_before_eof() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     ct.cancel();
-    assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(ctx.subrequest_response_mode(), SubRequestResponseMode::Streaming);
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "connector discovery permits inference"
+    );
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Streaming,
+        "connector selects streaming transport"
+    );
     let mut chunk = Some(Bytes::from_static(
         b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
     ));
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut chunk, false).unwrap(),
+            FilterAction::Continue
+        ),
+        "the message start leaves the stream open"
+    );
     assert!(
         std::str::from_utf8(&chunk.unwrap())
             .unwrap()
-            .contains("event: message_start")
+            .contains("event: message_start"),
+        "the message start reaches the caller before EOF"
     );
 }
 
@@ -979,44 +990,61 @@ fn stream_state_is_instance_local_and_released_after_a_terminal_error() {
     ctx.insert_filter_state(streaming::StreamRound::new(128));
     let prefix = Bytes::from_static(b"data: {\"type\":\"mes");
     let mut body = Some(prefix.clone());
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
-        FilterAction::Continue
-    ));
-    assert!(body.is_none());
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ),
+        "the owning filter buffers the partial frame"
+    );
+    assert!(body.is_none(), "a partial frame is withheld");
     // A different connector instance in the same context never reads the prefix.
     ctx.current_filter_id = Some(4);
     body = Some(prefix.clone());
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
-        FilterAction::Continue
-    ));
-    assert_eq!(body, Some(prefix));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ),
+        "the non-owning filter leaves the body alone"
+    );
+    assert_eq!(body, Some(prefix), "the non-owning filter preserves the body");
     ctx.current_filter_id = Some(3);
     body = Some(Bytes::from_static(b"sage_start\",\"message\":{\"id\":\"msg_1\"}}\n\n"));
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ),
+        "the owning filter consumes the rest of the frame"
+    );
     assert!(
         std::str::from_utf8(body.as_ref().unwrap())
             .unwrap()
-            .starts_with("event: message_start")
+            .starts_with("event: message_start"),
+        "the completed message start reaches the caller"
     );
     body = Some(Bytes::from(vec![b'x'; 129]));
     assert!(filter.on_response_body(&mut ctx, &mut body, false).is_err());
     // The router cancels the upstream before running the final callback.
     body = None;
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            FilterAction::Continue
+        ),
+        "the completion callback handles the failure"
+    );
     assert!(
         std::str::from_utf8(body.as_ref().unwrap())
             .unwrap()
-            .starts_with("event: error")
+            .starts_with("event: error"),
+        "the completion emits a Messages error"
     );
-    assert!(ctx.get_filter_state::<streaming::StreamRound>().is_none());
+    assert!(
+        ctx.get_filter_state::<streaming::StreamRound>().is_none(),
+        "completion releases the parser"
+    );
 }
 
 #[test]
