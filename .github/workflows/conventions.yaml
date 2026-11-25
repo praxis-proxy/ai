@@ -18,6 +18,7 @@ permissions: {}
 jobs:
   pr-context:
     permissions:
+      contents: read
       pull-requests: write
     uses: praxis-proxy/conventions/.github/workflows/pr-conventions.yaml@a94d5edb2929b4e623dcfc9f1820d67eab43f748 # conventions PR 49
     with:
