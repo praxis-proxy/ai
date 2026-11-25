@@ -947,3 +947,13 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.native.mcp_structured_result_projection
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/mcp-structured-result-projection
+    providers:
+      synthetic:
+        status: synthetic_only
+    reason: Native-boundary projection evidence only. MCP execution and both output paths are covered through the real proxy by the OpenAI SDK tests; independent MCP callouts are outside the one-exchange replay model.

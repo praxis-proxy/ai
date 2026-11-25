@@ -1331,6 +1331,7 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_agentic_loop"],
                 vec!["messages_to_chat_completions"],
+                vec!["responses_native_passthrough"],
             ]
         );
         assert_eq!(
@@ -1440,11 +1441,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 100, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 77, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 82, "manifest recording inventory count");
+        assert_eq!(report.features_total, 101, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 78, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 83, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1512,6 +1514,7 @@ mod tests {
                 "responses/invalid-stream-event-type",
                 "responses/irr-terminal-streaming",
                 "responses/mcp-request-preservation",
+                "responses/mcp-structured-result-projection",
                 "responses/mcp-tool-admission-untrusted-direct",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1527,7 +1530,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 100, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 101, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1984,6 +1987,10 @@ mod tests {
                     &"messages.request.degrade_mid_conversation_system".to_owned(),
                     &vec!["messages/degrade-features".to_owned()]
                 ),
+                (
+                    &"responses.native.mcp_structured_result_projection".to_owned(),
+                    &vec!["responses/mcp-structured-result-projection".to_owned()]
+                ),
             ]
         );
         // Every feature is synthetic-only unless it is listed here by id, so
@@ -2083,9 +2090,15 @@ mod tests {
             );
         }
         for feature in &manifest.features {
-            let expected_reason = (feature.id == "responses.native.request").then_some(
-                "Native request ordering also has controlled local Files API and SDK evidence; independent file callouts are outside the one-exchange replay model.",
-            );
+            let expected_reason = match feature.id.as_str() {
+                "responses.native.request" => Some(
+                    "Native request ordering also has controlled local Files API and SDK evidence; independent file callouts are outside the one-exchange replay model.",
+                ),
+                "responses.native.mcp_structured_result_projection" => Some(
+                    "Native-boundary projection evidence only. MCP execution and both output paths are covered through the real proxy by the OpenAI SDK tests; independent MCP callouts are outside the one-exchange replay model.",
+                ),
+                _ => None,
+            };
             assert_eq!(feature.reason.as_deref(), expected_reason);
             assert!(feature.providers.values().all(|coverage| coverage.reason.is_none()));
         }

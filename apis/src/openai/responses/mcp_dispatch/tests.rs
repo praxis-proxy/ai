@@ -1379,6 +1379,53 @@ fn process_call_result_tool_error() {
 }
 
 #[test]
+fn process_call_result_preserves_structured_content_in_both_outputs() -> Result<(), Box<dyn std::error::Error>> {
+    for is_error in [false, true] {
+        let mut call_result = rmcp::model::CallToolResult::success(vec![]);
+        call_result.structured_content = Some(json!({"temperature": 22.5}));
+        call_result.is_error = Some(is_error);
+        let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}", None, TEST_MAX_RESULT_BYTES);
+        let output = result.output_item["output"]
+            .as_str()
+            .ok_or("MCP output must be a string")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(output)?,
+            json!({"content": [], "structuredContent": {"temperature": 22.5}})
+        );
+        assert_eq!(
+            result.message["output"],
+            if is_error {
+                format!("Error: {output}")
+            } else {
+                output.to_owned()
+            }
+        );
+        assert!(!result.limit_exceeded);
+        if is_error {
+            assert_eq!(result.output_item["error"]["content"], output);
+        } else {
+            assert!(result.output_item.get("error").is_none());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn process_call_result_replaces_oversized_structured_content_with_a_limit_error() {
+    let mut call_result = rmcp::model::CallToolResult::success(vec![]);
+    call_result.structured_content = Some(json!({"payload": "x".repeat(4096)}));
+    let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}", None, 1024);
+    assert!(result.limit_exceeded);
+    assert_eq!(result.output_item["output"], "");
+    assert!(
+        result.message["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("per-result byte limit"))
+    );
+    assert_eq!(result.output_item["error"]["type"], "mcp_tool_execution_error");
+}
+
+#[test]
 fn process_call_result_transport_error() {
     let err = crate::mcp_client::McpClientError::CallTool {
         url: crate::mcp_client::McpDisplayUrl::from_uri(&"http://example.com/mcp".parse().unwrap()),
