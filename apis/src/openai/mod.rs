@@ -54,6 +54,8 @@ pub use responses::AgenticLoopFilter;
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use responses::FileResolveFilter;
+#[cfg(feature = "openai-mcp-tools")]
+pub use responses::McpConnectorFilter;
 #[cfg(feature = "openai-responses-openapi")]
 pub use responses::implementation_openapi_json as responses_openapi_json;
 /// Hidden entry points used by the workspace's Responses initialization benchmark.
@@ -67,8 +69,6 @@ pub use responses::{
     responses_proxy::ResponsesProxyFilter, responses_to_chat_completions::ResponsesToChatCompletionsFilter,
     stream_events::StreamEventsFilter,
 };
-#[cfg(feature = "openai-mcp-tools")]
-pub use responses::{McpDispatchFilter, McpToolResolveFilter};
 pub use responses::{
     ModelRewriteFilter, ToolParseFilter,
     routes::{

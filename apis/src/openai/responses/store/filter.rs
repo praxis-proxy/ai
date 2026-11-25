@@ -689,7 +689,7 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 
 /// Mark this exchange as persistence-armed on the shared [`ResponsesState`].
 ///
-/// This is the exchange-scoped signal `mcp_dispatch` requires before emitting an
+/// This is the exchange-scoped signal `mcp_connector` requires before emitting an
 /// `mcp_approval_request`. It is set only when the request classifies as one
 /// whose response this filter will persist, so, unlike pipeline-scoped registry
 /// membership, it proves persistence is armed for THIS exchange and catches a
@@ -1146,7 +1146,7 @@ impl HttpFilter for ResponseStoreFilter {
                 return Ok(FilterAction::Reject(reject_store_error()));
             }
             // Publish the exchange-scoped persistence-armed marker so a
-            // downstream approval pause (mcp_dispatch) can tell that THIS
+            // downstream approval pause (mcp_connector) can tell that THIS
             // response will be persisted, not merely that a store is provisioned
             // somewhere in the pipeline.
             arm_persistence_if_persisting(ctx);

@@ -213,10 +213,10 @@ headroom once an intermediate value is released.
 | History | [`openai_responses_rehydrate`] | Bound Store reads before decoding previous responses or conversation history; charge replay state. |
 | History | [`openai_responses_compact`] | Bound stored history and summarization output; charge source, summary, and persistence projections. |
 | Tool preparation | [`openai_client_tool_compat`] | Charge the extra request and response forms used when lowering client tools to backend functions. |
-| Tool preparation | [`openai_mcp_tool_resolve`] | Bound eager or deferred `tools/list` discovery, parsed listings, tool maps, and expanded declarations. |
+| Tool preparation | [`openai_mcp_connector`] | Bound eager or deferred `tools/list` discovery, parsed listings, tool maps, and expanded declarations. |
 | Loop | [`openai_agentic_loop`] | Charge each round's buffered body as round-local; at the round boundary retain the surviving output and release the round-local charge. Own the loop decision and terminal failure. |
 | Streaming | [`openai_stream_events`] | Charge SSE chunks and assembled frames as round-local and the terminal output as retained; local tool-event synthesis is retained output. The loop releases the round-local stream charge at each round boundary. |
-| Tool execution | [`openai_mcp_dispatch`] | Reserve in-flight MCP results and approval data; bound transport and parsing before call results enter state. |
+| Tool execution | [`openai_mcp_connector`] | Reserve in-flight MCP results and approval data; bound transport and parsing before call results enter state. |
 | Tool execution | [`openai_file_search_dispatch`] | Charge search fanout, raw and parsed results, model context, public output, and citations. |
 | Tool execution | [`openai_web_search_dispatch`] | Limit provider response bytes from remaining headroom and charge results and both model-facing and public output. |
 | Translation | [`openai_responses_to_chat_completions`] | Charge translated Chat requests and responses, including streaming converter frames and snapshots. |
@@ -260,10 +260,9 @@ whole-process peak memory under concurrent load.
 [`openai_responses_rehydrate`]: ../filters/agents/openai_responses_rehydrate.md
 [`openai_responses_compact`]: ../filters/agents/openai_responses_compact.md
 [`openai_client_tool_compat`]: ../filters/apis/openai_client_tool_compat.md
-[`openai_mcp_tool_resolve`]: ../filters/agents/openai_mcp_tool_resolve.md
+[`openai_mcp_connector`]: ../filters/agents/openai_mcp_connector.md
 [`openai_agentic_loop`]: ../filters/agents/openai_agentic_loop.md
 [`openai_stream_events`]: ../filters/apis/openai_stream_events.md
-[`openai_mcp_dispatch`]: ../filters/agents/openai_mcp_dispatch.md
 [`openai_file_search_dispatch`]: ../filters/agents/openai_file_search_dispatch.md
 [`openai_web_search_dispatch`]: ../filters/agents/openai_web_search_dispatch.md
 [`openai_responses_to_chat_completions`]: ../filters/apis/openai_responses_to_chat_completions.md

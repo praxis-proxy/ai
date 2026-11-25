@@ -202,7 +202,7 @@ declaration does not mean the gateway has an executor for it. The managed path
 rejects `code_interpreter`, `background:true`, and non-null reusable `prompt`
 references (direct provider-owned passthrough is a separate path). See
 [managed validation](../filters/apis/openai_responses_request.md),
-[MCP dispatch](../filters/agents/openai_mcp_dispatch.md), and
+[MCP connector](../filters/agents/openai_mcp_connector.md), and
 [retained-payload bounds](../architecture/responses-retained-payload.md).
 
 ## Conversations and state

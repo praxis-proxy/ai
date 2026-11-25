@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_mcp_tool_resolve` filter.
+//! Unit tests for the `openai_mcp_connector` filter.
 
 use std::sync::{Arc, Mutex};
+
+use praxis_filter::{BodyAccess, BodyMode, HttpFilter};
 
 use super::*;
 use crate::{
@@ -64,14 +66,14 @@ impl tracing::field::Visit for WarnMessageVisitor {
 #[test]
 fn default_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector", "filter name");
 }
 
 #[test]
 fn declares_dual_phase_body_access() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.request_body_access(),
         BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
@@ -84,24 +86,24 @@ fn declares_dual_phase_body_access() {
 
 #[test]
 fn config_with_custom_timeout() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 10000").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+    let yaml: serde_yaml::Value = serde_yaml::from_str("discovery_timeout_ms: 10000").unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector", "filter name");
 }
 
 #[test]
 fn config_accepts_scoped_connector_slots() {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str("user_credential: mcp_gateway\nauthorization_assertion: mcp_gateway\n").unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+    assert!(McpConnectorFilter::from_config(&yaml).is_ok());
 }
 
 #[test]
 fn require_connector_defaults_to_false_and_accepts_true() {
-    let default: McpToolResolveConfig = serde_yaml::from_str("{}").unwrap();
+    let default: McpConnectorConfig = serde_yaml::from_str("{}").unwrap();
     assert!(!default.require_connector, "require_connector must default to false");
 
-    let enabled: McpToolResolveConfig = serde_yaml::from_str("require_connector: true").unwrap();
+    let enabled: McpConnectorConfig = serde_yaml::from_str("require_connector: true").unwrap();
     assert!(enabled.require_connector, "require_connector must parse true");
 }
 
@@ -109,7 +111,7 @@ fn require_connector_defaults_to_false_and_accepts_true() {
 fn scoped_connector_context_without_require_connector_warns() {
     for yaml in ["user_credential: mcp_gateway", "authorization_assertion: mcp_gateway"] {
         let warnings = capture_warn_messages(|| {
-            let cfg: McpToolResolveConfig = serde_yaml::from_str(yaml).unwrap();
+            let cfg: McpConnectorConfig = serde_yaml::from_str(yaml).unwrap();
             assert!(build_config(cfg).is_ok());
         });
         assert_eq!(warnings.len(), 1, "expected one warning for {yaml:?}: {warnings:?}");
@@ -120,7 +122,7 @@ fn scoped_connector_context_without_require_connector_warns() {
     }
 
     let warnings = capture_warn_messages(|| {
-        let cfg: McpToolResolveConfig = serde_yaml::from_str(
+        let cfg: McpConnectorConfig = serde_yaml::from_str(
             "user_credential: mcp_gateway\nauthorization_assertion: mcp_gateway\nrequire_connector: true",
         )
         .unwrap();
@@ -134,7 +136,7 @@ fn scoped_connector_context_without_require_connector_warns() {
 
 #[tokio::test]
 async fn budgeted_mcp_resolve_requires_shared_budget_before_discovery() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -160,7 +162,7 @@ async fn budgeted_mcp_resolve_requires_shared_budget_before_discovery() {
 #[tokio::test]
 async fn budgeted_eager_mcp_discovery_rewrites_tools_and_settles_reservation() {
     let (server_url, ct) = start_single_tool_mcp_server().await;
-    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::Value::Null).unwrap();
+    let filter = McpConnectorFilter::from_config_allow_private(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -283,7 +285,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -305,7 +307,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     ctx.extensions.insert(
@@ -332,7 +334,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     ctx.extensions.insert(
@@ -351,7 +353,7 @@ connectors:
 #[test]
 fn config_validates_forward_headers() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+    assert!(McpConnectorFilter::from_config(&yaml).is_ok());
 
     for yaml in [
         "forward_headers: [host]",
@@ -359,7 +361,7 @@ fn config_validates_forward_headers() {
         "forward_headers: [x-user-id, X-User-ID]",
     ] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+        assert!(McpConnectorFilter::from_config(&yaml).is_err());
     }
 }
 
@@ -367,14 +369,14 @@ fn config_validates_forward_headers() {
 fn config_rejects_unknown_fields() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("unknown_field: true").unwrap();
     assert!(
-        McpToolResolveFilter::from_config(&yaml).is_err(),
+        McpConnectorFilter::from_config(&yaml).is_err(),
         "unknown fields should be rejected"
     );
 }
 
 #[test]
 fn body_mode_is_stream_buffer() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     match filter.request_body_mode() {
         BodyMode::StreamBuffer { max_bytes } => {
             assert_eq!(
@@ -389,10 +391,10 @@ fn body_mode_is_stream_buffer() {
 
 #[test]
 fn config_rejects_zero_timeout() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 0").unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str("discovery_timeout_ms: 0").unwrap();
     assert!(
-        McpToolResolveFilter::from_config(&yaml).is_err(),
-        "timeout_ms: 0 should be rejected"
+        McpConnectorFilter::from_config(&yaml).is_err(),
+        "discovery_timeout_ms: 0 should be rejected"
     );
 }
 
@@ -400,7 +402,7 @@ fn config_rejects_zero_timeout() {
 fn config_rejects_zero_max_servers() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 0").unwrap();
     assert!(
-        McpToolResolveFilter::from_config(&yaml).is_err(),
+        McpConnectorFilter::from_config(&yaml).is_err(),
         "max_servers: 0 should be rejected"
     );
 }
@@ -408,15 +410,15 @@ fn config_rejects_zero_max_servers() {
 #[test]
 fn config_with_custom_max_servers() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 5").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector", "filter name");
 }
 
 #[test]
 fn config_rejects_zero_max_tools() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tools: 0").unwrap();
     assert!(
-        McpToolResolveFilter::from_config(&yaml).is_err(),
+        McpConnectorFilter::from_config(&yaml).is_err(),
         "max_tools: 0 should be rejected"
     );
 }
@@ -424,8 +426,8 @@ fn config_rejects_zero_max_tools() {
 #[test]
 fn config_with_custom_max_tools() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tools: 50").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector", "filter name");
 }
 
 // =========================================================================
@@ -859,7 +861,7 @@ fn mcp_body(server_url: &str) -> serde_json::Value {
 /// without corrupting `request_body`.
 #[tokio::test]
 async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -895,7 +897,7 @@ async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
 #[tokio::test]
 async fn rewritten_body_over_limit_rejected_with_413() {
     let filter =
-        McpToolResolveFilter::from_config(&serde_yaml::from_str("max_rewritten_body_bytes: 10").unwrap()).unwrap();
+        McpConnectorFilter::from_config(&serde_yaml::from_str("max_rewritten_body_bytes: 10").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -922,7 +924,7 @@ async fn rewritten_body_over_limit_rejected_with_413() {
 /// rewriting the `mcp` entry into a `function` tool.
 #[tokio::test]
 async fn rewritten_body_under_limit_committed() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -958,7 +960,7 @@ async fn rewritten_body_under_limit_committed() {
 /// continuation cannot smuggle an SSRF URL through cached tools.
 #[tokio::test]
 async fn cache_hit_with_blocked_url_still_rejected() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -984,7 +986,7 @@ async fn cache_hit_with_blocked_url_still_rejected() {
 /// insert a default one (whose `request_body` is `Null`).
 #[tokio::test]
 async fn no_spurious_state_creation_without_existing_state() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1005,7 +1007,7 @@ async fn no_spurious_state_creation_without_existing_state() {
 
 #[tokio::test]
 async fn connector_id_entry_without_configured_connectors_rejected() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1026,7 +1028,7 @@ async fn connector_id_entry_without_configured_connectors_rejected() {
 
 #[tokio::test]
 async fn missing_server_label_skips_resolution() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1046,7 +1048,7 @@ async fn missing_server_label_skips_resolution() {
 
 #[tokio::test]
 async fn defer_loading_true_skips_eager_resolution() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1575,7 +1577,7 @@ fn insert_tools_preserves_authorization_and_require_approval() {
 
 #[tokio::test]
 async fn connector_id_entry_without_configured_connectors_rejects_with_400() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1598,7 +1600,7 @@ async fn connector_id_entry_without_configured_connectors_rejects_with_400() {
 
 #[tokio::test]
 async fn require_connector_rejects_direct_server_url_before_identity_or_callout() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("require_connector: true").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("require_connector: true").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1827,7 +1829,7 @@ fn merge_allowed_names_existing_unrestricted() {
 /// retrieves the full listing for all entries in the group.
 #[tokio::test]
 async fn dedup_cache_miss_when_partial_cache_covers_only_representative() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1940,7 +1942,7 @@ fn same_server_different_allowed_tools_both_inserted() {
 #[tokio::test]
 async fn max_servers_exceeded_returns_rejection() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 1").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1974,7 +1976,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -1998,7 +2000,7 @@ connectors:
 #[tokio::test]
 async fn deferred_entries_not_counted_against_max_servers() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 1").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -3395,7 +3397,7 @@ fn duplicate_label_reports_offending_label() {
 
 #[tokio::test]
 async fn duplicate_label_entries_rejected_at_filter_level() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -3432,7 +3434,7 @@ async fn duplicate_label_entries_rejected_at_filter_level() {
 /// Build a filter with a specific `max_rewritten_body_bytes` limit.
 fn filter_with_max_rewritten_body_bytes(limit: usize) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {limit}")).unwrap();
-    McpToolResolveFilter::from_config(&yaml).unwrap()
+    McpConnectorFilter::from_config(&yaml).unwrap()
 }
 
 /// Build a cached tool listing with a schema large enough to
@@ -3894,15 +3896,15 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_tool_resolve");
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector");
 }
 
 #[test]
 fn config_with_empty_connectors_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("connectors: []").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_tool_resolve");
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector");
 }
 
 #[test]
@@ -3917,7 +3919,7 @@ connectors:
 ",
     )
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3930,7 +3932,7 @@ connectors:
 "#,
     )
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3943,7 +3945,7 @@ connectors:
 "#,
     )
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3953,7 +3955,7 @@ fn config_rejects_connector_id_too_long() {
         "connectors:\n  - id: {long_id}\n    server_url: https://a.example.com/mcp"
     ))
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3961,7 +3963,7 @@ fn config_rejects_connector_url_too_long() {
     let long_url = format!("https://a.example.com/{}", "x".repeat(2049));
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(&format!("connectors:\n  - id: valid\n    server_url: {long_url}")).unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3971,7 +3973,7 @@ fn config_rejects_too_many_connectors() {
         .collect::<Vec<_>>()
         .join("\n");
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("connectors:\n{entries}")).unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3984,7 +3986,7 @@ connectors:
 ",
     )
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -3997,7 +3999,7 @@ connectors:
 ",
     )
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -4010,7 +4012,7 @@ connectors:
 ",
     )
     .unwrap();
-    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    assert!(McpConnectorFilter::from_config(&yaml).is_err());
 }
 
 #[test]
@@ -4025,7 +4027,7 @@ connectors:
     )
     .unwrap();
     assert!(
-        McpToolResolveFilter::from_config(&yaml).is_err(),
+        McpConnectorFilter::from_config(&yaml).is_err(),
         "unknown fields in connector entries should be rejected"
     );
 }
@@ -4036,7 +4038,7 @@ connectors:
 
 #[tokio::test]
 async fn connector_entry_rejected_when_no_connectors_configured() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -4067,7 +4069,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -4102,7 +4104,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -4137,7 +4139,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -4360,7 +4362,7 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
         state
             .mcp_tool_map
             .contains_key(&("weather".to_owned(), "get_weather".to_owned())),
-        "listed tools should feed mcp_dispatch"
+        "listed tools should feed mcp_connector"
     );
     assert!(
         state
@@ -4700,7 +4702,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -4732,7 +4734,7 @@ connectors:
 ",
     )
     .unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -4995,7 +4997,7 @@ async fn zero_permitted_tools_does_not_leak_credentials_to_backend() {
     let (server_url, ct) = start_single_tool_mcp_server().await;
 
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    let filter = McpToolResolveFilter::from_config_allow_private(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config_allow_private(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -5044,8 +5046,8 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     drop(listener);
 
-    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 1000").unwrap();
-    let filter = McpToolResolveFilter::from_config_allow_private(&yaml).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str("discovery_timeout_ms: 1000").unwrap();
+    let filter = McpConnectorFilter::from_config_allow_private(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     // Per-filter state (the deferred-failure stash) is keyed by the filter's
@@ -6085,7 +6087,7 @@ fn cached_weather_listing(server_url: &str) -> serde_json::Value {
 /// executed so `openai_stream_events` synthesizes its lifecycle.
 #[tokio::test]
 async fn cache_hit_seeds_mcp_list_tools_output_item() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -6335,7 +6337,7 @@ fn parse_named_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
     reason = "filter-level regression requires setup, action, and multi-assert verification"
 )]
 async fn malformed_allowed_tools_string_rejects_before_rewrite() {
-    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let filter = McpConnectorFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
@@ -6388,7 +6390,7 @@ mod admission {
     use serde_json::json;
 
     use super::super::{
-        ConnectorToolPolicy, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpToolResolveFilter,
+        ConnectorToolPolicy, EntryResolution, McpAdmissionDecisions, McpAdmissionPolicy, McpConnectorFilter,
         McpToolVerdict, admit_tools, build_entry_resolution, collect_deferred_connectors, protected_exclusion,
         tool_policy_for_entry,
     };
@@ -6450,7 +6452,7 @@ mod admission {
     #[test]
     fn config_accepts_protected_mode() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("tool_admission:\n  mode: protected\n").unwrap();
-        assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+        assert!(McpConnectorFilter::from_config(&yaml).is_ok());
     }
 
     #[test]
@@ -6462,7 +6464,7 @@ mod admission {
             ))
             .unwrap();
             assert!(
-                McpToolResolveFilter::from_config(&yaml).is_ok(),
+                McpConnectorFilter::from_config(&yaml).is_ok(),
                 "tool policy {level} must be valid"
             );
         }
@@ -6486,7 +6488,7 @@ mod admission {
             "connectors:\n  - id: gw\n    server_url: https://gw.internal/mcp\n    tool_policy: bogus\n",
         )
         .unwrap();
-        assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+        assert!(McpConnectorFilter::from_config(&yaml).is_err());
     }
 
     // --- Connector policy resolution ---
@@ -6641,7 +6643,7 @@ mod admission {
     #[test]
     fn deferred_connector_queue_follows_tool_policy() {
         // `collect_deferred_connectors` is the gate that keeps an excluded
-        // connector out of `openai_mcp_dispatch`'s deferred discovery, so dispatch
+        // connector out of `openai_mcp_connector`'s deferred discovery, so dispatch
         // never dials it. `deny` is excluded; the other policies need discovery.
         let entry = json!({
             "type": "mcp",

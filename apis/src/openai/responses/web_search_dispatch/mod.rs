@@ -966,7 +966,7 @@ fn tool_type_drives_web_search_continuation(tool_type: &str) -> bool {
 /// [`tool_type_drives_web_search_continuation`]); a `tool_search` only when the
 /// request declares a server-executed one (`server_tool_search`, resolved from
 /// `state.tools` because the selector carries no `execution`); and, additionally, a
-/// `function` entry that is actually a resolved MCP tool. `openai_mcp_tool_resolve`
+/// `function` entry that is actually a resolved MCP tool. `openai_mcp_connector`
 /// rewrites every MCP selector to a plain `{"type":"function","name":"<label>__<tool>"}`
 /// and overwrites `ResponsesState.tools`/`tool_choice`, erasing the `"mcp"` type;
 /// `mcp_tool_map` is the only surviving provenance. Such a function still drives an

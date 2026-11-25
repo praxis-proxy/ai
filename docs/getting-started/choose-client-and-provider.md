@@ -89,7 +89,7 @@ quickstart's caller-key forwarding does not implement that flow.
 | Manage Responses at the gateway instead of forwarding natively | [Responses proxy](../filters/agents/openai_responses_proxy.md) | Experimental `openai-responses` and an inference backend; storage-related groups also need a store backend and its database |
 | Run an ephemeral server-side agent loop | [Agentic protocols](../architecture/agentic-protocols.md) | Experimental `openai-agentic-loop`, an inference backend, and credentials or services for the selected tools |
 | Classify or broker MCP traffic | [MCP](../filters/agents/mcp.md) | Reachable MCP servers and their authentication; separate from managed Responses tool execution |
-| Execute MCP tools within managed Responses | [MCP tool resolution](../filters/agents/openai_mcp_tool_resolve.md), [MCP dispatch](../filters/agents/openai_mcp_dispatch.md) | Experimental `openai-mcp-tools`, a store backend, and configured MCP servers; select the agent loop separately if needed |
+| Execute MCP tools within managed Responses | [MCP connector](../filters/agents/openai_mcp_connector.md) | Experimental `openai-mcp-tools`, a store backend, and configured MCP servers; select the agent loop separately if needed |
 
 [Cargo features](../features.md#cargo-features) lists exact build combinations
 and the [example configurations](../../examples/README.md) have complete filter
