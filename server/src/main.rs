@@ -19,6 +19,7 @@ mod commands;
 mod dump;
 
 use clap::Parser;
+use praxis_core::config::{Config, ConfigFile};
 use tracing::info;
 
 // -----------------------------------------------------------------------------
@@ -75,8 +76,21 @@ fn main() {
     }
 
     let config_path = praxis_ai::resolve_config_path(explicit.as_deref());
-    let config = praxis_ai::load_config(explicit.as_deref()).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    let file = config_path
+        .as_deref()
+        .map(ConfigFile::read)
+        .transpose()
+        .unwrap_or_else(|e| praxis_ai::fatal(&e));
+    let (config, warnings) = praxis_core::logging::with_bootstrap_logging(|| {
+        let yaml = file
+            .as_ref()
+            .map_or(include_str!("default.yaml"), |file| file.content.as_str());
+        Config::from_yaml_with_deprecations(yaml)
+    })
+    .unwrap_or_else(|e| praxis_ai::fatal(&e));
+    drop(file);
     let _tracing_guard = praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    warnings.emit();
     info!("starting server");
     praxis_ai::run_server(config, config_path)
 }

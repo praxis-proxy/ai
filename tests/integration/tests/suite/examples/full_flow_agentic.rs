@@ -2281,12 +2281,8 @@ fn full_flow_agentic_non_responses_path_bypasses_irr() {
 }
 
 /// Flatten every filter the gateway listener composes, in the listener's
-/// declared chain order, into one owned sequence. The full-flow config expresses
-/// its pipeline as three named chains (`ingress-and-binding`, `managed-responses`,
-/// `managed-execution`) so the shared managed-provider gate is inherited once at
-/// the chain level (praxis #1280). Tests that reason about the whole pipeline —
-/// filter presence, relative order across the binding boundary — must see that
-/// composed view rather than a single chain.
+/// declared chain order, into one owned sequence. Tests that check filter order across
+/// the binding boundary need the composed sequence.
 fn flatten_listener_pipeline(config: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
     let chains = config["filter_chains"]
         .as_sequence()
