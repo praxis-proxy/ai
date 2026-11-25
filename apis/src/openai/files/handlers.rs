@@ -80,9 +80,6 @@ pub(super) fn invalid_query_response(invalid: &InvalidQuery) -> Result<TerminalR
 }
 
 /// Render a service failure. `file_id` names the requested file for retrieve.
-///
-/// Catalog and store details never reach the client: they can carry
-/// connection strings or SQL text.
 pub(super) fn error_response(error: &FileServiceError, file_id: Option<&str>) -> Result<TerminalResponse, FilterError> {
     match error {
         FileServiceError::NotFound => {
@@ -111,8 +108,16 @@ pub(super) fn error_response(error: &FileServiceError, file_id: Option<&str>) ->
     }
 }
 
+/// Render a missing or unprovisioned catalog as a 503.
+pub(super) fn unavailable_response() -> Result<TerminalResponse, FilterError> {
+    json_response(
+        503,
+        &ErrorResponse::new("Files service unavailable.", "server_error", None, None),
+    )
+}
+
 /// Serialize `body` as a buffered JSON response.
-fn json_response<T: Serialize>(status: u16, body: &T) -> Result<TerminalResponse, FilterError> {
+pub(super) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<TerminalResponse, FilterError> {
     let bytes = serde_json::to_vec(body)
         .map_err(|error| FilterError::from(format!("openai_files: serialize failed: {error}")))?;
     let mut headers = HeaderMap::new();

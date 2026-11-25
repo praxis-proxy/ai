@@ -12,9 +12,9 @@
 //! Each operation declares its owned contract (parameters, request body,
 //! success response, and pinned error responses) once, and the runtime
 //! request-body shape is derived from that same declaration so the two cannot
-//! diverge. Entries stay `Passthrough` until local handlers land, so the
-//! success and error responses are contract groundwork; generation and
-//! conformance comparison follow the declared contract, not the handling mode.
+//! diverge. Operations stay `Passthrough` until their local handlers land;
+//! `listFiles` and `retrieveFile` are `Local`. Generation and conformance
+//! comparison follow the declared contract, not the handling mode.
 //! Operation IDs are the official ones from the pinned OpenAI specification,
 //! reproduced verbatim including
 //! upstream's casing.
@@ -236,7 +236,7 @@ files_operations! {
         method: Get,
         transport: Http,
         path: "/files",
-        mode: Passthrough,
+        mode: Local,
         contract: {
             parameters: [
                 query_parameter!("purpose", String, "Only return files with the given purpose."),
@@ -279,7 +279,7 @@ files_operations! {
         method: Get,
         transport: Http,
         path: "/files/{file_id}",
-        mode: Passthrough,
+        mode: Local,
         contract: {
             parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
             request: [none],
@@ -412,17 +412,19 @@ mod tests {
         use super::*;
 
         #[test]
-        fn every_spec_declares_a_contract_but_passthrough_does_not_own_it() {
+        fn every_spec_declares_a_contract_and_only_local_operations_own_it() {
             for spec in OPERATION_SPECS {
                 assert!(
                     spec.owned_contract().is_some(),
                     "{} lacks a contract",
                     spec.operation_id()
                 );
-                assert!(
-                    !spec.owns_contract(),
-                    "{} is passthrough; switching to local requires handler-produced rejection \
-                     tests for every declared error status",
+                let local = matches!(spec.operation, FilesOperation::ListFiles | FilesOperation::RetrieveFile);
+                assert_eq!(
+                    spec.owns_contract(),
+                    local,
+                    "{} ownership must follow its handler: only list and retrieve are local; a newly \
+                     local operation needs handler-produced tests for every declared error status",
                     spec.operation_id()
                 );
             }

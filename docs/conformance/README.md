@@ -86,16 +86,23 @@ Every operation has one proxy-boundary mode:
 - `transform`: map between input and output contracts owned by Praxis.
 - `local`: terminate the request and produce the response in Praxis.
 
-Operations with an owned mode (`transform` or `local`) or a declared contract
-enter owned-contract OpenAPI comparison. The generator emits every operation
-that declares a contract, so the comparison covers exactly what is generated.
-All eight current Conversations operations are `local`.
+Operations with an owned mode (`transform` or `local`) or a declared
+contract enter owned-contract OpenAPI comparison. The generator emits every
+operation that declares a contract, so the comparison covers exactly what is
+generated. All eight current Conversations operations are `local`.
+
+`listFiles` and `retrieveFile` are `local`; the other three Files operations are
+`passthrough`. All five declare their contracts, so oasdiff compares them
+against the pinned Files projection. See
+[Files contract](#files-contract) for the recorded deviations.
+`cargo xtask check-files-registry` additionally compares pinned, runtime, and
+generated operation identity three ways and runs in `make lint`.
 
 ### Files contract
 
-- **Handling mode versus contract.** All five Files operations are
-  `passthrough`: Praxis forwards them without mutation. Each still declares a
-  contract, and generation and oasdiff comparison follow that contract, not the
+- **Handling mode versus contract.** `listFiles` and `retrieveFile` are
+  `local`; upload, content and delete stay `passthrough` and are forwarded
+  without mutation. Each still declares a contract, and generation and oasdiff comparison follow that contract, not the
   handling mode.
 - **Schema deviations from the pin**, recorded as `FILES_CONTRACT_EXCEPTIONS`
   in `xtask/src/openai_conformance/area.rs`: `evals` is added to

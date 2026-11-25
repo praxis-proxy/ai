@@ -16,7 +16,7 @@ pub(crate) mod decisions;
 pub(crate) mod error;
 pub(crate) mod error_response_formatter;
 pub mod files;
-#[cfg(feature = "store")]
+#[cfg(any(feature = "store", feature = "openai-files"))]
 pub(crate) mod include;
 mod operation;
 pub(crate) mod responses;

@@ -77,7 +77,7 @@
     "by_mode": [
       {
         "mode": "passthrough",
-        "operations": 11
+        "operations": 9
       },
       {
         "mode": "inspect",
@@ -89,7 +89,7 @@
       },
       {
         "mode": "local",
-        "operations": 8
+        "operations": 10
       }
     ],
     "covered_operations": [
@@ -429,7 +429,7 @@
           "path": "/files",
           "operation": "GET /files",
           "area": "Files",
-          "mode": "passthrough",
+          "mode": "local",
           "evidence": "praxis_ai_apis::openai::files_operation_specs::ListFiles"
         }
       },
@@ -449,7 +449,7 @@
           "path": "/files/{file_id}",
           "operation": "GET /files/{file_id}",
           "area": "Files",
-          "mode": "passthrough",
+          "mode": "local",
           "evidence": "praxis_ai_apis::openai::files_operation_specs::RetrieveFile"
         }
       },
@@ -1130,7 +1130,8 @@
       {
         "area": "Files",
         "modes": [
-          "passthrough"
+          "passthrough",
+          "local"
         ],
         "status": "passed",
         "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-files --lib conformance_files_ -- --show-output",
