@@ -57,12 +57,20 @@ def timeout_anthropic_client(error_proxy_ports):
 
 
 class TestAnthropicErrorFormatter:
-    def test_messages_connection_refused(self, anthropic_client):
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "hello",
+            [{"type": "image", "source": {"type": "url", "url": "https://example.test/image.png"}}],
+        ],
+        ids=["text", "image"],
+    )
+    def test_messages_connection_refused(self, anthropic_client, content):
         with pytest.raises(APIStatusError) as exc_info:
             anthropic_client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=100,
-                messages=[{"role": "user", "content": "hello"}],
+                messages=[{"role": "user", "content": content}],
             )
         err = exc_info.value
         assert err.status_code == 502, "upstream connection refusal must surface as 502"

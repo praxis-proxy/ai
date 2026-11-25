@@ -84,6 +84,23 @@ fn text_only_request_stays_on_text_cluster() {
     assert_eq!(response, "text", "text-only content should use the default cluster");
 }
 
+/// An unrelated media field on a text part must leave routing unchanged.
+#[test]
+fn image_field_on_text_part_stays_on_text_cluster() {
+    let _lock = routing_test_lock();
+    let (proxy, backends) = start_gateway();
+    let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hello","image_url":{"url":"https://example.test/image.png"}}]}]}"#;
+
+    let (status, response) = http_post_retry(proxy.addr(), "/v1/chat/completions", body);
+
+    assert_eq!(status, 200, "text request should be proxied: {response}");
+    assert_eq!(
+        response, "text",
+        "an unrelated media field must not select the image cluster"
+    );
+    assert_routed_unchanged(&backends, 3, body);
+}
+
 /// Ignore an arbitrary client-supplied modality header.
 #[test]
 fn client_supplied_modality_header_cannot_influence_routing() {

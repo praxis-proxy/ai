@@ -628,9 +628,7 @@ fn handle_unclassifiable(
 /// still read from the body, since routing and state depend on them; only the
 /// protocol identity is fixed by the matched operation.
 fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
-    let mut classified = classify_object(obj);
-    classified.format = AiRequestFormat::Responses;
-    classified
+    classify_object(obj, AiRequestFormat::Responses)
 }
 
 /// The Responses operation the request head resolves to, with its declared

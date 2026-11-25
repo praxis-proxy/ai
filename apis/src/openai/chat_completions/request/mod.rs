@@ -131,7 +131,7 @@ impl HttpFilter for OpenaiChatCompletionsRequestFilter {
             None => &[],
         };
 
-        let classified = classify_request_body(bytes);
+        let classified = classify_request_body(bytes, Some(AiRequestFormat::ChatCompletions));
 
         debug!(
             model = ?classified.model,
@@ -186,7 +186,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
         );
     }
     if let Some(modality) = classified.modality {
-        ctx.set_metadata("openai_chat_completions_request.modality", modality.as_str());
+        ctx.set_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
     }
 }
 

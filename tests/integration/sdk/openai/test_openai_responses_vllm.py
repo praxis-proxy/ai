@@ -2670,6 +2670,27 @@ def test_openai_bound_code_interpreter_is_forwarded_unchanged(witness_backend_cl
     )
 
 
+def test_openai_bound_image_input_is_forwarded_unchanged(witness_backend_client):
+    client, forwarded = witness_backend_client
+    request_body = {
+        "model": "gpt-5",
+        "store": False,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"}
+                ],
+            }
+        ],
+    }
+
+    response = client.responses.create(**request_body)
+
+    assert response.status == "completed", "image classification must preserve direct OpenAI forwarding"
+    assert forwarded == [request_body], "the complete image request must reach the backend unchanged"
+
+
 class TestOpenAIResponsesStoreCompression:
     """Integration tests for response store with zstd payload compression enabled."""
 

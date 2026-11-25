@@ -590,7 +590,7 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
         );
     }
     if let Some(modality) = classified.modality {
-        ctx.set_metadata("openai_responses_request.modality", modality.as_str());
+        ctx.set_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
     }
 }
 

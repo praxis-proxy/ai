@@ -31,7 +31,7 @@ header is never a fact.
 | Fact | Producer | Carrier | Remove-then-set | Read by routing |
 |---|---|---|---|---|
 | Model name | `model_to_header` | header `X-Model` (configurable) | yes (#1039) | `intelligent_route`, `provider_route`, `token_rate_limit` |
-| Content modality | `openai_responses_request`, `anthropic_messages_request`, `openai_chat_completions_request` | metadata `<filter>.modality`; matching `filter_results` value | not applicable (proxy-owned, no request-header carrier) | branch conditions |
+| Content modality | `openai_responses_request`, `anthropic_messages_request`, `openai_chat_completions_request` | metadata `ai.modality`; matching `filter_results` value | not applicable (proxy-owned, no request-header carrier) | branch conditions |
 | MCP method and tool name | `mcp` | metadata `mcp.method`, `mcp.name`; headers `x-praxis-mcp-*` | reserved prefix stripped at ingress | `intelligent_route` (tool routing takes precedence over the model header) |
 | A2A context/task owner | `a2a` | header `x-praxis-a2a-route-cluster` | reserved prefix stripped at ingress | core `router` |
 | Operation and protocol | `ai_operation` | headers `x-praxis-ai-operation`, `x-praxis-ai-application-protocol`; metadata `ai_operation.*` | yes (removed on no match) | branch conditions only |
@@ -45,6 +45,12 @@ Facts that do not exist yet, and would be produced in the same
 pre-read pass that `model_to_header` already performs: prompt
 size and a tools-present flag for routing (tracked in
 praxis-proxy/ai#106 and #107).
+
+The protocol request filters publish input modality under the
+same `ai.modality` metadata key. This describes the media in
+the request. The core router does not currently match request
+metadata, so the multimodal routing example uses filter
+results to select a route.
 
 ## Rules
 

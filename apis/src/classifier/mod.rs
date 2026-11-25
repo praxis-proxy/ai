@@ -41,6 +41,9 @@ impl AiRequestFormat {
     }
 }
 
+/// Common request metadata key for the detected input modality.
+pub(crate) const MODALITY_METADATA_KEY: &str = "ai.modality";
+
 // -----------------------------------------------------------------------------
 // ContentModality
 // -----------------------------------------------------------------------------
@@ -163,7 +166,7 @@ pub(crate) fn is_chat_completions_create(method: &http::Method, path: &str) -> b
 ///
 /// This function is pure: no I/O, no side effects, no mutation of
 /// the input bytes.
-pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
+pub(crate) fn classify_request_body(body: &[u8], format: Option<AiRequestFormat>) -> ClassifiedRequest {
     if body.is_empty() {
         return empty_result(AiRequestFormat::NonJson);
     }
@@ -179,7 +182,7 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
     // This parse is a throwaway owned by this function, so the model string is
     // moved out rather than copied.
     let model = take_string(obj, "model");
-    classify_fields(obj, model)
+    classify_fields(obj, model, format)
 }
 
 /// Extract routing facts from an already-parsed request object.
@@ -192,17 +195,24 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
 /// caller that reuses the same parsed value afterwards — to build request
 /// state, say — must still see the body the client actually sent. That costs
 /// one copy of the model string, which the owned path above avoids.
-pub(crate) fn classify_object(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
+pub(crate) fn classify_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    format: AiRequestFormat,
+) -> ClassifiedRequest {
     let model = copy_string(obj, "model");
-    classify_fields(obj, model)
+    classify_fields(obj, model, Some(format))
 }
 
 /// Extract the remaining facts once the model has been obtained.
 ///
 /// Split out so the owned and borrowed entry points differ only in how they
 /// get the model string, and cannot otherwise drift.
-fn classify_fields(obj: &serde_json::Map<String, serde_json::Value>, model: Option<String>) -> ClassifiedRequest {
-    let format = classify_format(obj);
+fn classify_fields(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    model: Option<String>,
+    format: Option<AiRequestFormat>,
+) -> ClassifiedRequest {
+    let format = format.unwrap_or_else(|| classify_format(obj));
 
     ClassifiedRequest {
         background: obj.get("background").and_then(serde_json::Value::as_bool),
@@ -239,7 +249,7 @@ fn detect_content_modality(
     match format {
         AiRequestFormat::Responses => detect_responses_input(obj.get("input"), &mut detected),
         AiRequestFormat::AnthropicMessages | AiRequestFormat::ChatCompletions => {
-            detect_messages(obj.get("messages"), &mut detected);
+            detect_messages(obj.get("messages"), format, &mut detected);
         },
         AiRequestFormat::UnknownJson | AiRequestFormat::InvalidJson | AiRequestFormat::NonJson => {},
     }
@@ -271,33 +281,15 @@ impl DetectedModalities {
             (true, true) => Some(ContentModality::ImageAudio),
         }
     }
-
-    /// Record an image/audio MIME type.
-    fn observe_media_type(&mut self, media_type: &str) {
-        if starts_with_ascii_case_insensitive(media_type, "image/") {
-            self.image = true;
-        } else if starts_with_ascii_case_insensitive(media_type, "audio/") {
-            self.audio = true;
-        }
-    }
-
-    /// Record a media data URL while ignoring ordinary text and URLs.
-    fn observe_data_url(&mut self, value: &str) {
-        if starts_with_ascii_case_insensitive(value, "data:image/") {
-            self.image = true;
-        } else if starts_with_ascii_case_insensitive(value, "data:audio/") {
-            self.audio = true;
-        }
-    }
 }
 
 /// Inspect Chat Completions or Anthropic message content.
-fn detect_messages(value: Option<&serde_json::Value>, detected: &mut DetectedModalities) {
+fn detect_messages(value: Option<&serde_json::Value>, format: AiRequestFormat, detected: &mut DetectedModalities) {
     let Some(messages) = value.and_then(serde_json::Value::as_array) else {
         return;
     };
     for message in messages {
-        detect_content(message.get("content"), detected);
+        detect_content(message.get("content"), format, detected);
         if detected.is_complete() {
             break;
         }
@@ -309,13 +301,20 @@ fn detect_responses_input(value: Option<&serde_json::Value>, detected: &mut Dete
     let Some(items) = value.and_then(serde_json::Value::as_array) else {
         return;
     };
+    let format = AiRequestFormat::Responses;
     for item in items {
         match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("computer_call_output" | "function_call_output") => {
-                detect_content(item.get("output"), detected);
+            Some("computer_call_output") => {
+                if item.get("output").is_some_and(|output| {
+                    output.get("type").and_then(serde_json::Value::as_str) == Some("computer_screenshot")
+                        && has_string(output.get("image_url"))
+                }) {
+                    detected.image = true;
+                }
             },
-            _ if item.get("content").is_some() => detect_content(item.get("content"), detected),
-            _ => detect_content_part(item, detected),
+            Some("function_call_output") => detect_content(item.get("output"), format, detected),
+            Some("message") | None => detect_content(item.get("content"), format, detected),
+            _ => {},
         }
         if detected.is_complete() {
             break;
@@ -324,102 +323,65 @@ fn detect_responses_input(value: Option<&serde_json::Value>, detected: &mut Dete
 }
 
 /// Inspect a structured content object or array.
-fn detect_content(value: Option<&serde_json::Value>, detected: &mut DetectedModalities) {
+fn detect_content(value: Option<&serde_json::Value>, format: AiRequestFormat, detected: &mut DetectedModalities) {
     match value {
         Some(serde_json::Value::Array(parts)) => {
             for part in parts {
-                detect_content_part(part, detected);
+                detect_content_part(part, format, detected);
                 if detected.is_complete() {
                     break;
                 }
             }
         },
-        Some(value @ serde_json::Value::Object(_)) => detect_content_part(value, detected),
+        Some(value @ serde_json::Value::Object(_)) => detect_content_part(value, format, detected),
         _ => {},
     }
 }
 
-/// Inspect one typed content part and its known media source fields.
-fn detect_content_part(part: &serde_json::Value, detected: &mut DetectedModalities) {
-    let Some(part) = part.as_object() else {
-        return;
-    };
+/// Match media only in content parts recognized by the selected protocol.
+fn detect_content_part(part: &serde_json::Value, format: AiRequestFormat, detected: &mut DetectedModalities) {
     let part_type = part.get("type").and_then(serde_json::Value::as_str);
-    let image_url = present(part.get("image_url"));
-    let audio_url = present(part.get("audio_url"));
-    let input_audio = present(part.get("input_audio"));
-    let source = present(part.get("source"));
-    let file_id = present(part.get("file_id"));
-
-    if image_url || matches!(part_type, Some("input_image")) && file_id || matches!(part_type, Some("image")) && source
-    {
-        detected.image = true;
-    }
-    if audio_url || input_audio || matches!(part_type, Some("audio")) && source {
-        detected.audio = true;
-    }
-
-    for source in [
-        part.get("image_url"),
-        part.get("audio_url"),
-        part.get("input_audio"),
-        part.get("source"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        detect_media_source(source, detected);
-    }
-    detect_embedded_media(part, part_type, detected);
-}
-
-/// Inspect media metadata and schema-defined nested content containers.
-fn detect_embedded_media(
-    part: &serde_json::Map<String, serde_json::Value>,
-    part_type: Option<&str>,
-    detected: &mut DetectedModalities,
-) {
-    if let Some(media_type) = part.get("media_type").and_then(serde_json::Value::as_str) {
-        detected.observe_media_type(media_type);
-    }
-
-    // Anthropic tool results may return typed content blocks. Arbitrary tool
-    // inputs remain opaque because no other object type is traversed here.
-    if matches!(part_type, Some("tool_result")) {
-        detect_content(part.get("content"), detected);
-    }
-}
-
-/// Inspect a direct data URL or a structured media source without cloning it.
-fn detect_media_source(value: &serde_json::Value, detected: &mut DetectedModalities) {
-    match value {
-        serde_json::Value::String(value) => detected.observe_data_url(value),
-        serde_json::Value::Object(source) => {
-            if let Some(media_type) = source.get("media_type").and_then(serde_json::Value::as_str) {
-                detected.observe_media_type(media_type);
-            }
-            for value in [source.get("data"), source.get("url")]
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-            {
-                detected.observe_data_url(value);
-            }
+    match (format, part_type) {
+        (AiRequestFormat::ChatCompletions, Some("image_url")) => {
+            detected.image |= part
+                .get("image_url")
+                .is_some_and(|source| has_string(source.get("url")));
+        },
+        (AiRequestFormat::ChatCompletions, Some("audio_url")) => {
+            detected.audio |= part
+                .get("audio_url")
+                .is_some_and(|source| has_string(source.get("url")));
+        },
+        (AiRequestFormat::ChatCompletions, Some("input_audio")) => {
+            detected.audio |= part
+                .get("input_audio")
+                .is_some_and(|source| has_string(source.get("data")));
+        },
+        (AiRequestFormat::Responses, Some("input_image")) => {
+            detected.image |= has_string(part.get("image_url")) || has_string(part.get("file_id"));
+        },
+        (AiRequestFormat::AnthropicMessages, Some("image")) => {
+            detected.image |=
+                part.get("source")
+                    .is_some_and(|source| match source.get("type").and_then(serde_json::Value::as_str) {
+                        Some("base64") => has_string(source.get("data")),
+                        Some("url") => has_string(source.get("url")),
+                        Some("file") => has_string(source.get("file_id")),
+                        _ => false,
+                    });
+        },
+        (AiRequestFormat::AnthropicMessages, Some("tool_result")) => {
+            detect_content(part.get("content"), format, detected);
         },
         _ => {},
     }
 }
 
-/// Return true when a source field exists and is non-null.
-fn present(value: Option<&serde_json::Value>) -> bool {
-    value.is_some_and(|value| !value.is_null())
-}
-
-/// Compare an ASCII prefix without allocating a lowercase media payload.
-fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+/// Whether an expected source string is present without validating its payload.
+fn has_string(value: Option<&serde_json::Value>) -> bool {
     value
-        .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
 }
 
 /// Determine format from top-level keys.
@@ -570,7 +532,7 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_slice(br#"{"model":"gpt-4.1","input":"hi"}"#).unwrap();
         let obj = value.as_object_mut().unwrap();
 
-        let classified = classify_object(obj);
+        let classified = classify_object(obj, AiRequestFormat::Responses);
 
         assert_eq!(classified.model.as_deref(), Some("gpt-4.1"));
         assert_eq!(
@@ -580,6 +542,10 @@ mod tests {
         );
     }
     use super::*;
+
+    fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
+        super::classify_request_body(body, None)
+    }
 
     #[test]
     fn responses_string_input() {
@@ -1286,10 +1252,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_base64_source_sets_audio_modality() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"UklGRg=="}}]}]}"#;
+    fn anthropic_base64_image_sets_image_modality() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}"#;
 
-        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Audio));
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
     }
 
     #[test]
@@ -1332,6 +1298,17 @@ mod tests {
         let body = br#"{"messages":[{"content":[{"type":"image_url"},{"type":"input_image","file_id":null},{"type":"input_audio","input_audio":null}]}]}"#;
 
         assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn unrelated_fields_and_cross_protocol_parts_do_not_set_modality() {
+        for body in [
+            r#"{"messages":[{"content":[{"type":"text","image_url":{"url":"https://example.test/image.png"}}]}]}"#,
+            r#"{"messages":[{"content":[{"type":"input_image","file_id":"file_123"}]}]}"#,
+            r#"{"input":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#,
+        ] {
+            assert_eq!(classify_request_body(body.as_bytes()).modality, None, "{body}");
+        }
     }
 
     #[test]

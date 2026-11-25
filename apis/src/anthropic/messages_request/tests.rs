@@ -116,7 +116,7 @@ async fn publishes_routing_metadata_and_filter_results() {
     assert_eq!(ctx.get_metadata("anthropic_messages_request.stream"), Some("true"));
     assert_eq!(ctx.get_metadata("anthropic_messages_request.max_tokens"), Some("64"));
     assert_eq!(ctx.get_metadata("anthropic_messages_request.has_tools"), Some("true"));
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.modality"), Some("image"));
+    assert_eq!(ctx.get_metadata("ai.modality"), Some("image"));
 
     let results = ctx
         .filter_results

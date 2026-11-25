@@ -137,8 +137,7 @@ impl AnthropicMessagesRequestFilter {
         ctx: &mut HttpFilterContext<'_>,
         object: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), FilterError> {
-        let mut classified = classify_object(object);
-        classified.format = AiRequestFormat::AnthropicMessages;
+        let classified = classify_object(object, AiRequestFormat::AnthropicMessages);
 
         debug!(model = ?classified.model, "processed anthropic create-message body");
 
@@ -343,7 +342,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
         ctx.set_metadata("anthropic_messages_request.has_tools", "true");
     }
     if let Some(modality) = classified.modality {
-        ctx.set_metadata("anthropic_messages_request.modality", modality.as_str());
+        ctx.set_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
     }
 }
 
