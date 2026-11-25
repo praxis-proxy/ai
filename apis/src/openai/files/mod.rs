@@ -11,6 +11,9 @@
 #[cfg(feature = "openai-files")]
 pub(crate) mod contracts;
 #[cfg(feature = "openai-files")]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the openai_files filter"))]
+mod handlers;
+#[cfg(feature = "openai-files")]
 mod mapping;
 #[cfg(feature = "openai-files")]
 mod model;
