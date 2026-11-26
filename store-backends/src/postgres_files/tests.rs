@@ -1230,18 +1230,30 @@ mod operations {
         c.close().await;
     }
 
-    /// The plan for the production paging statement, prepared with the bound
-    /// parameter types `list_ready` uses. `generic` forces the generic plan, which
-    /// cannot see the parameter values (the plan a long-lived prepared statement may
-    /// settle on).
+    /// The plan for the production paging statement for `query`, prepared with the
+    /// parameter types `list_ready` binds. `cursor_at` is the resolved `created_at`
+    /// of `query.after`. `generic` forces the generic plan, which cannot see the
+    /// parameter values (the plan a long-lived prepared statement may settle on).
     async fn explain_page(
         c: &PostgresFileCatalog,
-        order: SortDirection,
-        purpose: Option<&str>,
-        cursor: Option<(i64, &str)>,
+        query: &FileListQuery,
+        cursor_at: Option<i64>,
         generic: bool,
     ) -> String {
-        let sql = page_sql(&c.files, order);
+        let sql = page_sql(&c.files, query);
+        let mut types = vec!["text"];
+        let mut args = vec!["'tenant7'".to_owned()];
+        if let Some(purpose) = &query.purpose {
+            types.push("text");
+            args.push(format!("'{purpose}'"));
+        }
+        if let (Some(after), Some(at)) = (&query.after, cursor_at) {
+            types.extend(["bigint", "text"]);
+            args.extend([at.to_string(), format!("'{after}'")]);
+        }
+        types.push("bigint");
+        args.push((query.limit + 1).to_string());
+
         let mut tx = c.pool.begin().await.unwrap();
         let mode = if generic {
             "force_generic_plan"
@@ -1251,27 +1263,57 @@ mod operations {
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off; \
              SET LOCAL plan_cache_mode = {mode}; \
-             PREPARE page(text, text, bigint, text, bigint) AS {sql}"
+             PREPARE page({}) AS {sql}",
+            types.join(", ")
         )))
         .execute(&mut *tx)
         .await
         .unwrap();
-        let (cursor_at, cursor_id) = cursor.unzip();
-        let lit = |v: Option<String>| v.unwrap_or_else(|| "NULL".to_owned());
-        let args = format!(
-            "'tenant7', {}, {}, {}, 11",
-            lit(purpose.map(|p| format!("'{p}'"))),
-            lit(cursor_at.map(|v| v.to_string())),
-            lit(cursor_id.map(|v| format!("'{v}'"))),
-        );
-        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN EXECUTE page({args})")))
-            .fetch_all(&mut *tx)
-            .await
-            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN EXECUTE page({})",
+            args.join(", ")
+        )))
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
         // Prepared statements outlive the transaction on the pooled connection.
         sqlx::raw_sql("DEALLOCATE page").execute(&mut *tx).await.unwrap();
         tx.rollback().await.unwrap();
         plan.join("\n")
+    }
+
+    #[test]
+    fn page_sql_numbers_parameters_for_each_filter_combination() {
+        let sql = |purpose: Option<&str>, after: Option<&str>, order| {
+            let mut q = query(order, 10);
+            q.purpose = purpose.map(str::to_owned);
+            q.after = after.map(str::to_owned);
+            page_sql("f", &q)
+        };
+        let plain = sql(None, None, SortDirection::Asc);
+        assert!(plain.ends_with("ORDER BY created_at ASC, id ASC LIMIT $2"), "{plain}");
+        assert!(
+            !plain.contains("purpose =") && !plain.contains("(created_at, id)"),
+            "{plain}"
+        );
+
+        let purpose = sql(Some("x"), None, SortDirection::Asc);
+        assert!(
+            purpose.contains("AND purpose = $2") && purpose.ends_with("LIMIT $3"),
+            "{purpose}"
+        );
+
+        let cursor = sql(None, Some("a"), SortDirection::Desc);
+        assert!(
+            cursor.contains("AND (created_at, id) < ($2, $3)") && cursor.ends_with("LIMIT $4"),
+            "{cursor}"
+        );
+
+        let both = sql(Some("x"), Some("a"), SortDirection::Asc);
+        assert!(
+            both.contains("AND purpose = $2 AND (created_at, id) > ($3, $4)") && both.ends_with("LIMIT $5"),
+            "{both}"
+        );
     }
 
     #[tokio::test]
@@ -1282,13 +1324,20 @@ mod operations {
         for order in [SortDirection::Asc, SortDirection::Desc] {
             for purpose in [None, Some("x")] {
                 // A late cursor must still seek rather than scan the tenant from the start.
-                for (cursor, generic) in [
-                    (None, false),
-                    (Some((5000, "id5007")), false),
-                    (Some((5000, "id5007")), true),
-                ] {
-                    let plan = explain_page(&c, order, purpose, cursor, generic).await;
+                for (after, generic) in [(None, false), (Some("id5007"), false), (Some("id5007"), true)] {
+                    let mut q = query(order, 10);
+                    q.purpose = purpose.map(str::to_owned);
+                    q.after = after.map(str::to_owned);
+                    let plan = explain_page(&c, &q, after.map(|_| 5000), generic).await;
                     assert_uses(&plan, &c, "_list_idx", true);
+                    if after.is_some() {
+                        let cmp = if order == SortDirection::Asc { ">" } else { "<" };
+                        let index_cond = plan.lines().find(|l| l.contains("Index Cond")).unwrap_or_default();
+                        assert!(
+                            index_cond.contains(&format!("ROW(created_at, id) {cmp} ROW(")),
+                            "the cursor must bound the index scan, not filter it:\n{plan}"
+                        );
+                    }
                 }
             }
         }

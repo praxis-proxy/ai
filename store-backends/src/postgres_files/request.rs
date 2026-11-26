@@ -327,26 +327,41 @@ pub(super) async fn list_ready_impl(
     Ok(Ok(FileRecordPage { data, has_more }))
 }
 
-/// The paging statement: `$1` tenant, `$2` purpose, `$3`/`$4` cursor
-/// `created_at`/`id`, `$5` row limit. The nullable `$2`/`$3` predicates keep one
-/// statement for every filter combination.
-pub(super) fn page_sql(files: &str, order: SortDirection) -> String {
+/// The paging statement for `query`. Parameters are numbered in order: `$1`
+/// tenant, then purpose if filtered, then cursor `created_at` and `id` if paged,
+/// then the row limit.
+///
+/// Each predicate is present only when used, so a generic plan can still turn the
+/// cursor into an index bound (a nullable `$n IS NULL OR …` cannot be one).
+pub(super) fn page_sql(files: &str, query: &FileListQuery) -> String {
     // Fixed fragments only: nothing request-controlled is interpolated.
-    let (cmp, dir) = match order {
+    let (cmp, dir) = match query.order {
         SortDirection::Asc => (">", "ASC"),
         SortDirection::Desc => ("<", "DESC"),
     };
     let visible = visible();
+    let mut n = 1;
+    let purpose = if query.purpose.is_some() {
+        n += 1;
+        format!(" AND purpose = ${n}")
+    } else {
+        String::new()
+    };
+    let after = if query.after.is_some() {
+        n += 2;
+        format!(" AND (created_at, id) {cmp} (${}, ${n})", n - 1)
+    } else {
+        String::new()
+    };
     format!(
-        "SELECT {RECORD_COLUMNS} FROM {files} \
-         WHERE tenant_id = $1 AND {visible} \
-         AND ($2::text IS NULL OR purpose = $2) \
-         AND ($3::bigint IS NULL OR (created_at, id) {cmp} ($3, $4::text)) \
-         ORDER BY created_at {dir}, id {dir} LIMIT $5"
+        "SELECT {RECORD_COLUMNS} FROM {files} WHERE tenant_id = $1 AND {visible}{purpose}{after} \
+         ORDER BY created_at {dir}, id {dir} LIMIT ${}",
+        n + 1
     )
 }
 
 /// Fetch `limit + 1` visible rows after `cursor` in the requested order.
+/// `cursor` is `Some` exactly when `query.after` is, which `page_sql` relies on.
 async fn page_rows(
     c: &PostgresFileCatalog,
     tx: &mut Tx<'_>,
@@ -354,14 +369,15 @@ async fn page_rows(
     query: &FileListQuery,
     cursor: Option<(i64, &str)>,
 ) -> Result<Vec<PgRow>, PgBackendError> {
-    let limit = i64::from(query.limit);
-    let (cursor_at, cursor_id) = cursor.unzip();
-    sqlx::query(AssertSqlSafe(page_sql(&c.files, query.order)))
-        .bind(tenant)
-        .bind(query.purpose.as_deref())
-        .bind(cursor_at)
-        .bind(cursor_id)
-        .bind(limit + 1)
+    let mut statement = sqlx::query(AssertSqlSafe(page_sql(&c.files, query))).bind(tenant);
+    if let Some(purpose) = query.purpose.as_deref() {
+        statement = statement.bind(purpose);
+    }
+    if let Some((created_at, id)) = cursor {
+        statement = statement.bind(created_at).bind(id);
+    }
+    statement
+        .bind(i64::from(query.limit) + 1)
         .fetch_all(&mut **tx)
         .await
         .map_err(|e| c.pg_err(&e))
