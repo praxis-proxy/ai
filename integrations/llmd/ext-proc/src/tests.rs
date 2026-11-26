@@ -6892,6 +6892,17 @@ processing_mode:
     assert_eq!(filter.name(), "ext_proc", "full_duplex_streamed should be accepted");
 }
 
+#[test]
+fn deferred_request_processing_requires_full_duplex() {
+    let yaml = serde_yaml::from_str("target: http://127.0.0.1:50051\ndefer_request_processing: true").unwrap();
+    let error = ExtProcFilter::from_config(&yaml).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("requires request_body_mode: full_duplex_streamed")
+    );
+}
+
 #[tokio::test]
 async fn config_rejects_streamed_buffered_partial() {
     for mode in ["streamed", "buffered", "buffered_partial"] {
@@ -7844,6 +7855,153 @@ processing_mode:
     assert!(
         matches!(action, FilterAction::Reject(Rejection { status: 503, .. })),
         "oversized coalesced body mutation should use status_on_error, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn deferred_request_preserves_early_picker_rejection() {
+    let (addr, _guard) = start_duplex_processor(DuplexBehavior::ImmediateOnHeaders {
+        status: 429,
+        body: "picker is saturated".to_owned(),
+    })
+    .await;
+    let yaml = serde_yaml::from_str(&format!(
+        r#"
+target: "http://{addr}"
+defer_request_processing: true
+status_on_error: 503
+lifecycle_timeout_ms: 2000
+processing_mode:
+  request_body_mode: full_duplex_streamed
+  response_header_mode: skip
+"#,
+    ))
+    .unwrap();
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_ctx(&req);
+    ctx.current_filter_id = Some(42);
+    ctx.buffered_request_body = Some(Bytes::from(vec![b'a'; 8 * REQUEST_BODY_CHUNK_BYTES]));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected the picker rejection, got {action:?}");
+    };
+    assert_eq!(rejection.status, 429);
+    assert_eq!(rejection.body.as_deref(), Some(b"picker is saturated".as_slice()));
+}
+
+#[tokio::test]
+async fn deferred_request_delivers_processor_body_replacement_to_selected_upstream() {
+    let (addr, _guard) = start_duplex_processor(DuplexBehavior::StreamedBodyChunks {
+        chunks: vec![b"rewritten".to_vec()],
+    })
+    .await;
+    let yaml = serde_yaml::from_str(&format!(
+        r#"
+target: "http://{addr}"
+defer_request_processing: true
+processing_mode:
+  request_body_mode: full_duplex_streamed
+  response_header_mode: skip
+"#,
+    ))
+    .unwrap();
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/body-rewrite");
+    let mut ctx = make_ctx(&req);
+    ctx.current_filter_id = Some(42);
+    ctx.buffered_request_body = Some(Bytes::from_static(b"original"));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(ctx.buffered_request_body.as_deref(), Some(b"original".as_slice()));
+    assert!(
+        ctx.request_header_mutations
+            .iter()
+            .any(|edit| { matches!(edit, TrustedHeaderMutation::Remove(name) if name == CONTENT_LENGTH) }),
+        "the deferred replacement should remove Content-Length after reply edits"
+    );
+
+    let mut body = ctx.buffered_request_body.clone();
+    assert!(matches!(
+        filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap(),
+        SelectedUpstreamBodyOutcome::Continue
+    ));
+    assert_eq!(body.as_deref(), Some(b"rewritten".as_slice()));
+}
+
+#[test]
+fn deferred_reply_header_edits_follow_request_policy() {
+    use crate::proto::envoy::service::common::v3::header_value_option::HeaderAppendAction;
+
+    let mut req = make_request(Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("tracestate", http::HeaderValue::from_static("client=state"));
+    req.headers
+        .insert("content-type", http::HeaderValue::from_static("application/json"));
+    let mut ctx = make_ctx(&req);
+    ctx.request_header_mutations.extend([
+        TrustedHeaderMutation::Set(
+            http::HeaderName::from_static("traceparent"),
+            http::HeaderValue::from_static("policy-trace"),
+        ),
+        TrustedHeaderMutation::Set(
+            http::HeaderName::from_static("x-request-id"),
+            http::HeaderValue::from_static("policy-id"),
+        ),
+        TrustedHeaderMutation::Remove(http::HeaderName::from_static("tracestate")),
+    ]);
+    let header = |key: &str, value: &str, action: HeaderAppendAction| HeaderValueOption {
+        header: Some(HeaderValue {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            ..Default::default()
+        }),
+        append_action: action.into(),
+        ..Default::default()
+    };
+    mutations::apply_deferred_request_header_mutation(
+        &HeaderMutation {
+            remove_headers: vec!["x-request-id".to_owned()],
+            set_headers: vec![
+                header("traceparent", "picker-trace", HeaderAppendAction::OverwriteIfExists),
+                header("tracestate", "picker=state", HeaderAppendAction::AddIfAbsent),
+                header(
+                    "content-type",
+                    "application/json",
+                    HeaderAppendAction::AppendIfExistsOrAdd,
+                ),
+            ],
+        },
+        &mut ctx,
+    );
+
+    let mut headers = req.headers.clone();
+    for edit in &ctx.request_header_mutations {
+        edit.apply_to(&mut headers);
+    }
+    assert!(
+        !headers.contains_key("x-request-id"),
+        "picker removal should follow the policy set"
+    );
+    assert_eq!(
+        headers["traceparent"], "picker-trace",
+        "conditional overwrite should see the policy set"
+    );
+    assert_eq!(
+        headers["tracestate"], "picker=state",
+        "conditional add should see the policy removal"
+    );
+    assert_eq!(
+        headers.get_all("content-type").iter().count(),
+        1,
+        "a stock EPP echo should preserve singleton worker headers"
     );
 }
 
