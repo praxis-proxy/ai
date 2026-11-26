@@ -1,5 +1,7 @@
 # Praxis AI Documentation
 
+For verified CLI edits, permission modes and compaction outcomes by model and API route, see [Coding harness compatibility](conformance/coding-harness-compatibility.md).
+
 These pages describe **Development (current main)**. Build features and
 compatibility can differ in a released version, so use the documentation
 snapshot that matches your binary or image.

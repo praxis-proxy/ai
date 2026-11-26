@@ -3,7 +3,7 @@
 
 //! Validate MCP tool-call arguments against the tool's advertised input schema.
 //!
-//! `openai_mcp_tool_resolve` advertises each MCP tool's `inputSchema` to the
+//! `openai_mcp_connector` advertises each MCP tool's `inputSchema` to the
 //! model as the function-tool `parameters`, but the model's emitted arguments
 //! are otherwise forwarded to the upstream MCP server unchecked. This module
 //! enforces that contract at the gateway, before any outbound `tools/call`, so a

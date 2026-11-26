@@ -1,35 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Filter 8: execute MCP tool calls against upstream MCP servers.
+//! Responses MCP discovery, approval, and execution.
 //!
-//! Executes work prepared by `openai_agentic_loop` during the request-body
-//! phase of the next `iterative_request_router` iteration. The owner performs
-//! response classification, approval partitioning, and terminal policy. This
-//! dispatcher resumes client approval responses, lists deferred connectors
-//! after a hosted `tool_search_call`, and executes prepared MCP calls via
-//! [`mcp_client::call_tool_with_forwarded_headers`]. A streaming deferred `tools/list` failure is
-//! stashed during the body pre-read and emitted from `on_request` as the
-//! canonical `response.mcp_list_tools.failed` / `response.failed` lifecycle.
-//!
-//! # Pipeline dependencies
-//!
-//! - **`mcp_tool_resolve`** must run before this filter so that [`ResponsesState::mcp_tool_map`] is populated.
-//! - **`openai_stream_events`** (or equivalent accumulator) must populate [`ResponsesState::tool_calls`] from the
-//!   upstream response. Currently only `function_call` events are accumulated; native `mcp_call` events require either
-//!   `mcp_tool_resolve` rewriting MCP tools into function tools or the accumulator adding `mcp_call` support.
-//! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
-//!   then `openai_mcp_dispatch`.
-//! - The IRR transition must match `openai_agentic_loop.action = "loop"` and target the same inference step.
-//!
-//! Ordinary client-side function calls do not match the MCP tool map and are
-//! left untouched for the owner to return to the client.
-//!
-//! [`ResponsesState::tool_calls`]: super::state::ResponsesState
-//! [`ResponsesState::mcp_tool_map`]: super::state::ResponsesState
+//! The connector expands declarations on the first inference round and consumes
+//! the MCP assignments on re-entry. The agentic loop owns model-response
+//! classification and iteration. Stream events compose the logical SSE response.
 
 mod approval;
-mod config;
+pub(super) mod config;
 
 #[cfg(test)]
 #[cfg(feature = "store-sqlite")]
@@ -67,7 +46,7 @@ use self::{
         ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message, extract_approval_responses,
         is_approval_response, parse_approval_response, resolve_approval,
     },
-    config::{McpDispatchConfig, MinimumApproval, build_config, require_inline_outbound_chain},
+    config::{McpConnectorConfig, MinimumApproval, build_config},
 };
 #[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
 use super::state::McpApprovalState;
@@ -94,7 +73,7 @@ use crate::{
     json_body::{MAX_JSON_BODY_BYTES, serialized_len},
     mcp_client,
     mcp_core::{
-        admission::McpAdmissionDecisions,
+        admission::{ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionPolicy},
         classify::ApprovalFloor,
         execute::{
             self, MIN_RETAINED_RESULT_BYTES, McpCallIdentity, McpCallOutcome, McpExecutionOptions,
@@ -231,11 +210,26 @@ fn settle_mcp_execution(state: &mut ResponsesState, results: &[McpCallResult]) -
 }
 
 // -----------------------------------------------------------------------------
-// McpDispatchFilter
+// McpConnectorFilter
 // -----------------------------------------------------------------------------
 
-/// Executes MCP tool calls against upstream MCP servers within
-/// the Responses API agentic loop.
+/// Discovers and executes MCP tools for the Responses API agentic loop.
+///
+/// Configure once inside the inference step, before `openai_agentic_loop` and
+/// `openai_responses_proxy`. Keep `openai_stream_events` ahead of the connector
+/// for streamed requests. Request parsing and rehydration run before the IRR.
+///
+/// The first inference round expands eager declarations into admitted functions
+/// and records an `mcp_list_tools` item for each resolved server. Deferred
+/// connectors keep a sanitized declaration until the model emits a
+/// `tool_search_call`. The agentic loop uses the resolved map to assign work
+/// and decide whether inference continues. The connector executes its assignments
+/// on re-entry and appends each result using the original call ID.
+///
+/// For approval resumes, include the MCP declaration alongside the approval
+/// response and configure `openai_responses_store` and
+/// `openai_responses_rehydrate`. The connector reapplies current operator
+/// policy and matches the approval against the target and caller identity.
 ///
 /// Results with `structuredContent` use a compact JSON object containing both
 /// `content` and `structuredContent` in the model-facing `function_call_output`
@@ -247,59 +241,87 @@ fn settle_mcp_execution(state: &mut ResponsesState, results: &[McpCallResult]) -
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_mcp_dispatch
+/// filter: openai_mcp_connector
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_mcp_dispatch
+/// filter: openai_mcp_connector
+/// connectors:
+///   - id: corp_drive
+///     server_url: https://drive-mcp.internal/mcp
+///     tool_policy: read_only
+/// require_connector: true
+/// tool_admission:
+///   mode: protected
 /// minimum_approval: always
-/// forward_headers:
-///   - x-tenant-id
-///   - x-user-id
-/// timeout_ms: 30000
+/// user_credential: mcp_gateway
+/// authorization_assertion: mcp_gateway
+/// forward_headers: [x-tenant-id]
+/// outbound_chain:
+///   name: mcp-egress
+///   filters:
+///     - filter: request_id
+/// discovery_timeout_ms: 5000
+/// max_servers: 10
+/// max_tools: 128
+/// max_rewritten_body_bytes: 67108864
+/// call_timeout_ms: 30000
 /// max_calls_per_round: 32
 /// max_parallel_calls: 8
 /// max_result_bytes: 1048576
 /// max_total_result_bytes: 8388608
 /// ```
 ///
-/// `minimum_approval: always` is an operator approval floor: it forces approval
-/// for every MCP call in this pipeline regardless of the client's per-tool
-/// `require_approval`. Omit it to keep the client-driven default.
-///
-/// `forward_headers` applies only to connector-backed tools resolved by
-/// `openai_mcp_tool_resolve`. Direct client-selected `server_url` targets never
-/// receive ambient request headers. Credential headers are rejected; use the
-/// MCP tool entry's dedicated `authorization` field for per-target credentials.
-pub struct McpDispatchFilter {
+/// Ambient credentials, assertions, and trusted forwarded headers are scoped
+/// to configured connectors. Client-selected servers use only their own
+/// request-supplied credentials. Both discovery and execution share the bound
+/// outbound chain and are capped by the IRR's remaining deadline.
+pub struct McpConnectorFilter {
     /// Per-filter namespace preventing sessions from crossing dispatcher
     /// configuration boundaries within one logical execution.
     pool_namespace: mcp_client::McpPoolNamespace,
     /// Optional per-user bearer slot required for configured connectors.
-    user_credential_slot: Option<String>,
+    pub(super) user_credential_slot: Option<String>,
     /// Optional opaque assertion slot required for configured connectors.
-    authorization_assertion_slot: Option<String>,
-    /// Bound outbound pipeline the `tools/call` and deferred `tools/list`
-    /// callouts dial through.
-    ///
-    /// Carries only operator-configured cross-cutting filters (if any); the dial
-    /// target is staged by the transport, so no upstream-selecting filter is
-    /// prepended. This filter runs inside an `iterative_request_router` step, which
-    /// praxis core builds with a live [`ChainBindingContext`], so an inline
-    /// `outbound_chain` (or none) is bound at step-build time via
-    /// [`Self::from_config_with_binding`]; a named reference is rejected because IRR
-    /// supplies each step an empty top-level named-chain map.
-    outbound_pipeline: Arc<FilterPipeline>,
+    pub(super) authorization_assertion_slot: Option<String>,
+    /// Outbound pipeline shared by discovery and execution.
+    pub(super) outbound_pipeline: Arc<FilterPipeline>,
     /// Trusted request headers explicitly allowed across the MCP boundary.
-    forward_headers: Vec<http::HeaderName>,
+    pub(super) forward_headers: Vec<http::HeaderName>,
     /// Operator approval floor combined monotonically with each tool's client
     /// `require_approval` policy. [`ApprovalFloor::Always`] forces approval for
     /// every MCP call; [`ApprovalFloor::None`] preserves the client-driven policy.
     minimum_approval: ApprovalFloor,
     /// Timeout for MCP tool calls.
     timeout: Duration,
+    /// Connector ID to server URL mapping.
+    pub(super) connectors: HashMap<String, url::Url>,
+
+    /// Whether client-selected direct MCP `server_url` entries are rejected.
+    pub(super) require_connector: bool,
+
+    /// Operator metadata-admission policy snapshot.
+    pub(super) admission_policy: McpAdmissionPolicy,
+
+    /// Per-connector operator tool policies, keyed by connector id. Direct,
+    /// client-selected targets always use `Deny` and never appear here.
+    pub(super) connector_tool_policies: HashMap<String, ConnectorToolPolicy>,
+
+    /// Maximum size in bytes of the body produced after expanding
+    /// `mcp` tool entries into `function` entries.
+    pub(super) max_rewritten_body_bytes: usize,
+
+    /// Maximum number of distinct MCP servers per request.
+    pub(super) max_servers: usize,
+
+    /// Maximum number of tools returned by a single MCP server.
+    pub(super) max_tools: usize,
+
+    /// Per-server discovery timeout.
+    pub(super) discovery_timeout: Duration,
+
     /// Hard cap on calls accepted from one model round.
     max_calls_per_round: usize,
     /// Maximum number of concurrent calls.
@@ -310,7 +332,7 @@ pub struct McpDispatchFilter {
     max_total_result_bytes: usize,
 }
 
-impl McpDispatchFilter {
+impl McpConnectorFilter {
     /// Build from parsed YAML config as a plain builtin (no chain binding).
     ///
     /// This path cannot bind an operator `outbound_chain` (it has no
@@ -328,59 +350,79 @@ impl McpDispatchFilter {
     /// `outbound_chain` (unsupported without chain binding), or the empty outbound
     /// pipeline cannot be built.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpDispatchConfig = parse_filter_config("openai_mcp_dispatch", config)?;
+        let cfg: McpConnectorConfig = parse_filter_config("openai_mcp_connector", config)?;
         let validated = build_config(cfg)?;
         if validated.outbound_chain.is_some() {
             return Err(FilterError::from(
-                "openai_mcp_dispatch: outbound_chain requires chain-binding registration; register this \
+                "openai_mcp_connector: outbound_chain requires chain-binding registration; register this \
                  filter with register_chain_binding, not as a plain builtin",
             ));
         }
         // Empty outbound pipeline; posture stays at its safe default until pipeline
         // finalization propagates the operator's global insecure options.
         let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(false)
-            .map_err(|error| FilterError::from(format!("openai_mcp_dispatch: {error}")))?;
-        Ok(Self::assemble(&validated, outbound_pipeline))
+            .map_err(|error| FilterError::from(format!("openai_mcp_connector: {error}")))?;
+        Self::assemble(&validated, outbound_pipeline)
     }
 
-    /// Build from parsed YAML config, binding the operator `outbound_chain`
-    /// against the active registry.
-    ///
-    /// Registered via [`FilterRegistry::register_chain_binding`]. Although this
-    /// filter runs nested inside an `iterative_request_router` step, praxis core
-    /// builds each IRR step with a live [`ChainBindingContext`], so an inline
-    /// `outbound_chain` is bound at step-build time and its filters run as
-    /// cross-cutting outbound filters on every `tools/call` and deferred
-    /// `tools/list` callout. A named reference is rejected up front (via
-    /// `require_inline_outbound_chain`): IRR supplies each step an empty
-    /// top-level named-chain map, so a `Named` reference can never resolve inside a
-    /// step. The dial target is staged by the transport, so the bound chain carries
-    /// no upstream-selecting filter.
-    ///
-    /// [`FilterRegistry::register_chain_binding`]: praxis_filter::FilterRegistry::register_chain_binding
+    /// Bind the inline or named outbound chain once for all MCP exchanges.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the config is invalid, carries a named
-    /// `outbound_chain` (unsupported inside an IRR step), or the inline outbound
-    /// chain cannot be bound (a cycle, excessive nesting, a terminal filter, or an
-    /// ordering violation).
+    /// Returns [`FilterError`] if the config is invalid or chain binding fails.
     pub fn from_config_with_binding(
         config: &serde_yaml::Value,
         ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpDispatchConfig = parse_filter_config("openai_mcp_dispatch", config)?;
+        let cfg: McpConnectorConfig = parse_filter_config("openai_mcp_connector", config)?;
         let mut validated = build_config(cfg)?;
         let outbound_chain = validated.outbound_chain.take();
-        require_inline_outbound_chain(outbound_chain.as_ref())?;
         let outbound_pipeline =
-            mcp_client::bind_mcp_outbound_chain(outbound_chain, ctx, "openai_mcp_dispatch_outbound")?;
-        Ok(Self::assemble(&validated, outbound_pipeline))
+            mcp_client::bind_mcp_outbound_chain(outbound_chain, ctx, "openai_mcp_connector_outbound")?;
+        Self::assemble(&validated, outbound_pipeline)
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_config_allow_private(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: McpConnectorConfig = parse_filter_config("openai_mcp_connector", config)?;
+        let validated = build_config(cfg)?;
+        let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(true)
+            .map_err(|error| FilterError::from(format!("openai_mcp_connector: {error}")))?;
+        Self::assemble(&validated, outbound_pipeline)
     }
 
     /// Assemble the filter from a validated config and a bound outbound pipeline.
-    fn assemble(validated: &McpDispatchConfig, outbound_pipeline: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
-        Box::new(Self {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear assembly of the shared connector policy and operation limits"
+    )]
+    fn assemble(
+        validated: &McpConnectorConfig,
+        outbound_pipeline: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let connectors = validated
+            .connectors
+            .iter()
+            .map(|c| {
+                let url = url::Url::parse(&c.server_url)
+                    .map_err(|e| FilterError::from(format!("openai_mcp_connector: connector \"{}\": {e}", c.id)))?;
+                Ok((c.id.clone(), url))
+            })
+            .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
+        let connector_tool_policies = validated
+            .connectors
+            .iter()
+            .map(|c| (c.id.clone(), c.tool_policy.snapshot()))
+            .collect();
+        Ok(Box::new(Self {
+            connectors,
+            connector_tool_policies,
+            require_connector: validated.require_connector,
+            admission_policy: validated.tool_admission.snapshot(),
+            max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
+            max_servers: validated.max_servers,
+            max_tools: validated.max_tools,
+            discovery_timeout: Duration::from_millis(validated.discovery_timeout_ms),
             pool_namespace: mcp_client::McpPoolNamespace::new(),
             user_credential_slot: validated.user_credential.clone(),
             authorization_assertion_slot: validated.authorization_assertion.clone(),
@@ -393,12 +435,12 @@ impl McpDispatchFilter {
             minimum_approval: validated
                 .minimum_approval
                 .map_or(ApprovalFloor::None, MinimumApproval::as_floor),
-            timeout: Duration::from_millis(validated.timeout_ms),
+            timeout: Duration::from_millis(validated.call_timeout_ms),
             max_calls_per_round: validated.max_calls_per_round,
             max_parallel_calls: validated.max_parallel_calls,
             max_result_bytes: validated.max_result_bytes,
             max_total_result_bytes: validated.max_total_result_bytes,
-        })
+        }))
     }
 
     /// Execute the pending MCP calls admitted by the per-round MCP limit.
@@ -651,7 +693,7 @@ impl McpDispatchFilter {
                 let e = ApprovalError::Malformed(format!(
                     "This request includes too many approval responses; the platform administrator allows at most {max_batch}."
                 ));
-                warn!(error = %e.message(), "mcp_dispatch: rejecting oversized approval-response batch");
+                warn!(error = %e.message(), "mcp_connector: rejecting oversized approval-response batch");
                 return Err(approval_rejection(&e));
             }
             // A pending approval is bound to the response that issued it. Without
@@ -664,7 +706,7 @@ impl McpDispatchFilter {
                     "an mcp_approval_response requires previous_response_id to identify the originating request"
                         .to_owned(),
                 );
-                warn!(error = %e.message(), "mcp_dispatch: rejecting approval response without previous_response_id");
+                warn!(error = %e.message(), "mcp_connector: rejecting approval response without previous_response_id");
                 return Err(approval_rejection(&e));
             };
             let mut inputs = Vec::with_capacity(responses.len());
@@ -672,7 +714,7 @@ impl McpDispatchFilter {
                 match parse_approval_response(response) {
                     Ok(input) => inputs.push(input),
                     Err(e) => {
-                        warn!(error = %e.message(), "mcp_dispatch: rejecting malformed approval response");
+                        warn!(error = %e.message(), "mcp_connector: rejecting malformed approval response");
                         return Err(approval_rejection(&e));
                     },
                 }
@@ -691,7 +733,7 @@ impl McpDispatchFilter {
                         "an mcp_approval_response batch must not repeat approval_request_id '{}'",
                         input.approval_id
                     ));
-                    warn!(error = %e.message(), "mcp_dispatch: rejecting duplicate approval-response id");
+                    warn!(error = %e.message(), "mcp_connector: rejecting duplicate approval-response id");
                     return Err(approval_rejection(&e));
                 }
             }
@@ -712,7 +754,7 @@ impl McpDispatchFilter {
             .get::<ResponseStoreRegistry>()
             .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, &owner))
             .ok_or_else(|| {
-                warn!("mcp_dispatch: response store unavailable while resuming approvals");
+                warn!("mcp_connector: response store unavailable while resuming approvals");
                 responses_error_rejection(
                     500,
                     "server_error",
@@ -729,7 +771,7 @@ impl McpDispatchFilter {
                 .pending_approval_payload_bytes(&previous_response_id, &approval_ids)
                 .await
                 .map_err(|e| {
-                    warn!(error = %e, "mcp_dispatch: failed to size pending approvals");
+                    warn!(error = %e, "mcp_connector: failed to size pending approvals");
                     responses_error_rejection(500, "server_error", "failed to size pending approvals")
                 })?;
             if !ctx
@@ -744,7 +786,7 @@ impl McpDispatchFilter {
             .get_pending_approvals(&previous_response_id, &approval_ids)
             .await
             .map_err(|e| {
-                warn!(error = %e, "mcp_dispatch: failed to load pending approvals");
+                warn!(error = %e, "mcp_connector: failed to load pending approvals");
                 responses_error_rejection(500, "server_error", "failed to load pending approvals")
             })?;
 
@@ -764,13 +806,13 @@ impl McpDispatchFilter {
                         "no pending approval request matches id '{}'",
                         input.approval_id
                     ));
-                    warn!(error = %e.message(), "mcp_dispatch: rejecting unknown approval response");
+                    warn!(error = %e.message(), "mcp_connector: rejecting unknown approval response");
                     return Err(approval_rejection(&e));
                 };
                 match resolve_approval(input, pending, &state.mcp_tool_map) {
                     Ok(decision) => resolved.push(decision),
                     Err(e) => {
-                        warn!(error = %e.message(), "mcp_dispatch: rejecting unresolvable approval response");
+                        warn!(error = %e.message(), "mcp_connector: rejecting unresolvable approval response");
                         return Err(approval_rejection(&e));
                     },
                 }
@@ -792,7 +834,7 @@ impl McpDispatchFilter {
                         "The platform administrator's current policy forbids this tool call. {}",
                         reason.message()
                     ));
-                    warn!(error = %e.message(), "mcp_dispatch: rejecting approval for a policy-denied tool");
+                    warn!(error = %e.message(), "mcp_connector: rejecting approval for a policy-denied tool");
                     return Err(approval_rejection(&e));
                 }
             }
@@ -887,7 +929,10 @@ async fn consume_batch(
         Ok(None) => Ok(()),
         Ok(Some(index)) => {
             let approval_id = approval_ids.get(index).copied().unwrap_or_default();
-            warn!(approval_id, "mcp_dispatch: approval already consumed; rejecting replay");
+            warn!(
+                approval_id,
+                "mcp_connector: approval already consumed; rejecting replay"
+            );
             Err(responses_error_rejection(
                 400,
                 "invalid_request_error",
@@ -895,7 +940,7 @@ async fn consume_batch(
             ))
         },
         Err(e) => {
-            warn!(error = %e, "mcp_dispatch: failed to claim approval consumption");
+            warn!(error = %e, "mcp_connector: failed to claim approval consumption");
             Err(responses_error_rejection(
                 500,
                 "server_error",
@@ -974,14 +1019,14 @@ fn approval_persistence_rejection(state: &ResponsesState, tool_name: &str) -> Op
     if !response_will_be_stored(state) {
         warn!(
             tool_name = %tool_name,
-            "mcp_dispatch: rejecting approval-required call because store=false makes it unresumable"
+            "mcp_connector: rejecting approval-required call because store=false makes it unresumable"
         );
         return Some(approval_requires_store_rejection(tool_name));
     }
     if !state.store_persist_armed {
         warn!(
             tool_name = %tool_name,
-            "mcp_dispatch: rejecting approval-required call because the response store did not arm \
+            "mcp_connector: rejecting approval-required call because the response store did not arm \
              persistence for this exchange"
         );
         return Some(approval_store_unavailable_rejection());
@@ -1084,10 +1129,13 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
     }
 }
 
+/// Eager discovery has run for this logical client request.
+struct PreparedMcpTools;
+
 #[async_trait]
-impl HttpFilter for McpDispatchFilter {
+impl HttpFilter for McpConnectorFilter {
     fn name(&self) -> &'static str {
-        "openai_mcp_dispatch"
+        "openai_mcp_connector"
     }
 
     fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
@@ -1111,15 +1159,27 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
         // Accept up to the absolute ceiling; the pipeline's body_limits
-        // decides the real raw cap. This filter only reads the body.
+        // decides the raw cap. The separate rewrite cap applies after expansion.
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
+    }
+
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<praxis_filter::BoundUpstreamBodyOutcome, FilterError> {
+        super::bound_body_outcome(self.on_request_body(ctx, body, true).await?)
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -1131,15 +1191,15 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // Streaming deferred-discovery failures are stashed during the
-        // request-body pre-read and emitted here, matching the initial
-        // `openai_mcp_tool_resolve` header-phase lifecycle.
+        // Listener-level discovery runs its synthesized response through
+        // the normal response hooks. Inside IRR, the body hook returns it
+        // through the executor's local-response path.
         Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
     }
 
     #[expect(
         clippy::too_many_lines,
-        reason = "deferred discovery and MCP execution share one request-body path"
+        reason = "connector request lifecycle stages must execute in order"
     )]
     async fn on_request_body(
         &self,
@@ -1149,6 +1209,13 @@ impl HttpFilter for McpDispatchFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+        if ctx.extensions.get::<PreparedMcpTools>().is_none() {
+            let action = self.prepare_mcp_tools(ctx, body, end_of_stream).await?;
+            if !matches!(action, FilterAction::Continue) {
+                return Ok(action);
+            }
+            ctx.extensions.insert(PreparedMcpTools);
         }
         ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         // Publish the operator approval floor onto typed request state so the
@@ -1160,6 +1227,15 @@ impl HttpFilter for McpDispatchFilter {
         // no MCP tool map to gate, so nothing is lost by skipping.
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.mcp_operator_approval_floor = self.minimum_approval;
+        }
+        let has_mcp_work = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            !state.mcp_tool_map.is_empty()
+                || !state.deferred_mcp.is_empty()
+                || state.mcp_admission.has_denied()
+                || state.messages.iter().any(is_approval_response)
+        });
+        if !has_mcp_work {
+            return Ok(FilterAction::Continue);
         }
         // Skip dispatch prep when this round has nothing to dispatch. Connector
         // entries are the exception: their ambient owner/credential/header context
@@ -1450,12 +1526,11 @@ async fn discover_pending_connectors(
         // streamed first round may already have committed HTTP 200, so an
         // HTTP 413 JSON Reject would corrupt that SSE stream. Let the loop
         // owner emit its terminal SSE error through DispatchFailure.
-        Err(ResolveError::RetainedBudget) => Ok(McpDispatchFilter::budget_limit_action(ctx)),
+        Err(ResolveError::RetainedBudget) => Ok(McpConnectorFilter::budget_limit_action(ctx)),
         Err(err) => {
-            let streaming = ctx
-                .filter_metadata
-                .get("openai_responses_request.stream")
-                .is_some_and(|v| v == "true");
+            let streaming = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+                state.request_body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+            });
             Ok(resolve_error_action(ctx, &err, streaming, body))
         },
     }

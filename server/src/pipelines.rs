@@ -1630,7 +1630,7 @@ filter_chains:
       - filter: openai_doc_extract
         allow_pre_security_callout: true
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
+      - filter: openai_mcp_connector
       - filter: openai_responses_proxy
 "#,
         )

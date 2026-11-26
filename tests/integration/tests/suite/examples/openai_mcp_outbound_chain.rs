@@ -3,13 +3,13 @@
 
 //! Functional tests for the mcp-outbound-chain example config.
 //!
-//! Proves that an operator `outbound_chain` bound onto `openai_mcp_tool_resolve`
+//! Proves that an operator `outbound_chain` bound onto `openai_mcp_connector`
 //! runs on the outbound MCP callout: the MCP transport stages the dial target
 //! and the operator's `headers` filter then stamps a probe header on every
 //! request the proxy dials to the MCP server.
 //!
 //! Also covers the two properties the example config only advertises in prose:
-//! that `openai_mcp_tool_resolve` (a top-level filter) resolves a **named**
+//! that `openai_mcp_connector` (a top-level filter) resolves a **named**
 //! `outbound_chain` against the top-level `filter_chains`, and that a
 //! client-controlled `server_url` carrying embedded credentials is refused
 //! before any dial — the egress credential the operator injects through its
@@ -82,7 +82,7 @@ fn openai_mcp_outbound_chain_example_stamps_probe_header_on_callout() {
     }
 }
 
-/// `openai_mcp_tool_resolve` is a top-level filter, so praxis core builds it
+/// `openai_mcp_connector` is a top-level filter, so praxis core builds it
 /// with a chain-binding context and its `outbound_chain` may be a **named**
 /// reference to a top-level `filter_chains` entry (not just an inline chain).
 /// Binding a named `mcp-egress` chain that is never attached to a listener must
@@ -193,7 +193,7 @@ fn openai_mcp_client_url_with_embedded_credentials_is_never_dialed() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// Build a Responses pipeline whose `openai_mcp_tool_resolve` binds a **named**
+/// Build a Responses pipeline whose `openai_mcp_connector` binds a **named**
 /// `outbound_chain` (`mcp-egress`) defined as a standalone top-level
 /// `filter_chains` entry — the shape the example config documents but does not
 /// itself exercise.
@@ -218,8 +218,8 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: 5000
         outbound_chain: mcp-egress
       - filter: openai_responses_proxy
         name: inference

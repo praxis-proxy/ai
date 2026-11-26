@@ -7,7 +7,7 @@
 # The iterative_request_router (IRR) repeatedly runs one inference step.
 # Three request-phase dispatchers execute the loop owner's assigned calls:
 # `openai_web_search_dispatch` runs web searches against an external provider,
-# `openai_mcp_dispatch` runs MCP calls against the server URL supplied in the
+# `openai_mcp_connector` runs MCP calls against the server URL supplied in the
 # request, and `openai_file_search_dispatch` runs hosted file searches against
 # the vector store. Each dispatches results back to the model via the loop.
 # Client-side function calls resolve to no dispatcher and are returned to the
@@ -48,7 +48,7 @@
 #
 # IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
-#     openai_stream_events → openai_web_search_dispatch → openai_mcp_dispatch
+#     openai_stream_events → openai_web_search_dispatch → openai_mcp_connector
 #       → openai_file_search_dispatch → openai_agentic_loop
 #       → openai_responses_proxy → router → load_balancer
 #   Response phase (reverse):
@@ -220,10 +220,6 @@ filter_chains:
         allow_private_inference_url: true
         default_model: gpt-4.1
 
-      - filter: openai_mcp_tool_resolve
-        connectors:
-          - id: corp_drive
-            server_url: https://drive-mcp.internal:8443/mcp
 
       - filter: iterative_request_router
         initial_step: inference
@@ -279,17 +275,16 @@ filter_chains:
                   name: web-search-outbound
                   filters:
                     - filter: request_id
-              # Request-phase dispatcher: runs second on re-entry to execute
-              # MCP calls prepared and classified by the loop owner.
-              - filter: openai_mcp_dispatch
-                # Every MCP tools/call and deferred tools/list sub-request runs
-                # through this chain. It must be inline ({ name, filters }): this
-                # filter runs inside an iterative_request_router step, whose
-                # pipeline is built with an empty named-chain map, so a top-level
-                # filter_chains reference cannot resolve here. The SSRF-validated
-                # destination is staged by the transport, so the chain never
-                # selects an upstream; it only observes and stamps the outbound
-                # MCP request.
+              # Discover MCP tools before inference and execute the loop
+              # owner's assignments on re-entry.
+              - filter: openai_mcp_connector
+                connectors:
+                  - id: corp_drive
+                    server_url: https://drive-mcp.internal:8443/mcp
+                # Discovery and execution share this outbound chain. A named
+                # alternative must start with an unconditional
+                # openai_mcp_streaming_selector. The transport stages and
+                # validates the destination before the exchange.
                 #
                 # Do NOT put static credentials in this chain: MCP destinations
                 # are client-selected (server_url), so a blanket credential header
@@ -356,7 +351,7 @@ filter_chains:
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046): it
               # parses each model response, records assignments for the
-              # request-phase dispatchers (web_search, mcp_dispatch,
+              # request-phase dispatchers (web_search, mcp_connector,
               # file_search_dispatch), and publishes the single continuation
               # signal. The IRR transitions only on the owner's action, never on
               # a dispatcher's.

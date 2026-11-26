@@ -309,15 +309,15 @@ def _write_full_flow_config(
     if tool_admission is not None:
         # Inject an operator metadata-admission policy under the resolver so the
         # SDK suite can exercise protected mode (#1724).
-        marker = "      - filter: openai_mcp_tool_resolve\n"
+        marker = "              - filter: openai_mcp_connector\n"
         assert config.count(marker) == 1, config
-        config = config.replace(marker, marker + tool_admission)
+        config = config.replace(marker, marker + "".join("        " + line for line in tool_admission.splitlines(keepends=True)))
     if require_connector is not None:
-        marker = "        require_connector: true\n"
+        marker = "                require_connector: true\n"
         assert config.count(marker) == 1, config
         config = config.replace(
             marker,
-            f"        require_connector: {str(require_connector).lower()}\n",
+            f"                require_connector: {str(require_connector).lower()}\n",
         )
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
     # The unified gateway wires openai_web_search_dispatch into the IRR; its config
@@ -440,10 +440,10 @@ def _write_full_flow_config(
         assert config.count(anchor) == 1
         config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
     if mcp_minimum_approval is not None:
-        # Inject the operator approval floor onto openai_mcp_dispatch so the
+        # Inject the operator approval floor onto openai_mcp_connector so the
         # pipeline requires approval for every MCP call regardless of the client's
         # per-tool require_approval (issue #1723).
-        anchor = "              - filter: openai_mcp_dispatch\n"
+        anchor = "              - filter: openai_mcp_connector\n"
         assert config.count(anchor) == 1, config
         config = config.replace(
             anchor,
@@ -838,7 +838,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
     already carries the rejection (a ``function_call_output``), so it needs no
     request counter and tolerates retries. On the first turn it emits a
     ``function_call`` to the resolved ``get_weather`` function tool with a
-    type-invalid ``city`` argument; ``openai_mcp_dispatch`` must reject it against
+    type-invalid ``city`` argument; ``openai_mcp_connector`` must reject it against
     the advertised ``inputSchema`` before any outbound ``tools/call``.
     """
 
@@ -6998,7 +6998,7 @@ def mcp_approval_floor_proxy(
 ):
     """Agentic proxy with the operator approval floor (minimum_approval: always).
 
-    Same pipeline as ``agentic_proxy`` with ``openai_mcp_dispatch.minimum_approval``
+    Same pipeline as ``agentic_proxy`` with ``openai_mcp_connector.minimum_approval``
     set to ``always`` so every MCP call requires approval regardless of the
     client's per-tool ``require_approval`` (issue #1723).
     """
@@ -8264,6 +8264,258 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
     )
 
 
+@qualification_profile("supporting")
+@pytest.mark.parametrize(
+    "scenario",
+    ["eager", "cached", "empty-list", "eager-stream", "listing-failure",
+     "deferred-listing-failure", "policy-rejection"],
+)
+def test_mcp_connector_inside_irr(tmp_path, nemo_guardrails_server, scenario):
+    """Observe MCP exchanges, inference bodies, and the SDK through the real IRR."""
+    deferred = scenario == "deferred-listing-failure"
+    listing_fails = deferred or scenario == "listing-failure"
+    streaming = listing_fails or scenario == "eager-stream"
+    model_requests = []
+    exchanges = []
+
+    class RecordingMcp(MCPHandler):
+        _request_count = 0
+
+        def _json_rpc(self, rid, result, error=None) -> None:
+            if result is not None and "tools" in result:
+                exchanges.append(("tools/list", self.headers.get("x-mcp-egress")))
+                if listing_fails:
+                    return super()._json_rpc(
+                        rid, None, {"code": -32603, "message": "listing unavailable"},
+                    )
+                if scenario == "empty-list":
+                    result = {"tools": []}
+            if result is not None and "content" in result:
+                exchanges.append(("tools/call", self.headers.get("x-mcp-egress")))
+            return super()._json_rpc(rid, result, error)
+
+    class RecordingModel(McpStructuredResultBackendHandler):
+        def _output(self, request_body):
+            model_requests.append(request_body)
+            if scenario == "empty-list":
+                return [{
+                    "id": "msg_empty_catalog", "type": "message", "status": "completed",
+                    "role": "assistant", "content": [{"type": "output_text", "text": "done"}],
+                }]
+            return super()._output(request_body)
+
+        def do_POST(self):
+            if not streaming or scenario == "listing-failure":
+                return super().do_POST()
+            request_body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if deferred:
+                model_requests.append(request_body)
+                item = {"id": "tsc_mock", "type": "tool_search_call", "status": "completed"}
+            else:
+                (item,) = self._output(request_body)
+            response = {
+                "id": f"resp_mcp_round_{len(model_requests)}", "object": "response",
+                "status": "in_progress", "output": [], "model": VLLM_MODEL,
+                "created_at": 1700000000, "temperature": 0.25,
+            }
+            events = [
+                ("response.created", {"response": response}),
+                ("response.output_item.added", {"output_index": 0, "item": item}),
+                ("response.output_item.done", {"output_index": 0, "item": item}),
+                ("response.completed", {"response": {
+                    **response, "status": "completed", "output": [item],
+                }}),
+            ]
+            payload = "".join(
+                f"event: {kind}\ndata: "
+                + json.dumps(dict(data, type=kind, sequence_number=seq))
+                + "\n\n"
+                for seq, (kind, data) in enumerate(events)
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    servers = [
+        HTTPServer(("127.0.0.1", 0), handler)
+        for handler in (RecordingMcp, RecordingModel)
+    ]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        mcp_port, model_port = (server.server_port for server in servers)
+        port = _free_port()
+        config = Path(_write_full_flow_config(
+            port,
+            str(tmp_path / "responses.db"),
+            backend_endpoint=f"127.0.0.1:{model_port}",
+            mcp_endpoint=f"http://127.0.0.1:{mcp_port}/mcp",
+            nemo_port=nemo_guardrails_server,
+            require_connector=False if scenario == "cached" else None,
+        ))
+        try:
+            yaml = config.read_text()
+            anchor = "              - filter: openai_mcp_connector\n"
+            assert yaml.count(anchor) == 1
+            yaml = yaml.replace(anchor, anchor + "                outbound_chain: test-mcp-egress\n")
+            yaml = yaml.replace(
+                "\nfilter_chains:\n",
+                "\nfilter_chains:\n"
+                "  - name: test-mcp-egress\n"
+                "    filters:\n"
+                "      - filter: openai_mcp_streaming_selector\n"
+                "      - filter: headers\n"
+                "        request_set:\n"
+                "          - name: x-mcp-egress\n"
+                "            value: connector\n",
+                1,
+            )
+            config.write_text(yaml)
+            log_path = tmp_path / "praxis.log"
+            with log_path.open("w") as log, subprocess.Popen(
+                [_find_binary(), "-c", str(config)], stdout=log, stderr=subprocess.STDOUT,
+            ) as proc:
+                try:
+                    _wait_for_proxy(port, proc, str(log_path))
+                    with _make_openai_client(
+                        port, default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+                    ) as client:
+                        tool = {
+                            "type": "mcp",
+                            "server_label": "weather",
+                            "allowed_tools": ["get_weather"],
+                            "require_approval": "never",
+                        }
+                        if scenario == "policy-rejection":
+                            tool["server_url"] = f"http://127.0.0.1:{mcp_port}/mcp"
+                            with pytest.raises(openai.BadRequestError):
+                                client.responses.create(
+                                    model=VLLM_MODEL, input="Find the weather.", tools=[tool],
+                                    stream=True, store=False,
+                                )
+                            assert RecordingMcp.request_count() == 0
+                            assert model_requests == []
+                            return
+                        if scenario == "cached":
+                            # Only unauthenticated, exact-target direct listings are eligible.
+                            tool["server_url"] = f"http://127.0.0.1:{mcp_port}/mcp"
+                        else:
+                            tool["connector_id"] = "trusted-mcp"
+                        if deferred:
+                            tool["defer_loading"] = True
+                        response = client.responses.create(
+                            model=VLLM_MODEL,
+                            input="What is the weather in Paris?",
+                            tools=[{"type": "tool_search"}, tool] if deferred else [tool],
+                            stream=streaming,
+                            store=listing_fails or scenario == "cached",
+                        )
+                        if listing_fails:
+                            events = list(response)
+                            assert exchanges == [("tools/list", "connector")]
+                            if deferred:
+                                assert len(model_requests) == 1
+                                sanitized = model_requests[0]["tools"][1]
+                                assert sanitized["type"] == "mcp"
+                                assert "connector_id" not in sanitized
+                                assert "server_url" not in sanitized
+                            else:
+                                assert model_requests == []
+                            types = [event.type for event in events]
+                            assert types.count("response.mcp_list_tools.failed") == 1
+                            assert types.count("response.created") == 1
+                            assert types[-1] == "response.failed"
+                            sequences = [event.sequence_number for event in events]
+                            assert sequences == sorted(set(sequences))
+                            failed = events[-1].response
+                            assert failed.id == events[0].response.id
+                            assert failed.status == "failed"
+                            stored = _retrieve_with_retry(client, failed.id)
+                            assert stored.status == "failed"
+                            if deferred:
+                                for snapshot in (events[0].response, failed, stored):
+                                    assert snapshot.created_at == 1700000000
+                                    assert snapshot.temperature == 0.25
+                            assert stored.output[-1].type == "mcp_list_tools"
+                            assert stored.output[-1].id == failed.output[-1].id
+                        elif scenario == "eager-stream":
+                            events = list(response)
+                            kinds = [event.type for event in events]
+                            listed = kinds.index("response.mcp_list_tools.completed")
+                            message = next(
+                                i for i, event in enumerate(events)
+                                if event.type == "response.output_item.added"
+                                and event.item.type == "message"
+                            )
+                            assert listed < message
+                            assert kinds.count("response.created") == 1
+                            assert kinds[-1] == "response.completed"
+                            assert exchanges == [("tools/list", "connector"), ("tools/call", "connector")]
+                            assert len(model_requests) == 2
+                        elif scenario == "empty-list":
+                            listings = [item for item in response.output if item.type == "mcp_list_tools"]
+                            assert len(listings) == 1
+                            assert listings[0].server_label == "weather"
+                            assert listings[0].tools == []
+                            assert response.output_text == "done"
+                            assert exchanges == [("tools/list", "connector")]
+                            assert len(model_requests) == 1
+                            assert not model_requests[0].get("tools")
+                        else:
+                            assert exchanges == [("tools/list", "connector"), ("tools/call", "connector")]
+                            assert response.status == "completed"
+                            assert response.output_text == "done"
+                            listings = [item for item in response.output if item.type == "mcp_list_tools"]
+                            assert len(listings) == 1
+                            assert listings[0].server_label == "weather"
+                            calls = [item for item in response.output if item.type == "mcp_call"]
+                            assert len(calls) == 1
+                            assert "72F and sunny in Paris" in calls[0].output
+                            assert calls[0].id == "call_mcp_invalid_1"
+                            if scenario == "cached":
+                                _retrieve_with_retry(client, response.id)
+                                resumed = client.responses.create(
+                                    model=VLLM_MODEL,
+                                    previous_response_id=response.id,
+                                    input="Use the same tool catalogue.",
+                                    tools=[tool],
+                                    store=False,
+                                )
+                                assert sum(item.type == "mcp_list_tools" for item in resumed.output) == 1
+                                assert exchanges.count(("tools/list", "connector")) == 1
+                finally:
+                    proc.send_signal(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+        finally:
+            config.unlink()
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+
+    if scenario in {"eager", "cached", "eager-stream"}:
+        if scenario == "cached":
+            assert len(model_requests) >= 3
+        else:
+            assert len(model_requests) == 2
+        first, second = model_requests[:2]
+        assert len(first["tools"]) == 1
+        assert first["tools"][0]["type"] == "function"
+        assert first["tools"][0]["name"].endswith("get_weather")
+        assert second["tools"] == first["tools"]
+        results = [item for item in second["input"] if item["type"] == "function_call_output"]
+        assert len(results) == 1
+        assert results[0]["call_id"] == "call_mcp_invalid_1"
+        assert "72F and sunny in Paris" in results[0]["output"]
+
+
 @pytest.fixture(scope="session")
 def structured_mcp_client(tmp_path_factory, request, nemo_guardrails_server):
     """Full-flow agentic proxy with a 10 MiB retained budget, a scripted model,
@@ -8796,7 +9048,7 @@ class TestAgenticLoopVLLM:
         announce every locally seeded output item before a delta references it.
 
         The approval resume runs *before* the first inference round. Tool
-        discovery (``openai_mcp_tool_resolve``) seeds the ``mcp_list_tools``
+        discovery (``openai_mcp_connector``) seeds the ``mcp_list_tools``
         listing at accumulated output index 0 (issue #1022), the executed
         mcp_call lands at index 1, and the resumed model output follows at
         index 2+. Every one of those slots must be announced with a
@@ -9522,7 +9774,8 @@ class TestAgenticLoopVLLM:
                 "Use web search exactly once to find the official Rust "
                 "programming language website, then report its URL. /no_think"
             ),
-            tools=[{"type": "web_search", "search_context_size": "low"}],
+            tools=[{"type": "web_search", "search_context_size": "low",
+                    "external_web_access": True, "search_content_types": ["text", "image"]}],
             tool_choice={"type": "web_search"},
             include=["web_search_call.action.sources"],
             max_tool_calls=1,
@@ -10030,7 +10283,7 @@ class TestAgenticLoopVLLM:
     ):
         """Issue #1022: successful local MCP discovery surfaces as an output item.
 
-        ``openai_mcp_tool_resolve`` already exposes a *failed* ``mcp_list_tools``
+        ``openai_mcp_connector`` already exposes a *failed* ``mcp_list_tools``
         item (#320). This proves the complementary success path: a resolved
         ``tools/list`` emits exactly one ``mcp_list_tools`` output item per server
         in the buffered terminal response, ahead of the tool activity it enabled,

@@ -2,7 +2,7 @@
 # Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates operator-owned metadata admission and read-only enforcement for
-# the `openai_mcp_tool_resolve` filter (issue #1724).
+# the `openai_mcp_connector` filter (issue #1724).
 #
 # MCP servers supply tool descriptions, schemas, and annotations. In protected
 # mode, operators choose how each configured connector's tools are admitted.
@@ -87,7 +87,6 @@ filter_chains:
       - filter: ai_operation
 
       - filter: openai_responses_request
-        initialize_state: false
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -97,28 +96,35 @@ filter_chains:
 
       - filter: openai_tool_parse
 
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
-        # Operator-owned metadata admission. Defaults to advisory; protected mode
-        # enforces each connector's configured tool_policy (default: deny).
-        tool_admission:
-          mode: protected
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_mcp_connector
+                discovery_timeout_ms: 5000
+                # Operator-owned metadata admission. Defaults to advisory; protected mode
+                # enforces each connector's configured tool_policy (default: deny).
+                tool_admission:
+                  mode: protected
 
-      - filter: openai_responses_proxy
-        name: inference
+              - filter: openai_responses_proxy
+                name: inference
 
-      - filter: router
-        routes:
-          - path: "/v1/responses"
-            headers:
-              x-praxis-ai-format: "openai_responses"
-            cluster: "inference-backend"
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
 
-      - filter: load_balancer
-        clusters:
-          - name: "inference-backend"
-            endpoints:
-              - "127.0.0.1:3001"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

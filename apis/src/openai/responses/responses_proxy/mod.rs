@@ -667,6 +667,14 @@ impl HttpFilter for ResponsesProxyFilter {
             trace!("buffering request body chunk");
             return Ok(FilterAction::Continue);
         }
+        if ctx
+            .extensions
+            .get::<super::web_search_dispatch::NativeWebSearchCompatibility>()
+            .is_some()
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            super::web_search_dispatch::lower_native_web_search(state);
+        }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
             return Ok(FilterAction::Continue);
@@ -692,6 +700,14 @@ impl HttpFilter for ResponsesProxyFilter {
         body: &mut Option<Bytes>,
     ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
         let preserve_native_compaction = selected_backend_uses_native_responses(ctx);
+        if ctx
+            .extensions
+            .get::<super::web_search_dispatch::NativeWebSearchCompatibility>()
+            .is_some()
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            super::web_search_dispatch::lower_native_web_search(state);
+        }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
             if let Some(rejection) = enforce_agentic_stream_guard(ctx) {

@@ -3352,7 +3352,7 @@ fn streamed_tool_search_call_is_queued_for_deferred_discovery() {
     assert_eq!(
         state.tool_search_calls.len(),
         1,
-        "streamed tool_search_call must be visible to openai_mcp_dispatch"
+        "streamed tool_search_call must be visible to openai_mcp_connector"
     );
     assert!(
         !state
