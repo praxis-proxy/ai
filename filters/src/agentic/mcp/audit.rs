@@ -237,7 +237,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
 
@@ -259,79 +259,87 @@ mod tests {
         }
     }
 
-    fn capture_targets() -> Arc<Mutex<Vec<String>>> {
+    /// Run `f` under a thread-local scoped subscriber that captures event
+    /// targets.  Unlike `try_init()`, `set_default()` installs a per-thread
+    /// subscriber that does not conflict with other tests running in
+    /// parallel, so every test reliably captures its own events.
+    fn with_captured_events<F: FnOnce()>(f: F) -> Vec<String> {
         let targets = Arc::new(Mutex::new(Vec::<String>::new()));
         let layer = CapturingLayer {
             events: Arc::clone(&targets),
         };
-        // best-effort — ignore if a subscriber is already set
-        let _ = tracing_subscriber::registry().with(layer).try_init();
-        targets
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f();
+        Arc::try_unwrap(targets)
+            .expect("only one reference remains")
+            .into_inner()
+            .unwrap()
     }
 
     #[test]
     fn emit_rejected_uses_audit_target() {
-        let targets = capture_targets();
-        emit_rejected(
-            "tools/call",
-            Some("query_database"),
-            Some("sess_abc"),
-            Some("2026-11-05"),
-            Some("acme-corp"),
-            "invalid_params",
-        );
-        let locked = targets.lock().unwrap();
+        let targets = with_captured_events(|| {
+            emit_rejected(
+                "tools/call",
+                Some("query_database"),
+                Some("sess_abc"),
+                Some("2026-11-05"),
+                Some("acme-corp"),
+                "invalid_params",
+            );
+        });
         assert!(
-            !locked.is_empty(),
+            !targets.is_empty(),
             "expected at least one tracing event, got none"
         );
     }
 
     #[test]
     fn emit_non_tool_uses_audit_target() {
-        let targets = capture_targets();
-        emit_non_tool("tools/list", Some("sess_xyz"), Some("2026-11-05"), None);
-        let locked = targets.lock().unwrap();
+        let targets = with_captured_events(|| {
+            emit_non_tool("tools/list", Some("sess_xyz"), Some("2026-11-05"), None);
+        });
         assert!(
-            !locked.is_empty(),
+            !targets.is_empty(),
             "expected at least one tracing event, got none"
         );
     }
 
     #[test]
     fn emit_completed_ok_uses_audit_target() {
-        let targets = capture_targets();
-        let state = AuditState {
-            start: Instant::now(),
-            method: "tools/call".to_owned(),
-            tool_name: "query_database".to_owned(),
-            session_id: Some("sess_abc".to_owned()),
-            protocol_version: Some("2026-11-05".to_owned()),
-            tenant: Some("acme-corp".to_owned()),
-        };
-        emit_completed(&state, "analytics-mcp", 200);
-        let locked = targets.lock().unwrap();
+        let targets = with_captured_events(|| {
+            let state = AuditState {
+                start: Instant::now(),
+                method: "tools/call".to_owned(),
+                tool_name: "query_database".to_owned(),
+                session_id: Some("sess_abc".to_owned()),
+                protocol_version: Some("2026-11-05".to_owned()),
+                tenant: Some("acme-corp".to_owned()),
+            };
+            emit_completed(&state, "analytics-mcp", 200);
+        });
         assert!(
-            !locked.is_empty(),
+            !targets.is_empty(),
             "expected at least one tracing event, got none"
         );
     }
 
     #[test]
     fn emit_completed_error_uses_audit_target() {
-        let targets = capture_targets();
-        let state = AuditState {
-            start: Instant::now(),
-            method: "tools/call".to_owned(),
-            tool_name: "query_database".to_owned(),
-            session_id: None,
-            protocol_version: None,
-            tenant: None,
-        };
-        emit_completed(&state, "analytics-mcp", 500);
-        let locked = targets.lock().unwrap();
+        let targets = with_captured_events(|| {
+            let state = AuditState {
+                start: Instant::now(),
+                method: "tools/call".to_owned(),
+                tool_name: "query_database".to_owned(),
+                session_id: None,
+                protocol_version: None,
+                tenant: None,
+            };
+            emit_completed(&state, "analytics-mcp", 500);
+        });
         assert!(
-            !locked.is_empty(),
+            !targets.is_empty(),
             "expected at least one tracing event, got none"
         );
     }
