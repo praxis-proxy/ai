@@ -10,7 +10,7 @@
 //! without padding. Verifying the tag needs no per-session state, so
 //! `initialize` cannot be used to grow memory.
 //!
-//! The signing key is drawn from OpenSSL's generator when the filter is
+//! The signing key is drawn from OpenSSL's private generator when the filter is
 //! built and never leaves the process. A config reload or restart therefore
 //! invalidates every outstanding id: clients get `404` and send a new
 //! `initialize`, as the MCP Streamable HTTP transport requires. Several
@@ -32,7 +32,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use praxis_ai_apis::hash::{HmacSha256, SHA256_LEN, random_bytes};
+use praxis_ai_apis::hash::{HmacSha256, SHA256_LEN, private_random_bytes, random_bytes};
 use zeroize::Zeroizing;
 
 // -----------------------------------------------------------------------------
@@ -114,7 +114,7 @@ impl GatewaySessions {
     /// [`Self::new`] with an explicit ended-list capacity.
     fn with_capacity(max_ended: usize) -> Result<Self, IssueError> {
         let mut key = Zeroizing::new([0; KEY_LEN]);
-        random_bytes(key.as_mut()).map_err(|_error| IssueError)?;
+        private_random_bytes(key.as_mut()).map_err(|_error| IssueError)?;
         Ok(Self {
             ended: Mutex::new(Ended::default()),
             key,
