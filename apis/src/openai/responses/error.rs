@@ -18,17 +18,18 @@ use praxis_filter::Rejection;
 /// Produces `{"error":{"message":"<msg>","type":"<code>","param":null,"code":"<code>"}}`.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn responses_error_body(code: &str, message: &str) -> Bytes {
-    responses_error_body_with_code(code, code, message)
+    responses_error_body_with_param(code, code, None, message)
 }
 
-/// Build a non-streaming OpenAI API error JSON body with distinct type and code.
-fn responses_error_body_with_code(error_type: &str, code: &str, message: &str) -> Bytes {
+/// Build a non-streaming OpenAI API error JSON body with distinct type and code,
+/// and the offending request member as `param` when one is known.
+fn responses_error_body_with_param(error_type: &str, code: &str, param: Option<&str>, message: &str) -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": {
                 "message": message,
                 "type": error_type,
-                "param": null,
+                "param": param,
                 "code": code,
             },
         })
@@ -85,9 +86,20 @@ pub(crate) fn responses_error_rejection_with_code(
     code: &str,
     message: &str,
 ) -> Rejection {
+    responses_error_rejection_with_param(status, error_type, code, None, message)
+}
+
+/// Build a [`Rejection`] that names the offending request member in `param`.
+pub(crate) fn responses_error_rejection_with_param(
+    status: u16,
+    error_type: &str,
+    code: &str,
+    param: Option<&str>,
+    message: &str,
+) -> Rejection {
     Rejection::status(status)
         .with_header("content-type", "application/json")
-        .with_body(responses_error_body_with_code(error_type, code, message))
+        .with_body(responses_error_body_with_param(error_type, code, param, message))
 }
 
 // -----------------------------------------------------------------------------
@@ -122,6 +134,27 @@ mod tests {
         );
         assert_eq!(parsed["error"]["message"], "bad input", "message field should match");
         assert!(parsed["error"]["param"].is_null(), "param should be null");
+    }
+
+    #[test]
+    fn rejection_reports_the_offending_param() {
+        let rejection = responses_error_rejection_with_param(
+            400,
+            "invalid_request_error",
+            "unsupported_parameter",
+            Some("previous_input_messages"),
+            "bad input",
+        );
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+
+        assert_eq!(
+            body["error"]["param"], "previous_input_messages",
+            "param should name the offending member"
+        );
+        assert_eq!(
+            body["error"]["code"], "unsupported_parameter",
+            "error code should match"
+        );
     }
 
     #[test]

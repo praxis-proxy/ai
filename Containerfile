@@ -4,7 +4,7 @@
 # Stage 1: Build
 # ------------------------------------------------------------------------------
 
-FROM rust:1.99-alpine3.24 AS builder
+FROM rust:1.100-alpine3.24 AS builder
 
 # Published binaries exclude experimental Responses, agentic loops and stores.
 # Opt in with --build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite.

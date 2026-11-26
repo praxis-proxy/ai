@@ -628,6 +628,33 @@ fn assistant_message(template: &Map<String, Value>, content: Vec<Value>) -> Valu
     Value::Object(object)
 }
 
+/// Move the assistant call and corresponding results into the next model request.
+pub(super) fn rebuild_after_calls(
+    mut request: Map<String, Value>,
+    previous: &mut Map<String, Value>,
+    results: Vec<Value>,
+    limit: usize,
+) -> Result<Vec<u8>, praxis_filter::Rejection> {
+    let Some(Value::Array(messages)) = request.get_mut("messages") else {
+        return Err(super::wire::invalid_request_rejection(
+            "messages must be an array for MCP re-entry",
+        ));
+    };
+    let Some(Value::Array(content)) = previous.remove("content") else {
+        return Err(super::wire::error_rejection(
+            502,
+            super::wire::ErrorType::Api,
+            "MCP inference round lacks assistant content",
+        ));
+    };
+    messages.push(role_message("assistant", content));
+    messages.push(role_message("user", results));
+    if let Some(choice) = request.get_mut("tool_choice") {
+        *choice = serde_json::json!({"type": "auto"});
+    }
+    praxis_filter::json_size::to_vec_capped(&request, limit).map_err(|_error| super::oversized_request())
+}
+
 /// Build a `{role, content}` message.
 fn role_message(role: &str, content: Vec<Value>) -> Value {
     let mut object = Map::with_capacity(2);

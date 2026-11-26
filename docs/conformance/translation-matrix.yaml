@@ -839,7 +839,7 @@ surfaces:
         evidence: apis/src/bedrock/converse/request.rs:141-146; apis/src/bedrock/converse/request.rs:217
       streaming:
         status: translated
-        evidence: apis/src/bedrock/converse/response.rs:286-310; apis/src/bedrock/converse/response.rs:317-511
+        evidence: apis/src/bedrock/converse/response.rs:315-340; apis/src/bedrock/converse/response.rs:346-510
       streaming-terminal-events:
         status: translated
         note: >-
@@ -851,7 +851,7 @@ surfaces:
         note: >-
           Exception and truncated frames become an in-band SSE error frame
           with a typed code and no [DONE].
-        evidence: apis/src/bedrock/converse/mod.rs:414-430; apis/src/bedrock/converse/mod.rs:453-509; apis/src/bedrock/converse/response.rs:514-552
+        evidence: apis/src/bedrock/converse/mod.rs:414-430; apis/src/bedrock/converse/mod.rs:453-509; apis/src/bedrock/converse/response.rs:543-601
       content-filter-signal:
         status: translated
         note: >-
@@ -862,20 +862,22 @@ surfaces:
       usage-accounting:
         status: translated-lossy
         note: Missing token fields default to 0 rather than erroring.
-        evidence: apis/src/bedrock/converse/response.rs:221-240
+        evidence: apis/src/bedrock/converse/response.rs:250-269
       cache-accounting:
         status: dropped
         note: cacheReadInputTokens and cacheWriteInputTokens are discarded.
         blocker: https://github.com/praxis-proxy/ai/issues/2054
-        evidence: apis/src/bedrock/converse/response.rs:221-240
+        evidence: apis/src/bedrock/converse/response.rs:250-269
       reasoning-content:
         status: dropped
         note: >-
-          Streaming reasoningContent deltas return Ok(None) with no output and
-          no error. Citation, toolResult and image deltas take the same path
-          and vanish silently.
+          Finite single-member object reasoningContent and streaming object
+          reasoningContent are omitted while adjacent answer text is preserved;
+          finite empty or multi-member reasoning unions are rejected. Streaming
+          citation, toolResult and image deltas take the same path and vanish
+          silently.
         blocker: https://github.com/praxis-proxy/ai/issues/2055
-        evidence: apis/src/bedrock/converse/response.rs:441-451
+        evidence: apis/src/bedrock/converse/response.rs:162-222; apis/src/bedrock/converse/response.rs:470-477
       request-reasoning-cache-controls:
         status: rejected
         note: >-
