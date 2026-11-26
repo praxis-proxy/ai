@@ -1,16 +1,15 @@
 # Responses Store Schema Upgrade
 
-Current releases require schema version 5 and refuse to start against any older
-store. Schema upgrades are recreate-only: Praxis does not migrate an existing
-store in place, and it fails closed rather than auto-stamping a newer version.
+Current releases require schema version 5 and refuse to start against an older
+store. Upgrades are recreate-only: Praxis does not migrate a store in place,
+and it fails closed rather than stamping a newer version on an old schema.
 
-Schema version 5 adds the owner-scoped SSE replay event-log table used by
-[streaming replay](../../architecture/response-store.md#sse-replay) on top of the
-version-4 layout. Version 4 (shipped after Praxis AI v0.4.1's version 3) changed
-the conversation-item layout and cannot reuse the older tables.
+Version 5 adds the owner-scoped SSE replay event-log table used by
+[streaming replay](../../architecture/response-store.md#sse-replay) to the
+version 4 layout. Version 4, which followed Praxis AI v0.4.1's version 3,
+changed the conversation-item layout, so older tables cannot be reused.
 
-Existing response and conversation state is intentionally disposable. To
-upgrade:
+Response and conversation state is disposable by design. To upgrade:
 
 1. Stop every proxy instance that uses the store.
 2. Back up the old database if its contents may still be needed for audit or
@@ -23,15 +22,15 @@ upgrade:
    schema-v5 table set (including the replay event-log table) before the service
    becomes ready.
 
-Do not update only the schema-version row, and do not reuse v0.4.1 tables
-unchanged. Their v3 layout lacks the owner-scoped conversation-item identity
-and uniqueness constraints required by v4.
+Do not edit only the schema-version row to make a newer binary accept an older
+schema, and do not reuse v0.4.1 tables. Their v3 layout lacks the owner-scoped
+conversation-item identity and uniqueness constraints that v4 requires.
 
-The same recreate-only policy applies to standalone `openai_responses_store`,
-standalone `openai_conversations`, and compatible deployments where the two
-filters share one backend. When a PostgreSQL database contains unrelated data,
-create a new database for Praxis AI rather than dropping the shared database.
+The policy is the same for standalone `openai_responses_store`, standalone
+`openai_conversations`, and deployments where the two filters share one
+backend. If a PostgreSQL database also holds unrelated data, create a new
+database for Praxis AI instead of dropping the shared one.
 
-For historical pre-#570 data recovery only, see
+To recover historical pre-#570 data, see
 [repair duplicate item positions](legacy-item-position-repair.md). That repair
-is not a supported upgrade to schema v5.
+is not an upgrade path to schema v5.

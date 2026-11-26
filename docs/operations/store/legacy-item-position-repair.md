@@ -1,20 +1,18 @@
 # Repair duplicate conversation item positions in a legacy database
 
-Before #570, concurrent item appends could assign the same `position` to two
-items in one `(tenant_id, conversation_id)` scope. The unique index added by
-[#570](https://github.com/praxis-proxy/ai/pull/570) cannot be created while
-those rows exist, so store startup fails. This
-is an **operator-run data repair**, not an automatic startup migration: changing
-persisted ordering without a backup or while writers are active is unsafe.
+Before #570, concurrent item appends could give two items in one
+`(tenant_id, conversation_id)` scope the same `position`. The unique index added
+by [#570](https://github.com/praxis-proxy/ai/pull/570) cannot be created while
+those rows exist, so store startup fails. Startup does not repair this
+automatically, because changing persisted ordering without a backup or while
+writers are active is unsafe; you run the repair yourself.
 
-These statements apply to the **pre-#570, version 1** items table, before its
-`(tenant_id, conversation_id, position)` unique index exists. They are for
-**historical data recovery only**, not an upgrade to the current schema.
-Current releases require a new, empty schema-v5 store; follow the
-[recreate-only upgrade policy](schema-migration.md) rather than repairing an
-older database for reuse. Do not change the schema-version stamp to make a
-newer binary accept an older schema. Index definitions have also changed;
-`IF NOT EXISTS` alone will **not** replace an old index definition.
+The statements below apply to the pre-#570, version 1 items table, before its
+`(tenant_id, conversation_id, position)` unique index exists, and are for
+historical data recovery only. They do not upgrade the database to the current
+schema: current releases need a new, empty schema-v5 store, as described in the
+[recreate-only upgrade policy](schema-migration.md). Index definitions have
+also changed, and `IF NOT EXISTS` does not replace an old index definition.
 
 1. Stop every gateway instance writing to this database and take a backup.
 2. Substitute the configured items table name for `<items>` throughout the
@@ -27,12 +25,11 @@ newer binary accept an older schema. Index definitions have also changed;
    HAVING COUNT(*) > 1;
    ```
 
-3. Run the backend-specific transaction below. It keeps every item and assigns
-   positions 1, 2, ... in the existing `(position, item_id)` order **only for
-   conversations with duplicates**. That is also the order used to build the
-   conversation message cache, so the cache's item order does not change.
-   If any statement fails, roll back and investigate instead of starting the
-   gateway.
+3. Run the backend-specific transaction below. It keeps every item and, only
+   in conversations with duplicates, renumbers positions 1, 2, ... in the
+   existing `(position, item_id)` order. The conversation message cache is
+   built in that same order, so its item order does not change. If any
+   statement fails, roll back and investigate before starting the gateway.
 
 ## PostgreSQL
 
@@ -113,7 +110,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_<items>_position
 COMMIT;
 ```
 
-Run the inspection query again. It must return no rows. Check that the item
-count still matches the backup before using the recovered historical data.
-Do not reuse this repaired database with a current release; provision a new
-store as described in [schema migration](schema-migration.md).
+Run the inspection query again; it must return no rows. Check that the item
+count still matches the backup before using the recovered data. Do not run a
+current release against the repaired database; provision a new store as
+described in [schema migration](schema-migration.md).

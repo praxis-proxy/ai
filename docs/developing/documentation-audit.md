@@ -1,11 +1,12 @@
 # Operator documentation support audit
 
-Reviewed **2026-11-13**, against main
+Reviewed **2026-11-13** against main
 `56dc39a25d7f44da0467c28f0e85bfa4ca220130` (the checkout matched fetched
-`origin/main` before edits). This document records evidence and remaining work;
-the [client/provider selector](../getting-started/choose-client-and-provider.md) is the reader entry
-point. The onboarding/client-provider guides from #1976 were already present
-and are extended rather than replaced with competing guides.
+`origin/main` before edits). This page records the evidence behind the operator
+documentation and the work that remains. Readers start at the
+[client/provider selector](../getting-started/choose-client-and-provider.md).
+The audit extended the onboarding and client-provider guides from #1976 rather
+than adding competing guides.
 
 ## Evidence and support boundaries
 
@@ -13,9 +14,10 @@ The audit checked [server feature wiring](../../server/Cargo.toml),
 [filter registration](../../filters/src/register.rs), API implementation modules,
 complete example YAML, functional example tests, SDK tests, and the
 [generated translation matrix](../conformance/translation-matrix.md).
-Registration establishes availability, not protocol conformance. Fixture replay
-establishes behavior against the recorded or synthetic backend, not a live
-provider/model. A test gated on infrastructure can skip and prove nothing live.
+Registration shows a filter is available, not that it conforms to the
+protocol. Fixture replay shows behavior against the recorded or synthetic
+backend, not a live provider/model. A test gated on infrastructure can skip and
+prove nothing live.
 
 | Capability | Source and existing test evidence | Operator boundary |
 | --- | --- | --- |
@@ -35,47 +37,47 @@ provider/model. A test gated on infrastructure can skip and prove nothing live.
 | Tokens, limits and metering | [Usage implementation](../../filters/src/token_usage), [count tests](../../tests/integration/tests/suite/examples/token_counting.rs), [tenant metrics tests](../../tests/integration/tests/suite/examples/token_usage_metrics.rs), [metering reference](../filters/control/external_metering.md) | Observed usage is not enforcement; token ceilings, budgets and inflight tracking are optional experimental; body counts arrive after headers |
 | Credentials, identity and enrichment | [Registration](../../filters/src/register.rs), [credential boundaries](../guides/README.md#credentials), [prompt enrichment](../filters/core/prompt_enrich.md) | Header capture is not authentication; distinguish cluster credentials, selected-provider credentials, and destination-bound callout secrets |
 
-The matrix explicitly distinguishes `translated`, `passthrough`, `lossy`,
-`rejected`, `n/a`, and `gap`. Its known gaps include accepted-but-incomplete
-behavior and must remain visible when promoting a provider recipe. Examples
-with local stubs, placeholder providers, or a broad path route are not complete
-provider qualifications. See [Anthropic evidence](../anthropic-messages.md) for
-existing pinned GPU/model lanes; they were not rerun as part of this audit.
+The matrix statuses are `translated`, `passthrough`, `lossy`, `rejected`,
+`n/a`, and `gap`. Its known gaps include accepted-but-incomplete behavior and
+must stay visible when a provider recipe is promoted. Examples with local
+stubs, placeholder providers, or a broad path route do not qualify a provider.
+The pinned GPU/model lanes in [Anthropic evidence](../anthropic-messages.md)
+were not rerun for this audit.
 
 ## Documentation changes
 
 - Reorganized the landing page around onboarding, APIs, providers, routing,
   protection, tools/state, operations, and reference/development.
-- Extended the existing selector to include selected Anthropic, Bedrock,
-  Conversations, explicit mode/build/auth distinctions, and compatibility status.
-- Added Chat Completions to the existing hosted quickstart, and a cloud adapter
-  runbook completing the existing examples with TLS, credentials, and startup.
+- Extended the selector with selected Anthropic, Bedrock, Conversations,
+  explicit mode/build/auth distinctions, and compatibility status.
+- Added Chat Completions to the hosted quickstart, and a cloud adapter runbook
+  that completes the existing examples with TLS, credentials, and startup.
 - Reused the native/translated Anthropic and model-mapping examples in recipes.
-- Added full local composition recipes for guardrails with usage and for an
+- Added complete local recipes for guardrails with usage and for an
   experimental managed Responses/MCP/SQLite lab.
-- Moved Rust hosting/registration material to [development](filter-hosts.md).
-- Added an [operations path](../operations/README.md).
+- Moved Rust hosting/registration material to [development](filter-hosts.md)
+  and added an [operations path](../operations/README.md).
 
 ## Verification for this change
 
-The following checks passed against the reviewed source plus documentation edits:
+These checks passed against the reviewed source plus the documentation edits:
 
 - `cargo build -p praxis-ai-proxy` (standard) and
-  `cargo build -p praxis-ai-proxy --features openai-all,store-sqlite,basic-auth-filter`.
-  A third build added `vertex-anthropic-filter` to that optional feature set.
-  Separate copies of the resulting binaries were used to check feature availability.
+  `cargo build -p praxis-ai-proxy --features openai-all,store-sqlite,basic-auth-filter`,
+  plus a third build that added `vertex-anthropic-filter` to that optional
+  set. Separate copies of the binaries were used to check feature availability.
 - `make doc`, with warnings denied by the repository target.
 - `cargo xtask lint-filter-docs`, `lint-example-tests`, `lint-markdown-links`,
   `sync-example-readme`, `sync-inference-readme`, `sync-responses-readme`,
   `sync-flow-visualizers`, `check-inference`, and `translation-matrix`.
-  These are reference/manifest consistency checks, not execution of all examples
-  or replay of every inference fixture.
-- `git diff --check`, plus a supplemental local-target/fragment check over new
-  and changed Markdown. The repository link linter enumerates tracked files,
-  so it does not by itself check new, unstaged files.
+  These check reference and manifest consistency; they do not run every
+  example or replay every inference fixture.
+- `git diff --check`, plus a local-target/fragment check over new and changed
+  Markdown, because the repository link linter enumerates tracked files and
+  misses new, unstaged ones.
 
-Configuration validation used the actual binaries above, with placeholder
-secrets and YAML extracted from the documentation where applicable:
+Configuration validation ran the binaries above with placeholder secrets and,
+where applicable, YAML extracted from the documentation:
 
 | Binary | Configurations accepted by `--validate` |
 | --- | --- |
@@ -83,14 +85,15 @@ secrets and YAML extracted from the documentation where applicable:
 | Optional build above | Native and translated credential-isolated Anthropic examples, managed Responses/MCP/SQLite recipe |
 | Optional build plus `vertex-anthropic-filter` | Original Vertex Anthropic example and its cloud-runbook adaptation |
 
-The standard binary also rejected the managed recipe with an unknown-filter
-error, confirming that the optional build is necessary. The cloud-runbook
-adaptations for Azure, Vertex Gemini, Bedrock, and Vertex Anthropic also passed validation with placeholder secrets and the appropriate
-binary, including the added TLS/SNI/Host and credential settings. These checks
-still need real credentials, permissions, model access, and live provider tests.
+The standard binary rejected the managed recipe with an unknown-filter error,
+confirming that the optional build is necessary. The cloud-runbook adaptations
+for Azure, Vertex Gemini, Bedrock, and Vertex Anthropic, including the added
+TLS/SNI/Host and credential settings, passed validation with placeholder
+secrets and the appropriate binary. They still need real credentials,
+permissions, model access, and live provider tests.
 
-A temporary local HTTP recording harness exercised the documented configurations
-against controlled stubs, with assertions on responses and captured requests:
+A temporary local HTTP recording harness ran the documented configurations
+against controlled stubs and asserted on responses and captured requests:
 
 - Static alias selected port 9001 and rewrote the model; an unmatched model
   selected port 9002 unchanged.
@@ -108,28 +111,27 @@ against controlled stubs, with assertions on responses and captured requests:
   Resuming with approval executed exactly one tool call, then returned the
   final model answer. MCP requests did not receive the inference bearer.
 
-These local checks used the exact documented ports and filter chains. Stub
-verdicts do not establish real NeMo rail behavior, and synthetic model output
-does not establish a model's ability to select tools. SSE runtime paths,
-approval denial/replay, and broader protocol contracts rely on the linked
-existing source/test evidence here; they were not rerun in this harness.
-No credentialed hosted-provider request, live MCP service, GPU run, or
-production sizing exercise was performed. Temporary proxies and stubs were
-stopped after verification.
+These checks used the exact documented ports and filter chains. Stub verdicts
+say nothing about real NeMo rail behavior, and synthetic model output says
+nothing about a model's ability to select tools. SSE runtime paths, approval
+denial/replay, and broader protocol contracts rest on the source and test
+evidence linked above; the harness did not rerun them. No credentialed
+hosted-provider request, live MCP service, GPU run, or production sizing
+exercise was performed. Temporary proxies and stubs were stopped afterwards.
 
 ## Remaining gaps and separate blockers
 
 - **Bedrock generated-reference omission:** `openai_chat_completions_to_bedrock_converse`
   is registered and exercised by tests, but the generated filter inventory has
-  no corresponding page. `cargo xtask lint-filter-docs` passes with this omission.
-  Fix generator discovery/source metadata in a separate change; do not hand-edit
-  the generated reference. This documentation links the implementation,
-  configuration, and compatibility evidence without inventing an exact-settings page.
+  no page for it, and `cargo xtask lint-filter-docs` passes anyway. Fix
+  generator discovery/source metadata in a separate change; do not hand-edit the
+  generated reference. Until then the docs link the implementation,
+  configuration, and compatibility evidence instead of an exact-settings page.
 - **Cloud account provisioning and qualification:** the [provider runbook](../guides/providers/README.md)
   completes gateway configuration and requests around existing examples. It
-  assumes cloud accounts, regional permissions, model/deployment access, and
-  a supported credential source. Those external prerequisites and live cloud
-  validation remain outside the checks run here.
+  assumes cloud accounts, regional permissions, model/deployment access, and a
+  supported credential source; those prerequisites and live cloud validation
+  were not checked here.
 - **Runtime product gaps:** generated translation-matrix gaps, response-phase
   streaming guardrails, and body-to-response-header token timing remain visible.
   No Rust behavior was changed to conceal or fix them.
@@ -139,9 +141,10 @@ stopped after verification.
 ## Development versus v0.10.0
 
 The release tag `v0.10.0` resolves to
-`f96d0114a995765793b1fb33f86f94ecc298eb08`. This change is based on later main,
-including later onboarding, provider, translation, and Conversations changes.
-No released snapshot was edited. New recipes/navigation and current-main
+`f96d0114a995765793b1fb33f86f94ecc298eb08`. This audit is based on later main,
+with later onboarding, provider, translation, and Conversations changes, and
+edited no released snapshot. New recipes, navigation, and current-main
 compatibility statements belong in **Development** until a release containing
-them is published and imported by the website. Do not backport this selector's
-support claims to v0.10.0 without auditing that tag's code and binary separately.
+them is published and imported by the website. Do not backport the selector's
+support claims to v0.10.0 without auditing that tag's code and binary
+separately.
