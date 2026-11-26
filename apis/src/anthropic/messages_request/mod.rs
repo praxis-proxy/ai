@@ -90,6 +90,9 @@ pub(crate) const MCP_CONNECTOR_RESOLVED: &str = "resolved";
 
 /// Processes an Anthropic create-message body once and publishes its facts.
 ///
+/// Structured image/audio content is published as `modality` metadata and a
+/// branch result; it is never promoted to an HTTP header.
+///
 /// The registry decides which operation this filter owns, so only
 /// `POST /v1/messages` has its body processed. Every other Anthropic Messages
 /// operation — token counting, the batch family — is released without body
@@ -148,8 +151,7 @@ impl AnthropicMessagesRequestFilter {
         ctx: &mut HttpFilterContext<'_>,
         object: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), FilterError> {
-        let mut classified = classify_object(object);
-        classified.format = AiRequestFormat::AnthropicMessages;
+        let classified = classify_object(object, AiRequestFormat::AnthropicMessages);
         let mcp_connector = uses_mcp_connector(object);
 
         debug!(model = ?classified.model, mcp_connector, "processed anthropic create-message body");
@@ -382,6 +384,9 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
     if mcp_connector {
         ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, "true");
     }
+    if let Some(modality) = classified.modality {
+        ctx.record_ai_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
+    }
 }
 
 /// Promote the configured routing headers.
@@ -440,6 +445,9 @@ fn promote_filter_results(
     }
     if classified.has_tools {
         results.set("has_tools", "true")?;
+    }
+    if let Some(modality) = classified.modality {
+        results.set("modality", modality.as_str())?;
     }
     if mcp_connector {
         results.set("mcp_connector", "true")?;

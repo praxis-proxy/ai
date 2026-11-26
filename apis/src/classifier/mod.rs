@@ -41,6 +41,35 @@ impl AiRequestFormat {
     }
 }
 
+/// Common request metadata key for the detected input modality.
+pub(crate) const MODALITY_METADATA_KEY: &str = "ai.modality";
+
+// -----------------------------------------------------------------------------
+// ContentModality
+// -----------------------------------------------------------------------------
+
+/// Bounded content capability derived from structured request content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentModality {
+    /// Audio content only.
+    Audio,
+    /// Image content only.
+    Image,
+    /// Both image and audio content.
+    ImageAudio,
+}
+
+impl ContentModality {
+    /// Stable value used by metadata and branch results.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Image => "image",
+            Self::ImageAudio => "image_audio",
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // ClassifiedRequest
 // -----------------------------------------------------------------------------
@@ -93,6 +122,8 @@ pub(crate) struct ClassifiedRequest {
     pub max_output_tokens: Option<u64>,
     /// Extracted `max_tokens` field value, if present.
     pub max_tokens: Option<u64>,
+    /// Image/audio capability required by structured request content.
+    pub modality: Option<ContentModality>,
     /// Extracted `model` field value, if present.
     pub model: Option<String>,
     /// Extracted `store` field value, if present.
@@ -135,7 +166,7 @@ pub(crate) fn is_chat_completions_create(method: &http::Method, path: &str) -> b
 ///
 /// This function is pure: no I/O, no side effects, no mutation of
 /// the input bytes.
-pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
+pub(crate) fn classify_request_body(body: &[u8], format: Option<AiRequestFormat>) -> ClassifiedRequest {
     if body.is_empty() {
         return empty_result(AiRequestFormat::NonJson);
     }
@@ -151,7 +182,7 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
     // This parse is a throwaway owned by this function, so the model string is
     // moved out rather than copied.
     let model = take_string(obj, "model");
-    classify_fields(obj, model)
+    classify_fields(obj, model, format)
 }
 
 /// Extract routing facts from an already-parsed request object.
@@ -164,17 +195,24 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
 /// caller that reuses the same parsed value afterwards — to build request
 /// state, say — must still see the body the client actually sent. That costs
 /// one copy of the model string, which the owned path above avoids.
-pub(crate) fn classify_object(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
+pub(crate) fn classify_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    format: AiRequestFormat,
+) -> ClassifiedRequest {
     let model = copy_string(obj, "model");
-    classify_fields(obj, model)
+    classify_fields(obj, model, Some(format))
 }
 
 /// Extract the remaining facts once the model has been obtained.
 ///
 /// Split out so the owned and borrowed entry points differ only in how they
 /// get the model string, and cannot otherwise drift.
-fn classify_fields(obj: &serde_json::Map<String, serde_json::Value>, model: Option<String>) -> ClassifiedRequest {
-    let format = classify_format(obj);
+fn classify_fields(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    model: Option<String>,
+    format: Option<AiRequestFormat>,
+) -> ClassifiedRequest {
+    let format = format.unwrap_or_else(|| classify_format(obj));
 
     ClassifiedRequest {
         background: obj.get("background").and_then(serde_json::Value::as_bool),
@@ -191,10 +229,190 @@ fn classify_fields(obj: &serde_json::Map<String, serde_json::Value>, model: Opti
             .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())),
         max_output_tokens: obj.get("max_output_tokens").and_then(serde_json::Value::as_u64),
         max_tokens: obj.get("max_tokens").and_then(serde_json::Value::as_u64),
+        modality: detect_content_modality(obj, format),
         model,
         store: obj.get("store").and_then(serde_json::Value::as_bool),
         stream: obj.get("stream").and_then(serde_json::Value::as_bool),
     }
+}
+
+/// Detect image/audio requirements from the protocol's structured content.
+///
+/// The classifier walks the JSON value each request filter has already parsed;
+/// it does not deserialize the body a second time or copy media payloads.
+fn detect_content_modality(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    format: AiRequestFormat,
+) -> Option<ContentModality> {
+    let mut detected = DetectedModalities::default();
+
+    match format {
+        AiRequestFormat::Responses => {
+            detect_responses_input(obj.get("input"), &mut detected);
+            if !detected.image
+                && let Some(variables) = obj
+                    .get("prompt")
+                    .and_then(|prompt| prompt.get("variables"))
+                    .and_then(serde_json::Value::as_object)
+            {
+                for value in variables.values() {
+                    detect_content_part(value, format, &mut detected);
+                    if detected.image {
+                        break;
+                    }
+                }
+            }
+        },
+        AiRequestFormat::AnthropicMessages | AiRequestFormat::ChatCompletions => {
+            detect_messages(obj.get("messages"), format, &mut detected);
+        },
+        AiRequestFormat::UnknownJson | AiRequestFormat::InvalidJson | AiRequestFormat::NonJson => {},
+    }
+
+    detected.modality()
+}
+
+/// Image and audio signals accumulated while walking structured content.
+#[derive(Default)]
+struct DetectedModalities {
+    /// Whether audio content was observed.
+    audio: bool,
+    /// Whether image content was observed.
+    image: bool,
+}
+
+impl DetectedModalities {
+    /// Return true once no additional signal can change the routing value.
+    const fn is_complete(&self) -> bool {
+        self.audio && self.image
+    }
+
+    /// Convert accumulated signals to the bounded public routing value.
+    const fn modality(&self) -> Option<ContentModality> {
+        match (self.image, self.audio) {
+            (false, false) => None,
+            (false, true) => Some(ContentModality::Audio),
+            (true, false) => Some(ContentModality::Image),
+            (true, true) => Some(ContentModality::ImageAudio),
+        }
+    }
+}
+
+/// Inspect Chat Completions or Anthropic message content.
+fn detect_messages(value: Option<&serde_json::Value>, format: AiRequestFormat, detected: &mut DetectedModalities) {
+    let Some(messages) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for message in messages {
+        detect_content(message.get("content"), format, detected);
+        if detected.is_complete() {
+            break;
+        }
+    }
+}
+
+/// Inspect Responses API input messages and direct content items.
+fn detect_responses_input(value: Option<&serde_json::Value>, detected: &mut DetectedModalities) {
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let format = AiRequestFormat::Responses;
+    for item in items {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("computer_call_output") => {
+                if item.get("output").is_some_and(|output| {
+                    output.get("type").and_then(serde_json::Value::as_str) == Some("computer_screenshot")
+                        && (has_string(output.get("image_url")) || has_string(output.get("file_id")))
+                }) {
+                    detected.image = true;
+                }
+            },
+            Some("function_call_output" | "custom_tool_call_output") => {
+                detect_content(item.get("output"), format, detected);
+            },
+            Some("message") | None => detect_content(item.get("content"), format, detected),
+            _ => {},
+        }
+        if detected.is_complete() {
+            break;
+        }
+    }
+}
+
+/// Inspect a structured content object or array.
+fn detect_content(value: Option<&serde_json::Value>, format: AiRequestFormat, detected: &mut DetectedModalities) {
+    match value {
+        Some(serde_json::Value::Array(parts)) => {
+            for part in parts {
+                detect_content_part(part, format, detected);
+                if detected.is_complete() {
+                    break;
+                }
+            }
+        },
+        Some(value @ serde_json::Value::Object(_)) => detect_content_part(value, format, detected),
+        _ => {},
+    }
+}
+
+/// Match media only in content parts recognized by the selected protocol.
+fn detect_content_part(part: &serde_json::Value, format: AiRequestFormat, detected: &mut DetectedModalities) {
+    let part_type = part.get("type").and_then(serde_json::Value::as_str);
+    match (format, part_type) {
+        (AiRequestFormat::ChatCompletions, Some("image_url")) => {
+            detected.image |= part
+                .get("image_url")
+                .is_some_and(|source| has_string(source.get("url")));
+        },
+        (AiRequestFormat::ChatCompletions, Some("audio_url")) => {
+            detected.audio |= part
+                .get("audio_url")
+                .is_some_and(|source| has_string(source.get("url")));
+        },
+        (AiRequestFormat::ChatCompletions, Some("input_audio")) => {
+            detected.audio |= part
+                .get("input_audio")
+                .is_some_and(|source| has_string(source.get("data")));
+        },
+        (AiRequestFormat::Responses, Some("input_image")) => {
+            detected.image |= has_string(part.get("image_url")) || has_string(part.get("file_id"));
+        },
+        (AiRequestFormat::AnthropicMessages, _) => detect_anthropic_part(part, part_type, detected),
+        _ => {},
+    }
+}
+
+/// Inspect Anthropic image sources and the containers that may carry them.
+fn detect_anthropic_part(part: &serde_json::Value, part_type: Option<&str>, detected: &mut DetectedModalities) {
+    let format = AiRequestFormat::AnthropicMessages;
+    let source = part.get("source");
+    let source_type = source
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str);
+    match (part_type, source, source_type) {
+        (Some("image"), Some(source), Some("base64")) => detected.image |= has_string(source.get("data")),
+        (Some("image"), Some(source), Some("url")) => detected.image |= has_string(source.get("url")),
+        (Some("image"), Some(source), Some("file")) => detected.image |= has_string(source.get("file_id")),
+        (Some("document"), Some(source), Some("content")) => detect_content(source.get("content"), format, detected),
+        (Some("web_fetch_tool_result"), ..) => {
+            if let Some(result) = part.get("content")
+                && result.get("type").and_then(serde_json::Value::as_str) == Some("web_fetch_result")
+                && let Some(document) = result.get("content")
+                && document.get("type").and_then(serde_json::Value::as_str) == Some("document")
+            {
+                detect_anthropic_part(document, Some("document"), detected);
+            }
+        },
+        (Some("tool_result"), ..) => detect_content(part.get("content"), format, detected),
+        _ => {},
+    }
+}
+
+/// Whether an expected source string is present without validating its payload.
+fn has_string(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
 }
 
 /// Determine format from top-level keys.
@@ -276,6 +494,7 @@ pub(crate) fn empty_result(format: AiRequestFormat) -> ClassifiedRequest {
         has_tools: false,
         max_output_tokens: None,
         max_tokens: None,
+        modality: None,
         model: None,
         store: None,
         stream: None,
@@ -344,7 +563,7 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_slice(br#"{"model":"gpt-4.1","input":"hi"}"#).unwrap();
         let obj = value.as_object_mut().unwrap();
 
-        let classified = classify_object(obj);
+        let classified = classify_object(obj, AiRequestFormat::Responses);
 
         assert_eq!(classified.model.as_deref(), Some("gpt-4.1"));
         assert_eq!(
@@ -354,6 +573,10 @@ mod tests {
         );
     }
     use super::*;
+
+    fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
+        super::classify_request_body(body, None)
+    }
 
     #[test]
     fn responses_string_input() {
@@ -1035,5 +1258,137 @@ mod tests {
             Some("bad\nmodel"),
             "model with control chars should still be extracted by classifier"
         );
+    }
+
+    #[test]
+    fn chat_image_url_sets_image_modality() {
+        let body = br#"{"model":"gpt-4.1","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn chat_image_and_audio_set_combined_modality() {
+        let body = br#"{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::ImageAudio));
+    }
+
+    #[test]
+    fn responses_input_image_sets_image_modality() {
+        let body =
+            br#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"input_image","file_id":"file_123"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn anthropic_base64_image_sets_image_modality() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_computer_screenshot_sets_image_modality() {
+        let body = br#"{"input":[{"type":"computer_call_output","call_id":"call_123","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,AAAA"}}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_detects_only_typed_image_prompt_variables() {
+        let image =
+            br#"{"prompt":{"id":"pmpt_123","variables":{"picture":{"type":"input_image","file_id":"file_123"}}}}"#;
+        let text = br#"{"prompt":{"id":"pmpt_123","variables":{"picture":"data:image/png;base64,AAAA"}}}"#;
+        assert_eq!(classify_request_body(image).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
+    }
+
+    #[test]
+    fn anthropic_detects_images_in_successful_web_fetch_results() {
+        let image = br#"{"max_tokens":128,"messages":[{"content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}}}}]}]}"#;
+        let text = br#"{"max_tokens":128,"messages":[{"content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"content","content":[{"type":"text","text":"data:image/png;base64,AAAA"}]}}}}]}]}"#;
+        assert_eq!(classify_request_body(image).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
+    }
+
+    #[test]
+    fn responses_file_backed_screenshot_requires_a_source() {
+        let body = br#"{"input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"file_123"}}]}"#;
+        let missing =
+            br#"{"input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":""}}]}"#;
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(missing).modality, None);
+    }
+
+    #[test]
+    fn responses_custom_tool_output_only_inspects_structured_content() {
+        let body =
+            br#"{"input":[{"type":"custom_tool_call_output","output":[{"type":"input_image","file_id":"file_123"}]}]}"#;
+        let text = br#"{"input":[{"type":"custom_tool_call_output","output":"data:image/png;base64,AAAA"}]}"#;
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
+    }
+
+    #[test]
+    fn anthropic_document_only_detects_images_in_content_sources() {
+        let image = br#"{"max_tokens":128,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}}]}]}"#;
+        let text = br#"{"max_tokens":128,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"text","text":"data:image/png;base64,AAAA"}]}}]}]}"#;
+        assert_eq!(classify_request_body(image).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
+    }
+
+    #[test]
+    fn responses_function_output_image_sets_image_modality() {
+        let body = br#"{"input":[{"type":"function_call_output","call_id":"call_123","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn anthropic_tool_result_image_sets_image_modality() {
+        let body = br#"{"max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"text","text":"result"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_function_arguments_do_not_set_modality() {
+        let body = br#"{"input":[{"type":"function_call","call_id":"call_123","name":"inspect","arguments":"{\"image_url\":\"data:image/png;base64,AAAA\"}"}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn anthropic_tool_arguments_do_not_set_modality() {
+        let body = br#"{"max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_123","name":"inspect","input":{"image_url":"data:image/png;base64,AAAA"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn missing_media_source_does_not_set_modality() {
+        let body = br#"{"messages":[{"content":[{"type":"image_url"},{"type":"input_image","file_id":null},{"type":"input_audio","input_audio":null}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn unrelated_fields_and_cross_protocol_parts_do_not_set_modality() {
+        for body in [
+            r#"{"messages":[{"content":[{"type":"text","image_url":{"url":"https://example.test/image.png"}}]}]}"#,
+            r#"{"messages":[{"content":[{"type":"input_image","file_id":"file_123"}]}]}"#,
+            r#"{"input":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#,
+        ] {
+            assert_eq!(classify_request_body(body.as_bytes()).modality, None, "{body}");
+        }
+    }
+
+    #[test]
+    fn media_like_text_does_not_set_modality() {
+        let body = br#"{"messages":[{"content":[{"type":"text","text":"explain data:image/png;base64,AAAA"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
     }
 }

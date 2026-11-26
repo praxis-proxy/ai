@@ -712,7 +712,10 @@ async fn filter_results_are_published_under_this_filter() {
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
             "model": "gpt-4.1",
-            "input": "hi",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_image", "file_id": "file_123"}]
+            }],
             "previous_response_id": "resp_1"
         }))
         .unwrap(),
@@ -725,11 +728,27 @@ async fn filter_results_are_published_under_this_filter() {
         .get("openai_responses_request")
         .expect("results belong to the filter that published them");
     assert_eq!(results.get("format"), Some("openai_responses"));
+    assert_eq!(results.get("modality"), Some("image"));
+    assert_eq!(ctx.filter_metadata.get("ai.modality"), Some("image"));
     assert_eq!(
         results.get("mode"),
         Some("stateful"),
         "the routing fact a branch condition matches on"
     );
+}
+
+/// A classifier pass on a text body clears a preceding modality fact.
+#[tokio::test]
+async fn text_classification_clears_previous_modality() {
+    let filter = filter("initialize_state: false\n");
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    ctx.record_ai_metadata("ai.modality", "image");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(ctx.filter_metadata.get("ai.modality"), None);
 }
 
 /// A passthrough chain consumes no state, so it can opt out of building it.

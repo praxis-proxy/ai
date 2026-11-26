@@ -1,0 +1,79 @@
+# Multimodal Content Routing
+#
+# The existing protocol request filter derives a proxy-owned modality fact from
+# structured message content. Branch conditions route image, audio, combined
+# image/audio, and text-only requests without exposing the fact as an HTTP
+# header. The Responses and Anthropic request filters publish the same fact.
+
+listeners:
+  - name: gateway
+    address: "127.0.0.1:3000"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: ai_operation
+      - filter: openai_chat_completions_request
+        branch_chains:
+          - name: image-audio
+            on_result:
+              filter: openai_chat_completions_request
+              key: modality
+              result: image_audio
+            chains:
+              - name: image-audio-route
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: image-audio
+            rejoin: shared-load-balancer
+          - name: image
+            on_result:
+              filter: openai_chat_completions_request
+              key: modality
+              result: image
+            chains:
+              - name: image-route
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: image
+            rejoin: shared-load-balancer
+          - name: audio
+            on_result:
+              filter: openai_chat_completions_request
+              key: modality
+              result: audio
+            chains:
+              - name: audio-route
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: audio
+            rejoin: shared-load-balancer
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: text
+      - name: shared-load-balancer
+        filter: load_balancer
+        clusters:
+          - name: image-audio
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: image
+            endpoints:
+              - "127.0.0.1:3002"
+          - name: audio
+            endpoints:
+              - "127.0.0.1:3003"
+          - name: text
+            endpoints:
+              - "127.0.0.1:3004"
+
+insecure_options:
+  allow_private_endpoints: true

@@ -58,13 +58,35 @@ def timeout_anthropic_client(error_proxy_ports):
 
 class TestAnthropicErrorFormatter:
     @pytest.mark.parametrize("stream", [False, True])
-    def test_messages_connection_refused(self, anthropic_client, stream):
+    @pytest.mark.parametrize(
+        ("role", "content"),
+        [
+            ("user", "hello"),
+            ("user", [{"type": "image", "source": {"type": "url", "url": "https://example.test/image.png"}}]),
+            ("assistant", [{
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "srvtoolu_sdk",
+                "content": {
+                    "type": "web_fetch_result",
+                    "url": "https://example.test/document",
+                    "content": {
+                        "type": "document",
+                        "source": {"type": "content", "content": [
+                            {"type": "image", "source": {"type": "url", "url": "https://example.test/image.png"}}
+                        ]},
+                    },
+                },
+            }]),
+        ],
+        ids=["text", "image", "web-fetch-image"],
+    )
+    def test_messages_connection_refused(self, anthropic_client, role, content, stream):
         with pytest.raises(APIStatusError) as exc_info:
             anthropic_client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=100,
                 stream=stream,
-                messages=[{"role": "user", "content": "hello"}],
+                messages=[{"role": role, "content": content}],
             )
         err = exc_info.value
         assert err.status_code == 502, "upstream connection refusal must surface as 502"
