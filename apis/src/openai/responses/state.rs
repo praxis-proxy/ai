@@ -1419,6 +1419,10 @@ impl ResponsesState {
     /// immutable `input` length (rehydrate, compaction). Do not call after the
     /// agentic loop appends tool results — those sit after the current input and
     /// must not move this boundary.
+    ///
+    /// Only the store-backed rehydrate path and compaction rewrite that layout;
+    /// a plain `openai-responses` build keeps the default start of `0`.
+    #[cfg(any(feature = "store", feature = "openai-compact"))]
     pub(crate) fn sync_current_input_start(&mut self) {
         self.current_input_start = self.messages.len().saturating_sub(self.input.len());
     }

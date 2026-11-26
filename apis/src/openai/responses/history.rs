@@ -28,7 +28,7 @@ impl MessageHistory {
     }
 
     /// Whether the history is empty.
-    #[cfg(any(feature = "store", feature = "openai-compact", feature = "openai-responses", test))]
+    #[cfg(any(feature = "store", feature = "openai-compact", test))]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
