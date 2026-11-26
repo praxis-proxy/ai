@@ -3524,6 +3524,54 @@ class TestOpenAIResponsesVLLM:
         finally:
             client.conversations.delete(conversation.id)
 
+    def test_preprocessed_input_file_keeps_hosted_tool_results(self, witness_tool_client):
+        """#1907: doc_extract rewrite must not drop agentic tool results on re-entry.
+
+        Sends an inline ``input_file`` through the shipped full-flow graph so
+        ``openai_doc_extract`` rewrites the working history in place while
+        ``state.input`` keeps the client snapshot. The witness then drives a
+        hosted ``web_search`` round; the second upstream body must still carry
+        the search result after selected-input rebuild.
+        """
+        client, forwarded = witness_tool_client
+        file_bytes = b"STREAM-TOOL-410 from attached notes"
+        file_data = "data:text/plain;base64," + base64.b64encode(file_bytes).decode()
+        response = client.responses.create(
+            model="sdk-conversation-tool-stream",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": file_data,
+                        }
+                    ],
+                }
+            ],
+            store=False,
+            tools=[{"type": "web_search"}],
+            max_tool_calls=1,
+            extra_headers={"x-user-brave-key": "controlled-test-only"},
+        )
+        assert response.status == "completed", response
+        assert [item.type for item in response.output] == ["web_search_call", "message"]
+        assert len(forwarded) == 2, (
+            "preprocess + one tool dispatch should produce one re-entry; "
+            f"got {len(forwarded)} upstream bodies"
+        )
+        reentry = json.dumps(forwarded[1]["input"])
+        assert "Mock Search Result" in reentry, (
+            "selected-input rebuild must keep the hosted tool result after "
+            f"document preprocessing; re-entry input was: {reentry[:500]}"
+        )
+        assert "STREAM-TOOL-410" in reentry or "notes.txt" in reentry, (
+            "re-entry must still carry the preprocessed document text; "
+            f"got: {reentry[:500]}"
+        )
+
     def test_hosted_web_search_enforces_allowed_domains(self, witness_tool_client):
         """Native hosted search drops provider results outside ``allowed_domains`` (#1768).
 

@@ -152,10 +152,10 @@ fn merge<'a>(
     canonical: Vec<Cow<'a, Value>>,
     native: bool,
 ) -> Vec<Cow<'a, Value>> {
-    let appended_start = appended_tool_start(&live, state);
+    let appended_start = appended_tool_start(state);
     let appended: Vec<_> = state.messages.iter().skip(appended_start).map(Cow::Borrowed).collect();
     if state.history_rehydrated {
-        let history_len = state.messages.len().saturating_sub(state.input.len() + appended.len());
+        let history_len = state.current_input_start.min(state.messages.len());
         if !has_history(&live, state, history_len, native) {
             let mut history: Vec<_> = state.messages.iter().take(history_len).map(Cow::Borrowed).collect();
             history.append(&mut live);
@@ -172,29 +172,14 @@ fn merge<'a>(
 
 /// Index where agentic results begin after the current-input run in `messages`.
 ///
-/// Prefer the immutable client snapshot. When preprocessing rewrote that run in
-/// place (for example `input_file` → `input_text`) without updating the snapshot,
-/// fall back to locating the live current-input items so tool results still append.
-///
-/// Use the trailing `state.input.len()` items of `live` so a rehydrated history
-/// prefix (which may already be compaction-projected) does not prevent the match,
-/// and always advance by `state.input.len()` so the current-input span stays aligned
-/// with the rest of merge's history arithmetic.
-fn appended_tool_start(live: &[Cow<'_, Value>], state: &ResponsesState) -> usize {
-    if state.input.is_empty() {
-        return 0;
-    }
-    let input_len = state.input.len();
-    if let Some(start) = state.messages.rposition_run(&state.input) {
-        return start + input_len;
-    }
-    if let Some(live_input) = live.len().checked_sub(input_len).and_then(|start| live.get(start..)) {
-        let live_refs: Vec<&Value> = live_input.iter().map(AsRef::as_ref).collect();
-        if let Some(start) = state.messages.rposition_items(&live_refs) {
-            return start + input_len;
-        }
-    }
-    state.messages.len()
+/// Content-independent: [`ResponsesState::current_input_start`] plus the immutable
+/// client input length. Preprocessing may rewrite that run in place and a later
+/// live-body edit may diverge further; neither must hide the tool suffix (#1907).
+fn appended_tool_start(state: &ResponsesState) -> usize {
+    state
+        .current_input_start
+        .saturating_add(state.input.len())
+        .min(state.messages.len())
 }
 
 /// Recognize an already-rehydrated prefix without materializing that history.
