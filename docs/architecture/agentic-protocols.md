@@ -246,6 +246,15 @@ restart draws a new key, so every outstanding id gets
 `404` and clients reinitialize. Without
 `backend_sessions`, ids are not signed or checked.
 
+Ownership follows the forwarded credential headers, not a
+caller identity. A client whose token was refreshed, or a
+`policy` filter that mints a new delegated token before
+the broker, presents a different credential, so a `DELETE`
+of its own gateway session answers `409` while backend
+sessions created with the earlier token remain; they are
+left to idle expiry. Binding sessions to an asserted
+identity instead of the credential is tracked in #2191.
+
 Running several broker replicas behind one gateway
 address is not supported yet: the signing key, the
 ended-id list, and the backend mappings live in one

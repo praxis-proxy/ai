@@ -15,7 +15,9 @@
 # method: the client must send a new initialize without the
 # old Mcp-Session-Id header. A malformed header gets 400.
 # A DELETE that would end a session other credentials still
-# use answers 409 and leaves it usable.
+# use answers 409 and leaves it usable. Ownership follows the
+# forwarded credential, so a client whose token was refreshed
+# gets 409 until its older backend sessions expire.
 #
 # The handshake runs as a filtered subrequest through a
 # generated outbound chain whose load_balancer references

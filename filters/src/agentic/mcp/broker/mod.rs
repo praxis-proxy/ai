@@ -207,6 +207,9 @@ struct ForwardedCall {
 /// `initialize` without the header. A malformed header (empty, too long, or
 /// with characters outside visible ASCII) gets `400`. A `DELETE` that would end a session still holding backend
 /// sessions created with other credentials answers `409` and leaves it usable.
+/// Ownership follows the forwarded credential, so a caller whose token was
+/// refreshed or re-minted gets `409` on its own session until the older
+/// backend sessions expire.
 ///
 /// # YAML
 ///
