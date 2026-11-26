@@ -2,8 +2,8 @@
 
 This page covers what the GPU nightly CI runs, on which hardware, and where
 the detailed docs are. The GPU jobs run against real vLLM on a GPU. PRs get
-faster CPU coverage against the inference simulator through the
-`vllm-responses` and `vllm-live-cpu` jobs.
+faster CPU coverage: `vllm-responses` runs against the inference simulator,
+and `vllm-live-cpu` runs against real vLLM on CPU with `Qwen/Qwen3-0.6B`.
 
 > Note: `.github/workflows/nightly.yaml` is **not** the GPU suite. It is a
 > CPU-only nightly (lint, docs, unit tests, audit, coverage). The GPU nightly
@@ -15,7 +15,7 @@ faster CPU coverage against the inference simulator through the
 | --- | --- | --- |
 | [`vllm-integration.yaml`](../../.github/workflows/vllm-integration.yaml) | `17 4 * * *` | Main GPU suite: live Responses SDK suite, OpenAI Agents SDK loop, and the Claude Code / Codex CLI acceptance jobs against real Qwen3-8B. |
 | [`anthropic-vllm-vision.yaml`](../../.github/workflows/anthropic-vllm-vision.yaml) | `31 6 * * *` | Vision companion: Anthropic SDK image requests, OpenResponses image acceptance, and an OpenAI SDK image request through Responses-to-Chat translation, against `Qwen/Qwen3-VL-4B-Instruct` (the main nightly model is text-only). |
-| [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | push / PR to `main` on path filters (`vllm/Containerfile`, `vllm/images.json`, the GPU actions, and the workflow itself), `merge_group`, and manual | Builds, live-tests, and publishes every model-baked GPU image in [`vllm/images.json`](../../vllm/images.json) to GHCR. It is the only publisher; the two nightlies consume its images. |
+| [`vllm-gpu-container.yaml`](../../.github/workflows/vllm-gpu-container.yaml) | push / PR to `main` on path filters (`vllm/Containerfile`, `vllm/images.json`, the GPU actions, and the workflow itself), `merge_group`, and manual | Builds and live-tests every model-baked GPU image in [`vllm/images.json`](../../vllm/images.json); push and manual runs also publish them to GHCR, and a manual run can select one image. It is the only publisher; the two nightlies consume its images. |
 | [`vllm-dev-endpoint.yaml`](../../.github/workflows/vllm-dev-endpoint.yaml) | manual only | On-demand vLLM endpoint over a Cloudflare tunnel for interactive testing. Not part of CI. |
 
 All of them also accept `workflow_dispatch`. Apply the `vllm-full-suite` label
@@ -27,7 +27,7 @@ to force the main suite on a PR.
   (FlashAttention-2 available). An ephemeral EC2 runner, always torn down
   after the run (`gpu-start-runner` / `gpu-stop-runner`).
 - **Model:** `Qwen/Qwen3-8B` (~15.3 GiB bf16). It supports tool calling
-  (file_search, MCP); the 0.6B CPU simulator model used on PRs does not.
+  (file_search, MCP); the 0.6B CPU model used on PRs does not.
 - **Images:** `ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B` (main suite and every
   client acceptance job) and `:Qwen3-VL-4B-Instruct` (vision companion), both
   published by `vllm-gpu-container.yaml` from
@@ -301,7 +301,9 @@ the stale tag. An acceptance-only dispatch (`run_claude_acceptance`,
 its first acceptance job pulls the published image or, when none matches the
 checkout (for example right after a vLLM bump), builds it. Only that build
 gets the Hugging Face token; no serving container receives it, and no job
-downloads weights at run time.
+downloads weights at run time. The exception is a
+[Codex candidate dispatch](#qualifying-a-codex-candidate-checkpoint): its
+serving container gets the token and downloads the checkpoint.
 
 The qualification report records which image each lane served; see
 [image provenance fields](vllm-qualification.md#report-version-and-interpretation).
@@ -309,8 +311,10 @@ The qualification report records which image each lane served; see
 ## Jobs in the main suite (`vllm-integration.yaml`)
 
 - `changes`: path-filter gate.
-- `vllm-responses`, `vllm-live-cpu`, `vllm-responses-postgres`: fast CPU
-  coverage on PRs (simulator + `llm-d-inference-sim`).
+- `vllm-responses`, `vllm-responses-postgres`: fast CPU coverage on PRs
+  against `llm-d-inference-sim`.
+- `vllm-live-cpu`: CPU coverage on PRs against real vLLM serving
+  `Qwen/Qwen3-0.6B`.
 - `gpu-start-runner` / `gpu-stop-runner`: provision and tear down the GPU EC2
   instance.
 - `vllm-gpu-full-suite`: resolves the model-baked image (pulling the published

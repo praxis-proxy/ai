@@ -725,7 +725,7 @@ The per-model form below has the same exposure.
 `opencode run` drives a single non-interactive turn for CI and scripts:
 
 ```console
-opencode run --model "praxis/$VLLM_MODEL" --format json -- "Summarize README.md"
+opencode run --model "praxis/$VLLM_MODEL" --format json -- "Summarize README.md" < /dev/null
 ```
 
 The prompt is a positional argument. On `run`, `-p`/`--password` is the
@@ -1103,10 +1103,10 @@ kill "$PRAXIS_PID"
   is hit hardest, because its `/v1/chat/completions` traffic shares a listener
   with another protocol.
 - `400` with `maximum context length is 32768 tokens`: the prompt itself
-  exceeds the window, since vLLM clamps the output budget and an oversized
-  `max_tokens` is never the cause alone. If it happens on the first turn with an
-  input count near 28,000, Claude Code's startup prompt (MCP tool definitions,
-  plugin skills, and `CLAUDE.md`) fills most of the window. Run `/context` for
+  exceeds the window, or `max_tokens` alone exceeds `--max-model-len`;
+  otherwise vLLM clamps the output budget. If it happens on the first turn
+  with an input count near 28,000, Claude Code's startup prompt (MCP tool
+  definitions, plugin skills, and `CLAUDE.md`) fills most of the window. Run `/context` for
   the breakdown; it is local and works while requests fail. Start Claude Code
   with `--strict-mcp-config` to drop globally configured MCP servers, disable
   unneeded plugins with `/plugin`, and prefer a working directory with a small

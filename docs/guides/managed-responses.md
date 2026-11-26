@@ -17,7 +17,9 @@ Follow the [guide prerequisites](README.md). For this local lab you need:
 - An MCP server on `127.0.0.1:8001/mcp` with a harmless tool you may call, and
   its key if it requires one.
 - A fresh scratch directory for SQLite, since history and tool output may hold
-  sensitive content.
+  sensitive content. The config below uses `/tmp/praxis-managed-lab`; create
+  it with `mkdir /tmp/praxis-managed-lab`, which fails if an old lab is still
+  there.
 
 Build all experimental OpenAI groups plus SQLite:
 
@@ -54,12 +56,12 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_responses_store
         backend: sqlite
-        database_url: "sqlite://managed-lab.db?mode=rwc"
+        database_url: "sqlite:///tmp/praxis-managed-lab/managed-lab.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
       - filter: openai_conversations
         backend: sqlite
-        database_url: "sqlite://managed-lab.db?mode=rwc"
+        database_url: "sqlite:///tmp/praxis-managed-lab/managed-lab.db?mode=rwc"
         conversations_table: openai_conversations
         items_table: openai_conversation_items
       - filter: openai_responses_rehydrate
@@ -244,7 +246,8 @@ A2A routing are separate capabilities, described in
 Stop the proxy before removing lab state, and stop the backend and MCP server
 if you started them for this lab. Unset `BACKEND_API_KEY` in the proxy shell and
 `MODEL` in the client shell. Delete `managed-responses.yaml` and, for a
-disposable lab only, `managed-lab.db` with its `-wal`/`-shm` sidecars. For a
+disposable lab only, `/tmp/praxis-managed-lab` with the database and its
+`-wal`/`-shm` sidecars. For a
 deployed store, follow [store migrations](../operations/store/schema-migration.md)
 instead.
 

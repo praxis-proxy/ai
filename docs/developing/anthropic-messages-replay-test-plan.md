@@ -8,8 +8,8 @@ Owner: `franciscojavierarceo`
 
 The Anthropic Messages API shapes Praxis should cover in replay, passthrough,
 and translation tests. Praxis validates only the envelope and the fields it
-owns, and otherwise preserves request and response bodies; it does not
-reimplement Anthropic's request validator.
+owns, and native passthrough otherwise preserves request and response bodies;
+it does not reimplement Anthropic's request validator.
 
 This plan adds fixture and test coverage to the Messages API filter proposal,
 [00484_anthropic-messages-api-filters.md](https://github.com/praxis-proxy/enhancements/blob/main/proposals/00484_anthropic-messages-api-filters.md).

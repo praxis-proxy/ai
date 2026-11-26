@@ -95,9 +95,10 @@ The "outside the boundary" inventory for a cryptographic review:
 The general-purpose `store-postgres` profile enables SQLx's password
 authentication feature for compatibility. The `store-postgres-cert-auth`
 profile compiles no cleartext, MD5, or SCRAM authentication support, and omits
-migration checksums and advisory-lock string hashing. The FIPS build selects
-this reduced profile and also requires client-certificate authentication during
-startup validation.
+migration checksums and advisory-lock string hashing. The default FIPS feature
+set compiles no store. An experimental opt-in FIPS build adds this reduced
+profile and also requires client-certificate authentication during startup
+validation.
 
 ## Selected approach: certificate authentication
 
@@ -173,8 +174,8 @@ password-issuing server into a cert-only one.
   `pg_hba.conf` uses `cert`. The proxy validates its half; the server half is
   operational.
 - **CN → role mapping.** The client certificate's Common Name must equal the
-  database role, or be mapped via `pg_ident.conf` and a `clientcert` map
-  option. A mismatch is a hard connection failure. The CA in `ssl_ca_file`
+  database role, or be mapped through a `pg_ident.conf` map selected with the
+  `cert` rule's `map=<name>` option. A mismatch is a hard connection failure. The CA in `ssl_ca_file`
   must sign the client certificate the proxy presents.
 - **`verify-full` on loopback.** Verification checks the hostname/IP against
   the server certificate SANs, so test and dev servers need a certificate with

@@ -111,8 +111,11 @@ The requirement also covers what the binary carries. A build that registers a
 filter whose dependencies do their own cryptography outside the system OpenSSL
 (the `policy` filter's plugins, the response store's sqlx) refuses
 `PRAXIS_REQUIRE_FIPS` outright and names the filters, whatever the provider
-reports. Only the FIPS build, which compiles none of them, can honor the
-variable; the standard image is refused by design.
+reports. The response store is exempt only in the certificate-only SQLx
+profile: `store-postgres-cert-auth` without `store-postgres`, `store-sqlite`,
+`openai-compact`, or `openai-mcp-tools`. Only the FIPS build, which compiles
+none of the others, can honor the variable; the standard image is refused by
+design.
 
 ```console
 podman run --rm -e PRAXIS_REQUIRE_FIPS=1 ghcr.io/praxis-proxy/ai:0.3.0-fips
@@ -263,7 +266,8 @@ The per-operation record for both builds is the
 | PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
 | Conversations API | Conversations state in PostgreSQL through the certificate-only SQLx profile | compliant through system OpenSSL; the store uses `store-postgres-cert-auth` (no migrations, no password authentication) |
 | SQLite store, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
-| `openai_file_resolve`, `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
+| `openai_file_resolve` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider) | experimental opt-in; not in the default FIPS feature set |
+| `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
 | `gcp_adc` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider); the `key_file` source signs its `RS256` assertion through OpenSSL's EVP signing API | not in the FIPS build (experimental) |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
 | sha2, hmac, aws-sigv4, rcgen (with ring) | test utilities, fixtures, xtask and the `SigV4` test oracle | development only, absent from the shipped binary and its manifest; aws-lc-rs itself is gone from every graph, the policy engine aside |

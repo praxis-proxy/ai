@@ -90,10 +90,11 @@ process-wide Pingora/praxis-tls provider installed at startup
 share that TLS stack, so no filter selects its own TLS backend.
 
 On RHEL/OpenShift FIPS builds, the system OpenSSL provider enforces approved
-cipher suites and algorithms on every outbound connection. The FIPS feature
-set includes `openai-file-resolve-filter` and `aws-sigv4-filter`. It excludes
-`openai-mcp-tools`, because its `store` dependency pulls sha2 through sqlx, and
-excludes the response stores and policy engine for the same reason.
+cipher suites and algorithms on every outbound connection. The default FIPS
+feature set (`FIPS_FEATURES`) enables only `aws-sigv4-filter`;
+`openai-file-resolve-filter` is an experimental opt-in build. The FIPS profile
+excludes `openai-mcp-tools`, because its `store` dependency pulls sha2 through
+sqlx, and excludes the response stores and policy engine for the same reason.
 
 `reqwest` is a dev/test-only dependency. Test TLS infrastructure
 (`tests/utils/src/net/tls.rs`) uses rustls for mock servers and certificate

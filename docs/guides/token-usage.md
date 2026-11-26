@@ -1,8 +1,10 @@
 # Observe and meter token usage
 
 Turn provider-reported token usage into metrics, label per-tenant counters with
-trusted identity, and report usage to an external metering service. These
-filters observe usage; to enforce limits, see [Limit token usage](token-limits.md).
+trusted identity, and report usage to an external metering service. Usage
+extraction only observes; `external_metering` also rejects requests with `429`
+when the service reports no remaining balance. To enforce local limits, see
+[Limit token usage](token-limits.md).
 
 ## Prerequisites and configuration
 

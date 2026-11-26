@@ -176,10 +176,10 @@ shared projected mounts and trusted overlay sources alone.
 
 ## Failure checks and cleanup
 
-A missing or wrong gateway password is rejected before inference. A backend
-401/403 points at the backend credential or permissions. A 400 from
-translation often means a rejected field rather than a model failure; read
-the dialect-shaped error. For connection failures, check port 8000, backend
+In the Basic Auth recipes, a missing or wrong gateway password is rejected
+before inference. A backend 401/403 points at the backend credential or
+permissions. A 400 from translation often means a rejected field rather than
+a model failure; read the dialect-shaped error. For connection failures, check port 8000, backend
 logs, the exact model name, and the proxy startup log.
 
 Stop the proxy with Ctrl+C, then stop the backend only if you started it for

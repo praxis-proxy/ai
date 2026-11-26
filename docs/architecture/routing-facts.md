@@ -8,9 +8,10 @@ the rules that keep them trustworthy.
 `intelligent_route` and `provider_route` pick a destination from a few bounded
 strings derived from the request before routing: the promoted model header, MCP
 tool metadata, and a session key. Future candidate constraints (entitlement,
-region, data classification, tool capability) will read more of them. A client
-must not be able to forge any of these inputs, and each must be small enough to
-log and use as a label.
+region, data classification, tool capability) will read more of them. Each
+input must be small enough to log and use as a label. A client must not be able
+to forge a fact. The session key is the exception: it is client-owned by design
+and only selects affinity, never trust.
 
 A fact has three parts:
 

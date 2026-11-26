@@ -119,15 +119,16 @@ workflow runs nightly from the latest commit on `main`, publishing the rolling
 
 ### Image Tags
 
-Each run produces these tags:
+A run produces only the tags its trigger enables:
 
-| Pattern | Example | Description |
+| Pattern | Example | Produced by |
 | --------- | --------- | ------------- |
-| `sha-<hash>` | `sha-abc1234` | Git commit SHA |
-| `<version>` | `0.1.0` | Full semver (from git tag) |
-| `<major>.<minor>` | `0.1` | Major.minor shorthand |
-| `latest` | `latest` | Most recent tagged release |
-| `nightly` | `nightly` | Latest scheduled build from `main` |
+| `sha-<hash>` | `sha-abc1234` | Every run (git commit SHA) |
+| `<version>` | `0.1.0` | Release, from the version tag |
+| `<major>.<minor>` | `0.1` | Release, from the version tag |
+| `latest` | `latest` | Release (most recent tagged release) |
+| `nightly` | `nightly` | Scheduled Publish run from `main` |
+| `<branch>` | `main` | Publish dispatched on a branch ref |
 | `<any of the above>-experimental` | `0.1.0-experimental` | Same runs, for the experimental image |
 | `<any of the above>-fips` | `0.1.0-fips` | Same runs, for the FIPS image |
 

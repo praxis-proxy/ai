@@ -177,9 +177,11 @@ register_filters! {
 
 `register_filters!` takes protocol-prefixed entries, as in the example above
 (`http "model_blocklist" => ModelBlocklist::from_config`). It generates a
-`custom_registry()` function that returns a `FilterRegistry` with built-in,
-AI, and custom filters. Use it with the test utilities (`start_proxy_with_registry`) or in
-your own server bootstrap built from the workspace crates (`praxis-core`,
+`custom_registry()` function that returns a `FilterRegistry` with core
+built-in and custom filters. It does not add AI filters; call
+`praxis_ai_filters::register_ai_filters` on that registry for them. Use it
+with the test utilities (`start_proxy_with_registry`) or in your own server
+bootstrap built from the workspace crates (`praxis-core`,
 `praxis-filter`, `praxis-ai-apis`, `praxis-ai-filters`).
 
 ### YAML Config
@@ -225,7 +227,7 @@ Declare `request_body_access()` or `response_body_access()` only if the
 filter inspects or modifies the body, since each declaration changes how the
 pipeline buffers data. `BodyAccess::None` (the default) has no overhead. Use
 `ReadOnly` to inspect without modifying, and `ReadWrite` only to mutate chunks
-in place.
+in place or replace a buffered body.
 
 ### Choose the right body mode
 
