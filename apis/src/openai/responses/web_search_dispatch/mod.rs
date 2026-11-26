@@ -210,6 +210,7 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// max_query_bytes: 8192
 /// ```
 pub struct WebSearchDispatchFilter {
+    /// Enables function lowering at the native outbound Responses boundary.
     native_tool_compat: bool,
     /// The search client for executing queries.
     search_client: SearchClient,
@@ -1974,9 +1975,7 @@ pub(crate) fn lower_native_web_search(state: &mut ResponsesState) {
             .and_then(Value::as_str)
             .is_some_and(is_web_search_tool_type)
         {
-            let mut lowered = crate::openai::translation::chat_completions::synthesized_web_search_tool();
-            *tool = lowered["function"].take();
-            tool["type"] = Value::String("function".into());
+            *tool = crate::openai::translation::chat_completions::synthesized_web_search_tool_responses();
             changed = true;
         }
     }
@@ -1987,17 +1986,23 @@ pub(crate) fn lower_native_web_search(state: &mut ResponsesState) {
             .and_then(|v| v.get("type"))
             .and_then(Value::as_str)
             .is_some_and(is_web_search_tool_type)
+            && let Some(object) = state.request_body.as_object_mut()
         {
-            state.request_body["tool_choice"] = serde_json::json!({"type":"function","name":"web_search"});
+            object.insert(
+                "tool_choice".into(),
+                serde_json::json!({"type":"function","name":"web_search"}),
+            );
         }
         state.mark_request_body_for_rebuild();
     }
 }
 
+/// Identify the private inference function that represents hosted search.
 pub(crate) fn private_web_search_call(item: &Value) -> bool {
     item["type"] == "function_call" && item["name"] == "web_search"
 }
 
+/// Check the canonical tool declarations retained for local dispatch.
 pub(crate) fn has_hosted_web_search(state: &ResponsesState) -> bool {
     state.tools.iter().any(|t| {
         t.get("type")

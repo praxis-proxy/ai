@@ -1372,6 +1372,29 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
         }
     }
 
+    validate_live_search_options(tool)?;
+
+    if let Some(context_size) = tool.get("search_context_size")
+        && !matches!(context_size.as_str(), Some("low" | "medium" | "high"))
+    {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "search_context_size must be one of low, medium, or high".to_owned(),
+        ));
+    }
+
+    // `WebSearchApproximateLocation` is object-or-null in the pinned schema, so a
+    // null location is a valid "unset" and must be treated as omitted, not rejected.
+    if let Some(user_location) = tool.get("user_location")
+        && !user_location.is_null()
+    {
+        validate_web_search_user_location(user_location)?;
+    }
+
+    Ok(())
+}
+
+/// Validate the live text-search options emitted by coding clients.
+fn validate_live_search_options(tool: &Map<String, Value>) -> Result<(), TranslationError> {
     if tool
         .get("external_web_access")
         .is_some_and(|value| value.as_bool() != Some(true))
@@ -1392,22 +1415,6 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
         return Err(TranslationError::InvalidWebSearchTool(
             "search_content_types must allow text and contain only text or image".to_owned(),
         ));
-    }
-
-    if let Some(context_size) = tool.get("search_context_size")
-        && !matches!(context_size.as_str(), Some("low" | "medium" | "high"))
-    {
-        return Err(TranslationError::InvalidWebSearchTool(
-            "search_context_size must be one of low, medium, or high".to_owned(),
-        ));
-    }
-
-    // `WebSearchApproximateLocation` is object-or-null in the pinned schema, so a
-    // null location is a valid "unset" and must be treated as omitted, not rejected.
-    if let Some(user_location) = tool.get("user_location")
-        && !user_location.is_null()
-    {
-        validate_web_search_user_location(user_location)?;
     }
 
     Ok(())
@@ -1503,6 +1510,16 @@ pub(crate) fn synthesized_web_search_tool() -> Value {
             "strict": true
         }
     })
+}
+
+/// Build the flat Responses declaration from the shared search schema.
+pub(crate) fn synthesized_web_search_tool_responses() -> Value {
+    let mut tool = synthesized_web_search_tool();
+    let mut function = tool.get_mut("function").map(Value::take).unwrap_or_default();
+    if let Some(object) = function.as_object_mut() {
+        object.insert("type".into(), Value::String("function".into()));
+    }
+    function
 }
 
 /// Validate the vector stores that the callout will search.
