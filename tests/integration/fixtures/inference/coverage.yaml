@@ -69,6 +69,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.tool_result_error
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-result-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.tool_result_image_promotion
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-result-image-promotion
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.text
     scopes:
       - messages_to_chat_completions
@@ -108,6 +126,16 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.mcp.streaming_model_tool_round
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/mcp-model-tool-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+    reason: Wire replay covers the resolved model tool and its streamed arguments. The connector example reuses both sides of the fixture with a local MCP server to verify dispatch, result blocks, and continuation.
   - id: messages.response.streaming_tool_use_stop
     scopes:
       - messages_to_chat_completions

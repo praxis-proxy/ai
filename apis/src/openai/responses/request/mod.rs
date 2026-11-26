@@ -55,7 +55,7 @@ use tracing::{debug, trace};
 use super::{
     bound_body_outcome,
     config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config},
-    error::{responses_error_rejection, responses_error_rejection_with_code},
+    error::{responses_error_rejection, responses_error_rejection_with_code, responses_error_rejection_with_param},
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
@@ -70,6 +70,9 @@ use crate::{
 
 /// Filter name as configured in a pipeline.
 const FILTER_NAME: &str = "openai_responses_request";
+
+/// Request member naming vLLM's caller-supplied history extension.
+const PREVIOUS_INPUT_MESSAGES: &str = "previous_input_messages";
 
 /// Processes a Responses request body once and initializes state.
 ///
@@ -91,6 +94,13 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// should move its content into `input` rather than rely on the gateway to
 /// resolve the saved object. Prefer `input` over top-level `instructions`,
 /// which managed-path content-policy extraction does not screen.
+///
+/// On managed Responses creates, omit `previous_input_messages` or set it to
+/// `null` or `[]`, including on the first turn and with `store: false`. Any
+/// other value returns HTTP 400. To supply earlier messages yourself, include
+/// them in `input`. To resume stored history, use either `previous_response_id`
+/// or `conversation`. Provider-owned routes forward `previous_input_messages`
+/// unchanged.
 ///
 /// Promotes `openai_responses_request.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
@@ -144,6 +154,11 @@ impl OpenaiResponsesRequestFilter {
             return action;
         }
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
+            return action;
+        }
+        if operation == ResponsesOperation::CreateResponse
+            && let Some(action) = reject_caller_supplied_history(&parsed)
+        {
             return action;
         }
 
@@ -723,6 +738,35 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
             "invalid_request_error",
             "mutually_exclusive_parameters",
             "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ))
+    })
+}
+
+/// Reject a non-empty vLLM `previous_input_messages` extension on managed paths.
+///
+/// Praxis owns the history sent to inference on managed routes: it rehydrates
+/// stored turns into `input`. On its Harmony rendering path (gpt-oss models),
+/// vLLM places `previous_input_messages` in front of that history. vLLM rejects
+/// the field alongside `previous_response_id`, but Praxis strips that selector
+/// before forwarding, so the guard never fires and the model could see messages
+/// Praxis never persisted. Praxis cannot tell which rendering path a backend
+/// uses, so it rejects the field on every managed route. Absent, `null`, and
+/// `[]` carry no history and are accepted; any other value is rejected before
+/// inference. The pre-routing fact publisher never reaches this check, so
+/// provider-owned passthrough keeps the field intact.
+fn reject_caller_supplied_history(body: &serde_json::Value) -> Option<FilterAction> {
+    let supplied = body
+        .get(PREVIOUS_INPUT_MESSAGES)
+        .is_some_and(|value| !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty()));
+    supplied.then(|| {
+        FilterAction::Reject(responses_error_rejection_with_param(
+            400,
+            "invalid_request_error",
+            "unsupported_parameter",
+            Some(PREVIOUS_INPUT_MESSAGES),
+            "previous_input_messages is not supported on gateway-managed routes; \
+             include earlier messages in input, or resume stored history with \
+             previous_response_id or conversation.",
         ))
     })
 }

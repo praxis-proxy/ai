@@ -14,6 +14,7 @@
 mod config;
 mod request;
 mod response;
+mod streaming;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -39,7 +40,7 @@ use praxis_filter::{
     HttpFilterContext, IterationState, NextIterationBody, Rejection, SubRequestResponseMode, parse_filter_config,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use tracing::debug;
 
 use self::{
@@ -64,7 +65,7 @@ use crate::{
         fingerprint::{
             bind_credential_context, bind_forwarded_header_context, bind_owner_context, is_connector_tool_entry,
         },
-        naming::McpToolIndex,
+        naming::{McpToolIndex, ResolvedMcpTools, index_resolved_tools},
         tool_map::{admit_tools, insert_tools, protected_exclusion, select_forward_headers, tool_policy_for_entry},
     },
 };
@@ -82,12 +83,14 @@ const ACTION_DONE: &str = "done";
 /// IRR accumulator entry holding the latest serialized Messages request.
 const REQUEST_ACCUMULATOR_KEY: &str = "anthropic_mcp_connector.request";
 
+/// Reconstructed streamed Messages round, charged to IRR's retained-state
+/// ceiling alongside the request it will extend.
+const ROUND_ACCUMULATOR_KEY: &str = "anthropic_mcp_connector.round";
+/// Client terminal for a mixed round, charged to IRR until dispatch finishes.
+const TERMINAL_KEY: &str = "anthropic_mcp_connector.terminal";
+
 /// Header carrying the caller's Anthropic beta features.
 const ANTHROPIC_BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-beta");
-
-/// Client-facing reason for refusing a streamed connector request.
-const STREAMING_UNSUPPORTED: &str =
-    "streaming (`stream: true`) is not yet supported with the MCP connector on this gateway";
 
 // -----------------------------------------------------------------------------
 // Request State
@@ -98,8 +101,10 @@ const STREAMING_UNSUPPORTED: &str =
 /// Lives in the request extensions, which the `iterative_request_router`
 /// threads through every round of one client request.
 struct ConnectorState {
-    /// Resolved MCP tools keyed by `(server_name, tool_name)`.
-    tool_map: HashMap<(String, String), Value>,
+    /// Filter index owning response processing within the current IRR step.
+    owner: Option<usize>,
+    /// Resolved MCP tools keyed by the unique name sent to the model.
+    tool_map: ResolvedMcpTools,
     /// Operator admission verdicts, re-enforced at dispatch.
     admission: McpAdmissionDecisions,
     /// Whether any server resolved to an operator connector.
@@ -108,8 +113,17 @@ struct ConnectorState {
     earlier: Vec<Value>,
     /// Token usage of completed MCP rounds.
     usage: RoundUsage,
-    /// Whether the last classified round asked to run MCP calls.
-    pending: bool,
+    /// Model round awaiting dispatch in the next request hook.
+    pending: Option<PendingRound>,
+}
+
+/// The buffered transport retains its response on the router. A streaming
+/// step hands its reconstructed assistant message and client lifecycle forward.
+enum PendingRound {
+    /// Read the IRR's previous response.
+    Buffered,
+    /// Move the completed round out of the previous step's private filter state.
+    Streaming(Box<streaming::StreamRound>),
 }
 
 /// Request fields read before deciding whether the body needs parsing.
@@ -137,8 +151,9 @@ struct StreamEnvelope {
 /// response carries `mcp_tool_use` / `mcp_tool_result` blocks for every call.
 ///
 /// A client server is matched to an operator connector by URL. Unmatched URLs
-/// are rejected unless `allow_client_servers` is set. Streaming requests that
-/// use the connector are rejected for now.
+/// are rejected unless `allow_client_servers` is set. With `stream: true`, model blocks stream as they arrive.
+/// Executed calls produce `mcp_tool_result` blocks and the client receives
+/// one message lifecycle with usage summed across inference rounds.
 ///
 /// # YAML
 ///
@@ -312,11 +327,6 @@ impl AnthropicMcpConnectorFilter {
         if connector.is_none() && !history {
             return Ok(FilterAction::Continue);
         }
-        if connector.is_some() && streaming {
-            return Ok(FilterAction::Reject(wire::invalid_request_rejection(
-                STREAMING_UNSUPPORTED,
-            )));
-        }
         if history && let Err(message) = request::convert_mcp_history(&mut object) {
             return Ok(FilterAction::Reject(wire::invalid_request_rejection(&message)));
         }
@@ -330,6 +340,11 @@ impl AnthropicMcpConnectorFilter {
                 connector = state.has_connector,
                 "resolved Anthropic MCP connector"
             );
+            ctx.request_headers_to_set
+                .push((ACCEPT_ENCODING, HeaderValue::from_static("identity")));
+            if streaming {
+                ctx.insert_filter_state(streaming::StreamRound::new(self.config.max_body_bytes));
+            }
             ctx.extensions.insert(state);
             ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
             strip_beta_header(ctx);
@@ -447,12 +462,13 @@ impl AnthropicMcpConnectorFilter {
             bind_credential_context(entry, identity.as_ref().and_then(McpCalloutIdentity::user_credential));
         }
         Ok(ConnectorState {
-            tool_map,
+            owner: ctx.current_filter_id,
+            tool_map: index_resolved_tools(tool_map),
             admission,
             has_connector,
             earlier: Vec::new(),
             usage: RoundUsage::default(),
-            pending: false,
+            pending: None,
         })
     }
 
@@ -522,29 +538,42 @@ impl AnthropicMcpConnectorFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
-        if ctx.extensions.get::<ConnectorState>().is_none() {
-            return Ok(FilterAction::Continue);
-        }
-        ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
-        let Some(state) = ctx.extensions.get::<ConnectorState>().filter(|state| state.pending) else {
+        let Some(state) = ctx.extensions.get_mut::<ConnectorState>() else {
             return Ok(FilterAction::Continue);
         };
         let has_connector = state.has_connector;
-        let Some(iteration) = ctx.extensions.get::<IterationState>() else {
+        let mut stream = match state.pending.take() {
+            Some(PendingRound::Streaming(round)) => Some(round),
+            Some(PendingRound::Buffered) => None,
+            None => return Ok(FilterAction::Continue),
+        };
+        // IRR filter indices are local to each step. The instance consuming
+        // this handoff owns the new response, even when its position changes.
+        state.owner = ctx.current_filter_id;
+        ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
+        apply_transport(ctx, stream.is_some());
+        let Some(iteration) = ctx.extensions.get_mut::<IterationState>() else {
             return Err(FilterError::from(format!(
                 "{FILTER_NAME}: IRR iteration state unavailable"
             )));
         };
-        let previous: Value = iteration
-            .previous_response
-            .as_ref()
-            .and_then(|previous| serde_json::from_slice(&previous.body).ok())
+        let terminal = iteration.accumulator.remove(TERMINAL_KEY);
+        let reconstructed = iteration.accumulator.remove(ROUND_ACCUMULATOR_KEY);
+        let previous: Value = reconstructed
+            .as_deref()
+            .or_else(|| {
+                iteration
+                    .previous_response
+                    .as_ref()
+                    .map(|response| response.body.as_ref())
+            })
+            .and_then(|bytes| serde_json::from_slice(bytes).ok())
             .ok_or_else(|| FilterError::from(format!("{FILTER_NAME}: previous MCP round is unavailable")))?;
         let request_bytes = iteration
             .accumulator
             .get(REQUEST_ACCUMULATOR_KEY)
             .unwrap_or(&iteration.original_request.body);
-        let Ok(Value::Object(mut request)) = serde_json::from_slice::<Value>(request_bytes) else {
+        let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(request_bytes) else {
             return Err(FilterError::from(format!(
                 "{FILTER_NAME}: retained request is not a JSON object"
             )));
@@ -552,11 +581,11 @@ impl AnthropicMcpConnectorFilter {
 
         let identity = match self.stage_identity(ctx, has_connector) {
             Ok(identity) => identity,
-            Err(rejection) => return Ok(FilterAction::Reject(rejection)),
+            Err(rejection) => return Ok(streaming::rejection(ctx, stream, rejection)),
         };
         let callout = match self.callout(ctx) {
             Ok(callout) => callout,
-            Err(rejection) => return Ok(FilterAction::Reject(rejection)),
+            Err(rejection) => return Ok(streaming::rejection(ctx, stream, rejection)),
         };
         let forwarded = self.forwarded_headers(ctx);
         let session_pool = ctx
@@ -567,7 +596,7 @@ impl AnthropicMcpConnectorFilter {
         let Some(state) = ctx.extensions.get::<ConnectorState>() else {
             return Ok(FilterAction::Continue);
         };
-        let index = McpToolIndex::new(&state.tool_map);
+        let index = McpToolIndex::Resolved(&state.tool_map);
         let content = response::content_blocks(&previous);
         let calls: Vec<McpToolCall<'_>> = content
             .iter()
@@ -602,24 +631,43 @@ impl AnthropicMcpConnectorFilter {
             transport_budget: None,
         };
         let Ok(results) = Box::pin(execute_mcp_calls::<McpResult>(&calls, &index, options, &callout)).await else {
-            return Ok(FilterAction::Reject(wire::error_rejection(
-                502,
-                wire::ErrorType::Api,
-                "MCP tool results exceed a size limit set by the platform administrator.",
-            )));
+            return Ok(streaming::rejection(
+                ctx,
+                stream,
+                wire::error_rejection(
+                    502,
+                    wire::ErrorType::Api,
+                    "MCP tool results exceed a size limit set by the platform administrator.",
+                ),
+            ));
         };
-        let model_results: Vec<Value> = results.iter().map(McpResult::model_block).collect();
-        let client_blocks = response::client_content(content, &index, &state.admission, results);
         let mixed = response::has_client_tool_use(content, &index, &state.admission);
+        let model_results = if mixed {
+            Vec::new()
+        } else {
+            results.iter().map(McpResult::model_block).collect()
+        };
+        let client_blocks = if let Some(round) = &mut stream {
+            for result in results {
+                round.messages.emit_block(result.client_block(), &mut round.results);
+            }
+            Vec::new()
+        } else {
+            response::client_content(content, &index, &state.admission, results)
+        };
         drop(index);
 
         let Some(state) = ctx.extensions.get_mut::<ConnectorState>() else {
             return Ok(FilterAction::Continue);
         };
-        state.pending = false;
         let Value::Object(mut previous) = previous else {
             return Ok(FilterAction::Continue);
         };
+        if mixed && let Some(mut round) = stream.take() {
+            let terminal = terminal.ok_or_else(|| FilterError::from("missing mixed Messages terminal"))?;
+            round.results.extend_from_slice(&terminal);
+            return Ok(streaming::finish(ctx, round.results));
+        }
         if mixed {
             // Client tools in the same turn end the loop: return the MCP
             // results inline, as Anthropic does, and let the client answer
@@ -627,29 +675,24 @@ impl AnthropicMcpConnectorFilter {
             let mut earlier = std::mem::take(&mut state.earlier);
             earlier.extend(client_blocks);
             previous.remove("content");
+            previous.insert("stop_reason".to_owned(), Value::from("tool_use"));
             let synthesized = response::final_response(previous, earlier, state.usage);
             return Ok(FilterAction::Reject(synthesized_response(&synthesized)));
         }
-        state.usage.add(&previous);
+        if stream.is_none() {
+            state.usage.add(&previous);
+        }
         state.earlier.extend(client_blocks);
 
-        let assistant_content = previous.remove("content").unwrap_or_else(|| Value::Array(Vec::new()));
-        let Some(Value::Array(messages)) = request.get_mut("messages") else {
-            return Ok(FilterAction::Reject(wire::invalid_request_rejection(
-                "messages must be an array for MCP re-entry",
-            )));
-        };
-        messages.push(json!({"role": "assistant", "content": assistant_content}));
-        messages.push(json!({"role": "user", "content": model_results}));
-        if request.contains_key("tool_choice") {
-            request.insert("tool_choice".to_owned(), json!({"type": "auto"}));
-        }
-        let rebuilt = serde_json::to_vec(&request)
-            .map_err(|error| FilterError::from(format!("{FILTER_NAME}: request serialization failed: {error}")))?;
-        if rebuilt.len() > self.config.max_body_bytes {
-            return Ok(FilterAction::Reject(oversized_request()));
-        }
+        let rebuilt =
+            match request::rebuild_after_calls(request, &mut previous, model_results, self.config.max_body_bytes) {
+                Ok(bytes) => bytes,
+                Err(rejection) => return Ok(streaming::rejection(ctx, stream, rejection)),
+            };
         commit_request(ctx, body, Bytes::from(rebuilt), true);
+        if let Some(round) = stream {
+            return Ok(streaming::resume(ctx, round, self.config.max_body_bytes));
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -692,7 +735,7 @@ impl AnthropicMcpConnectorFilter {
             return Ok(FilterAction::Continue);
         };
         let calls_mcp = parsed.as_ref().is_some_and(|response| {
-            response::round_calls_mcp(response, &McpToolIndex::new(&state.tool_map), &state.admission)
+            response::round_calls_mcp(response, &McpToolIndex::Resolved(&state.tool_map), &state.admission)
         });
         if calls_mcp {
             if !router_can_reenter(ctx) {
@@ -703,7 +746,7 @@ impl AnthropicMcpConnectorFilter {
                 )));
             }
             if let Some(state) = ctx.extensions.get_mut::<ConnectorState>() {
-                state.pending = true;
+                state.pending = Some(PendingRound::Buffered);
             }
             set_action(ctx, ACTION_LOOP)?;
             return Ok(FilterAction::Continue);
@@ -789,20 +832,19 @@ impl HttpFilter for AnthropicMcpConnectorFilter {
 
     fn response_body_mode(&self) -> BodyMode {
         // Advertise incremental delivery so the filter composes in a
-        // streaming-capable step; connector requests select the buffered
-        // subrequest transport per request.
+        // streaming-capable step; the request selects its subrequest transport.
         BodyMode::Stream
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
-        // Requests without the connector keep the client's transport.
         true
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.extensions.get::<ConnectorState>().is_some() {
             // Every round must return identity-encoded JSON to be classified.
-            ctx.request_headers_to_remove.push(ACCEPT_ENCODING);
+            ctx.request_headers_to_set
+                .push((ACCEPT_ENCODING, HeaderValue::from_static("identity")));
         }
         Ok(FilterAction::Continue)
     }
@@ -821,12 +863,18 @@ impl HttpFilter for AnthropicMcpConnectorFilter {
             .get::<IterationState>()
             .is_some_and(|state| state.previous_response.is_some());
         if reentry {
-            return Box::pin(self.handle_reentry(ctx, body)).await;
+            let guard = streaming::ReentryGuard::new(ctx);
+            let result = Box::pin(self.handle_reentry(guard.ctx, body)).await;
+            guard.finish();
+            return result;
         }
         Box::pin(self.handle_initial(ctx, body)).await
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if ctx.get_filter_state::<streaming::StreamRound>().is_some() {
+            return Ok(streaming::on_headers(ctx));
+        }
         let rewrites_body = ctx
             .extensions
             .get::<ConnectorState>()
@@ -845,9 +893,14 @@ impl HttpFilter for AnthropicMcpConnectorFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            return streaming::on_body(ctx, body, end_of_stream, self.config.max_body_bytes);
+        }
         if !end_of_stream
-            || ctx.extensions.get::<ConnectorState>().is_none()
-            || ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
+            || ctx
+                .extensions
+                .get::<ConnectorState>()
+                .is_none_or(|s| s.owner != ctx.current_filter_id)
         {
             return Ok(FilterAction::Continue);
         }
