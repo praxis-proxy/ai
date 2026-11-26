@@ -9522,7 +9522,8 @@ class TestAgenticLoopVLLM:
                 "Use web search exactly once to find the official Rust "
                 "programming language website, then report its URL. /no_think"
             ),
-            tools=[{"type": "web_search", "search_context_size": "low"}],
+            tools=[{"type": "web_search", "search_context_size": "low",
+                    "external_web_access": True, "search_content_types": ["text", "image"]}],
             tool_choice={"type": "web_search"},
             include=["web_search_call.action.sources"],
             max_tool_calls=1,

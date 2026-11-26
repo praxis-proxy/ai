@@ -75,7 +75,8 @@ Details per use case:
   silently remove it (0.167.0 did that for `gpt-5.4`).
 - **Codex CLI live web search.** Two credentialed GPU steps enable live search on
   the pinned client, one per Responses route. Each adds the Tavily dispatcher and
-  agentic loop transition to its client-tool compatibility example. A host-side
+  agentic loop transition to its client-tool compatibility example. The native
+  case enables `native_tool_compat` to expose search to function-only inference. A host-side
   relay records the real Tavily exchange while the isolated CLI reaches Praxis.
   A passing case requires a completed CLI answer citing a returned source URL.
   Read the independent `codex_native_search` and `codex_translated_search` results

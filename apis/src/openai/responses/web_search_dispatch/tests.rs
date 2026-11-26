@@ -3816,3 +3816,28 @@ async fn preflight_allows_enforceable_filters() {
         );
     }
 }
+
+#[test]
+fn native_web_search_lowering_preserves_hosted_state_and_restores_calls() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model":"qwen", "tools":[{"type":"web_search","external_web_access":true}],
+        "tool_choice":{"type":"web_search"}
+    }));
+    lower_native_web_search(&mut state);
+    assert_eq!(state.tools[0]["type"], "web_search");
+    assert_eq!(state.request_body["tools"][0]["type"], "function");
+    assert_eq!(state.request_body["tools"][0]["name"], "web_search");
+    assert_eq!(state.request_body["tool_choice"]["name"], "web_search");
+    assert!(state.request_body_requires_rebuild());
+    let once = state.request_body.clone();
+    lower_native_web_search(&mut state);
+    assert_eq!(state.request_body, once);
+    let mut response = serde_json::json!({"output":[{
+        "type":"function_call","id":"search_1","call_id":"search_1",
+        "name":"web_search","arguments":"{\"queries\":[\"Rust release\"]}"
+    }]});
+    restore_web_search_calls(&mut response);
+    assert_eq!(response["output"][0]["type"], "web_search_call");
+    assert_eq!(response["output"][0]["action"]["queries"][0], "Rust release");
+    assert_eq!(response["output"][0]["status"], "in_progress");
+}

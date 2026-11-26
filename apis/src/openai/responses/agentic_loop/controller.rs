@@ -1033,6 +1033,9 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
     } else {
         Vec::new()
     };
+    if super::super::web_search_dispatch::has_hosted_web_search(state) {
+        super::super::web_search_dispatch::restore_web_search_calls(&mut response);
+    }
     // Stamp stable synthetic IDs on any id-less output items before accumulation,
     // so the public response never ships an item without an id (issue #955). Runs
     // after normalization so translated file-search calls are seen as such.
@@ -1289,6 +1292,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     } else {
         Vec::new()
     };
+    if super::super::web_search_dispatch::has_hosted_web_search(state) {
+        super::super::web_search_dispatch::restore_web_search_calls(&mut state.response_object);
+    }
     // The stream accumulator owns the response tree until this round is
     // complete. Build dispatch selections only after normalization and move.
     state.tool_calls.clear();

@@ -501,6 +501,20 @@ fn codex_search_config(
                 next: inference"#,
         );
     let mut config = praxis_core::config::Config::from_yaml(&yaml).expect("managed Codex search configuration");
+    if !translated {
+        let router = config.filter_chains[0]
+            .filters
+            .iter_mut()
+            .find(|f| f.filter_type == "iterative_request_router")
+            .expect("router");
+        let search = router.config["steps"][0]["filters"]
+            .as_sequence_mut()
+            .expect("filters")
+            .iter_mut()
+            .find(|f| f["filter"] == "openai_web_search_dispatch")
+            .expect("search");
+        search["native_tool_compat"] = serde_yaml::Value::Bool(true);
+    }
     // The gateway contacts the host-side Tavily relay on loopback.
     config.insecure_options.allow_private_upstreams = true;
     (example, config)
