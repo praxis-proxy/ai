@@ -18,6 +18,7 @@ mod openai_chat_completions_to_anthropic;
 mod openai_chat_completions_to_anthropic_stream;
 mod protocol;
 pub mod routes;
+mod tool_stream;
 mod web_search;
 mod wire;
 
@@ -32,3 +33,15 @@ pub use protocol::AnthropicMessagesProtocolFilter;
 pub use web_search::AnthropicWebSearchFilter;
 #[cfg(feature = "vertex-anthropic")]
 pub(crate) use wire::{ErrorType, error_body, error_rejection, invalid_request_rejection};
+
+/// Whether a response carries unencoded bytes that Messages filters can parse.
+fn has_identity_encoding(headers: &http::HeaderMap) -> bool {
+    headers.get_all(http::header::CONTENT_ENCODING).iter().all(|value| {
+        value.to_str().is_ok_and(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|coding| !coding.is_empty())
+                .all(|coding| coding.eq_ignore_ascii_case("identity"))
+        })
+    })
+}

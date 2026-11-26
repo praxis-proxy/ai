@@ -20,9 +20,8 @@
 #
 # A client `mcp_servers` entry is executed only when its `url` matches a
 # configured connector's `server_url`. Other URLs get a 400 unless
-# `allow_client_servers: true`. Streaming (`stream: true`) requests that use
-# the connector are rejected for now; requests without the connector are
-# unaffected, streamed or not.
+# `allow_client_servers: true`. With `stream: true`, the client receives text and
+# tool inputs incrementally, MCP results, and one final Messages stop.
 #
 # Filter ordering inside the inference step matters: `anthropic_mcp_connector`
 # is FIRST, so it rewrites the request before translation and, because
@@ -40,6 +39,7 @@
 #     -H 'anthropic-beta: mcp-client-2025-11-20' \
 #     -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"messages":[{"role":"user","content":"What is the weather in Paris?"}],"mcp_servers":[{"type":"url","url":"http://127.0.0.1:9100/mcp","name":"weather"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"weather"}]}'
 #
+# Add `"stream":true` and use curl -N to read events as they arrive.
 # Send `"model":"Qwen/Qwen3-8B"` to take the Chat Completions route.
 
 listeners:
@@ -112,7 +112,7 @@ filter_chains:
                         application_protocol: openai_chat_completions
 
               # Chat path only: convert streamed Chat Completions back into
-              # Anthropic Messages SSE for requests without the connector.
+              # Anthropic Messages SSE before the connector processes each chunk.
               - filter: anthropic_messages_to_chat_completions_stream
                 conditions:
                   - when:

@@ -1233,6 +1233,10 @@ mod tests {
             vec![
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
+                vec!["chat_completions_to_bedrock_converse"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
@@ -1343,10 +1347,14 @@ mod tests {
             vec![
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
@@ -1444,9 +1452,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 101, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 78, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 83, "manifest recording inventory count");
+        assert_eq!(report.features_total, 105, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 81, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 86, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1461,6 +1469,7 @@ mod tests {
                 "messages/invalid-tool-id",
                 "messages/malformed-success",
                 "messages/malformed-tool-arguments",
+                "messages/mcp-model-tool-stream",
                 "messages/model-provider-map",
                 "messages/named-tool-stop-stream",
                 "messages/native-basic-nonstream",
@@ -1471,6 +1480,8 @@ mod tests {
                 "messages/stop-sequence-nonstream",
                 "messages/stop-sequence-stream",
                 "messages/tool-input-presence",
+                "messages/tool-result-error",
+                "messages/tool-result-image-promotion",
                 "messages/typed-server-tools",
                 "messages/unrepresentable-parameters",
                 "messages/upstream-error",
@@ -1530,7 +1541,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 101, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 105, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1548,6 +1559,10 @@ mod tests {
                     &vec!["bedrock/basic-nonstream".to_owned()]
                 ),
                 (
+                    &"bedrock.converse.response.reasoning".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
+                (
                     &"messages.request.minimal".to_owned(),
                     &vec![
                         "messages/basic-nonstream".to_owned(),
@@ -1561,6 +1576,14 @@ mod tests {
                 (
                     &"messages.request.tool_input_presence".to_owned(),
                     &vec!["messages/tool-input-presence".to_owned()]
+                ),
+                (
+                    &"messages.request.tool_result_error".to_owned(),
+                    &vec!["messages/tool-result-error".to_owned()]
+                ),
+                (
+                    &"messages.request.tool_result_image_promotion".to_owned(),
+                    &vec!["messages/tool-result-image-promotion".to_owned()]
                 ),
                 (
                     &"messages.response.text".to_owned(),
@@ -1580,6 +1603,10 @@ mod tests {
                 (
                     &"messages.response.invalid_tool_id".to_owned(),
                     &vec!["messages/invalid-tool-id".to_owned()]
+                ),
+                (
+                    &"messages.mcp.streaming_model_tool_round".to_owned(),
+                    &vec!["messages/mcp-model-tool-stream".to_owned()]
                 ),
                 (
                     &"messages.response.streaming_tool_use_stop".to_owned(),
@@ -2096,6 +2123,9 @@ mod tests {
                 ),
                 "responses.native.mcp_structured_result_projection" => Some(
                     "Native-boundary projection evidence only. MCP execution and both output paths are covered through the real proxy by the OpenAI SDK tests; independent MCP callouts are outside the one-exchange replay model.",
+                ),
+                "messages.mcp.streaming_model_tool_round" => Some(
+                    "Wire replay covers the resolved model tool and its streamed arguments. The connector example reuses both sides of the fixture with a local MCP server to verify dispatch, result blocks, and continuation.",
                 ),
                 _ => None,
             };
