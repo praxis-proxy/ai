@@ -307,12 +307,14 @@ fn detect_responses_input(value: Option<&serde_json::Value>, detected: &mut Dete
             Some("computer_call_output") => {
                 if item.get("output").is_some_and(|output| {
                     output.get("type").and_then(serde_json::Value::as_str) == Some("computer_screenshot")
-                        && has_string(output.get("image_url"))
+                        && (has_string(output.get("image_url")) || has_string(output.get("file_id")))
                 }) {
                     detected.image = true;
                 }
             },
-            Some("function_call_output") => detect_content(item.get("output"), format, detected),
+            Some("function_call_output" | "custom_tool_call_output") => {
+                detect_content(item.get("output"), format, detected);
+            },
             Some("message") | None => detect_content(item.get("content"), format, detected),
             _ => {},
         }
@@ -360,19 +362,24 @@ fn detect_content_part(part: &serde_json::Value, format: AiRequestFormat, detect
         (AiRequestFormat::Responses, Some("input_image")) => {
             detected.image |= has_string(part.get("image_url")) || has_string(part.get("file_id"));
         },
-        (AiRequestFormat::AnthropicMessages, Some("image")) => {
-            detected.image |=
-                part.get("source")
-                    .is_some_and(|source| match source.get("type").and_then(serde_json::Value::as_str) {
-                        Some("base64") => has_string(source.get("data")),
-                        Some("url") => has_string(source.get("url")),
-                        Some("file") => has_string(source.get("file_id")),
-                        _ => false,
-                    });
-        },
-        (AiRequestFormat::AnthropicMessages, Some("tool_result")) => {
-            detect_content(part.get("content"), format, detected);
-        },
+        (AiRequestFormat::AnthropicMessages, _) => detect_anthropic_part(part, part_type, detected),
+        _ => {},
+    }
+}
+
+/// Inspect Anthropic image sources and the containers that may carry them.
+fn detect_anthropic_part(part: &serde_json::Value, part_type: Option<&str>, detected: &mut DetectedModalities) {
+    let format = AiRequestFormat::AnthropicMessages;
+    let source = part.get("source");
+    let source_type = source
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str);
+    match (part_type, source, source_type) {
+        (Some("image"), Some(source), Some("base64")) => detected.image |= has_string(source.get("data")),
+        (Some("image"), Some(source), Some("url")) => detected.image |= has_string(source.get("url")),
+        (Some("image"), Some(source), Some("file")) => detected.image |= has_string(source.get("file_id")),
+        (Some("document"), Some(source), Some("content")) => detect_content(source.get("content"), format, detected),
+        (Some("tool_result"), ..) => detect_content(part.get("content"), format, detected),
         _ => {},
     }
 }
@@ -1263,6 +1270,32 @@ mod tests {
         let body = br#"{"input":[{"type":"computer_call_output","call_id":"call_123","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,AAAA"}}]}"#;
 
         assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_file_backed_screenshot_requires_a_source() {
+        let body = br#"{"input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"file_123"}}]}"#;
+        let missing =
+            br#"{"input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":""}}]}"#;
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(missing).modality, None);
+    }
+
+    #[test]
+    fn responses_custom_tool_output_only_inspects_structured_content() {
+        let body =
+            br#"{"input":[{"type":"custom_tool_call_output","output":[{"type":"input_image","file_id":"file_123"}]}]}"#;
+        let text = br#"{"input":[{"type":"custom_tool_call_output","output":"data:image/png;base64,AAAA"}]}"#;
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
+    }
+
+    #[test]
+    fn anthropic_document_only_detects_images_in_content_sources() {
+        let image = br#"{"max_tokens":128,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}}]}]}"#;
+        let text = br#"{"max_tokens":128,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"text","text":"data:image/png;base64,AAAA"}]}}]}]}"#;
+        assert_eq!(classify_request_body(image).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
     }
 
     #[test]

@@ -1257,6 +1257,16 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
         pass
 
 
+WITNESS_IMAGE_INPUT = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"}
+        ],
+    }
+]
+
+
 class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     """Recording shim that sits between Praxis and the inference backend.
 
@@ -1293,6 +1303,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         if request_body and (
             request_body.get("prompt") is not None
             or request_body.get("previous_input_messages")
+            or request_body.get("input") == WITNESS_IMAGE_INPUT
             or "access_programs" in request_body
             or any(tool.get("type") == "code_interpreter" for tool in (request_body.get("tools") or []))
         ):
@@ -2813,18 +2824,7 @@ def test_openai_bound_code_interpreter_is_forwarded_unchanged(witness_backend_cl
 
 def test_openai_bound_image_input_is_forwarded_unchanged(witness_backend_client):
     client, forwarded = witness_backend_client
-    request_body = {
-        "model": "gpt-5",
-        "store": False,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"}
-                ],
-            }
-        ],
-    }
+    request_body = {"model": "gpt-5", "store": False, "input": WITNESS_IMAGE_INPUT}
 
     response = client.responses.create(**request_body)
 
