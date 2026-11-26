@@ -5,8 +5,9 @@
 //!
 //! [`McpSessionClient`] runs the `initialize`, `notifications/initialized`,
 //! and session `DELETE` exchanges as separate steps through the filtered
-//! subrequest transport the hosted MCP paths use, with `rmcp` building each
-//! message and parsing each reply. The caller holds the resulting
+//! subrequest transport the hosted MCP paths use. `rmcp` builds and decodes
+//! the JSON-RPC messages; SSE replies are framed by the crate's conforming SSE
+//! parser, and nothing a server sends is logged. The caller holds the resulting
 //! [`McpSessionInit`] and forwards its own requests on that session.
 //!
 //! No `rmcp` service runs between exchanges: a session costs no task, no
@@ -22,10 +23,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use praxis_core::subrequest::SubRequestClient;
-use praxis_filter::{FilterPipeline, StreamingResponseBody, SubResponse, SubrequestRuntime, TraceContext};
+use praxis_filter::{
+    CalloutResponseTooLarge, FilterPipeline, StreamingResponseBody, SubResponse, SubrequestRuntime, TraceContext,
+};
 use rmcp::{
     model::{
         ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest, Implementation, InitializeRequest,
@@ -38,6 +41,7 @@ use rmcp::{
 use super::subrequest_transport::{
     McpCallout, McpExchangeStage, McpSubrequestClient, McpTransportError, TransportSignal,
 };
+use crate::openai::sse::SseFrameParser;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -188,7 +192,7 @@ impl McpSessionClient {
 
     /// POST `initialize` and read the session id and negotiated version from
     /// the reply, whether it arrives as JSON or on an SSE stream.
-    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
+    #[expect(clippy::large_stack_frames, reason = "executor futures are inherently large")]
     async fn initialize_exchange(
         &self,
         transport: &McpSubrequestClient,
@@ -205,19 +209,13 @@ impl McpSessionClient {
                 .await
                 .map_err(classify)?;
         let (response, body, session_id) = accept_initialize_head(response, body).await?;
-        let (reply, _session) = Box::pin(transport.classify_post_response(
-            response,
-            body,
-            message,
-            false,
-            self.max_response_bytes,
-            Arc::clone(&signal),
-        ))
-        .await
-        .map_err(classify)?
-        .expect_initialized::<McpTransportError>()
-        .await
-        .map_err(classify)?;
+        let reply = read_initialize_reply(&response, body, self.max_response_bytes)
+            .await
+            .map_err(|error| match error {
+                // The executor ends the body at the exchange deadline.
+                McpSessionError::Transport if Instant::now() >= callout.deadline => McpSessionError::Timeout,
+                other => other,
+            })?;
         Ok(McpSessionInit {
             protocol_version: initialize_result_version(&reply, &request_id)?,
             session_id,
@@ -462,6 +460,137 @@ async fn accept_initialize_head(
             Err(error)
         },
     }
+}
+
+/// Read the JSON-RPC reply to `initialize` from a success response, within
+/// `limit` bytes.
+///
+/// A JSON body is parsed whole. An SSE body is read with the crate's
+/// conforming SSE parser, which ignores unknown fields and discards an event
+/// cut off at end of stream. Reading stops at the first response or error
+/// event, so a backend may keep the stream open after it, and the events
+/// before it are skipped without logging their contents.
+async fn read_initialize_reply(
+    response: &SubResponse,
+    body: Option<Box<dyn StreamingResponseBody>>,
+    limit: usize,
+) -> Result<ServerJsonRpcMessage, McpSessionError> {
+    let content_type = response
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let is_sse = crate::is_event_stream_content_type(content_type);
+    if !is_sse && !is_json_content_type(content_type) {
+        cancel(body).await;
+        return Err(McpSessionError::Malformed("unexpected content type"));
+    }
+    let Some(mut body) = body else {
+        return buffered_reply(&response.body, is_sse, limit);
+    };
+    let reply = if is_sse {
+        stream_sse_reply(&mut body, limit).await
+    } else {
+        collect_json_reply(&mut body, limit).await
+    };
+    body.cancel().await;
+    reply
+}
+
+/// The reply in a body the chain buffered. The executor bounded it only by the
+/// looser streaming backstop, so the exact limit is checked here.
+fn buffered_reply(body: &[u8], is_sse: bool, limit: usize) -> Result<ServerJsonRpcMessage, McpSessionError> {
+    if body.len() > limit {
+        return Err(McpSessionError::ResponseTooLarge { limit });
+    }
+    if !is_sse {
+        return parse_reply(body);
+    }
+    for data in crate::buffered_sse_event_data(body) {
+        if let Some(reply) = sse_reply(&data)? {
+            return Ok(reply);
+        }
+    }
+    Err(McpSessionError::Malformed("initialize stream has no reply"))
+}
+
+/// Read SSE events until the first JSON-RPC response or error.
+async fn stream_sse_reply(
+    body: &mut Box<dyn StreamingResponseBody>,
+    limit: usize,
+) -> Result<ServerJsonRpcMessage, McpSessionError> {
+    // The parser stores an `event:` value lossily decoded, and each invalid
+    // byte becomes a three-byte U+FFFD, so three times the read limit covers
+    // any input within it.
+    let mut parser = SseFrameParser::new(limit.saturating_mul(3));
+    let mut read = 0_usize;
+    while let Some(chunk) = next_chunk(body).await? {
+        read = read
+            .checked_add(chunk.len())
+            .filter(|total| *total <= limit)
+            .ok_or(McpSessionError::ResponseTooLarge { limit })?;
+        let frames = parser
+            .parse_chunk(&chunk)
+            .map_err(|_overflow| McpSessionError::ResponseTooLarge { limit })?;
+        for frame in frames {
+            if let Some(reply) = sse_reply(&frame.data)? {
+                return Ok(reply);
+            }
+        }
+    }
+    Err(McpSessionError::Malformed("initialize stream has no reply"))
+}
+
+/// Buffer a streamed JSON body within `limit` bytes and parse it.
+async fn collect_json_reply(
+    body: &mut Box<dyn StreamingResponseBody>,
+    limit: usize,
+) -> Result<ServerJsonRpcMessage, McpSessionError> {
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = next_chunk(body).await? {
+        if buf.len().checked_add(chunk.len()).is_none_or(|total| total > limit) {
+            return Err(McpSessionError::ResponseTooLarge { limit });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    parse_reply(&buf)
+}
+
+/// The next body chunk; an overflow the executor reports stays a size failure
+/// and any other read failure is a transport failure.
+async fn next_chunk(body: &mut Box<dyn StreamingResponseBody>) -> Result<Option<Bytes>, McpSessionError> {
+    body.next_chunk().await.map_err(|error| {
+        error
+            .downcast_ref::<CalloutResponseTooLarge>()
+            .map_or(McpSessionError::Transport, |overflow| {
+                McpSessionError::ResponseTooLarge { limit: overflow.limit }
+            })
+    })
+}
+
+/// The message in one SSE event when it is a response or error; other
+/// messages, and events without data, are skipped.
+fn sse_reply(data: &[u8]) -> Result<Option<ServerJsonRpcMessage>, McpSessionError> {
+    if data.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let message = parse_reply(data)?;
+    Ok(matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)).then_some(message))
+}
+
+/// Parse one JSON-RPC message from the server.
+fn parse_reply(bytes: &[u8]) -> Result<ServerJsonRpcMessage, McpSessionError> {
+    serde_json::from_slice(bytes).map_err(|_error| McpSessionError::Malformed("initialize reply is not JSON-RPC"))
+}
+
+/// Whether a `Content-Type` value is `application/json`.
+fn is_json_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json")
 }
 
 /// Read and validate the server `Mcp-Session-Id` response header.

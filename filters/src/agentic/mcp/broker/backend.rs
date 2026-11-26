@@ -11,7 +11,7 @@
 //!
 //! [`FilteredMcpBackendClient`] runs each exchange through
 //! [`McpSessionClient`], the MCP client the hosted MCP paths share: `rmcp`
-//! builds the messages and parses the replies, and the filtered subrequest
+//! builds and decodes the JSON-RPC messages, and the filtered subrequest
 //! transport runs them through the broker's generated outbound chain. Replies
 //! are bounded before they are parsed, and an `initialize` reply on an SSE
 //! stream completes when it arrives even if the backend keeps the stream open.

@@ -261,6 +261,25 @@ async fn initialize_with(
     max_response_bytes: usize,
     timeout: Duration,
 ) -> (Result<McpSessionInit, McpSessionError>, Vec<Received>) {
+    initialize_via(session_client(max_response_bytes), reply, timeout).await
+}
+
+/// A client over a chain that never selects streaming, as when an operator
+/// filter buffers response bodies.
+fn buffering_client(max_response_bytes: usize) -> McpSessionClient {
+    McpSessionClient::new(
+        build_bare_outbound_pipeline(true).unwrap(),
+        max_response_bytes,
+        Duration::from_secs(5),
+    )
+}
+
+/// Run `initialize` with `client` against a backend answering with `reply`.
+async fn initialize_via(
+    client: McpSessionClient,
+    reply: impl Fn(&str) -> Reply + Send + Sync + 'static,
+    timeout: Duration,
+) -> (Result<McpSessionInit, McpSessionError>, Vec<Received>) {
     // The reply must echo the random request id, so the backend answers in
     // two phases: record the request, then build the reply from it.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -281,7 +300,7 @@ async fn initialize_with(
         tokio::time::sleep(reply.hold).await;
     });
     let url = format!("http://{addr}/mcp");
-    let result = session_client(max_response_bytes)
+    let result = client
         .initialize("/mcp", staged(&url).await, &callout(timeout), "2025-06-18")
         .await;
     let received = received.lock().unwrap().clone();
@@ -460,6 +479,139 @@ async fn sse_reply_accepts_cr_framing_and_bom() {
         .await;
         assert!(result.is_ok(), "{framing:?} framing with a BOM must parse: {result:?}");
     }
+}
+
+/// An SSE `initialize` reply preceded by a field SSE requires clients to
+/// ignore, a colonless field, and a notification carrying `marker`.
+fn sse_with_extras(body: &str, marker: &str) -> Reply {
+    let notification = format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"info","data":"{marker}"}}}}"#
+    );
+    let events = format!(
+        "x-vendor: 1\nretry\nevent: message\ndata: {notification}\n\nid: 7\nx-vendor: 2\ndata: {}\n\n",
+        init_result(body, "2025-06-18")
+    );
+    Reply::closed(http_response(
+        "200 OK",
+        &[("Content-Type", "text/event-stream")],
+        &events,
+    ))
+}
+
+#[tokio::test]
+async fn sse_reply_ignores_unknown_and_colonless_fields() {
+    let (result, _) = initialize_with(|body| sse_with_extras(body, "x"), 1 << 20, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        result.unwrap().protocol_version.as_ref(),
+        "2025-06-18",
+        "SSE requires unknown fields to be ignored"
+    );
+}
+
+#[tokio::test]
+async fn buffered_sse_reply_ignores_unknown_fields() {
+    let (result, _) = initialize_via(
+        buffering_client(1 << 20),
+        |body| sse_with_extras(body, "x"),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "a buffered SSE reply must parse the same way: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_sse_reply_discards_unterminated_event() {
+    let (result, _) = initialize_via(
+        buffering_client(1 << 20),
+        |body| {
+            Reply::closed(http_response(
+                "200 OK",
+                &[("Content-Type", "text/event-stream")],
+                &format!("data: {}", init_result(body, "2025-06-18")),
+            ))
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(McpSessionError::Malformed(_))),
+        "a buffered event cut off at end of stream is not an event: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_reply_over_the_limit_is_too_large() {
+    // Between the limit and the executor's doubled streaming backstop.
+    let (result, _) = initialize_via(
+        buffering_client(16 * 1024),
+        |body| {
+            let mut reply: serde_json::Value = serde_json::from_str(&init_result(body, "2025-06-18")).unwrap();
+            reply["result"]["serverInfo"]["padding"] = serde_json::json!("x".repeat(20 * 1024));
+            Reply::closed(http_response(
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                &reply.to_string(),
+            ))
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(McpSessionError::ResponseTooLarge { limit: 16 * 1024 }),
+        "a buffered reply must respect the exact limit"
+    );
+}
+
+#[tokio::test]
+async fn truncated_json_reply_is_a_transport_failure() {
+    let (result, _) = initialize_with(
+        |_body| {
+            Reply::closed(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"jsonrpc\""
+                    .to_vec(),
+            )
+        },
+        1 << 20,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(McpSessionError::Transport),
+        "a cut-off body is not an oversized one"
+    );
+}
+
+#[test]
+fn notification_content_before_the_reply_is_not_logged() {
+    const MARKER: &str = "secret-notification-marker";
+    let mut result = None;
+    let logs = crate::test_utils::capture_log_output(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        result = Some(runtime.block_on(initialize_with(
+            |body| sse_with_extras(body, MARKER),
+            1 << 20,
+            Duration::from_secs(5),
+        )));
+    });
+
+    assert!(result.unwrap().0.is_ok(), "the handshake must complete");
+    assert!(
+        !logs.contains(MARKER),
+        "notification content must not reach logs: {logs}"
+    );
 }
 
 #[tokio::test]

@@ -131,7 +131,7 @@ the `mcp_broker_backend` selector, any `outbound_filters`, and a
 `load_balancer` that references each server cluster by name. Server clusters
 must therefore be declared in top-level `clusters:`. Each exchange goes through
 the MCP client the hosted MCP paths use (`praxis_ai_apis::mcp_session`): `rmcp`
-builds the messages and parses the replies. No `rmcp` service is kept between
+builds and decodes the JSON-RPC messages. No `rmcp` service is kept between
 exchanges, so an idle backend session holds no task and no standalone `GET`
 stream. Each reply is bounded by `max_response_bytes`; oversized or chunked
 replies are rejected before the full body is retained. An `initialize` reply on
@@ -160,7 +160,7 @@ If a backend answers `initialize` with a protocol version outside the broker's
 and returns an `unsupported_protocol_version` error instead of forwarding the
 call. A client `MCP-Protocol-Version` the broker does not support gets HTTP 400
 before any handshake; without the header the broker offers its default
-version. SSE replies go through the MCP client's SSE parser (CR, LF, or CRLF
+version. SSE replies go through the shared conforming parser (CR, LF, or CRLF
 line endings and an optional leading BOM). As the SSE specification requires,
 an event the backend never terminated with a blank line is discarded.
 
