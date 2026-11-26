@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! [`OpenaiFilesFilter`] serves `GET /v1/files` and `GET /v1/files/{file_id}`
-//! locally via `FilterAction::TerminalResponse`.
+//! [`OpenaiFilesFilter`] serves `GET /v1/files`, `GET /v1/files/{file_id}` and
+//! `DELETE /v1/files/{file_id}` locally via `FilterAction::TerminalResponse`.
 //!
 //! The filter classifies from the request head with the Files route registry,
-//! so it works without `ai_operation`. Upload, content and delete are not
-//! implemented locally yet and pass through unchanged.
+//! so it works without `ai_operation`. Upload and content are not implemented
+//! locally yet and pass through unchanged.
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 use super::{
     FileList, FileService, FileServiceError,
     config::FilesConfig,
-    contracts::ListFilesResponse,
+    contracts::{DeleteFileResponse, ListFilesResponse, OpenAiFile},
     handlers,
     routes::{FilesOperation, MatchedFilesRoute, match_route},
 };
@@ -27,18 +27,22 @@ use crate::state_owner::{StateOwner, require_state_owner};
 // OpenaiFilesFilter
 // -----------------------------------------------------------------------------
 
-/// Handles the local Files metadata endpoints.
+/// Handles the local Files metadata and deletion endpoints.
 ///
-/// `GET /v1/files` and `GET /v1/files/{file_id}` are answered from the
-/// owner-scoped file catalog and never reach upstream. Every other request,
-/// including the not yet implemented upload, content and delete operations,
-/// continues down the pipeline.
+/// `GET /v1/files`, `GET /v1/files/{file_id}` and `DELETE /v1/files/{file_id}`
+/// are answered from the owner-scoped file catalog and never reach upstream.
+/// Every other request, including the not yet implemented upload and content
+/// operations, continues down the pipeline.
+///
+/// A delete hides the file at once and marks it for physical deletion; the
+/// bytes are removed later by a background cleanup. Only the delete that hides
+/// the file succeeds.
 ///
 /// A trusted owner is required: place `state_owner` earlier in the chain. A
 /// request without one is rejected with 401. Missing, expired, pending,
-/// failed, deleted and other tenants' files all return the same 404. Query
-/// errors return 400 and catalog failures a generic 500; catalog error text
-/// never reaches the client or the logs.
+/// failed, deleted and other tenants' files all return the same 404, for
+/// retrieve and delete alike. Query errors return 400 and catalog failures a
+/// generic 500; catalog error text never reaches the client or the logs.
 ///
 /// # YAML
 ///
@@ -90,13 +94,10 @@ impl HttpFilter for OpenaiFilesFilter {
             return Ok(FilterAction::Continue);
         };
         let operation = route.spec.operation;
-        // Temporary: upload, content and delete (#500, #501, delete PR) pass
-        // through without an owner. Delete this guard when the last of them is
-        // served locally; every matched route then needs the owner below.
-        if matches!(
-            operation,
-            FilesOperation::CreateFile | FilesOperation::DeleteFile | FilesOperation::DownloadFile
-        ) {
+        // Temporary: upload and content (#500, #501) pass through without an
+        // owner. Delete this guard when the last of them is served locally;
+        // every matched route then needs the owner below.
+        if matches!(operation, FilesOperation::CreateFile | FilesOperation::DownloadFile) {
             return Ok(FilterAction::Continue);
         }
         let owner = match require_state_owner(ctx) {
@@ -123,19 +124,22 @@ async fn serve(
     query: Option<&str>,
 ) -> Result<FilterAction, FilterError> {
     let response = match route.spec.operation {
-        FilesOperation::RetrieveFile => {
-            let id = route
-                .params
-                .get("file_id")
-                .ok_or_else(|| FilterError::from("openai_files: matched retrieve route missing file id"))?;
-            retrieve(service, owner, id).await
-        },
+        FilesOperation::RetrieveFile => retrieve(service, owner, file_id(route)?).await,
+        FilesOperation::DeleteFile => delete(service, owner, file_id(route)?).await,
         FilesOperation::ListFiles => list(service, owner, query).await,
-        FilesOperation::CreateFile | FilesOperation::DeleteFile | FilesOperation::DownloadFile => {
+        FilesOperation::CreateFile | FilesOperation::DownloadFile => {
             return Ok(FilterAction::Continue);
         },
     };
     terminal(response)
+}
+
+/// The `file_id` path parameter of a matched single-file route.
+fn file_id<'path>(route: &MatchedFilesRoute<'path>) -> Result<&'path str, FilterError> {
+    route
+        .params
+        .get("file_id")
+        .ok_or_else(|| FilterError::from("openai_files: matched route missing file id"))
 }
 
 /// Wrap a rendered response as the filter's terminal action.
@@ -148,10 +152,24 @@ async fn retrieve(service: &dyn FileService, owner: &StateOwner, id: &str) -> Re
     match service.retrieve(owner, id).await {
         Ok(info) => {
             debug!(operation = "retrieveFile", status = 200_u16, "files request served");
-            handlers::json_response(200, &super::contracts::OpenAiFile::from(info))
+            handlers::json_response(200, &OpenAiFile::from(info))
         },
         Err(error) => {
             log_failure("retrieveFile", &error);
+            handlers::error_response(&error, Some(id))
+        },
+    }
+}
+
+/// Serve `deleteFile`.
+async fn delete(service: &dyn FileService, owner: &StateOwner, id: &str) -> Result<TerminalResponse, FilterError> {
+    match service.delete(owner, id).await {
+        Ok(()) => {
+            debug!(operation = "deleteFile", status = 200_u16, "files request served");
+            handlers::json_response(200, &DeleteFileResponse::deleted(id))
+        },
+        Err(error) => {
+            log_failure("deleteFile", &error);
             handlers::error_response(&error, Some(id))
         },
     }
@@ -218,7 +236,7 @@ mod tests {
         test_utils::{capture_log_output, make_filter_context, make_request},
     };
 
-    /// What the fake service returns for retrieve and list.
+    /// What the fake service returns for retrieve, list and delete.
     #[derive(Clone, Copy)]
     enum Outcome {
         Found,
@@ -278,7 +296,7 @@ mod tests {
         }
 
         async fn delete(&self, _owner: &StateOwner, _id: &str) -> Result<(), FileServiceError> {
-            unimplemented!()
+            self.outcome(())
         }
     }
 
@@ -322,11 +340,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_is_served_locally() {
+        let (status, body) =
+            terminal_parts(run(&filter(Outcome::Found), Method::DELETE, "/v1/files/file_1", true).await);
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"id": "file_1", "object": "file", "deleted": true}));
+    }
+
+    #[tokio::test]
     async fn missing_owner_is_401_and_never_reaches_the_service() {
-        for uri in ["/v1/files", "/v1/files/file_1"] {
-            let action = run(&filter(Outcome::Found), Method::GET, uri, false).await;
+        for (method, uri) in [
+            (Method::GET, "/v1/files"),
+            (Method::GET, "/v1/files/file_1"),
+            (Method::DELETE, "/v1/files/file_1"),
+        ] {
+            let action = run(&filter(Outcome::Found), method.clone(), uri, false).await;
             let FilterAction::Reject(rejection) = action else {
-                panic!("expected a rejection for {uri}");
+                panic!("expected a rejection for {method} {uri}");
             };
             assert_eq!(rejection.status, 401);
         }
@@ -346,11 +376,37 @@ mod tests {
             (Outcome::CatalogDown, "/v1/files", 500, "server_error"),
         ];
         for (outcome, uri, expected, error_type) in cases {
-            let (status, body) = terminal_parts(run(&filter(outcome), Method::GET, uri, true).await);
-            assert_eq!(status, expected, "{uri}");
-            assert_eq!(body["error"]["type"], error_type);
-            assert!(!body.to_string().contains("secret-dsn"));
+            assert_error(outcome, Method::GET, uri, expected, error_type).await;
         }
+    }
+
+    #[tokio::test]
+    async fn delete_errors_map_to_statuses() {
+        assert_error(
+            Outcome::Missing,
+            Method::DELETE,
+            "/v1/files/file_1",
+            404,
+            "invalid_request_error",
+        )
+        .await;
+        assert_error(
+            Outcome::CatalogDown,
+            Method::DELETE,
+            "/v1/files/file_1",
+            500,
+            "server_error",
+        )
+        .await;
+    }
+
+    /// Assert the status and error type of a failed request, and that no
+    /// backend error text reaches the body.
+    async fn assert_error(outcome: Outcome, method: Method, uri: &str, expected: u16, error_type: &str) {
+        let (status, body) = terminal_parts(run(&filter(outcome), method.clone(), uri, true).await);
+        assert_eq!(status, expected, "{method} {uri}");
+        assert_eq!(body["error"]["type"], error_type);
+        assert!(!body.to_string().contains("secret-dsn"));
     }
 
     #[tokio::test]
@@ -364,10 +420,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_not_found_names_the_file() {
+        let (_status, body) =
+            terminal_parts(run(&filter(Outcome::Missing), Method::DELETE, "/v1/files/file_9", true).await);
+        assert_eq!(
+            body,
+            json!({"error": {"code": null, "message": "No such File object: file_9",
+                             "param": "id", "type": "invalid_request_error"}})
+        );
+    }
+
+    #[tokio::test]
     async fn unprovisioned_catalog_is_503() {
-        let (status, body) = terminal_parts(run(&OpenaiFilesFilter::default(), Method::GET, "/v1/files", true).await);
-        assert_eq!(status, 503);
-        assert_eq!(body["error"]["type"], "server_error");
+        for (method, uri) in [(Method::GET, "/v1/files"), (Method::DELETE, "/v1/files/file_1")] {
+            let (status, body) = terminal_parts(run(&OpenaiFilesFilter::default(), method.clone(), uri, true).await);
+            assert_eq!(status, 503, "{method} {uri}");
+            assert_eq!(body["error"]["type"], "server_error");
+        }
     }
 
     #[tokio::test]
@@ -375,7 +444,6 @@ mod tests {
         let filter = filter(Outcome::Found);
         for (method, uri) in [
             (Method::POST, "/v1/files"),
-            (Method::DELETE, "/v1/files/file_1"),
             (Method::GET, "/v1/files/file_1/content"),
             (Method::GET, "/v1/models"),
             (Method::POST, "/v1/responses"),
@@ -393,13 +461,16 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    for (outcome, uri) in [
-                        (Outcome::Found, "/v1/files"),
-                        (Outcome::Found, "/v1/files/marker-id"),
-                        (Outcome::Missing, "/v1/files/marker-id"),
-                        (Outcome::CatalogDown, "/v1/files?after=marker-cursor"),
+                    for (outcome, method, uri) in [
+                        (Outcome::Found, Method::GET, "/v1/files"),
+                        (Outcome::Found, Method::GET, "/v1/files/marker-id"),
+                        (Outcome::Missing, Method::GET, "/v1/files/marker-id"),
+                        (Outcome::CatalogDown, Method::GET, "/v1/files?after=marker-cursor"),
+                        (Outcome::Found, Method::DELETE, "/v1/files/marker-id"),
+                        (Outcome::Missing, Method::DELETE, "/v1/files/marker-id"),
+                        (Outcome::CatalogDown, Method::DELETE, "/v1/files/marker-id"),
                     ] {
-                        drop(run(&filter(outcome), Method::GET, uri, true).await);
+                        drop(run(&filter(outcome), method, uri, true).await);
                     }
                 });
         });

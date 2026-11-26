@@ -79,7 +79,8 @@ pub(super) fn invalid_query_response(invalid: &InvalidQuery) -> Result<TerminalR
     )
 }
 
-/// Render a service failure. `file_id` names the requested file for retrieve.
+/// Render a service failure. `file_id` names the requested file for retrieve
+/// and delete.
 pub(super) fn error_response(error: &FileServiceError, file_id: Option<&str>) -> Result<TerminalResponse, FilterError> {
     match error {
         FileServiceError::NotFound => {
@@ -95,8 +96,8 @@ pub(super) fn error_response(error: &FileServiceError, file_id: Option<&str>) ->
         FileServiceError::InvalidInput(message) => {
             json_response(400, &ErrorResponse::new(message, "invalid_request_error", None, None))
         },
-        // Upload, quota and stream failures cannot occur for list/retrieve;
-        // fail closed rather than invent a client status for them.
+        // Upload, quota and stream failures cannot occur for list, retrieve or
+        // delete; fail closed rather than invent a client status for them.
         FileServiceError::Catalog(_)
         | FileServiceError::Store(_)
         | FileServiceError::UploadTooLarge

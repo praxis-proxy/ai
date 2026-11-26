@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use praxis_ai_store::{FileCatalog, StateOwner};
+use praxis_ai_store::{DeletionOutcome, FileCatalog, StateOwner};
 
 use super::{FileDownload, FileService, FileServiceError, FileUploadSession};
 use crate::openai::files::{FileInfo, FileList, FilePage, FileStore};
@@ -16,7 +16,7 @@ pub struct DefaultFileService {
     /// Metadata catalog.
     catalog: Arc<dyn FileCatalog>,
     /// Byte store.
-    #[expect(dead_code, reason = "used by upload, content and delete (#500, #501, delete PR)")]
+    #[expect(dead_code, reason = "used by upload and content (#500, #501)")]
     store: Arc<dyn FileStore>,
 }
 
@@ -29,7 +29,7 @@ impl DefaultFileService {
 
 #[expect(
     clippy::unimplemented,
-    reason = "upload, content and delete are not implemented yet (#500, #501, delete PR)"
+    reason = "upload and content are not implemented yet (#500, #501)"
 )]
 #[async_trait]
 impl FileService for DefaultFileService {
@@ -60,8 +60,13 @@ impl FileService for DefaultFileService {
         unimplemented!()
     }
 
-    async fn delete(&self, _owner: &StateOwner, _id: &str) -> Result<(), FileServiceError> {
-        unimplemented!()
+    async fn delete(&self, owner: &StateOwner, id: &str) -> Result<(), FileServiceError> {
+        // A file already marked for deletion is reported as not found, like
+        // every other hidden file: only the call that hides it succeeds.
+        match self.catalog.mark_for_deletion(owner, id).await? {
+            DeletionOutcome::Marked => Ok(()),
+            DeletionOutcome::AlreadyPending | DeletionOutcome::NotFound => Err(FileServiceError::NotFound),
+        }
     }
 }
 
@@ -76,7 +81,8 @@ impl FileService for DefaultFileService {
     reason = "tests"
 )]
 mod tests {
-    //! `DefaultFileService::{retrieve, list}` against a real `PostgreSQL` catalog.
+    //! `DefaultFileService::{retrieve, list, delete}` against a real `PostgreSQL`
+    //! catalog.
     //!
     //! Every test needs a disposable `PostgreSQL` via `DATABASE_URL` and is
     //! `#[ignore]`d (`make test-postgres-unit` runs them). Files are created
@@ -361,5 +367,71 @@ mod tests {
                 "{cursor}"
             );
         }
+    }
+    // ---- delete ----
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn delete_hides_the_file_immediately() {
+        let f = Fixture::new().await;
+        let a = owner("a");
+        f.ready(&a, "gone", 1, "assistants").await;
+        f.ready(&a, "kept", 1, "assistants").await;
+
+        f.service.delete(&a, "gone").await.unwrap();
+
+        assert!(matches!(
+            f.service.retrieve(&a, "gone").await,
+            Err(FileServiceError::NotFound)
+        ));
+        assert_eq!(
+            f.list_ids(&a, &list(10, FileListOrder::Asc)).await,
+            (ids(&["kept"]), false)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn delete_twice_is_not_found() {
+        let f = Fixture::new().await;
+        let a = owner("a");
+        f.ready(&a, "f1", 1, "assistants").await;
+
+        f.service.delete(&a, "f1").await.unwrap();
+        assert!(matches!(
+            f.service.delete(&a, "f1").await,
+            Err(FileServiceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn delete_rejects_every_non_visible_file() {
+        let f = Fixture::new().await;
+        let a = owner("a");
+        let b = owner("b");
+
+        f.ready(&a, "ready", 1, "assistants").await;
+        f.catalog.create_pending(&new_file("pending", &a, 1)).await.unwrap();
+        f.catalog.create_pending(&new_file("failed", &a, 1)).await.unwrap();
+        f.catalog.fail_upload(&a, "failed").await.unwrap();
+        f.catalog.create_pending(&new_file("expired", &a, 1)).await.unwrap();
+        f.catalog
+            .complete_upload(&a, "expired", completion(1, "assistants", Some(Duration::ZERO)))
+            .await
+            .unwrap();
+
+        for id in ["missing", "pending", "failed", "expired"] {
+            assert!(
+                matches!(f.service.delete(&a, id).await, Err(FileServiceError::NotFound)),
+                "{id}"
+            );
+        }
+        assert!(
+            matches!(f.service.delete(&b, "ready").await, Err(FileServiceError::NotFound)),
+            "other tenant"
+        );
+        // The rejected attempts left the owner's file untouched.
+        f.service.retrieve(&a, "ready").await.unwrap();
     }
 }

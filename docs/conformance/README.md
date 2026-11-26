@@ -91,8 +91,8 @@ contract enter owned-contract OpenAPI comparison. The generator emits every
 operation that declares a contract, so the comparison covers exactly what is
 generated. All eight current Conversations operations are `local`.
 
-`listFiles` and `retrieveFile` are `local`; the other three Files operations are
-`passthrough`. All five declare their contracts, so oasdiff compares them
+`listFiles`, `retrieveFile` and `deleteFile` are `local`; the other two Files
+operations are `passthrough`. All five declare their contracts, so oasdiff compares them
 against the pinned Files projection. See
 [Files contract](#files-contract) for the recorded deviations.
 `cargo xtask check-files-registry` additionally compares pinned, runtime, and
@@ -100,8 +100,8 @@ generated operation identity three ways and runs in `make lint`.
 
 ### Files contract
 
-- **Handling mode versus contract.** `listFiles` and `retrieveFile` are
-  `local`; upload, content and delete stay `passthrough` and are forwarded
+- **Handling mode versus contract.** `listFiles`, `retrieveFile` and
+  `deleteFile` are `local`; upload and content stay `passthrough` and are forwarded
   without mutation. Each still declares a contract, and generation and oasdiff comparison follow that contract, not the
   handling mode.
 - **Schema deviations from the pin**, recorded as `FILES_CONTRACT_EXCEPTIONS`

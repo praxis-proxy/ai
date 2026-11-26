@@ -13,7 +13,7 @@
 //! success response, and pinned error responses) once, and the runtime
 //! request-body shape is derived from that same declaration so the two cannot
 //! diverge. Operations stay `Passthrough` until their local handlers land;
-//! `listFiles` and `retrieveFile` are `Local`. Generation and conformance
+//! `listFiles`, `retrieveFile` and `deleteFile` are `Local`. Generation and conformance
 //! comparison follow the declared contract, not the handling mode.
 //! Operation IDs are the official ones from the pinned OpenAI specification,
 //! reproduced verbatim including
@@ -292,7 +292,7 @@ files_operations! {
         method: Delete,
         transport: Http,
         path: "/files/{file_id}",
-        mode: Passthrough,
+        mode: Local,
         contract: {
             parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
             request: [none],
@@ -419,11 +419,14 @@ mod tests {
                     "{} lacks a contract",
                     spec.operation_id()
                 );
-                let local = matches!(spec.operation, FilesOperation::ListFiles | FilesOperation::RetrieveFile);
+                let local = matches!(
+                    spec.operation,
+                    FilesOperation::ListFiles | FilesOperation::RetrieveFile | FilesOperation::DeleteFile
+                );
                 assert_eq!(
                     spec.owns_contract(),
                     local,
-                    "{} ownership must follow its handler: only list and retrieve are local; a newly \
+                    "{} ownership must follow its handler: only list, retrieve and delete are local; a newly \
                      local operation needs handler-produced tests for every declared error status",
                     spec.operation_id()
                 );

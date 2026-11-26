@@ -77,7 +77,7 @@
     "by_mode": [
       {
         "mode": "passthrough",
-        "operations": 9
+        "operations": 8
       },
       {
         "mode": "inspect",
@@ -89,7 +89,7 @@
       },
       {
         "mode": "local",
-        "operations": 10
+        "operations": 11
       }
     ],
     "covered_operations": [
@@ -409,7 +409,7 @@
           "path": "/files/{file_id}",
           "operation": "DELETE /files/{file_id}",
           "area": "Files",
-          "mode": "passthrough",
+          "mode": "local",
           "evidence": "praxis_ai_apis::openai::files_operation_specs::DeleteFile"
         }
       },
