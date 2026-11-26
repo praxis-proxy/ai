@@ -8,6 +8,8 @@
 //! settings) is behavioral and owned by the acceptance tests, so serde
 //! ignores it.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
@@ -29,6 +31,12 @@ pub(crate) const PI: &str = "tests/integration/fixtures/pi-cli/pin.toml";
 /// Codex manifest, relative to the repository root.
 pub(crate) const CODEX: &str = "tests/integration/fixtures/codex-cli/pin.toml";
 
+/// Model-baked vLLM image manifest, relative to the repository root.
+pub(crate) const IMAGES: &str = "vllm/images.json";
+
+/// Directory vllm/Containerfile bakes weights under, as `<dir>/<model>`.
+pub(crate) const BAKED_MODEL_DIR: &str = "/opt/vllm/models";
+
 // -----------------------------------------------------------------------------
 // Shared Tables
 // -----------------------------------------------------------------------------
@@ -36,8 +44,11 @@ pub(crate) const CODEX: &str = "tests/integration/fixtures/codex-cli/pin.toml";
 /// A `[vllm]` backend pin block.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Vllm {
-    /// Digest-pinned container image reference.
-    pub(crate) image: String,
+    /// Digest-pinned upstream vLLM image that vllm/Containerfile builds from.
+    pub(crate) base_image: String,
+
+    /// Key of the served model-baked image in vllm/images.json.
+    pub(crate) baked_image: String,
 
     /// Model name the server exposes.
     pub(crate) served_model_name: String,
@@ -62,15 +73,30 @@ pub(crate) struct VllmLaunch {
 impl Vllm {
     /// The value following `--max-model-len` in the launch flags.
     pub(crate) fn flag_context(&self) -> Result<u64, String> {
+        self.flag_value("--max-model-len")?
+            .parse()
+            .map_err(|e| format!("--max-model-len in vllm.launch.flags must be followed by an integer: {e}"))
+    }
+
+    /// The value of a single launch option, in either CLI spelling.
+    pub(crate) fn flag_value(&self, flag: &str) -> Result<&str, String> {
         let flags = &self.launch.flags;
-        let index = flags
-            .iter()
-            .position(|flag| flag == "--max-model-len")
-            .ok_or("vllm.launch.flags must pass --max-model-len")?;
-        flags
-            .get(index + 1)
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| "--max-model-len in vllm.launch.flags must be followed by an integer".to_owned())
+        let mut matches = flags.iter().enumerate().filter_map(|(index, arg)| {
+            let (name, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+            (name == flag).then_some((index, inline))
+        });
+        let (index, inline) = matches
+            .next()
+            .ok_or_else(|| format!("vllm.launch.flags must pass {flag}"))?;
+        if matches.next().is_some() {
+            return Err(format!("vllm.launch.flags must pass {flag} exactly once"));
+        }
+        inline
+            .or_else(|| flags.get(index + 1).map(String::as_str))
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
+            .ok_or_else(|| format!("{flag} in vllm.launch.flags must be followed by a value"))
     }
 }
 
@@ -323,6 +349,9 @@ pub(crate) struct PiProvider {
 pub(crate) struct CodexManifest {
     /// `[codex]`.
     pub(crate) codex: Codex,
+
+    /// `[vllm]`.
+    pub(crate) vllm: Vllm,
 }
 
 /// `[codex]`.
@@ -365,6 +394,9 @@ pub(crate) struct Manifests {
 
     /// Codex.
     pub(crate) codex: CodexManifest,
+
+    /// Model-baked vLLM images.
+    pub(crate) images: BakedImages,
 }
 
 impl Manifests {
@@ -376,8 +408,37 @@ impl Manifests {
             opencode_v2: parse(repo, OPENCODE_V2)?,
             pi: parse(repo, PI)?,
             codex: parse(repo, CODEX)?,
+            images: serde_json::from_str(&repo.read(IMAGES)?).map_err(|e| format!("{IMAGES}: {e}"))?,
         })
     }
+
+    /// Every `[vllm]` block, with its manifest path.
+    pub(crate) fn vllm_blocks(&self) -> Vec<(&'static str, &Vllm)> {
+        let mut blocks = vec![(CLAUDE, &self.claude.vllm)];
+        if let Some(vllm) = &self.opencode.vllm {
+            blocks.push((OPENCODE, vllm));
+        }
+        blocks.push((CODEX, &self.codex.vllm));
+        blocks
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Baked Images
+// -----------------------------------------------------------------------------
+
+/// `vllm/images.json`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BakedImages {
+    /// Image entries keyed by name.
+    pub(crate) images: BTreeMap<String, BakedImage>,
+}
+
+/// One entry under `images` in `vllm/images.json`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BakedImage {
+    /// Hugging Face model ID baked into the image.
+    pub(crate) model: String,
 }
 
 /// Read and deserialize one manifest.

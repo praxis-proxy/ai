@@ -30,8 +30,9 @@ applying the `vllm-full-suite` label.
 - **Model:** `Qwen/Qwen3-8B` (~15.3 GiB bf16) — chosen because it supports
   tool-calling (file_search, MCP); the 0.6B CPU simulator model used on PRs does
   not.
-- **Images:** `ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B` (main suite) and
-  `:Qwen3-VL-4B-Instruct` (vision companion), both published by
+- **Images:** `ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B` (the main suite and
+  every client acceptance job) and `:Qwen3-VL-4B-Instruct` (vision companion),
+  both published by
   `vllm-gpu-container.yaml` from [`vllm/images.json`](../../vllm/images.json).
   Each also gets an immutable `:<tag>-<commit sha>` tag. The nightlies pull
   these rather than rebuilding them; see
@@ -197,8 +198,10 @@ Manually dispatch `vllm-integration.yaml` with `run_codex_acceptance=true`
 and every other `run_*` input false, including `run_compaction_only`. Set
 `codex_model` to the Hugging Face checkpoint ID and
 `codex_served_model_name` to a slash-free alias. This runs the Codex GPU job
-without holding the candidate GPU for the Qwen3-8B full suite. The daily
-Qwen3-8B nightly and labeled jobs keep their existing settings.
+without holding the candidate GPU for the Qwen3-8B full suite. The daily Qwen3-8B nightly and
+labeled jobs keep their Qwen3-8B settings. Candidate dispatches use the
+manifest's digest-pinned upstream vLLM image and download the selected
+checkpoint at its resolved Hugging Face revision.
 
 Set `gpu_instance_type`, `codex_tensor_parallel_size`, and
 `codex_max_model_len` for the checkpoint and runner. The context length must
@@ -309,12 +312,25 @@ XFAIL — tracked separately as a possible filter feature, not done here.
 
 ## Reusing published images
 
-Neither nightly rebuilds the model-baked image by default. Each calls
+Neither nightly rebuilds the model-baked image by default. Each job serving a baked model calls
 [`resolve-vllm-gpu-image`](../../.github/actions/resolve-vllm-gpu-image/action.yml),
 which pulls the published tag and keeps it only when the image's provenance
 labels match that checkout — the same `vllm/Containerfile` hash, model ID, and
 pinned model revision. On a mismatch, an unreachable registry, or a tag that
 does not exist yet, it falls back to building from source.
+
+In the main suite, each Qwen3-8B job goes through
+[`prepare-vllm-gpu-image`](../../.github/actions/prepare-vllm-gpu-image/action.yml),
+which builds the image if resolution fails, including when GHCR login fails. The jobs run
+one after another on the same instance, so the client acceptance jobs first
+look for an image an earlier job already prepared there and serve it without
+pulling; after a local build that matters, because the registry still holds the
+stale tag. An acceptance-only dispatch (`run_claude_acceptance`,
+`run_compaction_only`, and the other client inputs) skips the full suite, so its
+first acceptance job pulls the published image or, when none matches the
+checkout (for example right after a vLLM bump), builds it in that job. The
+Hugging Face token is passed only to that build; no serving container receives
+it, and no job downloads weights at run time.
 
 That keeps two properties at once: a nightly where nothing changed skips a
 multi-gigabyte rebuild entirely, and a PR that edits the `Containerfile` or
@@ -324,7 +340,12 @@ run or, worse, qualifying a stale backend.
 
 The qualification record reports which happened: `backend.image_source` is
 `registry` or `local-build`, and `backend.registry_digest` is populated only
-for a pulled image.
+for a pulled image. Each client lane using baked weights also records the image its own
+container served under `suites.<client>_acceptance.backend`: the tag, local
+image ID, model, revision, base image, and `image_source` (`registry`, `runner`
+for an image an earlier job prepared, or `build`), with the registry digest
+when that job pulled it. Matching local image IDs show that the suite and the
+clients ran against the same image.
 
 ## Jobs in the main suite (`vllm-integration.yaml`)
 
@@ -344,7 +365,8 @@ for a pulled image.
   against the same keyed vLLM (step `selected_anthropic_openai_chat`, captured in
   the `claude_acceptance` qualification suite).
 - `vllm-gpu-codex-acceptance` — pinned Codex over native Responses + translated
-  Chat paths.
+  Chat paths, with the vLLM launch flags pinned in
+  `tests/integration/fixtures/codex-cli/pin.toml`.
 - `vllm-gpu-opencode-acceptance` — pinned OpenCode over the native Chat
   Completions path: one text turn and one tool-call round trip for each of the
   pinned 1.x and 2.x clients, against one shared vLLM container in its own
@@ -357,12 +379,14 @@ for a pulled image.
   the OpenCode backend pins and launches the client inside its own locked-down
   network namespace.
 - `pins` — parses `tests/integration/fixtures/claude-code-cli/pin.toml`,
+  `tests/integration/fixtures/codex-cli/pin.toml`,
   `tests/integration/fixtures/opencode-cli/pin.toml`,
   `tests/integration/fixtures/opencode-cli-v2/pin.toml`, and
   `tests/integration/fixtures/pi-cli/pin.toml`, cross-validates their
-  invariants (each OpenCode manifest against its own declared major, and pi
-  against the OpenCode backend pins it shares), and exports every value the
-  acceptance jobs consume so those jobs carry no hardcoded version strings.
+  invariants (each OpenCode manifest against its own declared major, pi
+  against the OpenCode backend pins it shares, and every `[vllm]` launch against
+  the baked weights of its `vllm/images.json` entry), and exports every value
+  the acceptance jobs consume so those jobs carry no hardcoded version strings.
 - `gpu-qualification-summary` — writes `qualification.json` and the Actions
   summary even if provisioning fails.
 
