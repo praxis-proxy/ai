@@ -144,7 +144,8 @@ pub(crate) struct ResponsesRequestConfig {
     /// On by default, because the stateful Responses filters read the state it
     /// builds. When enabled the filter is the managed owner: it initializes
     /// `ResponsesState` and enforces the managed-path policy that rejects
-    /// provider-owned `background`/`prompt` and conflicting history selectors.
+    /// provider-owned `background`/`prompt`, conflicting history selectors, and
+    /// caller-supplied `previous_input_messages` history.
     /// The owner reuses the parse a pre-routing publisher cached, so a managed
     /// create body is deserialized exactly once across the two phases.
     ///

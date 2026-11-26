@@ -1925,6 +1925,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3909,7 +3911,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3930,7 +3932,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3956,7 +3958,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3990,10 +3992,11 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "futures",
  "h2",
@@ -4019,7 +4022,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4533,7 +4536,7 @@ dependencies = [
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "log",
  "parking_lot",
  "rand 0.10.4",

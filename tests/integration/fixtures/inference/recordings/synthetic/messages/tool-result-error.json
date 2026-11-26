@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "scenario_id": "messages/tool-result-error",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-tool-result-model",
+    "source_id": "controlled-anthropic-tool-result-error"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_error": "call_recorded_0001",
+      "chatcmpl-tool-result-error": "chatcmpl-recorded-0003",
+      "msg_chatcmpl-tool-result-error": "msg_recorded_0002"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "id": "call_recorded_0001",
+                      "input": {},
+                      "name": "lookup",
+                      "type": "tool_use"
+                    }
+                  ],
+                  "role": "assistant"
+                },
+                {
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "rate limited",
+                          "type": "text"
+                        }
+                      ],
+                      "is_error": true,
+                      "tool_use_id": "call_error",
+                      "type": "tool_result"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-tool-result-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "container": null,
+              "content": [
+                {
+                  "citations": null,
+                  "text": "Retried",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0002",
+              "model": "synthetic-tool-result-model",
+              "role": "assistant",
+              "stop_details": null,
+              "stop_reason": "end_turn",
+              "stop_sequence": null,
+              "type": "message",
+              "usage": {
+                "cache_creation": null,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+                "inference_geo": null,
+                "input_tokens": 12,
+                "output_tokens": 1,
+                "output_tokens_details": null,
+                "server_tool_use": null,
+                "service_tier": null
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "role": "assistant",
+                  "tool_calls": [
+                    {
+                      "function": {
+                        "arguments": "{}",
+                        "name": "lookup"
+                      },
+                      "id": "call_recorded_0001",
+                      "type": "function"
+                    }
+                  ]
+                },
+                {
+                  "content": "Anthropic tool_result error:\nrate limited",
+                  "role": "tool",
+                  "tool_call_id": "call_recorded_0001"
+                }
+              ],
+              "model": "synthetic-tool-result-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "Retried",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0003",
+              "model": "synthetic-tool-result-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 12,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -216,12 +216,14 @@ pub fn discover_store_declarations_permissive(
     roots: &[String],
     chains: &HashMap<&str, &[FilterEntry]>,
 ) -> Result<Vec<StoreDeclaration>, ProvisionError> {
-    let mut declarations = discover_response_declarations_permissive(roots, chains)?;
     #[cfg(feature = "openai-conversations")]
     {
+        let mut declarations = discover_response_declarations_permissive(roots, chains)?;
         declarations.extend(discover_conversations_declarations_permissive(roots, chains)?);
+        Ok(declarations)
     }
-    Ok(declarations)
+    #[cfg(not(feature = "openai-conversations"))]
+    discover_response_declarations_permissive(roots, chains)
 }
 
 /// Discover reaper policy bindings reachable from the selected root chains.

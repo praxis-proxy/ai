@@ -56,9 +56,29 @@ pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
 /// Building this once per filter phase avoids repeatedly encoding every
 /// resolved `(server_label, tool_name)` pair for each model-emitted call.
 /// Lossy name collisions remain explicit so dispatch can fail closed.
-pub(crate) struct McpToolIndex<'a> {
-    /// Encoded function names mapped to their unique entry or collision count.
-    entries: HashMap<String, McpToolMatch<'a>>,
+pub(crate) enum McpToolIndex<'a> {
+    /// Reverse lookup built from a protocol's borrowed tool map.
+    Indexed(HashMap<String, McpToolMatch<'a>>),
+    /// Lookup into a connector's already-indexed, collision-checked tools.
+    #[cfg(feature = "anthropic-mcp-connector")]
+    Resolved(&'a ResolvedMcpTools),
+}
+
+/// Owned lookup shared by streaming callbacks and dispatch throughout a request.
+#[cfg(feature = "anthropic-mcp-connector")]
+pub(crate) type ResolvedMcpTools = HashMap<String, ((String, String), serde_json::Value)>;
+
+/// Move resolved tool names and metadata into the index. The adapter has
+/// already rejected encoded-name collisions when building the model's tools.
+#[cfg(feature = "anthropic-mcp-connector")]
+pub(crate) fn index_resolved_tools(tools: HashMap<(String, String), serde_json::Value>) -> ResolvedMcpTools {
+    let count = tools.len();
+    let indexed: ResolvedMcpTools = tools
+        .into_iter()
+        .map(|(key, entry)| (encode_function_name(&key.0, &key.1), (key, entry)))
+        .collect();
+    debug_assert_eq!(indexed.len(), count, "resolved tool names were checked for collisions");
+    indexed
 }
 
 /// Resolution state for one encoded MCP function name.
@@ -95,16 +115,22 @@ impl<'a> McpToolIndex<'a> {
                 })
                 .or_insert(McpToolMatch::Unique { key, entry });
         }
-        Self { entries }
+        Self::Indexed(entries)
     }
 
     /// Return whether any resolved MCP tool owns `encoded_name`.
     pub(crate) fn contains(&self, encoded_name: &str) -> bool {
-        self.entries.contains_key(encoded_name)
+        self.get(encoded_name).is_some()
     }
 
     /// Return the unique entry or collision state for `encoded_name`.
     pub(crate) fn get(&self, encoded_name: &str) -> Option<McpToolMatch<'a>> {
-        self.entries.get(encoded_name).copied()
+        match self {
+            Self::Indexed(entries) => entries.get(encoded_name).copied(),
+            #[cfg(feature = "anthropic-mcp-connector")]
+            Self::Resolved(tools) => tools
+                .get(encoded_name)
+                .map(|(key, entry)| McpToolMatch::Unique { key, entry }),
+        }
     }
 }
