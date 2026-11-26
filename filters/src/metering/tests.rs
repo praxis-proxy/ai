@@ -1159,7 +1159,9 @@ async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
     // The positive direction of non-divergence: when every source names the
     // same model, the preflight authorizes exactly that model — the one the
     // provider receives (modulo the provider-side rewrite, which preserves
-    // the client-facing alias).
+    // the client-facing alias). No client-model metadata is recorded, so
+    // the body's model is a comparison source alongside the identity claim
+    // (the preceding test is the control for a completed rewrite).
     let port = spawn_admitting_metering();
     let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
@@ -1169,9 +1171,6 @@ async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
         .unwrap();
     ctx.filter_metadata
         .insert("x-tenant-model".to_owned(), "requested-model".to_owned())
-        .unwrap();
-    ctx.filter_metadata
-        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model")
         .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "requested-model", "messages": []}"#));
 
@@ -1265,10 +1264,15 @@ async fn model_policy_verified_identity_model_wins_over_forged_header() {
 #[test]
 fn request_body_mode_is_stream_buffer_when_model_policy_enabled() {
     let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
-    assert!(matches!(
-        filter.request_body_mode(),
-        BodyMode::StreamBuffer { max_bytes: Some(_) }
-    ));
+    assert!(
+        matches!(
+            filter.request_body_mode(),
+            BodyMode::StreamBuffer {
+                max_bytes: Some(DEFAULT_JSON_BODY_MAX_BYTES)
+            }
+        ),
+        "the pre-read bound must be the standard JSON body maximum, not an arbitrary cap"
+    );
 }
 
 #[test]
