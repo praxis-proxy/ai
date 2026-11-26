@@ -24,7 +24,7 @@ Can a developer edit a file through Praxis on a self-hosted model? The November 
 | Finish and verify the task after compaction | Not validated | Not validated | On this Qwen3-8B nightly the native test permits skipping the final file and verifier assertions. |
 | Use stored continuation with `previous_response_id` | Not validated | Not validated | The [Responses parameter table](openai-responses-state-conformance.md#responses-support-and-qualification) covers gateway storage and SDK evidence. |
 | Invoke developer-configured MCP; edit inside OpenShell | Not validated | Not validated | Each needs its own client scenario: consume the MCP result, or run the edit and verifier inside the sandbox. |
-| Hosted web search from Codex | Not validated | Not validated | This baseline predates the dedicated Codex search cases. New runs record native and translated results independently and require a final answer citing a URL returned by Tavily. The [Claude Code](#claude-code) card covers its built-in WebSearch tool. |
+| Hosted web search from Codex | Supported | Supported | The [November 26 GPU run](https://github.com/praxis-proxy/ai/actions/runs/45806924447) completed authenticated Tavily searches on both routes. Each CLI answer cited an exact returned source URL. Native enables native_tool_compat. Search uses read-only sandbox mode and live web search. |
 | Image input or WebSocket sessions | Not validated | Not validated | The edit used text and HTTP. The vision workflow exercises SDK image input. |
 
 ## Claude Code
