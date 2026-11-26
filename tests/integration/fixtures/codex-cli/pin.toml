@@ -37,3 +37,38 @@ archive = "codex-x86_64-unknown-linux-musl.tar.gz"
 # Exact `codex --version` output. Observed: the product prefix is `codex-cli`,
 # not `codex`.
 version_output = "codex-cli 0.170.0"
+
+[vllm]
+# Backend pins for the GPU lane (`vllm-gpu-codex-acceptance`). The CPU lanes
+# ignore this block; they run against a scripted backend.
+#
+# Pinned in the same two layers as the Claude Code manifest: `base_image` is the
+# upstream vLLM build, by digest, that vllm/Containerfile builds `FROM`, and
+# `baked_image` is the vllm/images.json entry the lane serves, with the weights
+# already inside. The model and its Hugging Face revision are owned by that
+# entry. The lane records the baked image it served in its acceptance results.
+base_image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+baked_image = "text"
+# Slash-free alias the Codex provider config addresses.
+served_model_name = "qwen3-8b"
+tool_call_parser = "hermes"
+# Must equal --max-model-len below.
+context_length = 16384
+seed = 0
+
+# Unlike the Claude Code and OpenCode backends, Codex is served with thinking
+# left on and the `deepseek_r1` reasoning parser; this is the configuration the
+# lane was validated with. `--model` is the baked weights' path inside the
+# image. Do NOT add --served-model-name or --api-key here: the CI container run
+# appends both, from `served_model_name` above and the per-job ephemeral token.
+# `check-pins` enforces all three.
+[vllm.launch]
+flags = [
+  "--model", "/opt/vllm/models/Qwen/Qwen3-8B",
+  "--max-model-len", "16384",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser", "hermes",
+  "--reasoning-parser", "deepseek_r1",
+  "--gpu-memory-utilization", "0.9",
+  "--seed", "0",
+]

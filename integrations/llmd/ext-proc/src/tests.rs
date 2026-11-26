@@ -2523,6 +2523,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         request_body_bytes: 0,
         request_body_mode: BodyMode::Stream,
         request_start: Instant::now(),
+        response_delivery_complete: None,
         response_body_bytes: 0,
         response_body_mode: BodyMode::Stream,
         response_header: None,

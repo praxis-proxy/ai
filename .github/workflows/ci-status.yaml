@@ -24,9 +24,9 @@ jobs:
   ci-status:
     runs-on: ubuntu-24.04
     # A merge group entry is abandoned by GitHub after the ruleset's
-    # check_response_timeout_minutes (60), so a job that outlives that window
+    # check_response_timeout_minutes (90), so a job that outlives that window
     # only burns a runner on an entry nothing is waiting for.
-    timeout-minutes: ${{ github.event_name == 'merge_group' && 55 || 180 }}
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 85 || 180 }}
     permissions:
       checks: read
       pull-requests: read

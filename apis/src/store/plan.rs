@@ -183,8 +183,25 @@ fn discover_conversations_declarations_permissive(
         .into_iter()
         .filter_map(Result::ok)
     {
-        let Some(store_ref) = permissive_conversations_ref(&config) else {
-            continue;
+        // Conversations store-ref extraction parses the full filter config,
+        // including ttl, so a malformed reaper field fails before pairing.
+        // Propagate that as a reaper config error; keep skipping incomplete
+        // filters that set no reaper keys.
+        let store_ref = match conversations_store_ref(&config) {
+            Ok(store_ref) => store_ref,
+            Err(error) if filter_sets_reaper_fields(&config) => {
+                return Err(backend_error(
+                    CONVERSATIONS_STORE_NAME,
+                    BackendError::Config(error.to_string()),
+                ));
+            },
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "conversations store config could not be prepared for provisioning"
+                );
+                continue;
+            },
         };
         declarations.push(pair_reaper_policy(
             CONVERSATIONS_STORE_NAME,
@@ -817,6 +834,30 @@ mod tests {
         assert!(
             text.contains("ttl") || text.contains("duration") || text.contains("1hr30"),
             "parse-related error expected: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "openai-conversations")]
+    fn paired_discovery_rejects_malformed_ttl_on_conversations_ref() {
+        let filters: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: openai_conversations\n  backend: sqlite\n  database_url: 'sqlite::memory:'\n  \
+             conversations_table: conversations\n  items_table: items\n  ttl: 1hr30",
+        )
+        .expect("filter chain");
+        let chains = HashMap::from([("main", filters.as_slice())]);
+        let roots = ["main".to_owned()];
+        let error = discover_store_declarations_permissive(&roots, &chains).expect_err(
+            "malformed ttl on conversations must fail closed as a reaper config error",
+        );
+        let text = error.to_string();
+        assert!(
+            !text.contains("must retain their rows"),
+            "malformed conversations ttl must not look like enabled-vs-unset: {error}"
+        );
+        assert!(
+            text.contains("ttl") || text.contains("duration") || text.contains("1hr30"),
+            "parse-related reaper config error expected: {error}"
         );
     }
 

@@ -17,6 +17,15 @@ An unavailable GPU result does not hide successful unit, integration, SDK,
 security, or other CI results. The CI report never counts simulator or CPU
 jobs as live GPU qualification.
 
+The **Live vLLM CPU Decisions and System One** job appears in the broader
+release CI evidence under **vLLM integration**. It records separate step
+outcomes for OpenAI SDK requests to `POST /v1/decisions` and HTTP requests to
+`POST /v1/systemone`, both through Praxis to a pinned vLLM CPU image serving a
+pinned revision of `Qwen/Qwen3-0.6B`. The Decisions example selects the
+classified route for the former and its default passthrough route for the
+latter. The tests validate typed answers and token usage without requiring
+the model to give a particular answer.
+
 ## Report version and interpretation
 
 The report has `schema_version: 3` and
