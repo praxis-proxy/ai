@@ -59,6 +59,14 @@ fn repository_pins_agree() {
 }
 
 #[test]
+fn candidate_codex_exports_its_pinned_upstream_image() {
+    let repo = Repo::new(workspace_root());
+    let mut manifests = Manifests::load(&repo).expect("manifests should parse");
+    manifests.codex.vllm.base_image = "candidate-image-pin".into();
+    assert!(outputs(&manifests).contains(&("codex_vllm_base_image", "candidate-image-pin".into())));
+}
+
+#[test]
 fn outputs_match_the_pins_job_contract() {
     // Every key the GPU lanes read through `needs.pins.outputs.*` must be
     // exported, and nothing else: a renamed key would hand a lane an empty pin.
@@ -128,8 +136,92 @@ fn drifted_vllm_image_is_reported_per_site() {
 
 #[test]
 fn diverging_manifest_images_are_reported() {
-    let errors = errors_with(manifest::CLAUDE, "image = \"docker.io/", "image = \"quay.io/");
-    assert_reported(&errors, &["must pin the same vLLM image"]);
+    for path in [manifest::CLAUDE, manifest::CODEX] {
+        let errors = errors_with(path, "base_image = \"docker.io/", "base_image = \"quay.io/");
+        assert_reported(&errors, &["must pin the same vLLM image", path]);
+    }
+}
+
+#[test]
+fn unknown_baked_image_is_reported() {
+    let errors = errors_with(manifest::OPENCODE, "baked_image = \"text\"", "baked_image = \"other\"");
+    assert_reported(
+        &errors,
+        &["vllm.baked_image `other` is not an image in vllm/images.json"],
+    );
+}
+
+#[test]
+fn launch_must_load_the_baked_weights() {
+    // A Hugging Face ID would make vLLM download the weights at run time.
+    for path in [manifest::CLAUDE, manifest::OPENCODE, manifest::CODEX] {
+        let errors = errors_with(
+            path,
+            "\"--model\", \"/opt/vllm/models/Qwen/Qwen3-8B\"",
+            "\"--model\", \"Qwen/Qwen3-8B\"",
+        );
+        assert_reported(
+            &errors,
+            &[path, "must be the baked weights' path `/opt/vllm/models/Qwen/Qwen3-8B`"],
+        );
+    }
+}
+
+#[test]
+fn launch_must_follow_the_baked_model() {
+    let errors = errors_with(
+        manifest::IMAGES,
+        "\"model\": \"Qwen/Qwen3-8B\"",
+        "\"model\": \"Qwen/Qwen3-4B\"",
+    );
+    assert_reported(&errors, &[manifest::CODEX, "`/opt/vllm/models/Qwen/Qwen3-4B`"]);
+}
+
+#[test]
+fn launch_flags_the_workflow_appends_are_rejected() {
+    for flag in ["--api-key", "--served-model-name", "--revision", "--download-dir"] {
+        for form in [format!(r#""{flag}", "x""#), format!(r#""{flag}=x""#)] {
+            let errors = errors_with(manifest::CODEX, r#""--seed", "0""#, &form);
+            assert_reported(&errors, &[manifest::CODEX, &format!("must not pass {flag}")]);
+        }
+    }
+}
+
+#[test]
+fn launch_flags_must_survive_shell_word_splitting() {
+    for separator in [" ", r"\t", r"\n"] {
+        let bundled = format!(r#""--model{separator}other""#);
+        let errors = errors_with(manifest::CODEX, r#""--seed", "0""#, &bundled);
+        assert_reported(&errors, &[manifest::CODEX, "shell whitespace"]);
+    }
+}
+
+#[test]
+fn launch_rejects_a_second_model() {
+    for form in [r#""--model", "other""#, r#""--model=other""#] {
+        let errors = errors_with(manifest::CODEX, r#""--seed", "0""#, form);
+        assert_reported(&errors, &[manifest::CODEX, "--model", "exactly once"]);
+    }
+}
+
+#[test]
+fn codex_launch_must_select_the_pinned_tool_parser() {
+    let parser = r#""--tool-call-parser", "hermes""#;
+    for replacement in ["", r#""--tool-call-parser", "other","#] {
+        let errors = errors_with(manifest::CODEX, &format!("{parser},"), replacement);
+        assert_reported(&errors, &[manifest::CODEX, "--tool-call-parser"]);
+    }
+    let errors = errors_with(manifest::CODEX, parser, r#""--tool-call-parser=hermes""#);
+    assert!(errors.is_empty(), "pins should agree: {errors:#?}");
+}
+
+#[test]
+fn codex_context_must_match_the_server_flag() {
+    let errors = errors_with(manifest::CODEX, "context_length = 16384", "context_length = 32768");
+    assert_reported(
+        &errors,
+        &[manifest::CODEX, "vllm.context_length must match --max-model-len"],
+    );
 }
 
 #[test]
@@ -415,6 +507,19 @@ mod bump {
                 .any(|item| item.contains("websocket-codex-0.164.0.json") && item.contains("`0.163.0`")),
             "{items:#?}"
         );
+    }
+
+    #[test]
+    fn codex_checklist_names_every_acceptance_lane() {
+        let items = checklist(Pin::Codex, "0.163.0", "0.164.0");
+        for lane in ["`codex-http`", "`codex-websocket`", "`vllm-gpu-codex-acceptance`"] {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.starts_with(&format!("Check that {lane} passes"))),
+                "{lane} missing: {items:#?}"
+            );
+        }
     }
 
     /// The pinned Codex version, its recording, and that recording carried

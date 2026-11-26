@@ -1,4 +1,4 @@
-# Opt-in OpenAI Chat Completions SDK test backend.
+# Opt-in OpenAI hosted SDK test backend.
 # The listener is local to the test runner. The SDK supplies the upstream key.
 listeners:
   - name: gateway
@@ -10,6 +10,10 @@ filter_chains:
       - filter: router
         routes:
           - path_prefix: /v1/chat/completions
+            cluster: openai
+          - path_prefix: /v1/embeddings
+            cluster: openai
+          - path_prefix: /v1/responses
             cluster: openai
       - filter: load_balancer
         clusters:

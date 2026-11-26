@@ -162,7 +162,7 @@ make test-fips-host  # the suites as the FIPS build, inside the UBI 9 toolchain 
 ```
 
 On a RHEL 9 host in FIPS mode, two more targets give the runtime proof the
-hosted checks cannot ([FIPS 140-3](../fips.md#verifying-a-deployment)):
+hosted checks cannot ([FIPS 140-3](../operations/fips.md#verifying-a-deployment)):
 
 ```console
 make fips-host-check     # attest the host and the image's module build (target/fips/host-attestation.*)
@@ -194,7 +194,7 @@ OpenSSL; nothing is installed into the runtime image beyond the binary
 and the legal files. The report's exit status is non-zero while findings
 remain. See [FIPS Tooling](fips.md) for what is checked, the provenance
 of the pinned images and signing key, and why the build uses cargo's SBOM
-precursor; [FIPS 140-3](../fips.md) is the operator's view.
+precursor; [FIPS 140-3](../operations/fips.md) is the operator's view.
 
 ### Supply Chain Safety
 

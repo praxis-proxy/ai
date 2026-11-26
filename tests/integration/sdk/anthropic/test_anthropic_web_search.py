@@ -590,13 +590,34 @@ def _messages_kwargs() -> dict:
 class TestAnthropicWebSearch:
     """The one example config serves buffered and streaming web search."""
 
-    def test_buffered_web_search_loop(self, anthropic_client, web_search_stack):
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected_reentry"),
+        [
+            (None, None),
+            (
+                {
+                    "type": "tool",
+                    "name": "WebSearch",
+                    "disable_parallel_tool_use": True,
+                },
+                {"type": "auto", "disable_parallel_tool_use": True},
+            ),
+        ],
+        ids=["omitted", "parallel-restricted"],
+    )
+    def test_buffered_web_search_loop(
+        self, anthropic_client, web_search_stack, tool_choice, expected_reentry
+    ):
         model = web_search_stack["model"]
         search = web_search_stack["search"]
         model.requests.clear()
         search.requests.clear()
 
-        response = anthropic_client.messages.create(**_messages_kwargs())
+        kwargs = _messages_kwargs()
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
+        response = anthropic_client.messages.create(**kwargs)
 
         # The client receives one final JSON answer; the managed WebSearch
         # tool-use block is resolved server-side and never surfaced.
@@ -610,6 +631,10 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "buffered loop re-enters the model"
         assert len(search.requests) == 1, "buffered loop dispatches one search"
         assert model.requests[0].get("stream") is not True
+        if expected_reentry is None:
+            assert "tool_choice" not in model.requests[1]
+        else:
+            assert model.requests[1]["tool_choice"] == expected_reentry
         # Issue #1389: Tavily is header-authenticated. The configured key travels
         # in the Authorization bearer header injected at the pinned provider, and
         # never in the request body the outbound chain can read.
@@ -669,7 +694,24 @@ class TestAnthropicWebSearch:
             ["tool_use", "WebSearch", TOOL_USE_ID, ["potato"]]
         ]
 
-    def test_streaming_web_search_loop(self, anthropic_client, web_search_stack):
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected_reentry"),
+        [
+            (None, None),
+            (
+                {
+                    "type": "tool",
+                    "name": "WebSearch",
+                    "disable_parallel_tool_use": True,
+                },
+                {"type": "auto", "disable_parallel_tool_use": True},
+            ),
+        ],
+        ids=["omitted", "parallel-restricted"],
+    )
+    def test_streaming_web_search_loop(
+        self, anthropic_client, web_search_stack, tool_choice, expected_reentry
+    ):
         model = web_search_stack["model"]
         search = web_search_stack["search"]
         model.requests.clear()
@@ -678,7 +720,10 @@ class TestAnthropicWebSearch:
         event_types: list[str] = []
         collected = ""
         block_types: list[str] = []
-        with anthropic_client.messages.stream(**_messages_kwargs()) as stream:
+        kwargs = _messages_kwargs()
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        with anthropic_client.messages.stream(**kwargs) as stream:
             for event in stream:
                 event_types.append(event.type)
                 if event.type == "content_block_start":
@@ -712,6 +757,10 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "streaming loop re-enters the model"
         assert len(search.requests) == 1, "streaming loop dispatches one search"
         assert model.requests[0].get("stream") is True, "the first model round must request streaming transport"
+        if expected_reentry is None:
+            assert "tool_choice" not in model.requests[1]
+        else:
+            assert model.requests[1]["tool_choice"] == expected_reentry
 
 
     @pytest.mark.parametrize(

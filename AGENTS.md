@@ -44,7 +44,7 @@ make lint           # clippy, fmt, dependency, docs, and example checks
 make doc            # rustdoc with -D warnings
 make audit          # cargo audit + cargo deny check
 make container      # build praxis-ai container image
-make container-fips # FIPS runtime image on UBI 9 (see docs/fips.md)
+make container-fips # FIPS runtime image on UBI 9 (see docs/operations/fips.md)
 ```
 
 Run a single test:
@@ -236,6 +236,10 @@ which existing filters were considered and why extending them is unsuitable.
 
 ## Key Patterns
 
+- **Protocol compliance**: Follow the specs Praxis speaks (SSE, MCP, OpenAI, Anthropic, etc.). Let upstream violations fail.
+  Do not add lenient parsing, synthetic terminators, or retries solely to accommodate a violation.
+  Fix or track gaps for permitted behavior, including SHOULD-level choices such as an MCP server keeping an SSE stream open after its response.
+  Decline review findings that only help a spec-violating upstream and cite the relevant spec section.
 - **Filter callouts**: use `FilteredSubrequestExecutor` for every outbound call made by a filter. It runs the configured outbound filter chain around the HTTP exchange, including credential injection and other outbound policies. `SubRequestClient::execute_url()` performs the HTTP exchange without running a configured filter pipeline.
 - **Callout targets**: an operator-configured target is a `cluster` name from top-level `clusters:`, so endpoints, TLS, client certificates, private-address policy, and `credential_injection` come from the cluster. URL fields are for request-derived and protocol-owned targets only. Existing operator URL fields (`server_url`, `endpoint`, `*_url`) are migration debt, not precedent. Classification and checklist: `docs/architecture/outbound-callouts.md`.
 - **Classify → route → branch**: classifier filters

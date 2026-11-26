@@ -23,11 +23,17 @@ def render():
     workflow = (ROOT / WORKFLOW).read_text()
     suite = (ROOT / SUITE).read_text()
     cron = field(r'^\s+- cron: "([^"]+)"$', workflow)
+    anthropic_cron = field(r'^    - cron: "([^"]+ 1)"$', workflow)
     runner = field(r"^\s+runs-on: (\S+)$", workflow)
     secret = field(r"secrets\.([A-Z_]+)", workflow)
     artifact = field(r"^\s+name: (hosted-\S+-results)$", workflow)
     sdk = field(r'"openai==([^"]+)"', suite)
     model = field(r'^MODEL = "([^"]+)"$', suite)
+
+    bedrock_model = field(r"^ +BEDROCK_MODEL: (\S+)$", workflow)
+    bedrock_config = field(r"^ +GATEWAY_CONFIG: (\S+)$", workflow)
+
+    embedding_model = field(r'^EMBEDDING_MODEL = "([^"]+)"$', suite)
 
     return f"""# Hosted passthrough nightly
 
@@ -35,7 +41,11 @@ def render():
 
 [Hosted Passthrough Nightly](../../{WORKFLOW}) runs on
 `{runner}` at cron `{cron}` (UTC) and supports manual dispatch.
-It builds Praxis from the workflow checkout and uses the
+Each job builds Praxis from the workflow checkout.
+
+## Official OpenAI
+
+The OpenAI job uses the
 `{secret}` Actions secret to call official OpenAI. A missing
 secret fails the credential check before the build. Fork schedules skip
 the job. Manual runs require the secret in the repository running the job.
@@ -45,6 +55,9 @@ through the local [Praxis configuration](../../{CONFIG})
 over TLS to OpenAI. It uses OpenAI Python `{sdk}` and model
 `{model}`. It checks completions and token usage, streaming,
 tool result continuation, and the upstream error for an unknown model.
+It also checks embedding batch indices, requested vector dimensions, and usage
+for `{embedding_model}`. Responses passthrough checks completed text, usage,
+streaming text events, and stateless tool-result continuation with `store: false` on `{model}`.
 
 To reproduce locally, build with `cargo build --locked -p praxis-ai-proxy`,
 start `target/debug/praxis-ai -c {CONFIG}` from the
@@ -62,8 +75,40 @@ qualification records this lane when it finds a run for the exact release
 commit. A release with no matching run shows `not_run`. Update the pinned
 model snapshot in the SDK suite when OpenAI retires it.
 
-The tests forward the caller's provider key. Gateway authorization,
-tenant isolation, credential injection, and retries are outside this suite.
+The OpenAI tests forward the caller's provider key. Gateway authorization,
+tenant isolation, credential injection, and retries are outside the OpenAI suite.
+
+## Bedrock Runtime
+
+On upstream main, a separate job assumes the CI role using
+`AWS_BEDROCK_ROLE_ARN` and sends billable requests through the
+[loopback gateway](../../{bedrock_config}) for `{bedrock_model}` in
+`us-east-1`. Praxis rewrites the client path and signs the upstream request
+using temporary AWS credentials. The check requires HTTP 200 and an assistant
+completion envelope. The release qualification report lists the job outcome
+under Hosted passthrough. The [OpenAI SDK suite](../../tests/integration/sdk/openai/test_bedrock_runtime_live.py)
+checks streaming text, finish reason, usage, a tool result followed by a final
+assistant response, and an upstream validation error. The
+`hosted-bedrock-passthrough-results` artifact contains JUnit results.
+The job also runs one non-streaming Responses request with `store: false`
+through the [Bedrock translation fixture](../../tests/integration/fixtures/bedrock/responses-to-runtime-live.yaml).
+Praxis translates it to Chat Completions and signs the final request body
+for Bedrock Runtime.
+The check requires a completed Responses resource with output text.
+Tenant isolation and retries remain unqualified by this job. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
+exercises AWS credentials and inference independently of the gateway.
+
+## Anthropic Messages passthrough
+
+The Anthropic job runs on Mondays at cron `{anthropic_cron}` (UTC) and
+on manual dispatch. It uses the `ANTHROPIC_API_KEY` Actions secret and the
+[local gateway fixture](../../tests/integration/fixtures/anthropic/messages-live.yaml).
+The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
+uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most two
+inference requests with a 64-token output cap per request and SDK retries
+disabled. It checks tool arguments, streamed tool-result continuation,
+completion, and usage. JUnit results are in `hosted-anthropic-passthrough-results`.
+A separate unknown-model request checks the native Anthropic 404 error.
 """
 
 

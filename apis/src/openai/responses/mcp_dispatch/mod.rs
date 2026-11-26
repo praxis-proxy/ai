@@ -237,6 +237,13 @@ fn settle_mcp_execution(state: &mut ResponsesState, results: &[McpCallResult]) -
 /// Executes MCP tool calls against upstream MCP servers within
 /// the Responses API agentic loop.
 ///
+/// Results with `structuredContent` use a compact JSON object containing both
+/// `content` and `structuredContent` in the model-facing `function_call_output`
+/// and public `mcp_call.output` strings. This preserves structured-only results
+/// and distinct text or media blocks. Without structured content, text blocks
+/// remain newline-joined and non-text results remain JSON content arrays.
+/// The combined serialized output is subject to the existing result-byte limits.
+///
 /// # YAML
 ///
 /// ```yaml

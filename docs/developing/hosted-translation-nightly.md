@@ -33,3 +33,31 @@ model snapshot in the SDK suite when OpenAI retires it.
 
 Praxis injects the OpenAI key upstream and the SDK uses a dummy local key.
 Gateway authorization, tenant isolation, and retries are outside this suite.
+
+## OpenAI Responses to Chat Completions
+
+A separate job builds with `--features openai-responses` and uses the
+[Responses translation fixture](../../tests/integration/fixtures/openai/responses-to-chat-live.yaml).
+It runs the Responses completion and streaming cases from the
+[OpenAI SDK suite](../../tests/integration/sdk/openai/test_openai_chat_completions_live.py).
+Praxis injects the provider key and translates requests to official OpenAI
+Chat Completions. The checks cover completed text and usage, streaming text
+the terminal completion event, and stateless tool-result continuation, with `store: false`. The
+`hosted-responses-to-chat-results` artifact contains JUnit results and gateway logs.
+
+## OpenAI Chat Completions to Anthropic Messages
+
+The Anthropic job runs on Mondays at cron `53 5 * * 1` (UTC) and
+on manual dispatch. It uses the `ANTHROPIC_API_KEY` Actions secret and the
+[local gateway fixture](../../tests/integration/fixtures/anthropic/chat-to-anthropic-live.yaml).
+The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
+uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. Two round
+trips cover buffered tool calls with streamed results and streamed tool-call
+arguments with buffered results. The suite checks tool IDs, arguments, finish
+reasons, and usage. It makes at most four inference requests with a 64-token
+output cap per request and SDK retries disabled. JUnit results are in `hosted-anthropic-translation-results`.
+A separate invalid-temperature request checks that Anthropic’s validation error
+reaches the OpenAI SDK as HTTP 400. Both streaming cases require a final
+usage-only chunk.
+During initial testing, Haiku 5.5 emitted a streamed thinking block that
+the Chat Completions translator rejected. This lane qualifies Haiku 4.5.

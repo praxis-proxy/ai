@@ -30,10 +30,14 @@ pub mod hash;
 mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) mod mcp_client;
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) mod mcp_core;
+/// Outbound MCP chain selector shared by every MCP adapter. Registered under
+/// its historical `openai_mcp_streaming_selector` name for config stability.
+#[cfg(feature = "mcp")]
+pub use mcp_client::McpStreamingSelectorFilter;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;
@@ -54,6 +58,7 @@ pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use callout_identity::credential_authority;
+pub use openai::sse::buffered_sse_event_data;
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwnerFilter, project_state_owner};
@@ -136,7 +141,7 @@ pub(crate) mod test_utils {
     /// Installs a thread-local subscriber, so parallel tests sharing the
     /// process-wide subscriber are unaffected. Use it to assert that request
     /// or response content never reaches logs.
-    #[cfg(feature = "openai-responses")]
+    #[cfg(any(feature = "openai-responses", feature = "anthropic-mcp-connector"))]
     pub(crate) fn capture_log_output<F: FnOnce()>(f: F) -> String {
         use std::{
             fmt::Write as _,
@@ -211,6 +216,7 @@ pub(crate) mod test_utils {
             request_body_bytes: 0,
             request_body_mode: praxis_filter::BodyMode::Stream,
             request_start: std::time::Instant::now(),
+            response_delivery_complete: None,
             response_body_bytes: 0,
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
@@ -220,8 +226,7 @@ pub(crate) mod test_utils {
             attempted_endpoints: Vec::new(),
             retry_policy: None,
             route_retry_policy: None,
-            cluster_retry_state: None,
-            cluster_retry_state_released: false,
+            cluster_admission: None,
             endpoint_reselector: None,
             pinned_endpoint_address: None,
             rewritten_path: None,

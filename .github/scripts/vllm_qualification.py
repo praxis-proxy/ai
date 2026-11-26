@@ -180,10 +180,12 @@ def capture(args):
     # working tree. The suite reuses the build vllm-gpu-container.yaml published
     # whenever it matches this checkout, so "what the image was built from" is
     # the honest claim; hashing the checked-out Containerfile would describe a
-    # build that may never have happened on this runner. A registry digest is
-    # present only when the image was pulled, absent when it was built here.
-    registry_digest = image_inspect(
-        runtime, image, "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}")
+    # build that may never have happened on this runner. The registry digest
+    # comes from resolve-vllm-gpu-image, which reports one only when it reused
+    # the pulled image. The image's own RepoDigests cannot decide this: podman
+    # records a manifest digest for a local build too, which would label a
+    # build that was never pushed as a registry pull.
+    registry_digest = os.environ.get("VLLM_GPU_IMAGE_DIGEST") or None
     containerfile_sha256 = (image_label(runtime, image, "praxis.vllm.containerfile-sha256")
                             or file_hash("vllm/Containerfile"))
     base_image = image_label(runtime, image, "praxis.vllm.base-image")
@@ -246,6 +248,25 @@ def capture(args):
     write_json(args.output, report)
 
 
+def capture_codex(output):
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    cases = []
+    checkpoint = os.environ.get("CODEX_MODEL") or os.environ.get("VLLM_GPU_MODEL")
+    revision = os.environ.get("CODEX_MODEL_REVISION") or model_revision(os.environ.get("CONTAINER_RUNTIME", "docker"), checkpoint)
+    for name in ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION"):
+        case = {"id": name.lower(), "status": os.environ.get(name) or "unexecuted"}
+        evidence = read_json(os.environ.get(name + "_EVIDENCE"))
+        if isinstance(evidence, dict):
+            evidence.update(checkpoint=checkpoint, resolved_revision=revision,
+                            served_model=os.environ.get("CODEX_VLLM_MODEL"), image=os.environ.get("VLLM_GPU_IMAGE"),
+                            tool_parser=os.environ.get("CODEX_TOOL_CALL_PARSER"),
+                            reasoning_parser=os.environ.get("CODEX_REASONING_PARSER"))
+            case["capabilities"] = evidence
+        cases.append(case)
+    write_json(output, {"run_id": int(os.environ["GITHUB_RUN_ID"]),
+                        "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "checkout_sha": sha, "cases": cases})
+
+
 def acceptance(path, job_result, run_id, attempt, sha, scope):
     raw = read_json(path)
     if (not isinstance(raw, dict) or raw.get("run_id") != run_id
@@ -255,8 +276,16 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
                 "job_status": job_result, "scope": scope,
                 "reason": "per-scenario result artifact unavailable or provenance mismatch",
                 "cases": []}
-    return {"status": job_result, "job_status": job_result, "scope": scope,
-            "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    result = {"status": job_result, "job_status": job_result, "scope": scope,
+              "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    # The model-baked vLLM image the lane served, recorded by
+    # prepare-vllm-gpu-image. Each lane runs its own container, so this is the
+    # lane's backend provenance, not the full suite's.
+    if isinstance(raw.get("backend"), dict):
+        result["backend"] = raw["backend"]
+    if isinstance(raw.get("provenance"), dict):
+        result["provenance"] = raw["provenance"]
+    return result
 
 
 def passing_suite_problem(report):
@@ -362,7 +391,7 @@ def render(report, detailed=False):
         lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable recent ancestor GPU nightly qualification report was found.")
         lines += ["", f"Reason: {report.get('reason', 'GPU evidence unavailable')}."]
     elif status == "not_requested":
-        lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
+        lines.append("vLLM Responses gateway qualification: Full Responses GPU suite was not requested.")
     else:
         lines.append(f"vLLM Responses gateway qualification: **{status.replace('_', ' ')}**. {report.get('reason', '')}")
     context = report.get("release_context", {})
@@ -396,12 +425,25 @@ def render(report, detailed=False):
                          + ", ".join(f"{key} {counts.get(key, 0)}" for key in OUTCOMES) + ".")
         if report.get("suites", {}).get("unclassified", {}).get("selected"):
             lines.append(f"Unclassified selected cases: {len(report['suites']['unclassified']['selected'])} (profile attribution required).")
-        for name in ("credentialed_tools", "claude_acceptance", "codex_acceptance", "opencode_acceptance",
-                     "pi_acceptance"):
-            suite_data = report.get("suites", {}).get(name, {})
-            cases = suite_data.get("cases", [])
-            suffix = f" ({sum(case.get('status') == 'success' for case in cases)}/{len(cases)} scenarios succeeded)" if cases else ""
-            lines.append(f"{name.replace('_', ' ').title()}: {suite_data.get('status', 'unavailable')}{suffix}.")
+    client_suites = ("claude_acceptance", "codex_acceptance", "opencode_acceptance", "pi_acceptance")
+    if status == "not_requested":
+        # A manual dispatch can run individual clients without the full suite.
+        optional_suites = [name for name in client_suites
+                           if report.get("suites", {}).get(name, {}).get("status") not in (None, "skipped")]
+    elif status == "unavailable":
+        optional_suites = ()
+    else:
+        optional_suites = ("credentialed_tools", *client_suites)
+    for name in optional_suites:
+        suite_data = report.get("suites", {}).get(name, {})
+        cases = suite_data.get("cases", [])
+        suffix = f" ({sum(case.get('status') == 'success' for case in cases)}/{len(cases)} scenarios succeeded)" if cases else ""
+        served = suite_data.get("backend", {})
+        if served.get("local_image_id"):
+            digest = served.get("registry_digest")
+            suffix += (f"; vLLM image `{served['local_image_id']}` ({served.get('image_source') or 'unknown'}"
+                       + (f", digest `{digest}`" if digest else "") + ")")
+        lines.append(f"{name.replace('_', ' ').title()}: {suite_data.get('status', 'unavailable')}{suffix}.")
     if report.get("workflow", {}).get("url"):
         lines += ["", f"[Workflow run]({report['workflow']['url']}) and [report/diagnostic artifacts]({report['workflow']['url']}#artifacts)"]
     if detailed:
@@ -421,7 +463,7 @@ def render(report, detailed=False):
                     lines.append(f"- `{case['id']}`{sdk_info}: {case.get('outcome')} | {reason}")
                 if len(notable) > 20:
                     lines.append(f"- {len(notable) - 20} further cases in the artifact")
-        for suite_name in ("claude_acceptance", "codex_acceptance", "opencode_acceptance", "pi_acceptance"):
+        for suite_name in client_suites:
             cases = report.get("suites", {}).get(suite_name, {}).get("cases", [])
             if cases:
                 lines += ["", f"{suite_name.replace('_', ' ').title()} scenarios:"]
@@ -658,6 +700,7 @@ def main():
     cap.add_argument("--credentialed", required=True)
     cap.add_argument("--setup", choices=("passed", "failed"), required=True)
     cap.add_argument("--output", required=True)
+    sub.add_parser("capture-codex").add_argument("--output", required=True)
     fin = sub.add_parser("finish")
     fin.add_argument("--raw", required=True)
     fin.add_argument("--requested", choices=("true", "false"), required=True)
@@ -681,6 +724,8 @@ def main():
     args = parser.parse_args()
     if args.command == "capture":
         capture(args)
+    elif args.command == "capture-codex":
+        capture_codex(args.output)
     elif args.command == "finish":
         report = finish(args.raw, args.requested == "true", args.start_result, args.suite_result,
                         args.claude_result, args.codex_result, int(args.run_id), int(args.attempt), args.url, args.sha,

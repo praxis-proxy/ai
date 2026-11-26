@@ -54,8 +54,11 @@ openai-files = ["experimental", "dep:utoipa"]
 openai-files-s3 = ["openai-files", "dep:object_store", "object_store/aws-base"]
 # Context compaction with tiktoken token estimation.
 openai-compact = ["store", "dep:tiktoken-rs"]
+# Protocol-neutral MCP client and tool execution core shared by the OpenAI
+# Responses and Anthropic Messages adapters. Enabled through an adapter feature.
+mcp = ["dep:rmcp", "dep:sse-stream", "dep:jsonschema"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
-openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream", "dep:jsonschema"]
+openai-mcp-tools = ["store", "mcp"]
 # Every OpenAI group, including experimental capabilities, without a backend.
 openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-files", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
 # Every non-experimental capability. Experimental OpenAI groups stay opt-in.
@@ -66,6 +69,9 @@ experimental = []
 # (Anthropic Messages to Vertex AI rawPredict). Work in progress; the config
 # surface may change. Enabled through praxis-ai-filters' vertex-anthropic-filter.
 vertex-anthropic = []
+# Experimental: anthropic_mcp_connector executes the Anthropic Messages MCP
+# connector (`mcp_servers` + `mcp_toolset`) in Praxis for non-Anthropic backends.
+anthropic-mcp-connector = ["mcp", "experimental"]
 praxis-main = []
 
 [lints]

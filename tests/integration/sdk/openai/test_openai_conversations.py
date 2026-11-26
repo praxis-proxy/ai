@@ -1337,6 +1337,8 @@ class TestOpenAIConversations:
                 OWNER_HEADER: _owner_assertion("alice"),
                 "Connection": "Upgrade",
                 "Upgrade": "websocket",
+                "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                "Sec-WebSocket-Version": "13",
             },
             timeout=10,
         )

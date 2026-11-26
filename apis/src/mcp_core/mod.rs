@@ -11,11 +11,34 @@
 //! result normalization. Protocol adapters such as the OpenAI Responses MCP
 //! filters own only their request rewrite, response shapes, and loop wiring.
 
+#[cfg_attr(
+    not(any(test, feature = "openai-mcp-tools")),
+    expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
+)]
 pub(crate) mod admission;
+#[cfg_attr(
+    not(any(test, feature = "openai-mcp-tools")),
+    expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
+)]
 pub(crate) mod classify;
 pub(crate) mod connector;
+#[cfg_attr(
+    not(feature = "openai-mcp-tools"),
+    expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
+)]
 pub(crate) mod execute;
 pub(crate) mod fingerprint;
+#[cfg_attr(
+    not(any(test, feature = "openai-mcp-tools")),
+    expect(
+        dead_code,
+        reason = "the OpenAI adapter builds its reverse lookup from a borrowed tool map"
+    )
+)]
 pub(crate) mod naming;
+#[cfg_attr(
+    not(feature = "openai-mcp-tools"),
+    expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
+)]
 pub(crate) mod tool_map;
 pub(crate) mod validate;

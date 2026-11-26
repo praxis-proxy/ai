@@ -142,7 +142,14 @@ class BedrockSimulatorHandler(BaseHTTPRequestHandler):
                 "output": {
                     "message": {
                         "role": "assistant",
-                        "content": [{"text": "Paris is the capital of France."}],
+                        "content": [
+                            {
+                                "reasoningContent": {
+                                    "reasoningText": {"text": "Thinking"}
+                                }
+                            },
+                            {"text": "Paris is the capital of France."},
+                        ],
                     }
                 },
                 "stopReason": "end_turn",

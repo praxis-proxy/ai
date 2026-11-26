@@ -60,6 +60,43 @@ def report():
 
 
 class QualificationTest(unittest.TestCase):
+    def test_codex_capture_keeps_assertion_results_and_lane_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory, "native.json")
+            evidence.write_text(json.dumps({"outcomes": [["verified file edit", "passed"]]}))
+            output = Path(directory, "acceptance.json")
+            env = {"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2", "VLLM_GPU_MODEL": "checkpoint",
+                   "CODEX_VLLM_MODEL": "served", "VLLM_GPU_IMAGE": "image", "CODEX_TOOL_CALL_PARSER": "hermes",
+                   "CODEX_REASONING_PARSER": "deepseek_r1", "CODEX_NATIVE": "success",
+                   "CODEX_NATIVE_EVIDENCE": str(evidence), "CODEX_TRANSLATED": "skipped"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                qualification, "model_revision", return_value=None
+            ), mock.patch.object(subprocess, "check_output", return_value="abcd"):
+                qualification.capture_codex(output)
+            suite = qualification.acceptance(output, "success", 17, 2, "abcd", "Codex")
+            native, translated, compaction = suite["cases"]
+            self.assertEqual(suite["cases"][0]["capabilities"]["checkpoint"], "checkpoint")
+            self.assertNotIn("checkout_sha", native["capabilities"])
+            self.assertEqual(native["capabilities"]["outcomes"], [["verified file edit", "passed"]])
+            self.assertEqual(native["capabilities"]["served_model"], "served")
+            self.assertIsNone(native["capabilities"]["resolved_revision"])
+            self.assertEqual(translated, {"id": "codex_translated", "status": "skipped"})
+            self.assertEqual(compaction, {"id": "codex_compaction", "status": "unexecuted"})
+
+    def test_codex_capture_keeps_step_status_without_enrichment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory, "invalid.json")
+            invalid.write_text("[]")
+            output = Path(directory, "acceptance.json")
+            env = {"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2", "CODEX_NATIVE": "failure",
+                   "CODEX_NATIVE_EVIDENCE": str(invalid)}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                subprocess, "check_output", return_value="abcd"
+            ):
+                qualification.capture_codex(output)
+            suite = qualification.acceptance(output, "failure", 17, 2, "abcd", "Codex")
+            self.assertEqual(suite["cases"][0], {"id": "codex_native", "status": "failure"})
+
     def test_release_uses_recent_ancestor_nightly_and_discloses_newer_failure(self):
         timestamp = qualification.now()
         def run(identifier, conclusion="success", sha="a" * 40, created=timestamp):
@@ -204,6 +241,10 @@ class QualificationTest(unittest.TestCase):
                 ))
             captured = json.loads(output.read_text())
             self.assertEqual(captured["backend"]["version"], "0.32.0")
+            # Every image_inspect query answers, as podman's RepoDigests does for
+            # a local build; without a digest from resolve it is still local.
+            self.assertEqual(captured["backend"]["image_source"], "local-build")
+            self.assertIsNone(captured["backend"]["registry_digest"])
             # Missing model metadata remains unknown, not fabricated.
             self.assertIsNone(captured["model"]["resolved_revision"])
             self.assertEqual(len(probes), 2)
@@ -221,6 +262,29 @@ class QualificationTest(unittest.TestCase):
             )
             self.assertEqual(unavailable["status"], "incomplete")
             self.assertEqual(unavailable["reason"], "required provenance unavailable: vLLM version")
+
+    def test_capture_reports_registry_only_with_resolved_digest(self):
+        # resolve-vllm-gpu-image hands over the pulled image's digest only when
+        # it reused the published build.
+        digest = "ghcr.io/praxis-proxy/vllm-gpu@sha256:" + "e" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            cases = directory / "cases.json"
+            cases.write_text(json.dumps({"selected": [], "exit_code": 0}))
+            output = directory / "raw.json"
+            with mock.patch.dict(os.environ, {
+                "CONTAINER_RUNTIME": "podman", "VLLM_GPU_MODEL": "test-model",
+                "VLLM_GPU_IMAGE_DIGEST": digest,
+            }), mock.patch.object(qualification.subprocess, "check_output", return_value="available"), \
+                 mock.patch.object(qualification, "file_hash", return_value="b" * 64), \
+                 mock.patch.object(qualification, "locked_version", return_value="0.8.0"), \
+                 mock.patch.object(qualification, "image_inspect", return_value="image-id"):
+                qualification.capture(SimpleNamespace(
+                    responses=cases, credentialed=cases, setup="passed", output=output,
+                ))
+            backend = json.loads(output.read_text())["backend"]
+        self.assertEqual(backend["image_source"], "registry")
+        self.assertEqual(backend["registry_digest"], digest)
 
     def test_client_fixture_profiles_and_unknown_paths(self):
         def item(*fixtures, override=None):
@@ -404,6 +468,70 @@ class QualificationTest(unittest.TestCase):
             self.assertEqual([case["status"] for case in result["cases"]], ["success", "failure"])
             wrong_attempt = qualification.acceptance(path, "success", 17, 3, "a" * 40, "Codex")
             self.assertEqual(wrong_attempt["status"], "unreported")
+
+    def test_acceptance_reports_the_vllm_image_the_lane_served(self):
+        backend = {"image_tag": "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B", "local_image_id": "sha256:abc",
+                   "registry_digest": None, "image_source": "runner", "model": "Qwen/Qwen3-8B"}
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.json"
+            raw.write_text(json.dumps(report()))
+            codex_raw = Path(directory) / "codex-acceptance.json"
+            codex_raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                             "cases": [{"id": "codex_native", "status": "success"}],
+                                             "backend": backend}))
+            finished = qualification.finish(raw, True, "success", "success", "skipped", "success",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=codex_raw)
+        self.assertEqual(finished["suites"]["codex_acceptance"]["backend"], backend)
+        self.assertIn("Codex Acceptance: success (1/1 scenarios succeeded); vLLM image `sha256:abc` (runner).",
+                      qualification.render(finished))
+        # A lane that recorded no image renders as before.
+        self.assertNotIn("backend", finished["suites"]["claude_acceptance"])
+
+    def test_acceptance_only_dispatch_reports_client_outcome_and_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "codex.json"
+            raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                       "cases": [{"id": "codex_native", "status": "failure"}],
+                                       "backend": {"local_image_id": "sha256:abc", "image_source": "registry",
+                                                   "registry_digest": "sha256:def"}}))
+            finished = qualification.finish(None, False, "success", "skipped", "skipped", "failure",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=raw)
+        for detailed in (False, True):
+            rendered = qualification.render(finished, detailed=detailed)
+            self.assertIn("Full Responses GPU suite was not requested", rendered)
+            self.assertIn("Codex Acceptance: failure (0/1 scenarios succeeded); "
+                          "vLLM image `sha256:abc` (registry, digest `sha256:def`).", rendered)
+            self.assertNotIn("Claude Acceptance:", rendered)
+            self.assertNotIn("Native Responses:", rendered)
+
+    def test_codex_provenance_is_separate_from_full_suite_and_requires_current_run(self):
+        provenance = {
+            "codex_version": "0.170.0",
+            "backend": {
+                "model": "openai/gpt-oss-120b", "served_model_name": "gpt-oss-120b",
+                "vllm_image": "vllm-openai@sha256:" + "b" * 64,
+                "tool_call_parser": "openai", "reasoning_parser": "openai_gptoss",
+                "tensor_parallel_size": 1, "max_model_len": 32768,
+            },
+            "runner": {"instance_type": "p5.4xlarge"},
+            "filter_chains": {"codex_native": ["ai_operation", "openai_client_tool_compat"]},
+            "candidate": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex-acceptance.json"
+            path.write_text(json.dumps({
+                "run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                "cases": [{"id": "codex_native", "status": "success"}],
+                "provenance": provenance,
+            }))
+            finished = qualification.finish(None, False, "success", "skipped", "skipped", "success",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=path)
+            self.assertEqual(finished["status"], "not_requested")
+            self.assertEqual(finished["suites"]["codex_acceptance"]["provenance"], provenance)
+            for run_id, attempt, sha in ((18, 2, "a" * 40), (17, 3, "a" * 40), (17, 2, "c" * 40)):
+                stale = qualification.acceptance(path, "success", run_id, attempt, sha, "Codex")
+                self.assertEqual(stale["status"], "unreported")
+                self.assertNotIn("provenance", stale)
 
     def test_pi_acceptance_is_reported_beside_the_other_clients(self):
         with tempfile.TemporaryDirectory() as directory:

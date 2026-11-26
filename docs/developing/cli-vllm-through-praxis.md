@@ -470,7 +470,7 @@ example to PostgreSQL is a single filter edit:
 - `allow_private_database_url` is required for a loopback or other
   local-sensitive target; the URL validator rejects those by default. It is
   intended for local development; see
-  [`openai_responses_store`](../filters/openai_responses_store.md) for the full
+  [`openai_responses_store`](../filters/agents/openai_responses_store.md) for the full
   field reference.
 - `ssl_mode` defaults to `verify-full`, which a local server without TLS can
   never satisfy. `disable` is honest only when the connection never leaves the
@@ -489,7 +489,7 @@ example to PostgreSQL is a single filter edit:
 - Schema upgrades are recreate-only: a Praxis release that requires a newer
   schema refuses to start against the old tables, so treat stored responses as
   disposable and recreate the database. See
-  [Responses store schema upgrade](../store/schema-migration.md).
+  [Responses store schema upgrade](../operations/store/schema-migration.md).
 
 ## 3. Connect Codex
 
@@ -718,7 +718,7 @@ the way the environment variable does.
 ## 5. Connect OpenCode
 
 OpenCode 1.x and 2.x need different setups. Check your version with
-`opencode --version`: 1.x prints a bare version such as `1.19.3`, and 2.x
+`opencode --version`: 1.x prints a bare version such as `1.19.6`, and 2.x
 prints `opencode v2.1.2`. The two majors ship as different npm packages
 (`opencode-ai` for 1.x, `@opencode/cli` for 2.x) and use different
 configuration schemas, so a 1.x configuration does not carry over to 2.x.
@@ -1061,9 +1061,9 @@ host. The `headers` map has no such check and sends the token wherever
 
 ## 6. Connect pi
 
-These steps are verified against pi 1.4.0. Install that version from the
-[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.4.0),
-or with `npm install -g @earendil-works/pi-coding-agent@1.4.0` (Node 22.19 or
+These steps are verified against pi 1.5.2. Install that version from the
+[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.5.2),
+or with `npm install -g @earendil-works/pi-coding-agent@1.5.2` (Node 22.19 or
 later), and check it with `pi --version`.
 
 pi reaches custom endpoints through providers declared in
@@ -1111,7 +1111,7 @@ Then launch pi from that shell. pi does not need `VLLM_API_KEY`:
 pi --model "praxis/$VLLM_MODEL"
 ```
 
-Notes on this configuration, verified against pi 1.4.0:
+Notes on this configuration, verified against pi 1.5.2:
 
 - **`apiKey` is a placeholder, but it must be set.** With no `apiKey`, pi
   reports `No API key found for praxis.` and sends nothing. The configured
@@ -1300,12 +1300,30 @@ kill "$PRAXIS_PID"
 
 ## Pinned client versions
 
-The integration tests pin one version of each client and one vLLM image. Each
+The integration tests pin one version of each client and one vLLM build. Each
 client's manifest under `tests/integration/fixtures/*/pin.toml` is the source
-of truth for that client; the vLLM image is pinned in the OpenCode 1.x and
-Claude Code manifests. `cargo xtask check-pins` (part of `make lint`) fails if
-any harness constant, workflow, checksum fixture, or image reference disagrees
-with them.
+of truth for that client. The vLLM backend is pinned in two layers in the
+`[vllm]` block of the Claude Code, OpenCode 1.x, and Codex manifests:
+
+- `base_image` is the upstream `vllm/vllm-openai` image, by digest. It is the
+  image `vllm/Containerfile` builds from, so it fixes the vLLM build every GPU
+  lane runs. To reproduce a lane's server yourself, run that image with the
+  manifest's `[vllm.launch]` flags as shown in
+  [Existing or local vLLM](#existing-or-local-vllm), passing
+  `--model Qwen/Qwen3-8B` in place of the in-image path.
+- `baked_image` names the [`vllm/images.json`](../../vllm/images.json) entry the
+  GPU lanes serve by default. The weights are already in the image, so these
+  containers start without downloading weights or using a Hugging Face token. That entry owns the
+  model and its Hugging Face revision. Its published tag is mutable, so each
+  lane records the image it served (local image ID, and registry digest when
+  pulled) in the qualification report rather than in the manifest.
+
+For a Codex candidate dispatch, the lane loads the requested checkpoint with
+the pinned upstream image. See [Qualifying a Codex candidate checkpoint](gpu-nightly-suite.md#qualifying-a-codex-candidate-checkpoint).
+
+`cargo xtask check-pins` (part of `make lint`) fails if any harness constant,
+workflow, checksum fixture, or image reference disagrees with them, or if a
+launch would load anything other than the baked weights.
 
 To move every pin to its latest upstream release within each manifest's
 `major_series`:

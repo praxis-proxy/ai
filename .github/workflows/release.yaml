@@ -67,7 +67,7 @@ jobs:
   test:
     needs: [validate]
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -77,7 +77,7 @@ jobs:
 
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
 
       - name: Run all tests
         run: make test
@@ -116,7 +116,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Publish container image
-        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           image-name: ${{ github.repository }}
 
@@ -205,7 +205,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust (for the Red Hat image verification)
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
         with:
           # The restored target/ would otherwise be swept into the build context.
           cache-target: "false"
@@ -398,6 +398,7 @@ jobs:
     needs: [validate, container-fips]
     if: >-
       !cancelled()
+      && !inputs.skip-fips-proof
       && needs.validate.result == 'success'
       && needs.container-fips.result == 'success'
       && needs.container-fips.outputs.fips-digest != ''

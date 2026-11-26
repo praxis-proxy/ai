@@ -11,7 +11,6 @@ use super::{
     *,
 };
 use crate::agentic::mcp::{
-    build_json_rpc_config,
     config::DEFAULT_MAX_BODY_BYTES,
     protocol::{
         PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_STATELESS_2026_07_28, ProtocolProfile, SUPPORTED_VERSIONS_CURRENT,
@@ -2935,20 +2934,9 @@ fn make_stateless_broker_filter() -> McpBrokerFilter {
 
 fn build_broker_filter_from_yaml(yaml: &str) -> McpBrokerFilter {
     let cfg: McpBrokerConfig = serde_yaml::from_str(yaml).unwrap();
+    let servers = cfg.servers.clone();
     let (validated, catalog) = build_config(cfg).unwrap();
-    let json_rpc_config = build_json_rpc_config(validated.max_body_bytes);
-
-    McpBrokerFilter {
-        cache_scope: validated.cache_scope,
-        cache_ttl_ms: validated.cache_ttl_ms,
-        catalog,
-        default_version: validated.default_version.clone(),
-        json_rpc_config,
-        max_body_bytes: validated.max_body_bytes,
-        protocol_profile: validated.protocol_profile,
-        public_path: validated.path.clone(),
-        supported_versions: validated.supported_versions.clone(),
-    }
+    McpBrokerFilter::build(&validated, catalog, &servers, None)
 }
 
 fn make_mcp_request() -> praxis_filter::Request {

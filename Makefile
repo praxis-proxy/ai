@@ -29,10 +29,10 @@ LINT_FMT_CARGO = PATH="$$(dirname "$$(rustup which --toolchain nightly cargo)"):
 # Experimental filter features are package-specific and off by default.
 # Basic Auth is exposed by praxis-ai-proxy and forwarded by the integration-test
 # crate; it is not a praxis-ai-filters feature.
-FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
-INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
+FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter,anthropic-mcp-connector-filter
+INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter,anthropic-mcp-connector-filter
 # Experimental praxis-ai-apis features, whose unit tests live in that crate.
-APIS_EXPERIMENTAL_FEATURES := vertex-anthropic
+APIS_EXPERIMENTAL_FEATURES := vertex-anthropic,anthropic-mcp-connector
 # Release and container builds exclude experimental Responses and agents.
 # Opt in with PRAXIS_AI_FEATURES=full,openai-all,store-sqlite when needed.
 PRAXIS_AI_FEATURES ?= full
@@ -278,7 +278,7 @@ test-integration-experimental:
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_quota examples::token_ceiling examples::inflight_tracking \
-		examples::vertex_anthropic body_contracts \
+		examples::vertex_anthropic examples::anthropic_mcp_connector body_contracts \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures: test-inference-fixtures-core test-inference-xtask
@@ -782,7 +782,7 @@ test-postgres-fips-host: | require-podman
 # that the provider reports FIPS and refuses MD5, and fail otherwise. Needs
 # the host's fips module (Fedora and RHEL ship /usr/lib64/ossl-modules/fips.so);
 # the same tests run inside the UBI 9 report stage (make fips-check), and
-# only a FIPS-mode host proves a deployment (docs/fips.md).
+# only a FIPS-mode host proves a deployment (docs/operations/fips.md).
 FIPS_PROVIDER_CNF       := $(CURDIR)/xtask/assets/fips/fips-provider.cnf
 test-fips-provider:
 	@OPENSSL_CONF=$(FIPS_PROVIDER_CNF) openssl list -providers 2>/dev/null | grep -q '^  fips$$' \
@@ -839,7 +839,7 @@ fips-toolchain: fips-verify-image
 # praxis-ai refuses to start as root, and the tests that boot the real
 # server would fail for that reason alone as container root.
 #
-# Needs rootless podman on a RHEL 9 host in FIPS mode (docs/fips.md). On any
+# Needs rootless podman on a RHEL 9 host in FIPS mode (docs/operations/fips.md). On any
 # other host it fails at the first test, by design.
 test-fips-host: fips-toolchain
 	podman run --rm --userns=keep-id --security-opt label=disable \
@@ -1101,7 +1101,7 @@ help:
 	@echo "  fips-verify-image    verify the pinned UBI 9 base images are Red Hat's (digest + signature)"
 	@echo "  fips-signature-store point podman at Red Hat's signature store (once, on Debian/Ubuntu hosts)"
 	@echo ""
-	@echo "FIPS host (RHEL 9 in FIPS mode; see docs/fips.md):"
+	@echo "FIPS host (RHEL 9 in FIPS mode; see docs/operations/fips.md):"
 	@echo "  test-integration-fips  the integration suite as the FIPS build (in-process proxy, FIPS binary for subprocess tests)"
 	@echo "  test-schema-fips       the schema suite as the FIPS build"
 	@echo "  fips-toolchain         build the UBI 9 toolchain image the host run uses"

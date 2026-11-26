@@ -3,6 +3,9 @@
 
 //! Configuration types for the MCP static catalog filter.
 
+use std::time::Duration;
+
+use praxis_core::config::FilterEntry;
 use praxis_filter::{
     FilterError, builtins::http::payload_processing::config_validation::validate_max_body_bytes, has_dot_dot_traversal,
 };
@@ -19,6 +22,24 @@ use super::super::{
 
 /// Default cache TTL in milliseconds (5 minutes).
 pub(super) const DEFAULT_CACHE_TTL_MS: u64 = 300_000; // 5 min
+
+/// Default maximum number of retained backend sessions.
+const DEFAULT_MAX_BACKEND_SESSIONS: usize = 4_096;
+
+/// Upper bound on `backend_sessions.max_sessions`.
+const MAX_BACKEND_SESSIONS_LIMIT: usize = 1_000_000;
+
+/// Default idle lifetime of a backend session mapping (10 minutes).
+const DEFAULT_BACKEND_IDLE_TIMEOUT_MS: u64 = 600_000;
+
+/// Default deadline for one backend handshake exchange (5 seconds).
+const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+
+/// Default ceiling for one backend handshake response body (1 MiB).
+const DEFAULT_HANDSHAKE_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Upper bound on `backend_sessions.max_response_bytes` (16 MiB).
+const MAX_HANDSHAKE_RESPONSE_BYTES_LIMIT: usize = 16 * 1_048_576;
 
 // -----------------------------------------------------------------------------
 // CacheScope
@@ -103,6 +124,57 @@ pub(super) struct McpServerConfig {
 }
 
 // -----------------------------------------------------------------------------
+// BackendSessionsConfig
+// -----------------------------------------------------------------------------
+
+/// Current-profile backend session management.
+///
+/// When present, current-profile `tools/call` lazily runs the backend
+/// `initialize` / `notifications/initialized` handshake once per
+/// `(gateway session, server)` pair and forwards the call to the server's
+/// cluster with the backend `Mcp-Session-Id`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BackendSessionsConfig {
+    /// Request headers copied from the client request onto the handshake.
+    #[serde(default = "default_forward_headers")]
+    pub forward_headers: Vec<String>,
+    /// Idle lifetime of one backend session mapping, in milliseconds.
+    #[serde(default = "default_backend_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Budget for one whole handshake, in milliseconds: waiting for a
+    /// concurrent handshake, `initialize`, and `notifications/initialized`
+    /// share it, and a parent deadline can shorten it.
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+    /// Maximum retained backend session mappings.
+    #[serde(default = "default_max_backend_sessions")]
+    pub max_sessions: usize,
+    /// Response body ceiling for each handshake exchange, in bytes.
+    #[serde(default = "default_handshake_response_bytes")]
+    pub max_response_bytes: usize,
+    /// Extra filters run on each handshake subrequest before the broker's
+    /// generated `load_balancer` (for example credential injection).
+    #[serde(default)]
+    pub outbound_filters: Vec<FilterEntry>,
+}
+
+/// Normalized backend session settings.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedBackendSessions {
+    /// Client request headers copied onto handshake exchanges.
+    pub forward_headers: Vec<http::HeaderName>,
+    /// Deadline for one handshake exchange.
+    pub handshake_timeout: Duration,
+    /// Idle lifetime of one backend session mapping.
+    pub idle_timeout: Duration,
+    /// Maximum retained backend session mappings.
+    pub max_sessions: usize,
+    /// Response body ceiling for each handshake exchange.
+    pub max_response_bytes: usize,
+}
+
+// -----------------------------------------------------------------------------
 // McpBrokerConfig (raw deserialized)
 // -----------------------------------------------------------------------------
 
@@ -114,6 +186,9 @@ pub(super) struct McpServerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct McpBrokerConfig {
+    /// Current-profile backend session management. Requires
+    /// `protocol_profile: current`.
+    pub backend_sessions: Option<BackendSessionsConfig>,
     /// Cache scope for stateless responses. Requires `protocol_profile: stateless`.
     pub cache_scope: Option<CacheScope>,
     /// Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`.
@@ -148,6 +223,8 @@ pub(super) struct McpBrokerConfig {
 /// Normalized broker configuration with all defaults resolved.
 #[derive(Debug)]
 pub(super) struct ValidatedBrokerConfig {
+    /// Current-profile backend session settings, when enabled.
+    pub backend_sessions: Option<ValidatedBackendSessions>,
     /// Cache scope for stateless responses.
     pub cache_scope: CacheScope,
     /// Cache TTL in milliseconds for stateless responses.
@@ -185,6 +262,8 @@ pub(crate) struct CatalogTool {
     pub input_schema: serde_json::Value,
     /// Original tool name on the backend.
     pub original_name: String,
+    /// Index of the owning server in configuration order.
+    pub server_index: usize,
     /// Backend server name from config.
     pub server_name: String,
 }
@@ -203,6 +282,32 @@ fn default_max_body_bytes() -> usize {
     DEFAULT_MAX_BODY_BYTES
 }
 
+/// Forward the client's bearer credential to the handshake by default, as the
+/// forwarded `tools/call` itself carries it.
+fn default_forward_headers() -> Vec<String> {
+    vec!["authorization".to_owned()]
+}
+
+/// Default backend session idle timeout.
+fn default_backend_idle_timeout_ms() -> u64 {
+    DEFAULT_BACKEND_IDLE_TIMEOUT_MS
+}
+
+/// Default handshake deadline.
+fn default_handshake_timeout_ms() -> u64 {
+    DEFAULT_HANDSHAKE_TIMEOUT_MS
+}
+
+/// Default retained backend session cap.
+fn default_max_backend_sessions() -> usize {
+    DEFAULT_MAX_BACKEND_SESSIONS
+}
+
+/// Default handshake response ceiling.
+fn default_handshake_response_bytes() -> usize {
+    DEFAULT_HANDSHAKE_RESPONSE_BYTES
+}
+
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
@@ -213,7 +318,7 @@ pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(ValidatedBrokerConfi
 
     let profile = cfg.protocol_profile;
 
-    validate_cache_fields_for_profile(profile, &cfg)?;
+    let backend_sessions = validate_profile_fields(profile, &cfg)?;
 
     let catalog = validate_and_build_catalog(&cfg)?;
 
@@ -234,6 +339,7 @@ pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(ValidatedBrokerConfi
     validate_versions(profile, &supported_versions, &default_version)?;
 
     let validated = ValidatedBrokerConfig {
+        backend_sessions,
         cache_scope,
         cache_ttl_ms,
         default_version,
@@ -260,6 +366,18 @@ fn validate_and_build_catalog(cfg: &McpBrokerConfig) -> Result<Vec<CatalogTool>,
     Ok(catalog)
 }
 
+/// Validate profile-specific fields and normalize `backend_sessions`.
+fn validate_profile_fields(
+    profile: ProtocolProfile,
+    cfg: &McpBrokerConfig,
+) -> Result<Option<ValidatedBackendSessions>, FilterError> {
+    validate_cache_fields_for_profile(profile, cfg)?;
+    cfg.backend_sessions
+        .as_ref()
+        .map(|sessions| validate_backend_sessions(profile, sessions))
+        .transpose()
+}
+
 /// Reject explicit cache config on profiles that do not use it.
 fn validate_cache_fields_for_profile(profile: ProtocolProfile, cfg: &McpBrokerConfig) -> Result<(), FilterError> {
     if profile == ProtocolProfile::Current {
@@ -271,6 +389,90 @@ fn validate_cache_fields_for_profile(profile: ProtocolProfile, cfg: &McpBrokerCo
         }
     }
     Ok(())
+}
+
+/// Validate current-profile backend session settings.
+fn validate_backend_sessions(
+    profile: ProtocolProfile,
+    cfg: &BackendSessionsConfig,
+) -> Result<ValidatedBackendSessions, FilterError> {
+    if profile != ProtocolProfile::Current {
+        return Err("mcp: backend_sessions requires protocol_profile 'current'".into());
+    }
+    validate_backend_session_limits(cfg)?;
+    if cfg
+        .outbound_filters
+        .iter()
+        .any(|entry| entry.filter_type == "load_balancer")
+    {
+        return Err(
+            "mcp: backend_sessions.outbound_filters must not contain load_balancer; the broker routes handshakes \
+             to each server's top-level cluster"
+                .into(),
+        );
+    }
+
+    Ok(ValidatedBackendSessions {
+        forward_headers: validate_forward_headers(&cfg.forward_headers)?,
+        handshake_timeout: Duration::from_millis(cfg.handshake_timeout_ms),
+        idle_timeout: Duration::from_millis(cfg.idle_timeout_ms),
+        max_sessions: cfg.max_sessions,
+        max_response_bytes: cfg.max_response_bytes,
+    })
+}
+
+/// Range-check numeric backend session settings.
+fn validate_backend_session_limits(cfg: &BackendSessionsConfig) -> Result<(), FilterError> {
+    if cfg.max_sessions == 0 || cfg.max_sessions > MAX_BACKEND_SESSIONS_LIMIT {
+        return Err(
+            format!("mcp: backend_sessions.max_sessions must be between 1 and {MAX_BACKEND_SESSIONS_LIMIT}").into(),
+        );
+    }
+    if cfg.idle_timeout_ms == 0 {
+        return Err("mcp: backend_sessions.idle_timeout_ms must be greater than 0".into());
+    }
+    if cfg.handshake_timeout_ms == 0 {
+        return Err("mcp: backend_sessions.handshake_timeout_ms must be greater than 0".into());
+    }
+    if cfg.max_response_bytes == 0 || cfg.max_response_bytes > MAX_HANDSHAKE_RESPONSE_BYTES_LIMIT {
+        return Err(format!(
+            "mcp: backend_sessions.max_response_bytes must be between 1 and {MAX_HANDSHAKE_RESPONSE_BYTES_LIMIT}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Parse forwarded header names, rejecting names the broker or transport owns.
+fn validate_forward_headers(names: &[String]) -> Result<Vec<http::HeaderName>, FilterError> {
+    let mut parsed = Vec::with_capacity(names.len());
+    for raw in names {
+        let name = http::HeaderName::from_bytes(raw.as_bytes()).map_err(|_e| {
+            FilterError::from(format!(
+                "mcp: backend_sessions.forward_headers has invalid name '{raw}'"
+            ))
+        })?;
+        if is_reserved_forward_header(&name) {
+            return Err(format!("mcp: backend_sessions.forward_headers must not include '{name}'").into());
+        }
+        if !parsed.contains(&name) {
+            parsed.push(name);
+        }
+    }
+    Ok(parsed)
+}
+
+/// Headers the handshake sets itself or that must never be copied.
+fn is_reserved_forward_header(name: &http::HeaderName) -> bool {
+    if praxis_ai_apis::http_hop::is_hop_by_hop(name.as_str()) {
+        return true;
+    }
+    let s = name.as_str();
+    matches!(
+        *name,
+        http::header::ACCEPT | http::header::CONTENT_LENGTH | http::header::CONTENT_TYPE | http::header::HOST
+    ) || matches!(s, "mcp-session-id" | "mcp-protocol-version" | "last-event-id")
+        || s.starts_with("x-praxis-")
 }
 
 /// Rejects versions that the selected profile does not recognize.
@@ -396,7 +598,7 @@ fn validate_unique_exposed_names(catalog: &[CatalogTool]) -> Result<(), FilterEr
 /// Build the static tool catalog from configured servers.
 fn build_catalog(servers: &[McpServerConfig], policy: InvalidToolPolicy) -> Result<Vec<CatalogTool>, FilterError> {
     let mut catalog = Vec::new();
-    for server in servers {
+    for (server_index, server) in servers.iter().enumerate() {
         for tool in &server.tools {
             if let Err(reason) = validate_tool_schemas(tool) {
                 match policy {
@@ -415,7 +617,7 @@ fn build_catalog(servers: &[McpServerConfig], policy: InvalidToolPolicy) -> Resu
                 }
             }
 
-            catalog.push(build_catalog_entry(server, tool));
+            catalog.push(build_catalog_entry(server_index, server, tool));
         }
     }
     Ok(catalog)
@@ -459,7 +661,7 @@ fn default_input_schema() -> serde_json::Value {
 
 /// Routing fields stay with catalog entries so follow-up `tools/call`
 /// routing can select the backend without reparsing config.
-fn build_catalog_entry(server: &McpServerConfig, tool: &ToolConfig) -> CatalogTool {
+fn build_catalog_entry(server_index: usize, server: &McpServerConfig, tool: &ToolConfig) -> CatalogTool {
     let exposed_name = if let Some(prefix) = &server.tool_prefix {
         format!("{prefix}{}", tool.name)
     } else {
@@ -474,6 +676,7 @@ fn build_catalog_entry(server: &McpServerConfig, tool: &ToolConfig) -> CatalogTo
         exposed_name,
         input_schema: tool.input_schema.clone().unwrap_or_else(default_input_schema),
         original_name: tool.name.clone(),
+        server_index,
         server_name: server.name.clone(),
     }
 }
@@ -726,7 +929,7 @@ schema:
             input_schema: Some(serde_json::json!({"type": "object"})),
             annotations: Some(serde_json::json!({"readOnly": true})),
         };
-        let entry = build_catalog_entry(&server, &tool);
+        let entry = build_catalog_entry(0, &server, &tool);
         assert_eq!(entry.exposed_name, "my_tool");
         assert_eq!(entry.original_name, "my_tool");
         assert_eq!(entry.server_name, "srv");
@@ -752,7 +955,7 @@ schema:
             input_schema: None,
             annotations: None,
         };
-        let entry = build_catalog_entry(&server, &tool);
+        let entry = build_catalog_entry(0, &server, &tool);
         assert_eq!(entry.exposed_name, "ns_action");
         assert_eq!(entry.original_name, "action");
         assert!(entry.description.is_none());
@@ -944,6 +1147,7 @@ schema:
                 exposed_name: "dup".into(),
                 input_schema: serde_json::json!({"type": "object"}),
                 original_name: "a".into(),
+                server_index: 0,
                 server_name: "s1".into(),
             },
             CatalogTool {
@@ -954,6 +1158,7 @@ schema:
                 exposed_name: "dup".into(),
                 input_schema: serde_json::json!({"type": "object"}),
                 original_name: "b".into(),
+                server_index: 0,
                 server_name: "s2".into(),
             },
         ];
@@ -971,6 +1176,7 @@ schema:
             exposed_name: "unique".into(),
             input_schema: serde_json::json!({"type": "object"}),
             original_name: "x".into(),
+            server_index: 0,
             server_name: "s".into(),
         }];
         assert!(validate_unique_exposed_names(&catalog).is_ok());
