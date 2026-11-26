@@ -382,15 +382,7 @@ async fn run_codex_web_search(translated: bool) {
     assert!(!key.is_empty(), "live search requires a nonempty provider key");
     let relay = praxis_test_utils::start_tavily_relay();
     let port = free_port();
-    let (example, config) = codex_search_config(
-        translated,
-        port,
-        &live.vllm_authority,
-        &live.backend_token,
-        live.database_url.as_deref().expect("live search requires PostgreSQL"),
-        &live.model,
-        &relay.base_url(),
-    );
+    let (example, config) = codex_search_config(translated, port, &live, &relay.base_url());
     print_acceptance_filter_chain(&config);
     let _proxy = start_proxy(&config);
     let observer = HttpTransportObserver::start_on(port, live.listen_address).await;
@@ -434,10 +426,16 @@ async fn run_codex_web_search(translated: bool) {
             "incorrect Tavily credential"
         );
         assert_eq!(capture.status, 200, "Tavily request failed");
-        assert!(capture.request["query"].as_str().is_some_and(|q| !q.trim().is_empty()));
+        assert!(
+            capture.request["query"].as_str().is_some_and(|q| !q.trim().is_empty()),
+            "Tavily query must be nonempty"
+        );
         for result in capture.response["results"].as_array().expect("Tavily results") {
             let url = result["url"].as_str().expect("Tavily result URL");
-            assert!(url.starts_with("https://") || url.starts_with("http://"));
+            assert!(
+                url.starts_with("https://") || url.starts_with("http://"),
+                "Tavily result URL must be absolute HTTP(S)"
+            );
             sources.push(url);
         }
     }
@@ -457,10 +455,7 @@ async fn run_codex_web_search(translated: bool) {
 fn codex_search_config(
     translated: bool,
     port: u16,
-    authority: &str,
-    backend_token: &str,
-    database_url: &str,
-    model: &str,
+    live: &CodexLiveConfig,
     relay_url: &str,
 ) -> (&'static str, praxis_core::config::Config) {
     let example = if translated {
@@ -474,8 +469,14 @@ fn codex_search_config(
     } else {
         patch_live_native_codex_config
     };
-    let yaml = patch(&yaml, port, authority, backend_token, database_url);
-    let yaml = patch_live_apply_patch_model_alias(&yaml, model);
+    let yaml = patch(
+        &yaml,
+        port,
+        &live.vllm_authority,
+        &live.backend_token,
+        live.database_url.as_deref().expect("live search requires PostgreSQL"),
+    );
+    let yaml = patch_live_apply_patch_model_alias(&yaml, &live.model);
     let yaml = yaml
         .replace(
             "              - filter: openai_agentic_loop",
@@ -523,15 +524,17 @@ fn codex_search_config(
 #[tokio::test]
 async fn codex_search_builds_the_dispatch_loop_on_both_routes() {
     for translated in [false, true] {
-        let (_, mut config) = codex_search_config(
-            translated,
-            18080,
-            "127.0.0.1:8000",
-            "test-key",
-            "postgres://u:p@127.0.0.1/db",
-            "qwen3-8b",
-            "http://127.0.0.1:12345",
-        );
+        let live = CodexLiveConfig {
+            codex_bin: OsString::new(),
+            vllm_authority: "127.0.0.1:8000".into(),
+            model: "qwen3-8b".into(),
+            candidate: false,
+            backend_token: "test-key".into(),
+            database_url: Some("postgres://u:p@127.0.0.1/db".into()),
+            listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            netns: None,
+        };
+        let (_, mut config) = codex_search_config(translated, 18080, &live, "http://127.0.0.1:12345");
         let router = config.filter_chains[0]
             .filters
             .iter_mut()
