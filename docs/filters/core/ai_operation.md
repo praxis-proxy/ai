@@ -5,6 +5,10 @@
 
 Classifies supported AI operations from the request head.
 
+## Configuration Notes
+
+Native Gemini requests retain their fallback route when they carry `x-goog-api-key`, `Authorization` with `x-goog-user-project` or `x-goog-api-client`, or a `key`, `access_token`, or `oauth_token` query parameter. For other requests to `GET /v1/models` and `GET /v1/models/{model_id}`, `anthropic-version` selects `anthropic_models`. Without that header the filter selects `openai_models`. This uses the client request independently of the upstream provider. The filter leaves version validation, model responses, and pagination to the selected handler.
+
 ## Configuration
 
 | Field | Type | Required | Description |

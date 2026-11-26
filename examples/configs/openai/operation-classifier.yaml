@@ -48,7 +48,16 @@
 # backend, or handled some other way is a routing policy decision this
 # filter does not make.
 #
+# Model list and retrieval share their paths across clients. The presence of
+# anthropic-version selects anthropic_models; otherwise they use openai_models.
+# Requests with x-goog-api-key, Authorization with a Google project or SDK
+# header, or a key, access_token, or oauth_token query parameter use the default route.
+#
 # Example requests:
+#
+#   curl http://localhost:8080/v1/models
+#   curl http://localhost:8080/v1/models/claude-opus-4-8 \
+#     -H "anthropic-version: 2023-06-01"
 #
 #   # classified openai_responses/createResponse -> responses backend
 #   curl -X POST http://localhost:8080/v1/responses \
@@ -127,8 +136,7 @@ filter_chains:
           application_protocol: x-praxis-ai-application-protocol
           operation: x-praxis-ai-operation
         # Branch on the published filter result, not on a path prefix.
-        # Conversations and Chat Completions each have their own backend;
-        # every other classified or unclassified request falls through.
+        # Requests with no matching branch use the default backend.
         branch_chains:
           - name: conversations
             on_result:
@@ -195,6 +203,32 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "anthropic-backend"
             rejoin: shared_load_balancer
+          - name: openai-models
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: openai_models
+            chains:
+              - name: openai-models-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "openai-models-backend"
+            rejoin: shared_load_balancer
+          - name: anthropic-models
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: anthropic_models
+            chains:
+              - name: anthropic-models-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "anthropic-backend"
+            rejoin: shared_load_balancer
           - name: gemini
             on_result:
               filter: ai_operation
@@ -255,6 +289,9 @@ filter_chains:
           - name: "bedrock-backend"
             endpoints:
               - "127.0.0.1:3008"
+          - name: "openai-models-backend"
+            endpoints:
+              - "127.0.0.1:3009"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
