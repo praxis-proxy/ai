@@ -135,7 +135,7 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
         "anthropic_web_search",
         "openai_responses_to_chat_completions",
         "openai_agentic_loop",
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         "mcp",
         "a2a",
     ] {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `openai_mcp_tool_resolve` filter.
+//! Integration tests for the `openai_mcp_connector` filter.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -288,7 +288,7 @@ fn run_streaming_mcp_failure(test_name: &str, extra_fields: &str) -> FailureRetr
 
 /// Same as [`run_streaming_mcp_failure`] but with the pipeline YAML supplied by
 /// `build_yaml`, so tests can exercise different filter orderings (e.g.
-/// `openai_stream_events` before vs. after `openai_mcp_tool_resolve`).
+/// `openai_stream_events` before vs. after `openai_mcp_connector`).
 fn run_streaming_mcp_failure_with_yaml(
     test_name: &str,
     extra_fields: &str,
@@ -456,7 +456,7 @@ async fn streaming_list_failure_persists_non_default_request_options() {
 }
 
 /// Regression for the pipeline-ordering persistence gap in `agentic-loop.yaml`,
-/// where `openai_stream_events` runs *after* `openai_mcp_tool_resolve` (nested in
+/// where `openai_stream_events` runs *after* `openai_mcp_connector` (nested in
 /// the iterative_request_router). The resolver's short-circuiting
 /// `TerminalResponse` means stream_events never runs on the response phase, so it
 /// never accumulates the failure into `ResponsesState.response_object`. Unless the
@@ -1036,8 +1036,8 @@ fn protected_mode_rejects_a_restored_cached_direct_listing() {
     let protected_proxy_port = free_port();
     let protected_yaml =
         resolve_yaml_store_stream_events_after_resolve(protected_proxy_port, backend.port(), db.url(), 500).replacen(
-            "      - filter: openai_mcp_tool_resolve\n",
-            "      - filter: openai_mcp_tool_resolve\n        tool_admission:\n          mode: protected\n",
+            "      - filter: openai_mcp_connector\n",
+            "      - filter: openai_mcp_connector\n        tool_admission:\n          mode: protected\n",
             1,
         );
     let protected_config = Config::from_yaml(&protected_yaml).unwrap();
@@ -1564,8 +1564,8 @@ fn configured_request_headers_are_forwarded_to_mcp_discovery() {
         mcp_server.port()
     );
     let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors).replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
+        "      - filter: openai_mcp_connector\n",
+        "      - filter: openai_mcp_connector\n        forward_headers: [x-tenant-id]\n",
         1,
     );
     let config = Config::from_yaml(&yaml).unwrap();
@@ -1599,8 +1599,8 @@ fn configured_request_headers_are_not_forwarded_to_direct_mcp_urls() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
     let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port()).replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
+        "      - filter: openai_mcp_connector\n",
+        "      - filter: openai_mcp_connector\n        forward_headers: [x-tenant-id]\n",
         1,
     );
     let config = Config::from_yaml(&yaml).unwrap();
@@ -1895,7 +1895,7 @@ fn with_private_upstreams(yaml: String) -> String {
 
 /// Pipeline mirroring the relevant shipped `full-flow-agentic.yaml` ordering for
 /// store retrieval: `openai_responses_store` runs pre-IRR, before
-/// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
+/// `openai_mcp_connector`. `openai_stream_events` is intentionally absent
 /// here -- it is IRR-only (it fails closed outside an `iterative_request_router`),
 /// and in the shipped `full-flow-agentic.yaml` it lives inside the IRR that follows the
 /// resolver, so the resolver's pre-IRR short-circuit never reaches it. The
@@ -1935,8 +1935,8 @@ filter_chains:
         database_url: "{db_url}"
         responses_table: openai_responses
         conversations_table: openai_conversations
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: {timeout_ms}
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: {timeout_ms}
       - filter: router
         routes:
           - path_prefix: "/"
@@ -1953,7 +1953,7 @@ insecure_options:
 }
 
 /// Pipeline mirroring `agentic-loop.yaml`'s ordering, where `openai_stream_events`
-/// runs *after* `openai_mcp_tool_resolve` (there, nested inside the
+/// runs *after* `openai_mcp_connector` (there, nested inside the
 /// iterative_request_router that follows the resolver). The resolver's
 /// header-phase `TerminalResponse` short-circuits before `openai_stream_events`
 /// ever runs, so stream_events never accumulates the failure into
@@ -1999,8 +1999,8 @@ filter_chains:
         responses_table: openai_responses
         conversations_table: openai_conversations
       - filter: openai_responses_rehydrate
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: {timeout_ms}
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: {timeout_ms}
       - filter: openai_stream_events
       - filter: router
         routes:
@@ -2018,7 +2018,7 @@ insecure_options:
     )
 }
 
-/// Minimal store pipeline with `openai_responses_store` + `openai_mcp_tool_resolve`
+/// Minimal store pipeline with `openai_responses_store` + `openai_mcp_connector`
 /// but WITHOUT `openai_responses_request`/`openai_responses_rehydrate` (and no
 /// `openai_stream_events`). Nothing builds a `ResponsesState` before the resolver,
 /// so persistence depends entirely on the resolver *creating* the state when it
@@ -2058,8 +2058,8 @@ filter_chains:
         database_url: "{db_url}"
         responses_table: openai_responses
         conversations_table: openai_conversations
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: {timeout_ms}
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: {timeout_ms}
       - filter: router
         routes:
           - path_prefix: "/"
@@ -2090,8 +2090,8 @@ filter_chains:
         initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: {timeout_ms}
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: {timeout_ms}
       - filter: router
         routes:
           - path_prefix: "/"
@@ -2122,7 +2122,7 @@ filter_chains:
         initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
+      - filter: openai_mcp_connector
       - filter: openai_responses_proxy
         name: inference
       - filter: router
@@ -2155,7 +2155,7 @@ filter_chains:
         initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
+      - filter: openai_mcp_connector
       - filter: router
         routes:
           - path_prefix: "/"
@@ -2187,7 +2187,7 @@ filter_chains:
         initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
+      - filter: openai_mcp_connector
         max_tools: {max_tools}
       - filter: router
         routes:
@@ -2220,7 +2220,7 @@ filter_chains:
         initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
+      - filter: openai_mcp_connector
       - filter: openai_responses_proxy
         name: inference
       - filter: router
@@ -2258,7 +2258,7 @@ filter_chains:
         initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
+      - filter: openai_mcp_connector
 {connectors_yaml}
       - filter: openai_responses_proxy
         name: inference

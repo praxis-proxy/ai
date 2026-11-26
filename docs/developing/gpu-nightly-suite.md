@@ -35,6 +35,8 @@ to force the main suite on a PR.
   `:<tag>-<commit sha>` tag. The nightlies pull these instead of rebuilding
   them; see [Reusing published images](#reusing-published-images).
 
+For verified CLI edits, permission modes and compaction outcomes by model and API route, see [Coding harness compatibility](../conformance/coding-harness-compatibility.md).
+
 ## Use cases: the client-path matrix
 
 The suite proves that real coding clients and SDKs complete real work through
@@ -71,6 +73,14 @@ Details per use case:
   model; inference still runs on Qwen. An offline pinned HTTP test checks that
   this catalog entry declares the grammar tool, so a client upgrade cannot
   silently remove it (0.167.0 did that for `gpt-5.4`).
+- **Codex CLI live web search.** Two credentialed GPU steps enable live search on
+  the pinned client, one per Responses route. Each adds the Tavily dispatcher and
+  agentic loop transition to its client-tool compatibility example. The native
+  case enables `native_tool_compat` to expose search to function-only inference. A host-side
+  relay records the real Tavily exchange while the isolated CLI reaches Praxis.
+  A passing case requires a completed CLI answer citing a returned source URL.
+  Read the independent `codex_native_search` and `codex_translated_search` results
+  in `suites.codex_acceptance.cases`. Fork PRs and compaction-only runs skip both.
 - **Claude Code.** A pinned Claude Code binary completes the same multi-step
   task in four scenarios: {native (`messages-native-vllm.yaml`) / transformed
   (`messages-to-openai-vllm.yaml`)} × {deterministic `acceptEdits` /

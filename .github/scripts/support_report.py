@@ -705,6 +705,8 @@ CodexCapability = namedtuple("CodexCapability", "label assertion native translat
 CODEX_CAPABILITIES = (
     CodexCapability("Apply a file patch", "verified file edit", "codex_native", "codex_translated",
      "Codex applies the patch, returns tool output through Praxis, and writes the exact expected file."),
+    CodexCapability("Cite a live web search", "cited live search source", "codex_native_search", "codex_translated_search",
+     "Codex completes a turn citing an exact source URL from a successful Tavily search through Praxis."),
     CodexCapability("Compact a session", "client compaction observed", "codex_compaction", None,
      "Codex sends a summarization request and resumes with compacted history."),
     CodexCapability("Finish a task after compaction", "post-compaction task completion", "codex_compaction", None,

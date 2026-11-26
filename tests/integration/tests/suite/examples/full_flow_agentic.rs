@@ -2325,7 +2325,7 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
 
     for dispatcher in [
         "openai_web_search_dispatch",
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         "openai_file_search_dispatch",
         "openai_agentic_loop",
     ] {
@@ -2422,21 +2422,15 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .expect("IRR inference step should contain openai_file_search_dispatch");
     assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
 
-    let mcp_resolve = outer_filters
-        .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_tool_resolve"))
-        .expect("outer chain should contain openai_mcp_tool_resolve");
-    assert_eq!(mcp_resolve["user_credential"].as_str(), Some("mcp_gateway"));
-    assert_eq!(mcp_resolve["authorization_assertion"].as_str(), Some("mcp_gateway"));
-    assert_eq!(mcp_resolve["require_connector"].as_bool(), Some(true));
     let mcp_dispatch = outer_filters[irr_index]["steps"][0]["filters"]
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_dispatch"))
-        .expect("IRR inference step should contain openai_mcp_dispatch");
+        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_connector"))
+        .expect("IRR inference step should contain openai_mcp_connector");
     assert_eq!(mcp_dispatch["user_credential"].as_str(), Some("mcp_gateway"));
     assert_eq!(mcp_dispatch["authorization_assertion"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_dispatch["require_connector"].as_bool(), Some(true));
 }
 
 #[test]

@@ -8,6 +8,39 @@ stateful agentic-loop pipeline: the `rehydrate` + `response_store` +
 passthrough chain without those filters forwards every field to the backend
 and claims none of the state behavior below.
 
+## Responses support and qualification
+
+Clients call `/v1/responses` in both GPU lanes. **Native** sends inference to
+vLLM's `/v1/responses`. **Translated** sends it to vLLM's
+`/v1/chat/completions`. The text nightly serves **Qwen/Qwen3-8B** on an
+**NVIDIA A10G** and runs the Responses suite with **OpenAI Python 2.x and
+3.x** against a PostgreSQL-backed gateway. The table identifies what each
+check exercises. Use the linked run evidence to determine which cases passed
+for a particular checkout.
+
+| Client operation or parameter | What the application can rely on | How we exercise it |
+| --- | --- | --- |
+| Persist a response with `store` | Managed Responses stores completed responses by default. Set `store: false` to disable response persistence. | Native and translated SDK cases create with `store: true`, retrieve by ID, page through input items, and delete the stored response. |
+| Continue with `previous_response_id` and `input` | Praxis loads a completed response and replays its history into inference. The native pipeline restores the previous ID on eligible JSON responses and SSE lifecycle events. | Native SDK cases check the echoed ID in buffered and streamed replies and reject an invalid ID. Translated cases exercise stored continuation, including returning custom tool output to the Chat backend. |
+| Attach a turn with `conversation` | Praxis loads the conversation history and appends the completed turn. Conversation items can persist even when the response itself uses `store: false`. | Native SDK cases create a conversation, run multiple turns, and list its items. A streaming case checks append after completion with response storage disabled. Standalone Conversations CRUD exercises the gateway store without model inference. |
+| Stream with `stream` and `stream_options` | Clients receive Responses SSE. The native lane consumes upstream Responses events. The translated lane constructs them from Chat chunks. | Native SDK cases cover usage options and continuation. Translated SDK cases exercise event decoding and the `include_obfuscation` option. |
+| Call tools with `tools` and `tool_choice` | A client can receive a function call and submit its output on a later turn. The agentic pipeline also uses `max_tool_calls` for local dispatch and reads `parallel_tool_calls` for scheduling. | A separate native GPU case forces a function call and completes the loop with **OpenAI Agents SDK 0.23.1 / OpenAI Python 3.26.0**. The Responses suite also exercises custom-tool continuation through the Chat lane. |
+| Request compaction with `context_management` | With the compact filter configured, Praxis can summarize rehydrated history before inference. | SDK cases exercise below- and over-threshold history using the compact configuration. Consult the per-case profile for the backend used. |
+| Set generation options | Native forwards fields including `instructions`, `temperature`, `top_p`, `max_output_tokens`, `reasoning`, and `text` to the provider. Translation maps supported fields to Chat equivalents. | Native SDK cases exercise structured output, logprobs via `include`, and `top_p` on a continuation. The independent [translation oracle](openresponses-translation.md) exercises system prompts, multi-turn input, tool calling, and streaming on CPU vLLM with **Qwen/Qwen3-0.6B**. |
+| Set `background: true` or a non-null `prompt` template | The managed vLLM path rejects these requests. | The [state flag reference](#state-related-request-flags) documents the validation boundary. |
+
+**Finding results.** The [vLLM Integration runs](https://github.com/praxis-proxy/ai/actions/workflows/vllm-integration.yaml)
+publish `qualification.json` with the checkout, resolved vLLM and SDK
+versions, model, and per-case profiles and outcomes. Supporting fixtures
+and skipped cases are identified separately. For release-specific results,
+use the qualification section and attached report on the
+[GitHub Release](https://github.com/praxis-proxy/ai/releases).
+See the [report field guide](../developing/vllm-qualification.md) and
+[GPU suite inventory](../developing/gpu-nightly-suite.md) for reproduction
+details and the separate vision and coding-client lanes.
+
+For verified CLI edits, permission modes and compaction outcomes by model and API route, see [Coding harness compatibility](coding-harness-compatibility.md).
+
 ## Conformance boundary (read this first)
 
 On `POST /v1/responses` Praxis forwards the client bytes to the backend

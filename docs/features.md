@@ -107,7 +107,7 @@ tracked in [#1717](https://github.com/praxis-proxy/ai/issues/1717).
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |
 | `openai-files` | none yet (Files wire contracts, generated OpenAPI, and conformance checks) | `utoipa`; activates `experimental` |
 | `openai-compact` | `openai_responses_compact` | `tiktoken-rs`, a store backend |
-| `openai-mcp-tools` | `openai_mcp_tool_resolve`, `openai_mcp_dispatch`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
+| `openai-mcp-tools` | `openai_mcp_connector`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
 | `openai-all` | every OpenAI group above, without choosing a store backend | |
 | `full` | every non-experimental filter (currently `standard`) | |
 

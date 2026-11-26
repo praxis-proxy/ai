@@ -2,7 +2,7 @@
 # Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates binding an operator `outbound_chain` onto the outbound MCP
-# callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery
+# callout made by `openai_mcp_connector` (the `tools/list` discovery
 # request). The callout is dialed through the pipeline's sub-request executor;
 # the MCP transport stages the SSRF-validated dial target onto the request, so
 # the operator's `outbound_chain` filters observe and may transform the outbound
@@ -14,13 +14,9 @@
 # credential, add tracing headers, or enforce an allow-list before the request
 # leaves the proxy.
 #
-# On `openai_mcp_tool_resolve` (a top-level filter), `outbound_chain` may be an
-# **inline** chain (as shown here) or a **named** reference to a top-level
-# `filter_chains` entry. `openai_mcp_dispatch` (the per-round `tools/call`
-# executor) runs inside `iterative_request_router`. praxis core builds each IRR
-# step with a live chain-binding context, so `openai_mcp_dispatch` also binds an
-# **inline** `outbound_chain`; a **named** reference cannot resolve there because
-# IRR supplies each step an empty top-level named-chain map.
+# An inline outbound chain gets the MCP streaming selector automatically.
+# A named outbound chain must start with openai_mcp_streaming_selector as
+# its first unconditional filter. Both forms work inside the IRR.
 #
 # SSRF posture: the outbound MCP callout is validated against the pipeline's
 # `insecure_options.allow_private_upstreams`. This example enables it so the
@@ -66,34 +62,41 @@ filter_chains:
 
       - filter: openai_tool_parse
 
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
-        # Inline outbound chain bound onto the MCP callout. The transport stages
-        # the dial target itself, so these filters run purely on the request
-        # dialed to the MCP server.
-        outbound_chain:
-          name: mcp-outbound
-          filters:
-            - filter: headers
-              request_set:
-                - name: x-mcp-outbound-probe
-                  value: praxis-outbound
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_mcp_connector
+                discovery_timeout_ms: 5000
+                # Inline outbound chain bound onto the MCP callout. The transport stages
+                # the dial target itself, so these filters run purely on the request
+                # dialed to the MCP server.
+                outbound_chain:
+                  name: mcp-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: x-mcp-outbound-probe
+                          value: praxis-outbound
 
-      - filter: openai_responses_proxy
-        name: inference
+              - filter: openai_responses_proxy
+                name: inference
 
-      - filter: router
-        routes:
-          - path: "/v1/responses"
-            headers:
-              x-praxis-ai-format: "openai_responses"
-            cluster: "inference-backend"
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
 
-      - filter: load_balancer
-        clusters:
-          - name: "inference-backend"
-            endpoints:
-              - "127.0.0.1:3001"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a loopback inference backend

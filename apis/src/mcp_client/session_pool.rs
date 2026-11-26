@@ -59,7 +59,7 @@ static NEXT_POOL_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 // Pool Identity
 // -----------------------------------------------------------------------------
 
-/// Unique namespace assigned to one `openai_mcp_dispatch` filter instance.
+/// Unique namespace assigned to one `openai_mcp_connector` filter instance.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct McpPoolNamespace(u64);
 

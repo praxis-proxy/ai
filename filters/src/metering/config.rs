@@ -33,9 +33,14 @@ const DEFAULT_SOURCE: &str = "ai-gateway";
 /// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
+/// model_policy_check: true
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent billing and model-policy controls"
+)]
 pub(super) struct ExternalMeteringConfig {
     /// Base URL of the external metering service (required).
     pub metering_url: String,
@@ -65,8 +70,33 @@ pub(super) struct ExternalMeteringConfig {
 
     /// When `true` (default), requests proceed if the metering service
     /// is unavailable. When `false`, requests are rejected with 503.
+    /// This is the *billing* gate's availability policy.
     #[serde(default = "default_true")]
     pub fail_open: bool,
+
+    /// When `true`, the entitlement preflight also enforces the metering
+    /// service's model-policy verdict (`modelAllowed` in the response): an
+    /// explicit denial rejects with 403 before any provider request,
+    /// regardless of `fail_open`. Disabled by default for compatibility
+    /// with services that return only `hasAccess`.
+    ///
+    /// When enabled, every metered request needs a trusted tenant identity
+    /// and a resolvable public model; the request body is pre-read (bounded
+    /// by the standard JSON body limit, 10 MiB; larger bodies reject with
+    /// 413) so the verdict is decided before provider dispatch. Every
+    /// available model source — the identity header, the
+    /// `model_to_provider` client model, and (when no client model was
+    /// recorded, since a recorded rewrite leaves the body naming the
+    /// provider target) the request body — must agree: conflicting
+    /// non-empty sources, or a body `"model"` member that is ambiguous
+    /// (duplicate or escaped key spellings) or undecodable (escaped or
+    /// non-string value), reject with 403 rather than authorizing a
+    /// model the provider does not receive. When identity comes from
+    /// raw `{prefix}*` request headers, the ingress boundary must strip
+    /// client-supplied copies and set the headers from authenticated
+    /// data: this filter cannot distinguish client-set headers.
+    #[serde(default)]
+    pub model_policy_check: bool,
 
     /// Prefix for tenant identity headers to capture and strip.
     /// Expected headers: `{prefix}username`, `{prefix}group`,

@@ -239,6 +239,9 @@ pub(crate) struct WebSearchFilterConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenAiWebSearchConfig {
+    /// Lower hosted tools for native function-only Responses backends.
+    #[serde(default)]
+    pub(crate) native_tool_compat: bool,
     /// Search backend provider.
     provider: SearchProvider,
 

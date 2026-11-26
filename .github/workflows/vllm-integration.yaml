@@ -96,6 +96,10 @@ on:
         required: false
         default: false
         type: boolean
+      codex_search_only:
+        description: With run_codex_acceptance, run only native and translated live search
+        type: boolean
+        default: false
       run_codex_acceptance:
         description: >-
           Run pinned Codex through native Responses and translated Chat paths
@@ -1862,7 +1866,7 @@ jobs:
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
         id: codex_native
-        if: ${{ !inputs.run_compaction_only }}
+        if: ${{ !inputs.run_compaction_only && !inputs.codex_search_only }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1891,7 +1895,7 @@ jobs:
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
         if: >-
-          always() && !cancelled() && !inputs.run_compaction_only &&
+          always() && !cancelled() && !inputs.run_compaction_only && !inputs.codex_search_only &&
           env.CODEX_SKIP_TRANSLATED != 'true' &&
           steps.codex_vllm_preflight.outcome == 'success' &&
           steps.codex_namespace.outcome == 'success' &&
@@ -1920,9 +1924,37 @@ jobs:
           grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
             "$RUNNER_TEMP/codex-acceptance-translated.log"
 
+      - name: Run Codex live web search (native)
+        id: codex_native_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: bash .github/scripts/codex_web_search.sh native
+
+      - name: Run Codex live web search (translated)
+        id: codex_translated_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' && env.CODEX_SKIP_TRANSLATED != 'true' }}
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: bash .github/scripts/codex_web_search.sh translated
+
       - name: Run Codex native-Responses compaction acceptance test (once, no retry)
         id: codex_compaction
-        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.codex_search_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1988,6 +2020,8 @@ jobs:
         env:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
+          CODEX_NATIVE_SEARCH: ${{ steps.codex_native_search.outcome }}
+          CODEX_TRANSLATED_SEARCH: ${{ steps.codex_translated_search.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
           CODEX_MODEL: >-
             ${{ env.CODEX_CANDIDATE_MODEL || steps.vllm_image.outputs.model }}
@@ -2004,7 +2038,7 @@ jobs:
           filter_chains = {}
           missing_chains = []
           prefix = "Codex acceptance filter chain: "
-          for path in ("native", "translated", "compaction"):
+          for path in ("native", "translated", "compaction", "native_search", "translated_search"):
               name = f"codex_{path}"
               status = statuses[name]
               log = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"codex-acceptance-{path}.log"
