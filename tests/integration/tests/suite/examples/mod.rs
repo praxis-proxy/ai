@@ -34,6 +34,7 @@ mod client_tool_compat_chat_completions;
 #[cfg(feature = "store-sqlite")]
 mod compact;
 mod credential_injection;
+mod decisions;
 mod external_metering;
 mod external_metering_file_key;
 #[cfg(feature = "policy-engine")]
