@@ -14,6 +14,6 @@ mod types;
 pub use catalog::FileCatalog;
 pub use error::CatalogError;
 pub use types::{
-    CleanupClaim, CleanupState, DeletionOutcome, FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile,
-    SortDirection, StoredFile,
+    CleanupClaim, CleanupState, FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile, SortDirection,
+    StoredFile,
 };

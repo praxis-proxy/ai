@@ -324,8 +324,8 @@ mod operations {
     use std::{error::Error as _, sync::Arc, time::Duration};
 
     use praxis_ai_store::{
-        CatalogError, CleanupClaim, CleanupState, DeletionOutcome, FileCatalog as _, FileCompletion, FileListQuery,
-        FileRecord, NewFile, SortDirection, StateOwner,
+        CatalogError, CleanupClaim, CleanupState, FileCatalog as _, FileCompletion, FileListQuery, FileRecord, NewFile,
+        SortDirection, StateOwner,
     };
     use tokio::task::JoinSet;
 
@@ -489,15 +489,12 @@ mod operations {
                 .data
                 .is_empty()
         );
-        assert_eq!(
-            c.mark_for_deletion(&other, "f1").await.unwrap(),
-            DeletionOutcome::NotFound
-        );
+        assert!(!c.mark_for_deletion(&other, "f1").await.unwrap());
         assert!(matches!(
             c.complete_upload(&other, "f1", completion(10, "assistants")).await,
             Err(CatalogError::Conflict)
         ));
-        assert_eq!(c.mark_for_deletion(&b, "f1").await.unwrap(), DeletionOutcome::Marked);
+        assert!(c.mark_for_deletion(&b, "f1").await.unwrap());
         assert!(c.get_ready(&a, "f1").await.unwrap().is_none());
         c.close().await;
     }
@@ -766,27 +763,21 @@ mod operations {
         let c = catalog().await;
         let a = owner("t1", "alice");
         ready(&c, &a, "f1", 10, "p").await;
-        assert_eq!(c.mark_for_deletion(&a, "f1").await.unwrap(), DeletionOutcome::Marked);
-        assert_eq!(
-            c.mark_for_deletion(&a, "f1").await.unwrap(),
-            DeletionOutcome::AlreadyPending
+        assert!(c.mark_for_deletion(&a, "f1").await.unwrap());
+        assert!(
+            !c.mark_for_deletion(&a, "f1").await.unwrap(),
+            "a repeat is not a new mark"
         );
-        assert_eq!(
-            c.mark_for_deletion(&a, "missing").await.unwrap(),
-            DeletionOutcome::NotFound
-        );
+        assert!(!c.mark_for_deletion(&a, "missing").await.unwrap());
         // Pending and failed files are not deletable.
         c.create_pending(&new_file("p", &a, 1)).await.unwrap();
-        assert_eq!(c.mark_for_deletion(&a, "p").await.unwrap(), DeletionOutcome::NotFound);
-        // An expired file is invisible; once the sweep marked it, a retry succeeds.
+        assert!(!c.mark_for_deletion(&a, "p").await.unwrap());
+        // An expired file is invisible, before and after the sweep marks it.
         ready(&c, &a, "e", 10, "p").await;
         exec(&c, "UPDATE {f} SET expires_at = 1 WHERE id = 'e'").await;
-        assert_eq!(c.mark_for_deletion(&a, "e").await.unwrap(), DeletionOutcome::NotFound);
+        assert!(!c.mark_for_deletion(&a, "e").await.unwrap());
         assert_eq!(c.mark_expired_for_deletion(10).await.unwrap(), 1);
-        assert_eq!(
-            c.mark_for_deletion(&a, "e").await.unwrap(),
-            DeletionOutcome::AlreadyPending
-        );
+        assert!(!c.mark_for_deletion(&a, "e").await.unwrap());
         assert_eq!(usage(&c, "t1").await, 21, "marking never changes usage");
         c.close().await;
     }
@@ -822,11 +813,39 @@ mod operations {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn quota_lock_does_not_block_same_tenant_on_other_table() {
+        let c = catalog().await;
+        let other = catalog().await;
+        // Hold t1's quota lock for the first table.
+        let mut held = c.pool.begin().await.unwrap();
+        sqlx::query(crate::postgres_files::request::QUOTA_LOCK_SQL)
+            .bind(&c.files)
+            .bind("t1")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        // The same tenant on an independent table is not blocked.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            other.create_pending(&new_file("a", &owner("t1", "s"), 10)),
+        )
+        .await
+        .expect("same tenant on another table must not wait on this table's lock")
+        .unwrap();
+        held.rollback().await.unwrap();
+        c.close().await;
+        other.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
     async fn quota_lock_does_not_block_other_tenants() {
         let c = Arc::new(catalog().await);
         // Hold tenant t1's quota lock in an open transaction.
         let mut held = c.pool.begin().await.unwrap();
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('praxis-files-quota'), hashtext('t1'))")
+        sqlx::query(crate::postgres_files::request::QUOTA_LOCK_SQL)
+            .bind(&c.files)
+            .bind("t1")
             .execute(&mut *held)
             .await
             .unwrap();
@@ -898,11 +917,7 @@ mod operations {
             deletes.spawn(async move { c.mark_for_deletion(&a, &format!("f{i}")).await.unwrap() });
         }
         while let Some(outcome) = deletes.join_next().await {
-            assert_ne!(
-                outcome.unwrap(),
-                DeletionOutcome::Marked,
-                "an expired file is not deletable"
-            );
+            assert!(!outcome.unwrap(), "an expired file is not deletable");
         }
         assert_eq!(sweeper.await.unwrap(), 10);
         for i in 0..10 {

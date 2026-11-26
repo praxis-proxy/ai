@@ -12,8 +12,7 @@
 //! `SELECT` decides between an idempotent retry, a conflict and not-found.
 
 use praxis_ai_store::{
-    DeletionOutcome, FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile, SortDirection, StateOwner,
-    StoredFile,
+    FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile, SortDirection, StateOwner, StoredFile,
 };
 use sqlx::{AssertSqlSafe, Row as _, postgres::PgRow};
 
@@ -55,6 +54,15 @@ fn record_from_row(row: &PgRow) -> Result<FileRecord, PgBackendError> {
     })
 }
 
+/// Takes the per-tenant quota lock, scoped to the files table.
+///
+/// Advisory locks are database-wide, so the key includes the table's OID
+/// (`$1`, resolved like the unqualified table name in every other query) and
+/// the tenant (`$2`). Catalogs on different tables in one database then never
+/// contend for the same tenant.
+pub(super) const QUOTA_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('praxis-files-quota'), \
+     hashtext(($1::text::regclass::oid)::text || ':' || $2::text))";
+
 /// One attempt of `create_pending`.
 ///
 /// Takes the per-tenant quota lock first (the only advisory lock in the
@@ -64,7 +72,8 @@ pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile)
     let tenant = file.owner.tenant_id();
     let mut tx = c.begin().await?;
 
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('praxis-files-quota'), hashtext($1))")
+    sqlx::query(QUOTA_LOCK_SQL)
+        .bind(&c.files)
         .bind(tenant)
         .execute(&mut *tx)
         .await
@@ -402,12 +411,12 @@ async fn resolve_cursor(
     .map_err(|e| c.pg_err(&e))
 }
 
-/// One attempt of `mark_for_deletion`.
+/// One attempt of `mark_for_deletion`: `true` only if this call marked the row.
 pub(super) async fn mark_for_deletion_once(
     c: &PostgresFileCatalog,
     owner: &StateOwner,
     id: &str,
-) -> Result<DeletionOutcome, PgBackendError> {
+) -> Result<bool, PgBackendError> {
     let files = &c.files;
     let visible = visible();
     let mut tx = c.begin().await?;
@@ -423,12 +432,6 @@ pub(super) async fn mark_for_deletion_once(
     .rows_affected();
     if updated == 1 {
         tx.commit().await.map_err(|e| c.pg_err(&e))?;
-        return Ok(DeletionOutcome::Marked);
     }
-    let state = state_of(c, &mut tx, owner, id).await?;
-    // Also covers an expiry sweep that marked the file first.
-    Ok(match state.as_deref() {
-        Some("deletion_pending") => DeletionOutcome::AlreadyPending,
-        _ => DeletionOutcome::NotFound,
-    })
+    Ok(updated == 1)
 }

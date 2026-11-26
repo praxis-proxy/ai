@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use praxis_ai_store::{
-    CatalogError, CleanupClaim, DeletionOutcome, FileCatalog, FileCompletion, FileListQuery, FileRecord,
-    FileRecordPage, NewFile, StateOwner, StoredFile,
+    CatalogError, CleanupClaim, FileCatalog, FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile,
+    StateOwner, StoredFile,
 };
 
 use super::{PostgresFileCatalog, cleanup, finish, request, retry::with_retry};
@@ -53,7 +53,7 @@ impl FileCatalog for PostgresFileCatalog {
         finish(request::list_ready_impl(self, owner, query).await)
     }
 
-    async fn mark_for_deletion(&self, owner: &StateOwner, id: &str) -> Result<DeletionOutcome, CatalogError> {
+    async fn mark_for_deletion(&self, owner: &StateOwner, id: &str) -> Result<bool, CatalogError> {
         backend(with_retry(|| request::mark_for_deletion_once(self, owner, id)).await)
     }
 

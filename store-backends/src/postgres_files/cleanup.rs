@@ -6,12 +6,17 @@
 //! These work across tenants and never change usage except the purge in
 //! [`complete_cleanup_once`]. Each
 //! batch is its own transaction. Claims are leases (`lease_until`): they
-//! prevent duplicate byte-store deletes and double as the retry delay, because
-//! a worker whose delete fails does nothing and the row is claimable again when
-//! its lease expires. Only claiming writes the lease, so a stale worker cannot
-//! shorten another's. Each claim gets a fresh token and the purge must match
-//! it, so only the latest claim can purge. Exactly-once release comes from the
-//! conditional purge: a row is deleted once, and its charge goes with it.
+//! reduce duplicate byte-store deletes but do not eliminate them. A lease can
+//! expire during a slow delete, and a crash after the delete but before the
+//! purge forces a retry, so a second worker may issue the same delete.
+//! Byte-store deletion must therefore be idempotent: a missing object counts
+//! as success. Leases also double as the retry delay, because a worker whose
+//! delete fails does nothing and the row is claimable again when its lease
+//! expires. Only claiming writes the lease, so a stale worker cannot shorten
+//! another's. Each claim gets a fresh token and the purge must match it, so
+//! only the latest claim can purge. Exactly-once release comes from the
+//! token-matched conditional purge: a row is deleted once, and its charge goes
+//! with it.
 
 use std::time::Duration;
 

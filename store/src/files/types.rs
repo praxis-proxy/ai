@@ -110,18 +110,6 @@ pub enum CleanupState {
     DeletionPending,
 }
 
-/// Result of [`FileCatalog::mark_for_deletion`](super::FileCatalog::mark_for_deletion).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeletionOutcome {
-    /// This call hid the file and marked it for deletion.
-    Marked,
-    /// The file was already marked, so a retry after an ambiguous commit
-    /// can succeed.
-    AlreadyPending,
-    /// No visible file exists in the tenant scope.
-    NotFound,
-}
-
 /// A leased cleanup task returned to a background reaper.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanupClaim {

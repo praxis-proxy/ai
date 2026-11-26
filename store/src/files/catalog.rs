@@ -8,8 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::{
-    CatalogError, CleanupClaim, DeletionOutcome, FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile,
-    StoredFile,
+    CatalogError, CleanupClaim, FileCompletion, FileListQuery, FileRecord, FileRecordPage, NewFile, StoredFile,
 };
 use crate::owner::StateOwner;
 
@@ -112,14 +111,16 @@ pub trait FileCatalog: Send + Sync {
     async fn list_ready(&self, owner: &StateOwner, query: &FileListQuery) -> Result<FileRecordPage, CatalogError>;
 
     /// Atomically hide a ready file and mark it for physical deletion.
-    /// [`DeletionOutcome::AlreadyPending`] lets a retry after an ambiguous
-    /// commit succeed instead of reporting not-found, until the row is purged;
-    /// a retry after the purge reports [`DeletionOutcome::NotFound`].
+    /// Returns `true` only if this call marked the row. Any other case returns
+    /// `false`: no visible file exists in the tenant scope, including a file
+    /// already marked (by an earlier delete or the expiry sweep) and one
+    /// already purged. A retry after an ambiguous commit therefore reports
+    /// `false`.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogError::Backend`] on persistence failure.
-    async fn mark_for_deletion(&self, owner: &StateOwner, id: &str) -> Result<DeletionOutcome, CatalogError>;
+    async fn mark_for_deletion(&self, owner: &StateOwner, id: &str) -> Result<bool, CatalogError>;
 
     /// Mark up to `limit` expired ready files for deletion, across tenants.
     /// Returns the number newly marked. No usage change.
