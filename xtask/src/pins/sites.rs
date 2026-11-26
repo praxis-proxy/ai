@@ -55,7 +55,7 @@ pub(crate) enum Pin {
     Pi,
     /// Codex version.
     Codex,
-    /// vLLM GPU image reference (`tag@sha256:digest`).
+    /// Upstream vLLM base image reference (`tag@sha256:digest`).
     Vllm,
 }
 
@@ -96,7 +96,7 @@ impl Pin {
                     .vllm
                     .as_ref()
                     .ok_or_else(|| format!("{}: must declare [vllm]", manifest::OPENCODE))?
-                    .image
+                    .base_image
             },
         })
     }
@@ -218,11 +218,14 @@ const CODEX_SITES: &[Site] = &[
     site(VLLM_INTEGRATION, "CODEX_VERSION: \"{v}\"", 1),
 ];
 
-/// vLLM GPU image sites.
+/// vLLM base image sites.
+///
+/// The GPU acceptance lanes serve the model-baked image built `FROM` this one,
+/// so the Containerfile is what ties the manifests to what runs.
 const VLLM_SITES: &[Site] = &[
-    site(manifest::OPENCODE, "image = \"{v}\"", 1),
-    site(manifest::CLAUDE, "image = \"{v}\"", 1),
-    site(VLLM_INTEGRATION, "VLLM_GPU_IMAGE: \"{v}\"", 1),
+    site(manifest::OPENCODE, "base_image = \"{v}\"", 1),
+    site(manifest::CLAUDE, "base_image = \"{v}\"", 1),
+    site(manifest::CODEX, "base_image = \"{v}\"", 1),
     site(VLLM_DEV_ENDPOINT, "VLLM_GPU_IMAGE: {v}\n", 1),
     site(CONTAINERFILE, "FROM {v}\n", 1),
 ];

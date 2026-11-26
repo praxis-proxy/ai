@@ -8,7 +8,9 @@ description: >-
   Anything else (no published tag, a registry that cannot be reached, differing
   provenance) reports `build-required=true` and leaves no image behind, so the
   caller falls back to build-vllm-gpu. Either way the tag is local afterwards, so
-  start-vllm should always be passed `pull: "false"`.
+  start-vllm should always be passed `pull: "false"`. With `reuse-local`, an
+  image already on the runner whose labels match is kept without a pull, so a
+  later job on the same instance reuses what an earlier job pulled or built.
 inputs:
   image:
     description: Fully qualified image reference to resolve (registry tag).
@@ -24,13 +26,36 @@ inputs:
     description: Container runtime binary (docker or podman).
     required: false
     default: docker
+  registry-username:
+    description: Optional GHCR username to authenticate the pull on a local miss.
+    required: false
+    default: ""
+  registry-token:
+    description: GHCR token paired with registry-username.
+    required: false
+    default: ""
+  reuse-local:
+    description: >-
+      "true" to keep an image already present on the runner when its provenance
+      labels match, before trying the registry. Safe only on a runner whose
+      local images all come from this workflow run, such as the ephemeral GPU
+      instance.
+    required: false
+    default: "false"
 outputs:
   build-required:
     description: '"true" when the caller must build the image from source.'
     value: ${{ steps.resolve.outputs.build-required }}
   digest:
-    description: Registry digest of the pulled image, empty when building.
+    description: >-
+      Registry digest of the image this step pulled; empty when building or
+      when reusing a runner-local image, whose origin this step cannot tell.
     value: ${{ steps.resolve.outputs.digest }}
+  source:
+    description: >-
+      Where the image came from: "registry" (pulled here), "runner" (already on
+      the runner with matching labels), or "build" (the caller must build it).
+    value: ${{ steps.resolve.outputs.source }}
 runs:
   using: composite
   steps:
@@ -42,6 +67,9 @@ runs:
         EXPECTED_MODEL: ${{ inputs.model }}
         EXPECTED_REVISION: ${{ inputs.revision }}
         CONTAINER_RUNTIME: ${{ inputs.runtime }}
+        GHCR_USERNAME: ${{ inputs.registry-username }}
+        GHCR_TOKEN: ${{ inputs.registry-token }}
+        REUSE_LOCAL: ${{ inputs.reuse-local }}
       run: |
         set -euo pipefail
 
@@ -60,31 +88,66 @@ runs:
           printf '%s' "$value"
         }
 
+        # Prints why the image under the tag does not match this checkout, or
+        # nothing when it does.
+        mismatch() {
+          local got_containerfile got_model got_revision
+          got_containerfile="$(label praxis.vllm.containerfile-sha256)"
+          got_model="$(label praxis.vllm.inference-model)"
+          got_revision="$(label praxis.vllm.inference-revision)"
+          if [ "$got_containerfile" != "$expected_containerfile" ]; then
+            echo "$1 Containerfile ${got_containerfile:-<unlabelled>} != checkout $expected_containerfile"
+          elif [ "$got_model" != "$EXPECTED_MODEL" ]; then
+            echo "$1 model ${got_model:-<unlabelled>} != expected $EXPECTED_MODEL"
+          elif [ "$got_revision" != "$EXPECTED_REVISION" ]; then
+            echo "$1 model revision ${got_revision:-<unpinned>} != expected ${EXPECTED_REVISION:-<unpinned>}"
+          fi
+        }
+
         reject() {
           echo "::notice::Building $IMAGE from source: $1"
           # Drop the tag so the stale pull cannot shadow the local build.
           "$CONTAINER_RUNTIME" rmi -f "$IMAGE" > /dev/null 2>&1 || true
           echo "build-required=true" >> "$GITHUB_OUTPUT"
           echo "digest=" >> "$GITHUB_OUTPUT"
+          echo "source=build" >> "$GITHUB_OUTPUT"
           exit 0
         }
+
+        # An earlier job on this runner already pulled or built a matching
+        # image. Keep it instead of pulling: after a local build the registry
+        # holds a stale tag whose pull would replace the good image and force a
+        # second build.
+        if [ "$REUSE_LOCAL" = "true" ] && \
+           "$CONTAINER_RUNTIME" image inspect "$IMAGE" > /dev/null 2>&1 && \
+           [ -z "$(mismatch local)" ]; then
+          echo "Reusing $IMAGE already on this runner"
+          echo "build-required=false" >> "$GITHUB_OUTPUT"
+          echo "digest=" >> "$GITHUB_OUTPUT"
+          echo "source=runner" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ -n "$GHCR_USERNAME" ] || [ -n "$GHCR_TOKEN" ]; then
+          # Keep pull credentials scoped to this step for both Docker and Podman.
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf "$auth_dir"' EXIT
+          export DOCKER_CONFIG="$auth_dir"
+          export REGISTRY_AUTH_FILE="$auth_dir/config.json"
+          printf '%s\n' '{"auths":{}}' > "$REGISTRY_AUTH_FILE"
+          if ! printf '%s\n' "$GHCR_TOKEN" | "$CONTAINER_RUNTIME" login ghcr.io \
+            --username "$GHCR_USERNAME" --password-stdin; then
+            reject "registry login failed"
+          fi
+        fi
 
         if ! "$CONTAINER_RUNTIME" pull "$IMAGE"; then
           reject "no published image could be pulled"
         fi
 
-        got_containerfile="$(label praxis.vllm.containerfile-sha256)"
-        got_model="$(label praxis.vllm.inference-model)"
-        got_revision="$(label praxis.vllm.inference-revision)"
-
-        if [ "$got_containerfile" != "$expected_containerfile" ]; then
-          reject "published Containerfile ${got_containerfile:-<unlabelled>} != checkout $expected_containerfile"
-        fi
-        if [ "$got_model" != "$EXPECTED_MODEL" ]; then
-          reject "published model ${got_model:-<unlabelled>} != expected $EXPECTED_MODEL"
-        fi
-        if [ "$got_revision" != "$EXPECTED_REVISION" ]; then
-          reject "published model revision ${got_revision:-<unpinned>} != expected ${EXPECTED_REVISION:-<unpinned>}"
+        reason="$(mismatch published)"
+        if [ -n "$reason" ]; then
+          reject "$reason"
         fi
 
         digest="$("$CONTAINER_RUNTIME" image inspect "$IMAGE" \
@@ -92,3 +155,4 @@ runs:
         echo "Reusing published $IMAGE (${digest:-digest unavailable})"
         echo "build-required=false" >> "$GITHUB_OUTPUT"
         echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        echo "source=registry" >> "$GITHUB_OUTPUT"

@@ -278,6 +278,11 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
                 "cases": []}
     result = {"status": job_result, "job_status": job_result, "scope": scope,
               "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    # The model-baked vLLM image the lane served, recorded by
+    # prepare-vllm-gpu-image. Each lane runs its own container, so this is the
+    # lane's backend provenance, not the full suite's.
+    if isinstance(raw.get("backend"), dict):
+        result["backend"] = raw["backend"]
     if isinstance(raw.get("provenance"), dict):
         result["provenance"] = raw["provenance"]
     return result
@@ -386,7 +391,7 @@ def render(report, detailed=False):
         lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable recent ancestor GPU nightly qualification report was found.")
         lines += ["", f"Reason: {report.get('reason', 'GPU evidence unavailable')}."]
     elif status == "not_requested":
-        lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
+        lines.append("vLLM Responses gateway qualification: Full Responses GPU suite was not requested.")
     else:
         lines.append(f"vLLM Responses gateway qualification: **{status.replace('_', ' ')}**. {report.get('reason', '')}")
     context = report.get("release_context", {})
@@ -420,12 +425,25 @@ def render(report, detailed=False):
                          + ", ".join(f"{key} {counts.get(key, 0)}" for key in OUTCOMES) + ".")
         if report.get("suites", {}).get("unclassified", {}).get("selected"):
             lines.append(f"Unclassified selected cases: {len(report['suites']['unclassified']['selected'])} (profile attribution required).")
-        for name in ("credentialed_tools", "claude_acceptance", "codex_acceptance", "opencode_acceptance",
-                     "pi_acceptance"):
-            suite_data = report.get("suites", {}).get(name, {})
-            cases = suite_data.get("cases", [])
-            suffix = f" ({sum(case.get('status') == 'success' for case in cases)}/{len(cases)} scenarios succeeded)" if cases else ""
-            lines.append(f"{name.replace('_', ' ').title()}: {suite_data.get('status', 'unavailable')}{suffix}.")
+    client_suites = ("claude_acceptance", "codex_acceptance", "opencode_acceptance", "pi_acceptance")
+    if status == "not_requested":
+        # A manual dispatch can run individual clients without the full suite.
+        optional_suites = [name for name in client_suites
+                           if report.get("suites", {}).get(name, {}).get("status") not in (None, "skipped")]
+    elif status == "unavailable":
+        optional_suites = ()
+    else:
+        optional_suites = ("credentialed_tools", *client_suites)
+    for name in optional_suites:
+        suite_data = report.get("suites", {}).get(name, {})
+        cases = suite_data.get("cases", [])
+        suffix = f" ({sum(case.get('status') == 'success' for case in cases)}/{len(cases)} scenarios succeeded)" if cases else ""
+        served = suite_data.get("backend", {})
+        if served.get("local_image_id"):
+            digest = served.get("registry_digest")
+            suffix += (f"; vLLM image `{served['local_image_id']}` ({served.get('image_source') or 'unknown'}"
+                       + (f", digest `{digest}`" if digest else "") + ")")
+        lines.append(f"{name.replace('_', ' ').title()}: {suite_data.get('status', 'unavailable')}{suffix}.")
     if report.get("workflow", {}).get("url"):
         lines += ["", f"[Workflow run]({report['workflow']['url']}) and [report/diagnostic artifacts]({report['workflow']['url']}#artifacts)"]
     if detailed:
@@ -445,7 +463,7 @@ def render(report, detailed=False):
                     lines.append(f"- `{case['id']}`{sdk_info}: {case.get('outcome')} | {reason}")
                 if len(notable) > 20:
                     lines.append(f"- {len(notable) - 20} further cases in the artifact")
-        for suite_name in ("claude_acceptance", "codex_acceptance", "opencode_acceptance", "pi_acceptance"):
+        for suite_name in client_suites:
             cases = report.get("suites", {}).get(suite_name, {}).get("cases", [])
             if cases:
                 lines += ["", f"{suite_name.replace('_', ' ').title()} scenarios:"]

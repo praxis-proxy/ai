@@ -1,0 +1,53 @@
+version: 1
+id: messages/tool-result-image-promotion
+description: Images promoted out of tool_result parts keep their backend-visible order with trailing content after the tool replies of the group.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.tool_result_image_promotion
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: assistant
+              content:
+                - type: tool_use
+                  id: call_chart
+                  name: render_chart
+                  input: {}
+            - role: user
+              content:
+                - type: tool_result
+                  tool_use_id: call_chart
+                  content:
+                    - type: text
+                      text: chart
+                    - type: image
+                      source:
+                        type: url
+                        url: https://example.com/a.png
+                - type: text
+                  text: meanwhile
+                - type: image
+                  source:
+                    type: url
+                    url: https://example.com/b.png
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

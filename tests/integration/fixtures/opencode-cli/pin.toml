@@ -202,19 +202,20 @@ permission_env = "OPENCODE_PERMISSION"
 # Backend pins for the GPU nightly lane (`vllm-gpu-opencode-acceptance`). The
 # CPU lane ignores this block entirely; it runs against a scripted backend.
 #
-# Pinned by digest, and deliberately the SAME CUDA 13 image the Claude
-# acceptance job uses, so both jobs share the warmed on-disk Hugging Face cache
-# on the ephemeral GPU runner. The cu129 variant resolves a CUDA 13 torchcodec
-# wheel that cannot load without libnvrtc.so.13.
-image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
-# Weights, and the exact alias they are served under. The alias is slash-free
+# Pinned in the same two layers as the Claude Code manifest: `base_image` is
+# the upstream vLLM build, by digest, that vllm/Containerfile builds `FROM`, and
+# `baked_image` is the vllm/images.json entry the lane serves, with the weights
+# already inside. The lane records the baked image it served in its acceptance
+# results. The cu129 variant resolves a CUDA 13 torchcodec wheel that cannot
+# load without libnvrtc.so.13.
+base_image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+baked_image = "text"
+# The exact alias the baked weights are served under. The alias is slash-free
 # and matches `[opencode.provider] model_id`: the client addresses the model as
-# `<provider_id>/<model_id>`, so a name containing "/" is unaddressable.
-model = "Qwen/Qwen3-8B"
+# `<provider_id>/<model_id>`, so a name containing "/" is unaddressable. The
+# model and its Hugging Face revision are owned by the `baked_image` entry in
+# vllm/images.json.
 served_model_name = "qwen3-8b"
-# HF commit the served weights resolve to. Documentary, recorded during
-# qualification; NOT an exported pin and NOT a launch flag.
-model_revision = "TBD-at-qualification"
 # Tool-calling must be served or the tool-call scenario silently degrades to a
 # plain text turn and proves nothing. The `pins` job asserts this is non-empty
 # and that --enable-auto-tool-choice is present in the launch flags.
@@ -231,12 +232,14 @@ seed = 0
 # `--default-chat-template-kwargs` were validated together; change them as a
 # pair.
 #
-# Do NOT add --served-model-name or --api-key here: the CI container run
-# appends both separately, from `served_model_name` above and the per-job
-# ephemeral token, and duplicating them would pass the flag twice.
+# `--model` is the baked weights' path inside the image. Do NOT add
+# --served-model-name or --api-key here: the CI container run appends both
+# separately, from `served_model_name` above and the per-job ephemeral token,
+# and duplicating them would pass the flag twice. `check-pins` enforces all
+# three.
 [vllm.launch]
 flags = [
-  "--model", "Qwen/Qwen3-8B",
+  "--model", "/opt/vllm/models/Qwen/Qwen3-8B",
   "--max-model-len", "32768",
   "--enable-auto-tool-choice",
   "--tool-call-parser", "hermes",

@@ -14,6 +14,7 @@
 //! ──────────────────────────────     ────────────────────────────────────────
 //! output.message.content[].text  →  choices[0].message.content
 //! output.message.content[].toolUse → choices[0].message.tool_calls[]
+//! output.message.content[].reasoningContent → omitted (see #2055)
 //! stopReason                     →  choices[0].finish_reason
 //! usage.inputTokens              →  usage.prompt_tokens
 //! usage.outputTokens             →  usage.completion_tokens
@@ -162,8 +163,10 @@ pub(crate) fn transform_response(body: &[u8], model: &str, id: &str) -> Result<V
 /// `output.message` object.
 ///
 /// A single Bedrock message may contain multiple content blocks of mixed
-/// types; text blocks are concatenated and toolUse blocks become
-/// individual `tool_call` objects.
+/// types; text blocks are concatenated, toolUse blocks become individual
+/// `tool_call` objects, and reasoningContent blocks are omitted because Chat
+/// Completions has no corresponding response field. Issue #2055 owns a shared
+/// finite and streaming representation policy for omitted Bedrock variants.
 fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), String> {
     let content_arr = message
         .get("content")
@@ -174,13 +177,7 @@ fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), Strin
     let mut tool_calls: Vec<Value> = Vec::new();
 
     for block in content_arr {
-        if let Some(text) = block.get("text").and_then(Value::as_str) {
-            text_parts.push(text);
-        } else if let Some(tool_use) = block.get("toolUse") {
-            tool_calls.push(translate_tool_use_block(tool_use)?);
-        } else {
-            return Err("unsupported Bedrock response content block".to_owned());
-        }
+        extract_content_block(block, &mut text_parts, &mut tool_calls)?;
     }
 
     let content = if text_parts.is_empty() {
@@ -190,6 +187,41 @@ fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), Strin
     };
 
     Ok((content, tool_calls))
+}
+
+/// Validate and project one Bedrock content-block union variant.
+fn extract_content_block<'a>(
+    block: &'a Value,
+    text_parts: &mut Vec<&'a str>,
+    tool_calls: &mut Vec<Value>,
+) -> Result<(), String> {
+    let block = block
+        .as_object()
+        .ok_or("Bedrock response content block must be an object")?;
+    if block.len() != 1 {
+        return Err("Bedrock response content block must contain exactly one union variant".to_owned());
+    }
+
+    match block.iter().next() {
+        Some((variant, Value::String(text))) if variant == "text" => text_parts.push(text),
+        Some((variant, tool_use)) if variant == "toolUse" => {
+            tool_calls.push(translate_tool_use_block(tool_use)?);
+        },
+        Some((variant, Value::Object(reasoning))) if variant == "reasoningContent" => {
+            if reasoning.len() != 1 {
+                return Err("Bedrock reasoningContent block must contain exactly one union variant".to_owned());
+            }
+            debug!(
+                reasoning_field_count = reasoning.len(),
+                "omitting Bedrock reasoning content from finite Chat Completions response"
+            );
+        },
+        Some((variant, _)) if variant == "reasoningContent" => {
+            return Err("Bedrock reasoningContent block must be an object".to_owned());
+        },
+        Some(_) | None => return Err("unsupported Bedrock response content block".to_owned()),
+    }
+    Ok(())
 }
 
 /// Convert a Bedrock `toolUse` content block to an OpenAI `tool_calls` entry.
@@ -667,6 +699,175 @@ mod tests {
         assert_eq!(result["usage"]["prompt_tokens"], 20);
         assert_eq!(result["usage"]["completion_tokens"], 8);
         assert_eq!(result["usage"]["total_tokens"], 28);
+    }
+
+    #[test]
+    fn transform_response_preserves_text_beside_reasoning_content() {
+        let bedrock = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "Thinking"}}},
+                        {"text": "2"}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 5, "outputTokens": 10, "totalTokens": 15}
+        });
+
+        let body = serde_json::to_vec(&bedrock).unwrap();
+        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
+
+        assert_eq!(result["choices"][0]["message"]["content"], "2");
+        assert_eq!(result["choices"][0]["finish_reason"], "stop");
+        assert_eq!(result["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn transform_response_preserves_text_and_tools_while_omitting_signed_reasoning() {
+        let bedrock = serde_json::json!({
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": "Before "},
+                        {"reasoningContent": {
+                            "reasoningText": {"text": "Thinking", "signature": "opaque"}
+                        }},
+                        {"text": "after."},
+                        {"toolUse": {"toolUseId": "tc1", "name": "lookup", "input": {}}}
+                    ]
+                }
+            },
+            "stopReason": "tool_use"
+        });
+
+        let result: Value =
+            serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap()).unwrap();
+
+        assert_eq!(result["choices"][0]["message"]["content"], "Before after.");
+        assert_eq!(result["choices"][0]["message"]["tool_calls"][0]["id"], "tc1");
+        assert!(
+            result["choices"][0]["message"].get("reasoning_content").is_none(),
+            "the signature cannot round-trip, so extended-thinking tool loops remain unsupported until #2055"
+        );
+    }
+
+    #[test]
+    fn transform_response_preserves_text_beside_redacted_reasoning() {
+        let bedrock = serde_json::json!({
+            "output": {"message": {"content": [
+                {"reasoningContent": {"redactedContent": "b3BhcXVl"}},
+                {"text": "visible answer"}
+            ]}},
+            "stopReason": "end_turn"
+        });
+
+        let result: Value =
+            serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap()).unwrap();
+        assert_eq!(result["choices"][0]["message"]["content"], "visible answer");
+    }
+
+    #[test]
+    fn transform_response_allows_reasoning_only_completion() {
+        let bedrock = serde_json::json!({
+            "output": {"message": {"content": [
+                {"reasoningContent": {"reasoningText": {"text": "Thinking"}}}
+            ]}},
+            "stopReason": "end_turn"
+        });
+
+        let result: Value =
+            serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap()).unwrap();
+
+        assert!(result["choices"][0]["message"]["content"].is_null());
+        assert!(result["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn transform_response_omits_single_variant_reasoning_payloads() {
+        for reasoning in [
+            serde_json::json!({"reasoningText": "future shape"}),
+            serde_json::json!({"futureVariant": {"opaque": true}}),
+        ] {
+            let bedrock = serde_json::json!({
+                "output": {"message": {"content": [
+                    {"reasoningContent": reasoning},
+                    {"text": "visible answer"}
+                ]}},
+                "stopReason": "end_turn"
+            });
+
+            let result: Value =
+                serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap())
+                    .unwrap();
+            assert_eq!(result["choices"][0]["message"]["content"], "visible answer");
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_empty_or_mixed_reasoning_union() {
+        for reasoning in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "reasoningText": {"text": "ambiguous"},
+                "redactedContent": "b3BhcXVl"
+            }),
+        ] {
+            let bedrock = serde_json::json!({
+                "output": {"message": {"content": [
+                    {"reasoningContent": reasoning},
+                    {"text": "must not survive an invalid union"}
+                ]}},
+                "stopReason": "end_turn"
+            });
+
+            let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+            assert_eq!(
+                error,
+                "Bedrock reasoningContent block must contain exactly one union variant"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_every_mixed_outer_union_regardless_of_key_order() {
+        for mixed in [
+            serde_json::json!({
+                "text": "must not survive",
+                "reasoningContent": {"reasoningText": {"text": "Thinking"}}
+            }),
+            serde_json::json!({
+                "reasoningContent": {"reasoningText": {"text": "Thinking"}},
+                "image": {}
+            }),
+        ] {
+            let bedrock = serde_json::json!({
+                "output": {"message": {"content": [mixed]}},
+                "stopReason": "end_turn"
+            });
+
+            let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+            assert_eq!(
+                error,
+                "Bedrock response content block must contain exactly one union variant"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_response_rejects_non_object_reasoning_content() {
+        let bedrock = serde_json::json!({
+            "output": {"message": {"content": [
+                {"reasoningContent": "not an object"},
+                {"text": "must not survive a malformed response"}
+            ]}},
+            "stopReason": "end_turn"
+        });
+
+        let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+        assert_eq!(error, "Bedrock reasoningContent block must be an object");
     }
 
     #[test]

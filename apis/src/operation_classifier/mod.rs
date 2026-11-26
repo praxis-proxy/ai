@@ -64,7 +64,7 @@ use crate::{
     gemini::routes as gemini_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
-        files::routes as files_routes, responses::routes as responses_routes,
+        decisions::routes as decisions_routes, files::routes as files_routes, responses::routes as responses_routes,
         vector_stores::routes as vector_stores_routes,
     },
     operation::{ApplicationProtocol, OperationEntry, PathParameterOffsets, RequestBody, RouteParams, Transport},
@@ -288,6 +288,7 @@ pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option
     let http_match = (transport == Transport::Http).then(|| {
         classify_conversation(method, path)
             .or_else(|| classify_chat_completions(method, path))
+            .or_else(|| classify_decisions(method, path))
             .or_else(|| classify_files(method, path))
             .or_else(|| classify_vector_stores(method, path))
             .or_else(|| classify_anthropic_messages(method, path))
@@ -307,6 +308,11 @@ fn classify_conversation(method: &str, path: &str) -> Option<AiOperationMatch> {
 /// Match one Chat Completions operation.
 fn classify_chat_completions(method: &str, path: &str) -> Option<AiOperationMatch> {
     chat_completions_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Decisions operation.
+fn classify_decisions(method: &str, path: &str) -> Option<AiOperationMatch> {
+    decisions_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Anthropic Messages operation.

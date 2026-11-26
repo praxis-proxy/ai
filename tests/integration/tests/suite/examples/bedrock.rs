@@ -13,13 +13,12 @@ use praxis_test_utils::{
 // Tests
 // -----------------------------------------------------------------------------
 
-#[test]
-fn bedrock_converse_translates_capital_of_france_end_to_end() {
+fn assert_bedrock_converse_response(content: &[serde_json::Value]) {
     let bedrock_response = serde_json::json!({
         "output": {
             "message": {
                 "role": "assistant",
-                "content": [{"text": "Paris is the capital of France."}]
+                "content": content
             }
         },
         "stopReason": "end_turn",
@@ -59,8 +58,14 @@ fn bedrock_converse_translates_capital_of_france_end_to_end() {
         response["choices"][0]["message"]["content"], "Paris is the capital of France.",
         "caller should receive OpenAI Chat Completions content"
     );
-    assert_eq!(response["choices"][0]["finish_reason"], "stop");
-    assert_eq!(response["usage"]["total_tokens"], 19);
+    assert_eq!(
+        response["choices"][0]["finish_reason"], "stop",
+        "Bedrock end_turn must map to the Chat Completions stop reason"
+    );
+    assert_eq!(
+        response["usage"]["total_tokens"], 19,
+        "Bedrock token usage must survive the response translation"
+    );
     assert_eq!(
         upstream["messages"][0]["content"][0]["text"], "What is the capital of France?",
         "Bedrock should receive the translated Converse content block"
@@ -69,4 +74,17 @@ fn bedrock_converse_translates_capital_of_france_end_to_end() {
         upstream.get("model").is_none(),
         "Bedrock Converse carries the model in the request path, not the body"
     );
+}
+
+#[test]
+fn bedrock_converse_translates_plain_text_end_to_end() {
+    assert_bedrock_converse_response(&[serde_json::json!({"text": "Paris is the capital of France."})]);
+}
+
+#[test]
+fn bedrock_converse_preserves_answer_beside_reasoning_end_to_end() {
+    assert_bedrock_converse_response(&[
+        serde_json::json!({"reasoningContent": {"reasoningText": {"text": "Thinking"}}}),
+        serde_json::json!({"text": "Paris is the capital of France."}),
+    ]);
 }
