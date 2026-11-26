@@ -7,6 +7,8 @@ Processes an Anthropic create-message body once and publishes its facts.
 
 ## Configuration Notes
 
+Structured image/audio content is published as `modality` metadata and a branch result; it is never promoted to an HTTP header.
+
 The registry decides which operation this filter owns, so only `POST /v1/messages` has its body processed. Every other Anthropic Messages operation — token counting, the batch family — is released without body work but still gets the Anthropic error shape, because those are supported endpoints and a chain may carry no other formatter. Traffic outside the Messages surface is left entirely alone.
 
 `on_invalid` governs the envelope: a missing, malformed, or non-object body is refused with an Anthropic-compatible client error under `reject`, or forwarded for the backend to answer under `continue`.
