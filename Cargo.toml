@@ -43,10 +43,10 @@ http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 humantime-serde = "1.1.1"
-jsonschema = { version = "0.61.2", default-features = false }
+jsonschema = { version = "0.62.0", default-features = false }
 nix = { version = "0.32.0", default-features = false, features = ["process", "resource", "signal", "user"] }
 percent-encoding = "2.3.2"
-notify = "8.2.0"
+notify = "9.0.0"
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
