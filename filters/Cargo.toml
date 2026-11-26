@@ -119,7 +119,9 @@ metrics = { workspace = true }
 notify = { workspace = true }
 openssl = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
-praxis-ai-apis = { workspace = true }
+# `mcp-client`: the `mcp` broker runs its backend session handshake and
+# termination through the shared MCP client.
+praxis-ai-apis = { workspace = true, features = ["mcp-client"] }
 praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.7.0 (no extra dependencies).

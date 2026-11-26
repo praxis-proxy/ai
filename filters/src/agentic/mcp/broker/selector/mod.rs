@@ -13,11 +13,18 @@
 //! exchange to a staged endpoint (`notifications/initialized` and `DELETE`
 //! follow the `initialize` that created the session) and reports the endpoint
 //! the `load_balancer` dialed back to the broker.
+//!
+//! As the chain's first filter it also selects a streamed response when the
+//! MCP client asks for one, so an SSE handshake reply is read as it arrives.
 
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_ai_apis::mcp_session::{McpExchangeStage, McpStreamingRequested};
+use praxis_filter::{
+    BodyAccess, BodyMode, BodyRequirement, FilterAction, FilterError, HttpFilter, HttpFilterContext, RequestExtensions,
+    SubRequestResponseMode, parse_filter_config,
+};
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
@@ -43,6 +50,12 @@ impl BrokerBackendCluster {
             pinned_endpoint,
             dialed: Arc::new(OnceLock::new()),
         }
+    }
+}
+
+impl McpExchangeStage for BrokerBackendCluster {
+    fn stage(&self, extensions: &mut RequestExtensions) {
+        extensions.insert(self.clone());
     }
 }
 
@@ -109,6 +122,22 @@ impl HttpFilter for McpBrokerBackendSelectorFilter {
         self.clusters.iter().map(ToString::to_string).collect()
     }
 
+    /// The MCP client streams SSE replies; without this declaration Praxis
+    /// buffers every callout response.
+    fn may_select_streaming_subrequest_response(&self) -> bool {
+        true
+    }
+
+    /// Read-only, so pipeline finalization keeps the response streamed instead
+    /// of clamping it to a size-limited buffered mode.
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly(BodyRequirement::Optional)
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let Some(staged) = ctx.extensions.get::<BrokerBackendCluster>() else {
             return Err(format!("{}: no broker backend cluster staged on this request", Self::NAME).into());
@@ -119,6 +148,9 @@ impl HttpFilter for McpBrokerBackendSelectorFilter {
         let pinned = staged.pinned_endpoint.clone();
         ctx.cluster = Some(Arc::clone(cluster));
         ctx.pinned_endpoint_address = pinned;
+        if ctx.extensions.get::<McpStreamingRequested>().is_some() {
+            ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+        }
         Ok(FilterAction::Continue)
     }
 

@@ -134,9 +134,20 @@ generated outbound chain: the `mcp_broker_backend`
 selector, any `outbound_filters`, and a `load_balancer`
 that references each server cluster by name, so server
 clusters must be declared in top-level `clusters:`.
+Each exchange goes through the MCP client the hosted MCP
+paths use (`praxis_ai_apis::mcp_session`): `rmcp` builds
+the messages and parses the replies, and the filtered
+subrequest transport carries them. No `rmcp` service is
+kept between exchanges, so an idle backend session costs
+no task and opens no standalone `GET` stream.
 Each reply is bounded by `max_response_bytes`; oversized
 or chunked replies are rejected before the full body is
-retained. `handshake_timeout_ms` is one budget for the
+retained. An `initialize` reply on an SSE stream
+completes as soon as its JSON-RPC response arrives, even
+when the backend keeps the stream open; an
+`outbound_filters` entry that buffers response bodies
+turns that back into a read to end of stream.
+`handshake_timeout_ms` is one budget for the
 whole handshake, not for each exchange: it starts before
 the broker waits on a concurrent handshake for the same
 pair, time `initialize` spends is no longer available to

@@ -100,6 +100,11 @@ pub struct McpMockConfig {
     /// When `Some(n)`, pad the `initialize` result to at least `n` bytes and
     /// send it with chunked transfer encoding (oversized handshake scenario).
     pub oversized_initialize_bytes: Option<usize>,
+
+    /// Answer `initialize` on a `text/event-stream` response and keep that
+    /// stream open after the JSON-RPC response, which MCP Streamable HTTP
+    /// permits (the server only *should* close it).
+    pub sse_initialize_held_open: bool,
 }
 
 impl Default for McpMockConfig {
@@ -117,6 +122,7 @@ impl Default for McpMockConfig {
             structured_content: None,
             enforce_sessions: false,
             oversized_initialize_bytes: None,
+            sse_initialize_held_open: false,
         }
     }
 }
@@ -576,6 +582,11 @@ fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
         return;
     }
 
+    if config.sse_initialize_held_open {
+        write_held_open_sse(stream, &result.to_string(), session_id.as_deref());
+        return;
+    }
+
     let body = result.to_string();
     let mut headers: Vec<(&str, String)> = vec![("Content-Type", "application/json".to_owned())];
 
@@ -596,6 +607,31 @@ fn mint_session(config: &McpMockConfig, sessions: &MockSessions) -> Option<Strin
     let session = format!("mock-mcp-session-{n}");
     sessions.live.lock().unwrap().insert(session.clone());
     Some(session)
+}
+
+/// Send `message` as one SSE event, then hold the stream open with keepalive
+/// comments until the client closes it or a bounded wait elapses.
+fn write_held_open_sse(stream: &mut TcpStream, message: &str, session_id: Option<&str>) {
+    let mut head = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n");
+    if let Some(session_id) = session_id {
+        head.push_str("MCP-Session-Id: ");
+        head.push_str(session_id);
+        head.push_str("\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let event = format!("data: {message}\n\n");
+    if stream.write_all(head.as_bytes()).is_err()
+        || stream.write_all(event.as_bytes()).is_err()
+        || stream.flush().is_err()
+    {
+        return;
+    }
+    for _ in 0..300 {
+        std::thread::sleep(Duration::from_millis(100));
+        if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
+            return;
+        }
+    }
 }
 
 /// Write a JSON body with chunked transfer encoding in 4 KiB chunks.
