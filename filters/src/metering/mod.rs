@@ -228,9 +228,10 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 ///   from trusted ones, so a client-set header would choose the identity used for model authorization. Every available
 ///   model source — the identity header, the `model_to_provider` client model, and (when no client model was recorded)
 ///   the request body's top-level `"model"` (bounded pre-read) — must agree; conflicting non-empty sources, or a body
-///   `"model"` member that is ambiguous (duplicate or escaped key spellings) or undecodable (escaped or non-string
-///   value), reject with 403 before dispatch, since authorizing one source would not authorize the model the provider
-///   receives. Reporting fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass
+///   `"model"` member that is ambiguous (duplicate key spellings, whether plain or escaped) or undecodable (an escaped
+///   or non-string value), reject with 403 before dispatch, since authorizing one source would not authorize the model
+///   the provider receives. A single escaped key spelling such as `"\u006dodel"` still names `"model"` and is a normal
+///   model source. Reporting fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass
 ///   authorization: such requests reject with 403 before dispatch.
 ///
 /// With `model_policy_check: false` (default), the legacy contract is
@@ -1019,10 +1020,10 @@ enum ModelResolution {
 /// has already replaced it with the *provider* target, which legitimately
 /// differs from the public alias. With enforcement enabled every available
 /// source must name the same model: a conflict — or a body `"model"` member
-/// that is ambiguous (duplicate or escaped key spellings) or undecodable
-/// (escaped or non-string value), which the provider's parser may resolve
-/// differently — rejects rather than authorizing a model the request does not
-/// actually use. With enforcement
+/// that is ambiguous (duplicate key spellings, whether plain or escaped) or
+/// undecodable (an escaped or non-string value), which the provider's parser
+/// may resolve differently — rejects rather than authorizing a model the
+/// request does not actually use. With enforcement
 /// disabled the legacy reporting contract is preserved: the identity model,
 /// then the client-facing model, and the body is consulted later for
 /// attribution only. `default_model` is deliberately not consulted: it is a
@@ -1628,8 +1629,8 @@ enum BodyModel {
     Usable(String),
 
     /// A `"model"` member exists but cannot be attributed safely: duplicate
-    /// or escaped key spellings, an escaped or non-string value, or a
-    /// non-UTF-8 / truncated body. The provider's parser may resolve the
+    /// key spellings (plain or escaped), an escaped or non-string value, or
+    /// a non-UTF-8 / truncated body. The provider's parser may resolve the
     /// member differently, so the value must not feed authorization.
     Unusable,
 }
@@ -1653,9 +1654,10 @@ impl BodyModel {
 /// `messages` content can never misattribute the request. Returns
 /// [`BodyModel::Absent`] when the fragment contains no top-level `"model"`
 /// member, and [`BodyModel::Unusable`] when one exists but cannot be
-/// attributed safely (duplicate or escaped key spellings, an escaped or
-/// non-string value, or a body that is not valid UTF-8 or is cut off mid
-/// value).
+/// attributed safely (duplicate key spellings — plain or escaped — an
+/// escaped or non-string value, or a body that is not valid UTF-8 or is cut
+/// off mid value). A single escaped key spelling such as `"\u006dodel"`
+/// names `"model"` and yields the value like a plain spelling.
 fn extract_model_from_bytes(bytes: &[u8]) -> BodyModel {
     let Some(text) = std::str::from_utf8(bytes).ok() else {
         return BodyModel::Unusable;

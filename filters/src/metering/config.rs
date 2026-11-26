@@ -89,9 +89,11 @@ pub(super) struct ExternalMeteringConfig {
     /// recorded, since a recorded rewrite leaves the body naming the
     /// provider target) the request body — must agree: conflicting
     /// non-empty sources, or a body `"model"` member that is ambiguous
-    /// (duplicate or escaped key spellings) or undecodable (escaped or
-    /// non-string value), reject with 403 rather than authorizing a
-    /// model the provider does not receive. When identity comes from
+    /// (duplicate key spellings, whether plain or escaped) or undecodable
+    /// (an escaped or non-string value), reject with 403 rather than
+    /// authorizing a model the provider does not receive. A single escaped
+    /// key spelling such as `"\u006dodel"` still names `"model"` and is a
+    /// normal model source. When identity comes from
     /// raw `{prefix}*` request headers, the ingress boundary must strip
     /// client-supplied copies and set the headers from authenticated
     /// data: this filter cannot distinguish client-set headers.

@@ -35,10 +35,12 @@
 # is enabled, a request without a trusted tenant identity or a resolvable
 # public model is rejected with 403 before dispatch, and so is a request
 # whose model sources conflict, including a body "model" member that is
-# ambiguous (duplicate or escaped key spellings) or undecodable (escaped or
-# non-string value) (403 "conflicting model inputs for model
-# authorization") — authorizing one source would not authorize the model
-# the provider receives. When identity comes from raw {prefix}* request
+# ambiguous (duplicate key spellings, whether plain or escaped) or
+# undecodable (an escaped or non-string value) (403 "conflicting model
+# inputs for model authorization") — authorizing one source would not
+# authorize the model the provider receives. A single escaped key
+# spelling such as "\u006dodel" still names "model" and is a normal
+# model source. When identity comes from raw {prefix}* request
 # headers, the ingress boundary must strip client-supplied copies and set
 # the headers from authenticated data: the filter cannot distinguish
 # client-set headers.
