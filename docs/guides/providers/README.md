@@ -1,10 +1,10 @@
 # Connect cloud provider adapters
 
-Use these guides with the complete committed configurations they link.
-Copy and adapt those files; do not replace them with an isolated adapter
-fragment. The [path selector](../../getting-started/choose-client-and-provider.md) distinguishes native
-forwarding, protocol translation, and experimental authentication helpers.
-These instructions describe Development, not the published v0.10.0 snapshot.
+Each guide starts from a complete committed configuration. Copy and adapt that
+file rather than building from an isolated adapter fragment. The
+[path selector](../../getting-started/choose-client-and-provider.md) explains
+native forwarding, protocol translation, and the experimental authentication
+helpers. These guides describe Development, not the published v0.10.0 snapshot.
 
 ## Provider guides
 
@@ -17,45 +17,45 @@ These instructions describe Development, not the published v0.10.0 snapshot.
 
 ## Prerequisites and shared workflow
 
-Follow the [guide prerequisites](../README.md). You need an existing provider
-account/project/resource, enabled inference service, permission to invoke the
-chosen deployment/model, outbound DNS/HTTPS, and trusted CA certificates.
-Account provisioning and model access approval are provider-side prerequisites;
-Praxis authentication filters do not grant them.
+Follow the [guide prerequisites](../README.md). You need a provider
+account, project, or resource with the inference service enabled, permission to
+invoke the chosen deployment or model, outbound DNS and HTTPS, and trusted CA
+certificates. You arrange account provisioning and model access with the
+provider; Praxis authentication filters do not grant them.
 
-The provider guides use short-lived test credentials or environment-backed keys.
-Replace every placeholder before starting. Run only one configuration at a
-time on port 8080. The resulting listener is a local test gateway: configure
-authenticated ingress before exposing gateway-owned credentials remotely.
+The guides use short-lived test credentials or keys from environment variables.
+Replace every placeholder, and run one configuration at a time on port 8080.
+The listener is a local test gateway: put authenticated ingress in front of it
+before exposing gateway-owned credentials remotely.
 
-For each copied configuration, after the edits in its section:
+After making a guide's edits to your copy, validate and start it:
 
 ```console
 ./target/debug/praxis-ai --validate -c provider-local.yaml
 ./target/debug/praxis-ai -c provider-local.yaml
 ```
 
-Run the selected section's request in another shell. A successful response
-proves that request on that selected model/deployment, not every provider API.
-Expect provider errors for invalid keys, permissions, quotas, models, or regions.
-Review the response body before diagnosing a proxy fault.
+Send the guide's request from another shell. Success shows that request works
+on that model or deployment, not that every provider API does. Invalid keys,
+permissions, quotas, models, or regions produce provider errors, so read the
+response body before suspecting the proxy.
 
 ## Cleanup and qualification
 
-Stop the proxy with Ctrl+C. Unset the applicable variables in its shell:
+Stop the proxy with Ctrl+C and unset the variables you set in its shell:
 
 ```console
 unset AZURE_OPENAI_KEY AZURE_CLIENT_SECRET GCP_ACCESS_TOKEN
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 ```
 
-Delete your disposable `provider-local.yaml`, and revoke credentials created
-only for testing according to your account policy. A token copied into the
-proxy environment is not refreshed by updating a different shell; refresh
-or restart the pipeline with its credential source as documented.
+Delete `provider-local.yaml` and revoke any credentials created only for
+testing, following your account policy. Updating a token in another shell does
+not refresh the one in the proxy's environment; refresh or restart the pipeline
+from its credential source.
 
-These adaptations provide configuration/start/request instructions. They do
-not provision cloud accounts, establish provider permissions, or certify a
-provider/model. The [audit](../../developing/documentation-audit.md#verification-for-this-change)
+These guides do not provision cloud accounts, grant provider permissions, or
+certify a provider or model. The
+[audit](../../developing/documentation-audit.md#verification-for-this-change)
 records which configurations were validated and which runtime paths were
-actually exercised. No live cloud request was made for this documentation change.
+exercised; no live cloud request was made when these guides were written.
