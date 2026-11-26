@@ -156,6 +156,15 @@ features:
         status: live_covered
       vllm:
         status: live_covered
+  - id: messages.streaming.usage_first_chunk
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/first-chunk-usage-stream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.error.upstream
     scopes:
       - messages_to_chat_completions

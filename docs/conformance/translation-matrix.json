@@ -318,10 +318,10 @@
         {
           "feature": "usage-accounting",
           "label": "Token usage accounting",
-          "status": "dropped",
-          "note": "message_start.usage.input_tokens is hardcoded 0 rather than null, so clients reading prompt tokens at message_start get a wrong number, not a missing one. Finite-path usage is correct.",
-          "evidence": "apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1045-1047",
-          "blocker": "https://github.com/praxis-proxy/ai/issues/2046"
+          "status": "translated-lossy",
+          "note": "A prompt token count delivered before content generation begins is passed through to message_start with the same non-cached semantics as the terminal delta. When the upstream withholds usage until the final chunk (OpenAI, vLLM), message_start reports 0 because the pinned Anthropic schema requires non-nullable integer token counts; the final message_delta reports complete usage.",
+          "evidence": "apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:679-684; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1124-1143",
+          "blocker": null
         },
         {
           "feature": "cache-accounting",
@@ -1342,11 +1342,11 @@
     }
   ],
   "status_totals": {
-    "dropped": 17,
+    "dropped": 16,
     "n-a": 10,
     "passthrough": 21,
     "rejected": 19,
     "translated": 39,
-    "translated-lossy": 24
+    "translated-lossy": 25
   }
 }

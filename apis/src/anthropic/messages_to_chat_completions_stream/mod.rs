@@ -678,6 +678,10 @@ fn transform_chunk(
 
     let started = matches!(state.progress, StreamProgress::Started);
 
+    // Retain usage before emitting `message_start` so a prompt token count
+    // delivered before content generation begins reaches the opening event.
+    extract_usage_tokens(state, chunk);
+
     if !started {
         emit_message_start(state, chunk, output);
     }
@@ -704,7 +708,6 @@ fn transform_chunk(
         }
     }
 
-    extract_usage_tokens(state, chunk);
     Ok(())
 }
 
@@ -769,7 +772,7 @@ fn emit_message_start(state: &mut StreamState, chunk: &Value, output: &mut Vec<u
                 "stop_reason": null,
                 "stop_sequence": null,
                 "stop_details": null,
-                "usage": message_start_usage(),
+                "usage": message_start_usage(state),
                 "container": null
             }
         }),
@@ -1120,9 +1123,22 @@ fn collect_delta_usage(state: &StreamState) -> MessageDeltaUsage {
     MessageDeltaUsage::new(output_tokens, input_tokens, cache_read)
 }
 
-/// Build a schema-complete Anthropic `Message.usage` value.
-fn message_start_usage() -> MessageUsage {
-    MessageUsage::new(0, 0, None)
+/// Build a schema-complete Anthropic `Message.usage` value for `message_start`.
+///
+/// The pinned Anthropic schema requires `input_tokens` and `output_tokens` as
+/// non-nullable integers, so an unknown count has no representation other than
+/// `0`. When the upstream delivers a prompt token count before content
+/// generation begins, it is reported here — with the same non-cached semantics
+/// as the terminal delta — instead of asserting a false zero. `output_tokens`
+/// stays `0`: the authoritative output count arrives in the final
+/// `message_delta` usage.
+fn message_start_usage(state: &StreamState) -> MessageUsage {
+    let input_tokens = state.input_tokens.map(|pt| match state.cache_read_tokens {
+        Some(cached) => pt.saturating_sub(cached),
+        None => pt,
+    });
+
+    MessageUsage::new(input_tokens.unwrap_or(0), 0, state.cache_read_tokens)
 }
 
 /// Map `OpenAI` finish reasons to Anthropic stop reasons.
@@ -1593,6 +1609,9 @@ mod tests {
     fn message_start_usage_matches_anthropic_schema() {
         let (filter, mut ctx) = make_filter_and_context();
 
+        // No usage in the first chunk: the pinned Anthropic schema requires
+        // `input_tokens` and `output_tokens` as non-nullable integers, so `0`
+        // is the only schema-valid value for an unknown count.
         let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
         let mut body = Some(Bytes::from(chunk));
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
@@ -1618,6 +1637,64 @@ mod tests {
         );
         assert_u64_field(usage, "input_tokens", 0, "message_start usage");
         assert_u64_field(usage, "output_tokens", 0, "message_start usage");
+    }
+
+    #[test]
+    fn message_start_reports_usage_from_first_chunk() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n";
+        let mut body = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_start");
+        let usage = event.pointer("/message/usage").unwrap();
+        assert_u64_field(usage, "input_tokens", 8, "message_start usage");
+        assert_u64_field(usage, "cache_read_input_tokens", 5, "message_start usage");
+        assert_u64_field(usage, "output_tokens", 0, "message_start usage");
+    }
+
+    #[test]
+    fn message_start_usage_without_upstream_usage_stays_zero() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_start");
+        let usage = event.pointer("/message/usage").unwrap();
+        assert_u64_field(usage, "input_tokens", 0, "message_start usage");
+        assert_u64_field(usage, "output_tokens", 0, "message_start usage");
+    }
+
+    #[test]
+    fn message_delta_prefers_final_usage_over_first_chunk() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":0}}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let chunk2 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(chunk2));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let final_usage = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":2}}\n\n";
+        let mut body3 = Some(Bytes::from(final_usage));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body4 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body4, false).unwrap());
+
+        let out = String::from_utf8(body4.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let usage = event.get("usage").unwrap();
+        assert_u64_field(usage, "input_tokens", 14, "message_delta usage");
+        assert_u64_field(usage, "output_tokens", 2, "message_delta usage");
     }
 
     #[test]

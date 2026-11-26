@@ -85,6 +85,8 @@ class RecordingBackend(BaseHTTPRequestHandler):
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
     fragmented_stream_once = False
+    usage_first_chunk_stream_once = False
+    plain_stream_once = False
     error_response_once = False
     named_tool_finish_gate = threading.Event()
 
@@ -141,6 +143,12 @@ class RecordingBackend(BaseHTTPRequestHandler):
             elif RecordingBackend.many_tool_calls_stream_once:
                 RecordingBackend.many_tool_calls_stream_once = False
                 self._send_many_tool_calls_stream()
+            elif RecordingBackend.usage_first_chunk_stream_once:
+                RecordingBackend.usage_first_chunk_stream_once = False
+                self._send_usage_first_chunk_stream()
+            elif RecordingBackend.plain_stream_once:
+                RecordingBackend.plain_stream_once = False
+                self._send_plain_stream()
             else:
                 self._send_invalid_tool_id_stream()
             return
@@ -369,6 +377,103 @@ class RecordingBackend(BaseHTTPRequestHandler):
             }],
         }
         wire = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
+
+    def _send_usage_first_chunk_stream(self):
+        """Send a stream whose first chunk carries a prompt token count.
+
+        Mirrors OpenAI-compatible backends that report usage before content
+        generation begins: the opening chunk carries `prompt_tokens` and a
+        cached-token detail, content follows, and a final usage-only chunk
+        supersedes the opening counts.
+        """
+        def chunk(delta, finish_reason, usage):
+            return {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+                "usage": usage,
+            }
+
+        opening = chunk(
+            {"role": "assistant"},
+            None,
+            {
+                "prompt_tokens": 13,
+                "completion_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 5},
+            },
+        )
+        content = chunk({"role": "assistant", "content": "Hi"}, "stop", None)
+        final = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 2,
+                "total_tokens": 22,
+                "prompt_tokens_details": {"cached_tokens": 6},
+            },
+        }
+        wire = (
+            f"data: {json.dumps(opening)}\n\n"
+            f"data: {json.dumps(content)}\n\n"
+            f"data: {json.dumps(final)}\n\n"
+            "data: [DONE]\n\n"
+        ).encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
+
+    def _send_plain_stream(self):
+        """Send a minimal stream with no usage until a final usage-only chunk."""
+        def chunk(delta, finish_reason):
+            return {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+                "usage": None,
+            }
+
+        opening = chunk({"role": "assistant"}, None)
+        content = chunk({"role": "assistant", "content": "Hi"}, "stop")
+        final = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [],
+            "usage": {"prompt_tokens": 14, "completion_tokens": 2, "total_tokens": 16},
+        }
+        wire = (
+            f"data: {json.dumps(opening)}\n\n"
+            f"data: {json.dumps(content)}\n\n"
+            f"data: {json.dumps(final)}\n\n"
+            "data: [DONE]\n\n"
+        ).encode()
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("content-length", str(len(wire)))
@@ -1374,6 +1479,73 @@ class TestStreamingResponseValidation:
             assert message.stop_reason == "end_turn"
         finally:
             RecordingBackend.fragmented_stream_once = False
+
+    def test_message_start_reports_usage_from_first_chunk(self, anthropic_client):
+        # A prompt token count delivered before content generation begins must
+        # reach `message_start` instead of a false zero: cached tokens are
+        # excluded from `input_tokens` and reported as cache reads, matching
+        # the terminal delta's semantics.
+        RecordingBackend.usage_first_chunk_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=64,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                start_usage = None
+                delta_usage = None
+                for event in stream:
+                    if event.type == "message_start":
+                        start_usage = event.message.usage
+                    elif event.type == "message_delta":
+                        delta_usage = event.usage
+                message = stream.get_final_message()
+        finally:
+            RecordingBackend.usage_first_chunk_stream_once = False
+
+        assert start_usage is not None, "stream must open with message_start"
+        assert start_usage.input_tokens == 8, (
+            "message_start must report the non-cached prompt token count: "
+            f"{start_usage.input_tokens} != 13 - 5"
+        )
+        assert start_usage.cache_read_input_tokens == 5
+        assert start_usage.output_tokens == 0
+        assert delta_usage is not None, "stream must close with message_delta"
+        assert delta_usage.input_tokens == 14, (
+            "the final usage chunk must supersede the opening counts: "
+            f"{delta_usage.input_tokens} != 20 - 6"
+        )
+        assert delta_usage.cache_read_input_tokens == 6
+        assert delta_usage.output_tokens == 2
+        assert message.usage.output_tokens == 2
+
+    def test_message_start_usage_stays_zero_without_upstream_usage(self, anthropic_client):
+        # A stream that carries no usage until the final chunk must report
+        # schema-valid zeros in `message_start`: the pinned Anthropic schema
+        # requires non-nullable integer token counts, so an unknown count has
+        # no representation other than 0.
+        RecordingBackend.plain_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=64,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                start_usage = None
+                delta_usage = None
+                for event in stream:
+                    if event.type == "message_start":
+                        start_usage = event.message.usage
+                    elif event.type == "message_delta":
+                        delta_usage = event.usage
+        finally:
+            RecordingBackend.plain_stream_once = False
+
+        assert start_usage is not None, "stream must open with message_start"
+        assert start_usage.input_tokens == 0
+        assert start_usage.output_tokens == 0
+        assert delta_usage is not None, "stream must close with message_delta"
+        assert delta_usage.input_tokens == 14, (
+            "the final usage chunk must still reach message_delta"
+        )
 
     def test_long_matched_stop_sequence_is_reported(self, anthropic_client):
         RecordingBackend.bodies.clear()
