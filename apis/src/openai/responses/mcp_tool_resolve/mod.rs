@@ -1,27 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Filter 18: resolve MCP tool declarations into concrete tool
-//! definitions by calling upstream MCP servers' `tools/list`.
+//! Discovery operation for the Responses MCP connector.
 //!
-//! Runs after `openai_tool_parse`, gated on `openai_tool_parse.has_mcp`.
-//! Reads MCP entries from the buffered request body, checks
-//! `previous_tools` for cached listings, calls `tools/list` via
-//! the `mcp_client` module, writes `mcp_tool_map` to
-//! [`ResponsesState`], and rewrites `type: "mcp"` entries in the
-//! request body to `type: "function"`.
-//!
-//! Configured `connector_id` entries with `defer_loading: true` are
-//! accepted when the request also includes a `tool_search` tool.
-//! Those entries are resolved to an internal endpoint without an
-//! eager `tools/list` call; `connector_id`, the configured URL, and
-//! credentials are stripped from the outbound body. Deferred loading
-//! requires `openai_mcp_dispatch` inside an agentic loop. The first
-//! inference round keeps a sanitized `type: mcp` stub plus
-//! `tool_search`; any later `tool_search_call` loads every pending
-//! deferred connector. Streaming deferred `tools/list` failures use the
-//! same header-phase SSE lifecycle as the initial resolver
-//! (`response.mcp_list_tools.failed` then `response.failed`).
+//! Expands admitted MCP declarations into function tools and stores their map
+//! in [`ResponsesState`]. Eager discovery runs once per logical request and
+//! reuses eligible private listings. Deferred discovery keeps a sanitized
+//! declaration until the loop owner assigns a hosted `tool_search_call`.
+//! Both operations use the same outbound pipeline and connector policy.
 //!
 //! # Function name encoding
 //!
@@ -39,7 +25,6 @@
 //!
 //! [`ResponsesState`]: super::state::ResponsesState
 
-mod config;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -61,21 +46,19 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_core::config::InsecureOptions;
 use praxis_filter::{
-    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, ChainBindingContext, FilterAction, FilterError, FilterPipeline,
-    HttpFilter, HttpFilterContext, TerminalResponse, parse_filter_config,
+    FilterAction, FilterError, HttpFilter as _, HttpFilterContext, IterationState, Rejection, TerminalResponse,
 };
 use tracing::debug;
 
-use self::config::{McpToolResolveConfig, build_config};
+#[cfg(test)]
+use super::mcp_connector::config::{McpConnectorConfig, build_config};
 use super::{
     AgenticBudgetPolicy,
     agentic_loop::budget::input_charge,
-    bound_body_outcome,
     error::responses_error_rejection,
+    mcp_connector::McpConnectorFilter,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
 use crate::{
@@ -390,280 +373,11 @@ fn discovery_retained_charge(
 
 
 // -----------------------------------------------------------------------------
-// McpToolResolveFilter
+// McpConnectorFilter
 // -----------------------------------------------------------------------------
 
-/// Resolves MCP tool entries from the Responses API `tools` array
-/// into concrete tool definitions by calling `tools/list` on each
-/// upstream MCP server.
-///
-/// Rejects the request with HTTP 400 before any callouts if two or
-/// more resolvable MCP entries share the same `server_label`
-/// (including entries that differ only by credentials).
-///
-/// With `require_connector: true`, raw client-selected `server_url` entries are
-/// rejected before identity staging or any MCP callout. `openai_mcp_dispatch`
-/// needs no duplicate gate: its existing connector-context policy already
-/// refuses ambient identity to non-connector entries and round-matches the
-/// resolver configuration, making resolve-side rejection the single effective
-/// connector-only gate.
-///
-/// Configured `connector_id` entries with `defer_loading: true` are
-/// accepted when the request also includes a `tool_search` tool.
-/// Those entries are resolved to an internal endpoint without an
-/// eager `tools/list` call; `connector_id`, the configured URL, and
-/// credentials are stripped from the outbound body. Deferred loading
-/// requires `openai_mcp_dispatch` inside an agentic loop. The first
-/// inference round keeps a sanitized `type: mcp` stub plus
-/// `tool_search` (an OpenAI-shaped hosted-tool backend); any later
-/// `tool_search_call` loads every pending deferred connector.
-///
-/// For streaming requests, a runtime or response-processing failure from
-/// `tools/list` is returned as a successful SSE transport
-/// containing `response.mcp_list_tools.failed` and a terminal
-/// `response.failed` event. Local policy failures such as SSRF blocking
-/// remain HTTP error responses.
-///
-/// On successful discovery, one `mcp_list_tools` output item per resolved server
-/// (in request order, including servers that resolve to zero tools) is seeded into
-/// `ResponsesState` for a downstream response-finalizing filter to surface: a
-/// buffered finalizer (`openai_agentic_loop` or `openai_mcp_dispatch`) lists it in
-/// `output`, and `openai_stream_events`, when placed inside the agentic loop on the
-/// streaming path, synthesizes its
-/// `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed`
-/// → `output_item.done` lifecycle ahead of the model output. Unlike the failure
-/// lifecycle above — which
-/// this filter emits itself as a terminal SSE — a successful discovery must still
-/// proceed to inference, so it cannot be surfaced without one of those downstream
-/// filters; the minimal `mcp-tool-resolve.yaml` example therefore demonstrates
-/// resolution and the failure lifecycle only (see `agentic-loop.yaml` for a
-/// pipeline that surfaces successful listings). A previous-response cache hit
-/// surfaces the same item without re-calling `tools/list`, and internal retries
-/// reuse the item and its id rather than emitting a second discovery.
-///
-/// # YAML
-///
-/// ```yaml
-/// filter: openai_mcp_tool_resolve
-/// ```
-///
-/// # Full YAML
-///
-/// ```yaml
-/// filter: openai_mcp_tool_resolve
-/// forward_headers:
-///   - x-tenant-id
-///   - x-user-id
-/// timeout_ms: 5000
-/// max_rewritten_body_bytes: 67108864
-/// max_tools: 128
-/// # Operator-owned metadata admission (issue #1724). Defaults to advisory
-/// # (unchanged behavior); protected mode enforces the connector tool policy below.
-/// tool_admission:
-///   mode: protected          # advisory (default) | protected
-/// connectors:
-///   - id: corp_drive
-///     server_url: https://drive-mcp.internal/mcp
-///     # Connector policy defaults to deny. `allow_all` permits writes;
-///     # `read_only` admits only affirmed read-only tools.
-///     tool_policy: read_only
-/// ```
-///
-/// `forward_headers` applies only to configured `connector_id` targets. Direct
-/// client-selected `server_url` targets never receive ambient request headers.
-/// Credential headers are rejected; use the MCP tool entry's dedicated
-/// `authorization` field for per-target credentials.
-///
-/// ## Metadata admission and read-only enforcement
-///
-/// The client selector `allowed_tools.read_only` stays **advisory**: it filters
-/// using the server-supplied `annotations.readOnlyHint` and is preserved for API
-/// compatibility, not as an operator guarantee. Operator enforcement is
-/// configured under `tool_admission` and cannot be weakened by client fields,
-/// tool descriptions, annotations, labels, or a matching URL.
-///
-/// In `protected` mode a client-selected direct `server_url` is untrusted and
-/// its tools are excluded (the target is not even dialed). A connector is
-/// excluded unless the operator configures its `tool_policy`. `allow_all` admits
-/// all of its tools, including tools that write. `read_only` admits only tools
-/// with an affirmative `readOnlyHint`; writable, missing, malformed, or
-/// conflicting classifications are excluded. Eligibility is re-enforced at
-/// dispatch, so a model-generated call to an excluded tool cannot execute. The
-/// service remains the owner of its catalog and per-call authorization; Praxis
-/// does not duplicate that policy engine.
-pub struct McpToolResolveFilter {
-    /// Optional per-user bearer slot required for configured connectors.
-    user_credential_slot: Option<String>,
-
-    /// Optional opaque authorization assertion slot required for configured connectors.
-    authorization_assertion_slot: Option<String>,
-
-    /// Trusted request headers explicitly allowed across the MCP boundary.
-    forward_headers: Vec<http::HeaderName>,
-
-    /// Connector ID to server URL mapping.
-    connectors: HashMap<String, url::Url>,
-
-    /// Whether client-selected direct MCP `server_url` entries are rejected.
-    require_connector: bool,
-
-    /// Operator metadata-admission policy snapshot.
-    admission_policy: McpAdmissionPolicy,
-
-    /// Per-connector operator tool policies, keyed by connector id. Direct,
-    /// client-selected targets always use `Deny` and never appear here.
-    connector_tool_policies: HashMap<String, ConnectorToolPolicy>,
-
-    /// Maximum size in bytes of the body produced after expanding
-    /// `mcp` tool entries into `function` entries.
-    max_rewritten_body_bytes: usize,
-
-    /// Maximum number of distinct MCP servers per request.
-    max_servers: usize,
-
-    /// Maximum number of tools returned by a single MCP server.
-    max_tools: usize,
-
-    /// Bound outbound filter pipeline the `tools/list` callout dials through.
-    ///
-    /// Carries only the operator's cross-cutting filters (if any); the dial
-    /// target is staged separately by the transport, so no upstream-selecting
-    /// filter is prepended. Constructed by [`Self::from_config_with_binding`]
-    /// (real operator chain, inline or named) or [`Self::from_config`] (empty
-    /// pipeline).
-    outbound_pipeline: Arc<FilterPipeline>,
-
-    /// Per-server timeout for `tools/list` calls.
-    timeout: Duration,
-}
-
-impl McpToolResolveFilter {
-    /// Build from parsed YAML config as a plain builtin (no chain binding).
-    ///
-    /// This path cannot bind an operator `outbound_chain` (it has no
-    /// [`ChainBindingContext`]), so it builds an empty outbound pipeline and
-    /// rejects a configured `outbound_chain`. Production registers this filter as
-    /// chain-binding via [`Self::from_config_with_binding`]; this method exists
-    /// for the no-chain default and unit tests, and keeps the `name()` +
-    /// `from_config()` pair the filter-docs generator anchors on.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the config is invalid, carries an
-    /// `outbound_chain` (unsupported without chain binding), or the empty
-    /// outbound pipeline cannot be built.
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
-        let validated = build_config(cfg)?;
-        if validated.outbound_chain.is_some() {
-            return Err(FilterError::from(
-                "openai_mcp_tool_resolve: outbound_chain requires chain-binding registration; register this \
-                 filter with register_chain_binding, not as a plain builtin",
-            ));
-        }
-        // Empty outbound pipeline; posture stays at its safe default until
-        // pipeline finalization propagates the operator's global insecure options.
-        let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(false)
-            .map_err(|error| FilterError::from(format!("openai_mcp_tool_resolve: {error}")))?;
-        Self::assemble(&validated, outbound_pipeline)
-    }
-
-    /// Build from parsed YAML config, binding the operator `outbound_chain`
-    /// against the active registry.
-    ///
-    /// Registered via [`FilterRegistry::register_chain_binding`]; the resolved
-    /// outbound pipeline is owned by the returned filter and participates in
-    /// runtime-resource propagation, hot-reload file discovery, and insecure-option
-    /// application through the delegating [`HttpFilter`] hooks. Because this runs
-    /// at top-level build time with a live [`ChainBindingContext`], both an inline
-    /// `outbound_chain` and a named reference (resolved against the top-level
-    /// `filter_chains`) are supported. The dial target is staged by the transport,
-    /// so the bound chain carries only cross-cutting outbound filters.
-    ///
-    /// [`FilterRegistry::register_chain_binding`]: praxis_filter::FilterRegistry::register_chain_binding
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the config is invalid or the outbound chain
-    /// cannot be bound (an unknown named reference, a cycle, excessive nesting, a
-    /// terminal filter, or an ordering violation).
-    pub fn from_config_with_binding(
-        config: &serde_yaml::Value,
-        ctx: &ChainBindingContext<'_>,
-    ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
-        let mut validated = build_config(cfg)?;
-        let outbound_chain = validated.outbound_chain.take();
-        let outbound_pipeline =
-            mcp_client::bind_mcp_outbound_chain(outbound_chain, ctx, "openai_mcp_tool_resolve_outbound")?;
-        Self::assemble(&validated, outbound_pipeline)
-    }
-
-    /// Build the filter with an allow-private outbound pipeline, for unit tests
-    /// that dial a loopback MCP server directly.
-    ///
-    /// In production the outbound pipeline's private-upstream posture is set by
-    /// pipeline finalization from the operator's global insecure options; a unit
-    /// test that constructs the filter in isolation has no finalization pass, so
-    /// this seam bakes an allow-private empty outbound pipeline instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the config is invalid or the empty outbound
-    /// pipeline cannot be built.
-    #[cfg(test)]
-    pub(crate) fn from_config_allow_private(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
-        let validated = build_config(cfg)?;
-        let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(true)
-            .map_err(|error| FilterError::from(format!("openai_mcp_tool_resolve: {error}")))?;
-        Self::assemble(&validated, outbound_pipeline)
-    }
-
-    /// Assemble the filter from a validated config and a bound outbound pipeline.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if a connector `server_url` cannot be parsed.
-    #[expect(clippy::too_many_lines, reason = "linear field assembly for the built filter")]
-    fn assemble(
-        validated: &McpToolResolveConfig,
-        outbound_pipeline: Arc<FilterPipeline>,
-    ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let connectors = validated
-            .connectors
-            .iter()
-            .map(|c| {
-                let url = url::Url::parse(&c.server_url)
-                    .map_err(|e| FilterError::from(format!("openai_mcp_tool_resolve: connector \"{}\": {e}", c.id)))?;
-                Ok((c.id.clone(), url))
-            })
-            .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
-        let connector_tool_policies = validated
-            .connectors
-            .iter()
-            .map(|c| (c.id.clone(), c.tool_policy.snapshot()))
-            .collect();
-        Ok(Box::new(Self {
-            user_credential_slot: validated.user_credential.clone(),
-            authorization_assertion_slot: validated.authorization_assertion.clone(),
-            forward_headers: validated
-                .forward_headers
-                .iter()
-                .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
-                .collect(),
-            connectors,
-            require_connector: validated.require_connector,
-            admission_policy: validated.tool_admission.snapshot(),
-            connector_tool_policies,
-            max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
-            max_servers: validated.max_servers,
-            max_tools: validated.max_tools,
-            outbound_pipeline,
-            timeout: Duration::from_millis(validated.timeout_ms),
-        }))
-    }
-
+#[expect(clippy::multiple_inherent_impl, reason = "keep discovery separate from dispatch")]
+impl McpConnectorFilter {
     /// Acquire the MCP callout for this request: capture the parent transport
     /// and downstream attributes and pair them with the bound outbound pipeline.
     ///
@@ -719,7 +433,7 @@ impl McpToolResolveFilter {
         } else {
             None
         };
-        require_tool_search_for_deferred(ctx, &mcp_entries.values)?;
+        require_tool_search_for_deferred(ctx, &mcp_entries.values, &parsed)?;
         self.validate_entries(&mcp_entries.values)?;
 
         // Capture the parent transport + downstream attributes for the outbound
@@ -728,7 +442,7 @@ impl McpToolResolveFilter {
         let callout = self.acquire_callout(ctx)?;
         let deferred_mcp = collect_deferred_connectors(
             &mcp_entries.values,
-            self.timeout,
+            self.discovery_timeout,
             self.max_tools,
             self.max_rewritten_body_bytes,
             &self.connector_tool_policies,
@@ -981,7 +695,7 @@ impl McpToolResolveFilter {
         // covers `defer_loading: true` entries — a deferred direct `server_url`
         // (which `resolvable_server_url` reports as `None`) would otherwise
         // pass through to the backend, and a deferred untrusted connector would
-        // otherwise be dialed later by `openai_mcp_dispatch` (#1724).
+        // otherwise be dialed later by `openai_mcp_connector` (#1724).
         if let Some(reason) = protected_exclusion(entry, self.admission_policy, &self.connector_tool_policies) {
             debug!(label, ?reason, "protected mode: excluding MCP target without dialing");
             return Ok(Some(Vec::new()));
@@ -1005,7 +719,7 @@ impl McpToolResolveFilter {
             // DNS resolution happens per path.
             mcp_client::validate_mcp_target(
                 server_url,
-                self.timeout,
+                self.discovery_timeout,
                 callout.allow_private(),
                 mcp_client::mcp_resolution_policy(is_connector),
             )
@@ -1020,7 +734,7 @@ impl McpToolResolveFilter {
         let options = FetchToolsOptions {
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: is_connector.then_some(forwarded_headers),
-            timeout: self.timeout,
+            timeout: self.discovery_timeout,
             max_tools: self.max_tools,
             callout,
             connector_identity: is_connector.then_some(connector_identity).flatten(),
@@ -1028,66 +742,13 @@ impl McpToolResolveFilter {
         };
         fetch_tools(entry, server_url, options).await.map(Some)
     }
-}
 
-#[async_trait]
-impl HttpFilter for McpToolResolveFilter {
-    fn name(&self) -> &'static str {
-        "openai_mcp_tool_resolve"
-    }
-
-    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
-        // Propagate runtime resources and the finalized SSRF posture into the
-        // bound outbound pipeline. It is uniquely owned during configuration, so
-        // `Arc::get_mut` succeeds; a shared handle would mean the pipeline was
-        // already cloned before finalization, which must not happen.
-        if let Some(pipeline) = Arc::get_mut(&mut self.outbound_pipeline) {
-            visitor(pipeline);
-        } else {
-            debug_assert!(false, "outbound pipeline must be uniquely owned during configuration");
-        }
-    }
-
-    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
-        self.outbound_pipeline.referenced_files()
-    }
-
-    fn apply_insecure_options(&self, options: &InsecureOptions) {
-        self.outbound_pipeline.apply_insecure_options(options);
-    }
-
-    fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
-    }
-
-    fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
-    }
-
-    fn request_body_mode(&self) -> BodyMode {
-        // Accept up to the absolute ceiling; the pipeline's body_limits
-        // decides the real raw cap. max_rewritten_body_bytes bounds only
-        // the post-expansion body produced during resolution.
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
-    }
-
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // A streaming `tools/list` runtime failure detected during the
-        // request-body pre-read is emitted here, in the header phase, because a
-        // `TerminalResponse` returned from a body-phase hook is discarded as
-        // `Continue`. Consuming the stash exactly once yields the terminal SSE;
-        // routing it through the response phase lets `openai_stream_events` and
-        // `openai_responses_store` observe and persist the failed response.
-        Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
-    }
-
+    /// Prepare eager and deferred declarations before the first model round.
     #[expect(
         clippy::too_many_lines,
         reason = "body preflight and atomic MCP resolution share the hook"
     )]
-    async fn on_request_body(
+    pub(super) async fn prepare_mcp_tools(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
@@ -1097,7 +758,14 @@ impl HttpFilter for McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !has_mcp_tools(ctx) {
+        if !has_mcp_tools(ctx)
+            && !ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+                state
+                    .tools
+                    .iter()
+                    .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("mcp"))
+            })
+        {
             return Ok(FilterAction::Continue);
         }
 
@@ -1126,7 +794,7 @@ impl HttpFilter for McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let streaming = is_streaming(ctx);
+        let streaming = is_streaming(ctx) || parsed.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
 
         // `bytes` is an `Arc`-backed `Bytes`; cloning bumps a refcount rather than
         // copying the body, so keeping a handle for the failure path (which
@@ -1142,15 +810,6 @@ impl HttpFilter for McpToolResolveFilter {
                 Ok(resolve_error_action(ctx, &e, streaming, &bytes))
             },
         }
-    }
-
-    async fn on_bound_upstream_request_body(
-        &self,
-        ctx: &mut HttpFilterContext<'_>,
-        body: &mut Option<Bytes>,
-    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
-        let action = self.on_request_body(ctx, body, true).await?;
-        bound_body_outcome(action)
     }
 }
 
@@ -1610,24 +1269,14 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
 pub(crate) fn resolve_error_rejection(err: &ResolveError) -> FilterAction {
     let (status, error_type) = resolve_error_status(err);
     let msg = err.to_string();
-    debug!(error = %msg, "openai_mcp_tool_resolve rejected");
+    debug!(error = %msg, "openai_mcp_connector rejected");
     FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
 }
 
-/// Map a [`ResolveError`] to the [`FilterAction`] returned from the
-/// request-body phase.
-///
-/// A streaming `tools/list` runtime failure is *deferred*: a compact
-/// [`PendingListToolsFailure`] descriptor is stashed and `Continue` is
-/// returned, because a `TerminalResponse` produced here (a body-phase hook)
-/// would be swallowed as `Continue` by the pipeline. The header-phase
-/// [`consume_pending_list_tools_failure`] consumes the stash and emits the
-/// terminal SSE so the response phase can observe and persist it. All other
-/// failures -- and every local request-policy failure such as SSRF -- are
-/// rejected immediately via [`FilterAction::Reject`].
-///
-/// Called from both the initial resolver and later-round deferred discovery
-/// in `openai_mcp_dispatch`.
+/// Return an HTTP rejection for local policy errors and nonstreaming failures.
+/// For a streaming runtime failure, IRR's executor accepts the complete SSE
+/// lifecycle as a body-phase local response. Listener pipelines stash it for
+/// their normal header-phase terminal response.
 pub(crate) fn resolve_error_action(
     ctx: &mut HttpFilterContext<'_>,
     err: &ResolveError,
@@ -1637,24 +1286,29 @@ pub(crate) fn resolve_error_action(
     if streaming && is_mcp_listing_runtime_failure(err) {
         let (_, error_type) = resolve_error_status(err);
         let msg = err.to_string();
-        debug!(error = %msg, "openai_mcp_tool_resolve rejected");
-        ctx.insert_filter_state(PendingListToolsFailure {
+        debug!(error = %msg, "openai_mcp_connector rejected");
+        let pending = PendingListToolsFailure {
             server_label: failure_server_label(err).to_owned(),
             error_type,
             message: msg,
             options: capture_echoed_options(body),
-        });
+        };
+        if ctx.extensions.get::<IterationState>().is_some() {
+            // IRR turns a body-phase local response into its terminal response;
+            // the nested header phase only recognizes rejections.
+            let response = build_list_tools_failure_response(ctx, &pending);
+            let mut rejection = Rejection::status(response.status).preserving_keepalive();
+            rejection.header_map = Some(Box::new(response.headers));
+            rejection.body = response.body;
+            return FilterAction::Reject(rejection);
+        }
+        ctx.insert_filter_state(pending);
         return FilterAction::Continue;
     }
     resolve_error_rejection(err)
 }
 
-/// Consume a stashed streaming listing failure and emit the terminal SSE.
-///
-/// Used from the header-phase `on_request` of both `openai_mcp_tool_resolve`
-/// (initial eager listing) and `openai_mcp_dispatch` (later-round deferred
-/// discovery). Filter state is keyed by the stashing filter's pipeline index,
-/// so each filter consumes only its own descriptor.
+/// Consume a listener-level discovery failure in the request header phase.
 pub(crate) fn consume_pending_list_tools_failure(ctx: &mut HttpFilterContext<'_>) -> Option<FilterAction> {
     let pending = ctx.remove_filter_state::<PendingListToolsFailure>()?;
     Some(FilterAction::TerminalResponse(Box::new(
@@ -1794,16 +1448,8 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
     (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
 }
 
-/// Build the terminal HTTP 200 SSE response for a deferred MCP discovery
-/// failure.
-///
-/// Consumes the [`PendingListToolsFailure`] stashed during the body pre-read.
-/// A successful HTTP status is required for Responses SDKs to expose SSE events
-/// to callers; the terminal `response.failed` event carries the request failure
-/// instead. Emitting as a `TerminalResponse` (rather than `Reject`) runs the
-/// already-executed request-phase filters on the response path, so
-/// `openai_stream_events` accumulates the failure and `openai_responses_store`
-/// persists it for later retrieval when `store` is enabled.
+/// Encode a discovery failure as a new SSE lifecycle or the terminal part
+/// of an active logical stream, and publish the same failed resource for storage.
 #[expect(
     clippy::too_many_lines,
     reason = "the complete local Responses failure lifecycle is easier to audit in event order"
@@ -1820,19 +1466,40 @@ fn build_list_tools_failure_response(
     // (the OpenAI default). `openai_stream_events` accumulates this failure into
     // `ResponsesState` and `openai_responses_store` persists it, so this flag must
     // match what the caller observes on retrieval.
-    let store = ctx.filter_metadata.get("openai_responses_request.store") != Some("false");
-    let response_id = ctx
-        .filter_metadata
-        .get("responses.response_id")
-        .or_else(|| {
-            ctx.extensions
-                .get::<ResponsesState>()
-                .and_then(|state| state.response_id.as_deref())
-        })
+    let store = ctx.filter_metadata.get("openai_responses_request.store") != Some("false")
+        && ctx
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.request_body.get("store").and_then(serde_json::Value::as_bool))
+            != Some(false);
+    let continuing_stream = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.logical_stream_response_id.is_some());
+    let mut body = if continuing_stream {
+        let Some(body) = super::stream_events::prepare_local_terminal_events(ctx) else {
+            return discovery_failure_terminal(
+                super::stream_events::encode_local_error(ctx, "server_error", "response payload limit exceeded")
+                    .unwrap_or_default(),
+            );
+        };
+        body
+    } else {
+        Vec::new()
+    };
+    let flushed_bytes = body.len();
+    let state = ctx.extensions.get::<ResponsesState>();
+    let response_id = state
+        .and_then(|state| state.logical_stream_response_id.as_deref())
+        .or_else(|| ctx.filter_metadata.get("responses.response_id"))
+        .or_else(|| state.and_then(|state| state.response_id.as_deref()))
         .map_or_else(
             || format!("resp_{}", ctx.id_generator.generate(ctx.time_source)),
             ToOwned::to_owned,
         );
+    let (sequence, output_index) = state.filter(|_| continuing_stream).map_or((2, 0), |state| {
+        (state.logical_stream_sequence, state.accumulated_output.len())
+    });
     let item_id = format!("mcpl_{}", ctx.id_generator.generate(ctx.time_source));
     let created_at = ctx.time_source.now().as_secs();
     // Size-bounded, credential-free request options captured from the request
@@ -1867,7 +1534,6 @@ fn build_list_tools_failure_response(
         store,
         request: options,
     };
-    let response = discovery_response(&params, DiscoveryResponseState::InProgress);
     let pending_item = serde_json::json!({
         "id": item_id,
         "type": "mcp_list_tools",
@@ -1875,40 +1541,27 @@ fn build_list_tools_failure_response(
         "tools": [],
         "error": null,
     });
-    let mut body = Vec::new();
 
-    // Each lifecycle event embeds a response snapshot. `json!` takes `response`
-    // by reference (so the same value is reused across the created/in_progress
-    // frames without a `.clone()` at the call site), but interpolating a `Value`
-    // deep-copies it into each frame via `serde_json::to_value`. This is a cold,
-    // one-shot local failure path, so the extra copies are immaterial. The
-    // snapshot echoes the caller's request parameters (see `discovery_response`);
-    // request `input` and `tools` are intentionally absent, the latter because
-    // MCP entries can carry per-entry credentials that must not be persisted.
-    append_sse_event(
-        "response.created",
-        &serde_json::json!({
-            "type": "response.created",
-            "sequence_number": 0,
-            "response": response,
-        }),
-        &mut body,
-    );
-    append_sse_event(
-        "response.in_progress",
-        &serde_json::json!({
-            "type": "response.in_progress",
-            "sequence_number": 1,
-            "response": response,
-        }),
-        &mut body,
-    );
+    if !continuing_stream {
+        let response = discovery_response(&params, DiscoveryResponseState::InProgress);
+        for (sequence_number, event_type) in [(0, "response.created"), (1, "response.in_progress")] {
+            append_sse_event(
+                event_type,
+                &serde_json::json!({
+                    "type": event_type,
+                    "sequence_number": sequence_number,
+                    "response": response,
+                }),
+                &mut body,
+            );
+        }
+    }
     append_sse_event(
         "response.output_item.added",
         &serde_json::json!({
             "type": "response.output_item.added",
-            "sequence_number": 2,
-            "output_index": 0,
+            "sequence_number": sequence,
+            "output_index": output_index,
             "item": pending_item,
         }),
         &mut body,
@@ -1917,8 +1570,8 @@ fn build_list_tools_failure_response(
         "response.mcp_list_tools.in_progress",
         &serde_json::json!({
             "type": "response.mcp_list_tools.in_progress",
-            "sequence_number": 3,
-            "output_index": 0,
+            "sequence_number": sequence.saturating_add(1),
+            "output_index": output_index,
             "item_id": item_id,
         }),
         &mut body,
@@ -1928,8 +1581,8 @@ fn build_list_tools_failure_response(
         "response.mcp_list_tools.failed",
         &serde_json::json!({
             "type": "response.mcp_list_tools.failed",
-            "sequence_number": 4,
-            "output_index": 0,
+            "sequence_number": sequence.saturating_add(2),
+            "output_index": output_index,
             "item_id": item_id,
         }),
         &mut body,
@@ -1945,74 +1598,85 @@ fn build_list_tools_failure_response(
         "response.output_item.done",
         &serde_json::json!({
             "type": "response.output_item.done",
-            "sequence_number": 5,
-            "output_index": 0,
+            "sequence_number": sequence.saturating_add(3),
+            "output_index": output_index,
             "item": failed_item,
         }),
         &mut body,
     );
 
-    let response = discovery_response(
-        &params,
-        DiscoveryResponseState::Failed {
-            error_type,
-            message,
-            item: &failed_item,
-        },
-    );
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+    if continuing_stream && !state.response_object.is_object() {
+        state.response_object = std::mem::take(&mut state.local_completion_response_template);
+    }
+    if let Some(response) = state.response_object.as_object_mut().filter(|_| continuing_stream) {
+        // Keep the fields already published for this logical response.
+        response.insert("status".to_owned(), serde_json::json!("failed"));
+        response.insert("completed_at".to_owned(), serde_json::Value::Null);
+        response.insert("incomplete_details".to_owned(), serde_json::Value::Null);
+        response.insert(
+            "error".to_owned(),
+            serde_json::json!({"code": error_type, "message": message}),
+        );
+        response.insert("store".to_owned(), serde_json::Value::Bool(store));
+    } else {
+        state.response_object = discovery_response(
+            &params,
+            DiscoveryResponseState::Failed {
+                error_type,
+                message,
+                item: &failed_item,
+            },
+        );
+    }
+    if continuing_stream {
+        // The same resource is used for the terminal frame and persistence.
+        // Canonicalize the already-streamed output before serializing it.
+        state.accumulated_output.push(failed_item);
+        if let Err(error) = super::stream_events::canonicalize_logical_response(state, state.history_rehydrated) {
+            state.response_object = serde_json::Value::Null;
+            body.truncate(flushed_bytes);
+            if let Some(error_body) = super::stream_events::encode_local_error(ctx, "server_error", &error.to_string())
+            {
+                body.extend_from_slice(&error_body);
+            }
+            return discovery_failure_terminal(Bytes::from(body));
+        }
+        state.logical_stream_sequence = sequence.saturating_add(5);
+        state.local_stream_terminal_emitted = true;
+    }
     append_sse_event(
         "response.failed",
-        &serde_json::json!({
-            "type": "response.failed",
-            "sequence_number": 6,
-            "response": response,
-        }),
+        &DiscoveryFailedEvent {
+            r#type: "response.failed",
+            sequence_number: sequence.saturating_add(4),
+            response: &state.response_object,
+        },
         &mut body,
     );
 
-    // Publish the terminal failed resource directly into the shared state so
-    // `openai_responses_store` can persist it. Streaming persistence reads
-    // `ResponsesState.response_object`, which is normally populated by
-    // `openai_stream_events` accumulating the terminal frame on the response
-    // phase. But this filter's short-circuiting `TerminalResponse` means any
-    // filter ordered *after* it never runs on the response phase, so persistence
-    // cannot rely on `openai_stream_events` to populate the field:
-    //   * In `agentic-loop.yaml`, `openai_stream_events` is nested in the iterative_request_router that follows this
-    //     filter, so it never runs.
-    //   * A pipeline with `openai_responses_store` + this filter but without
-    //     `openai_responses_request`/`openai_responses_rehydrate` never builds a `ResponsesState` up front, yet still
-    //     persists purely from `response_object` (the store reads only that field, not `request_body`).
-    // `get_or_insert_with` therefore both creates the state when absent and
-    // writes the snapshot, making persistence independent of pipeline ordering
-    // and of which upstream filters ran. When `openai_stream_events` *does* run
-    // on the response phase it overwrites this with the identical snapshot parsed
-    // from the same terminal frame (a full overwrite, not an append), so this
-    // write is a harmless no-op in that ordering. The echoed options borrow
-    // `pending` (not `ctx`) and the `model` metadata borrow of `ctx` both ended
-    // with the final `discovery_response` call above, so the snapshot is moved
-    // into state here without a clone.
-    ctx.extensions
-        .get_or_insert_with(ResponsesState::default)
-        .response_object = response;
+    discovery_failure_terminal(Bytes::from(body))
+}
 
-    // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
-    // response preserves downstream keepalive (this is a successful 200 transport
-    // of a failure, so it must pool like any normal Responses stream) and runs
-    // the response-phase filters that already executed in the request phase. That
-    // response-phase pass is the point: `openai_stream_events` accumulates the
-    // terminal `response.failed` into `ResponsesState` and `openai_responses_store`
-    // persists it, so a caller with `store` enabled can retrieve the failed
-    // response afterwards. The failure was stashed during the body pre-read and
-    // this response is built once here in the header phase, after the full request
-    // body was consumed, so upstream routing and I/O are skipped.
+/// Borrow the persisted snapshot when serializing the terminal SSE event.
+#[derive(serde::Serialize)]
+struct DiscoveryFailedEvent<'a> {
+    /// OpenAI event name.
+    r#type: &'static str,
+    /// Event ordinal in the logical response.
+    sequence_number: u64,
+    /// Failed Responses resource.
+    response: &'a serde_json::Value,
+}
+
+/// Wrap a local discovery failure stream in an HTTP terminal response.
+fn discovery_failure_terminal(body: Bytes) -> TerminalResponse {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("text/event-stream"),
     );
-    TerminalResponse::new(200)
-        .with_headers(headers)
-        .with_body(Bytes::from(body))
+    TerminalResponse::new(200).with_headers(headers).with_body(body)
 }
 
 /// Lifecycle stage a discovery-failure response snapshot represents.
@@ -2124,11 +1788,11 @@ fn discovery_response(params: &DiscoveryResponseParams<'_>, state: DiscoveryResp
 }
 
 /// Serialize one named SSE frame.
-fn append_sse_event(event_type: &str, payload: &serde_json::Value, output: &mut Vec<u8>) {
+fn append_sse_event(event_type: &str, payload: &impl serde::Serialize, output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
-    output.extend_from_slice(payload.to_string().as_bytes());
+    drop(serde_json::to_writer(&mut *output, payload));
     output.extend_from_slice(b"\n\n");
 }
 
@@ -2171,11 +1835,21 @@ fn is_deferred_connector(entry: &serde_json::Value) -> bool {
 fn require_tool_search_for_deferred(
     ctx: &HttpFilterContext<'_>,
     entries: &[serde_json::Value],
+    body: &serde_json::Value,
 ) -> Result<(), ResolveError> {
     let Some(entry) = entries.iter().find(|entry| is_deferred_connector(entry)) else {
         return Ok(());
     };
-    if has_tool_search(ctx) {
+    if has_tool_search(ctx)
+        || body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("tool_search"))
+            })
+    {
         return Ok(());
     }
     let connector_id = entry
@@ -2195,7 +1869,7 @@ fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Snapshot deferred connector entries into request-scoped state.
 ///
-/// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`
+/// The deferred `tools/list` callout is issued later by `openai_mcp_connector`
 /// inside the IRR step, so its SSRF posture is governed by that filter's outbound
 /// callout — not captured here.
 #[expect(
@@ -2219,7 +1893,7 @@ fn collect_deferred_connectors(
             let tool_policy = connector_tool_policies.get(connector_id).copied().unwrap_or_default();
             // Protected mode excludes a connector that can supply no admissible
             // tool in `resolve_entry` without dialing, so never queue it for
-            // deferred discovery — doing so would make `openai_mcp_dispatch` dial
+            // deferred discovery — doing so would make `openai_mcp_connector` dial
             // the service only to deny every tool (and abort the request if it is
             // unreachable). Covers connectors with tool_policy: deny (#1724).
             if protected_exclusion_reason(tool_policy, policy).is_some() {
@@ -2240,7 +1914,7 @@ fn collect_deferred_connectors(
                 server_url: server_url.to_owned(),
                 timeout,
                 // Tool policy is stamped from operator configuration at resolve time so
-                // deferred discovery (which runs inside openai_mcp_dispatch) never
+                // deferred discovery (which runs inside openai_mcp_connector) never
                 // needs the resolver's connector config.
                 tool_policy,
             })

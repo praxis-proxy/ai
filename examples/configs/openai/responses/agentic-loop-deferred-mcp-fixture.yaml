@@ -6,8 +6,8 @@
 # never opens an independent MCP callout. The configured connector URL is the
 # replay-owned inference backend and is not contacted on this path.
 #
-# Later-round discovery after `tool_search_call` requires `openai_mcp_dispatch`
-# and a live MCP server; that flow is covered by functional tests, not replay.
+# The connector runs inside the single terminal inference step. Functional
+# tests cover later-round discovery with a controlled MCP server.
 
 listeners:
   - name: ai-gateway
@@ -50,10 +50,6 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
-      - filter: openai_mcp_tool_resolve
-        connectors:
-          - id: corp_drive
-            server_url: http://127.0.0.1:3001/mcp
 
       - filter: iterative_request_router
         initial_step: inference
@@ -61,6 +57,10 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              - filter: openai_mcp_connector
+                connectors:
+                  - id: corp_drive
+                    server_url: http://127.0.0.1:3001/mcp
               - filter: openai_agentic_loop
                 max_infer_iters: 1
               - filter: openai_responses_proxy

@@ -139,14 +139,7 @@
 #      (on_unsupported: continue). This filter is optional — omit it when
 #      the inference backend natively supports input_file.
 #
-#   9. openai_mcp_tool_resolve resolves MCP tool entries from the tools
-#      array by calling tools/list on each upstream MCP server. Runs after
-#      rehydrate so previous_tools is available for cross-request caching.
-#      Writes mcp_tool_map to ResponsesState for downstream tool dispatch.
-#      Projected identity headers are forwarded only to operator-configured
-#      connector_id targets, never arbitrary client-selected server_url values.
-#
-#   10. Two terminal branches consume the frozen binding before the IRR.
+#   9. Two terminal branches consume the frozen binding before the IRR.
 #       One forwards provider-owned OpenAI Responses traffic unchanged; the
 #       other preserves the direct service/WebSocket routes. Both use
 #       `cluster_source: bound_upstream`, so no second routing decision can
@@ -172,7 +165,7 @@
 # IRR inference filter chain (canonical #1046 order with
 # protocol-adaptive translation):
 #   Request phase (forward):
-#     openai_stream_events → openai_web_search_dispatch → openai_mcp_dispatch
+#     openai_stream_events → openai_web_search_dispatch → openai_mcp_connector
 #       → openai_file_search_dispatch → ai_guardrails
 #       → openai_agentic_loop
 #       → headers → load_balancer(cluster_source=bound_upstream)
@@ -191,11 +184,10 @@
 #   openai_stream_events observe it. Exactly one body builder fires per
 #   request, keyed to the selected cluster's declared application_protocol;
 #   the match fails closed when the cluster declares none.
-#   The three dispatchers (openai_web_search_dispatch, openai_mcp_dispatch,
-#   openai_file_search_dispatch) have no response phase: each executes the
-#   loop owner's assigned calls at request-body EOS on the next iteration,
-#   reconciling results in place inside ResponsesState.accumulated_output.
-#   Each is inert unless the model emits the matching hosted tool call.
+#   The MCP connector resolves the effective declarations during the first
+#   inference round. On re-entry, the connector and the web- and file-search
+#   dispatchers execute the loop owner's assignments and write their results
+#   into ResponsesState.accumulated_output.
 #   ai_guardrails follows all dispatchers and checks only their newly produced
 #   local result suffix before openai_agentic_loop may allow model re-entry.
 #
@@ -710,19 +702,6 @@ filter_chains:
         default_model: gpt-4o-mini
         timeout_ms: 60000
 
-      - filter: openai_mcp_tool_resolve
-        user_credential: mcp_gateway
-        authorization_assertion: mcp_gateway
-        require_connector: true
-        forward_headers:
-          - x-tenant-id
-          - x-user-id
-        # Ambient trusted headers are forwarded only for connector-backed MCP
-        # entries; arbitrary client-supplied server_url targets never receive
-        # them. Clients reference this destination with connector_id.
-        connectors:
-          - id: trusted-mcp
-            server_url: http://127.0.0.1:8001/mcp
 
   # Terminal managed execution: the local resource-store 404 and the agentic
   # loop. This chain intentionally declares NO shared condition. OpenAI-bound
@@ -825,15 +804,21 @@ filter_chains:
                 # the exact resolved provider authority.
                 user_credential: brave_search
                 max_calls_per_round: 32
-              # Request-phase dispatcher: runs second on re-entry to execute
-              # MCP calls prepared and classified by the loop owner. Inert
-              # until the model emits an MCP tool call.
-              - filter: openai_mcp_dispatch
+              # Resolve eager MCP declarations before the first model call
+              # and execute the loop owner's assignments on re-entry.
+              - filter: openai_mcp_connector
                 user_credential: mcp_gateway
                 authorization_assertion: mcp_gateway
+                require_connector: true
                 forward_headers:
                   - x-tenant-id
                   - x-user-id
+                # Ambient trusted headers are forwarded only for connector-backed MCP
+                # entries; arbitrary client-supplied server_url targets never receive
+                # them. Clients reference this destination with connector_id.
+                connectors:
+                  - id: trusted-mcp
+                    server_url: http://127.0.0.1:8001/mcp
                 max_calls_per_round: 32
                 max_parallel_calls: 8
                 max_result_bytes: 1048576
@@ -987,7 +972,7 @@ filter_chains:
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
-              # request-phase dispatchers (web_search, mcp_dispatch,
+              # request-phase dispatchers (web_search, mcp_connector,
               # file_search_dispatch), and publishes the single continuation
               # signal. The IRR transitions only on the owner's action, never
               # on a dispatcher's.

@@ -57,7 +57,6 @@ filter_chains:
       # Resolves request-supplied MCP server_url tools before the first model
       # round. Production deployments should prefer configured connector_id
       # destinations and appropriate outbound policy.
-      - filter: openai_mcp_tool_resolve
 
       - filter: iterative_request_router
         initial_step: inference
@@ -74,7 +73,7 @@ filter_chains:
               - filter: openai_stream_events
 
               # Executes MCP assignments from the preceding model response.
-              - filter: openai_mcp_dispatch
+              - filter: openai_mcp_connector
                 max_calls_per_round: 32
                 max_parallel_calls: 8
                 max_result_bytes: 1048576

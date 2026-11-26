@@ -19,6 +19,7 @@ Domain handling matches hosted OpenAI where hosted documents it: each list accep
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `native_tool_compat` | bool | no | Lower hosted tools for native function-only Responses backends. |
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
 | `user_credential` | string | no | Optional callout-credential slot id (see [`WebSearchFilterConfig::user_credential`]). |
 | `api_key` | CredentialSource | yes | API key credential source for the search provider: exactly one of `value`, `env_var`, or `file`; see [`CredentialSource`]. |

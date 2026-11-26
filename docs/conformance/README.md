@@ -5,6 +5,10 @@ surfaces: Conversations, Responses and Files. Use it when you change
 OpenAI-compatible behavior and need to regenerate the report and pass the CI
 gate.
 
+See the [Responses support and qualification table](openai-responses-state-conformance.md#responses-support-and-qualification) for state parameters, SDK versions, and the native and translated vLLM test lanes.
+
+For verified CLI edits, permission modes and compaction outcomes by model and API route, see [Coding harness compatibility](coding-harness-compatibility.md).
+
 For the external OpenResponses runtime suite, see
 [full acceptance](openresponses-acceptance.md) and the separately scoped
 [translation coverage](openresponses-translation.md). The directory also

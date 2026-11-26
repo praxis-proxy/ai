@@ -436,11 +436,7 @@ mod tests {
     fn full_flow_flattens_to_thirty_six_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
-        assert_eq!(
-            nodes.len(),
-            36,
-            "22 main (incl. IRR) + 13 IRR-step filters + 1 unsupported-method static_response"
-        );
+        assert_eq!(nodes.len(), 35, "21 main + 13 IRR-step + 1 fallback filter");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -473,13 +469,12 @@ mod tests {
                 "openai_file_resolve",
                 "openai_doc_extract",
                 "openai_responses_compact",
-                "openai_mcp_tool_resolve",
                 "static_response",
                 IRR_FILTER,
                 "project_state_owner_headers",
                 "openai_stream_events",
                 "openai_web_search_dispatch",
-                "openai_mcp_dispatch",
+                "openai_mcp_connector",
                 "openai_file_search_dispatch",
                 "ai_guardrails",
                 "openai_agentic_loop",
@@ -496,22 +491,21 @@ mod tests {
         assert!(
             nodes
                 .iter()
-                .take(22)
+                .take(21)
                 .all(|node| node.depth == 0 && node.irr_step.is_none()),
             "all main-chain filters, including the IRR, have depth zero and no step owner"
         );
         assert!(
             nodes
                 .iter()
-                .skip(22)
+                .skip(21)
                 .take(13)
                 .all(|node| node.depth == 1 && node.irr_step.as_deref() == Some("inference")),
             "all inference-step filters have depth one and retain their step owner"
         );
-        let trailing = nodes.last().expect("flattened graph is non-empty");
-        assert_eq!(trailing.filter_type, "static_response");
-        assert_eq!(trailing.depth, 0, "unsupported-method chain stays on the main depth");
-        assert!(trailing.irr_step.is_none());
+        let fallback = nodes.last().expect("unsupported-method fallback exists");
+        assert_eq!(fallback.depth, 0);
+        assert!(fallback.irr_step.is_none());
     }
 
     #[test]

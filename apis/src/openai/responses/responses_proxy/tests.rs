@@ -1685,3 +1685,39 @@ fn repeated_input_members_reuse_one_input_measurement() {
     assert!(message.contains(&output.len().to_string()), "{message}");
     assert!(message.contains(&limit.to_string()), "{message}");
 }
+
+#[tokio::test]
+async fn native_search_lowers_after_rich_client_tool_validation() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request = json!({"model":"qwen", "input":"search", "tools":[
+        {"type":"custom","name":"edit","format":{"type":"text"}},
+        {"type":"web_search","external_web_access":true,"search_content_types":["text","image"]}
+    ]});
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(request.clone()));
+    ctx.extensions
+        .insert(super::super::web_search_dispatch::NativeWebSearchCompatibility);
+    let compat =
+        super::super::openai_client_tool_compat::ClientToolCompatFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+    assert!(matches!(
+        compat.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let proxy = make_filter();
+    assert!(matches!(
+        proxy
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap(),
+        SelectedUpstreamBodyOutcome::Continue
+    ));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["tools"][1]["type"], "function");
+    assert_eq!(outbound["tools"][1]["name"], "web_search");
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().tools[1]["type"],
+        "web_search"
+    );
+}

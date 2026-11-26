@@ -1,7 +1,7 @@
 # MCP Approval Floor
 # Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
-# Demonstrates the openai_mcp_dispatch operator approval floor on a complete
+# Demonstrates the openai_mcp_connector operator approval floor on a complete
 # persisted agentic Responses pipeline. The floor (minimum_approval: always) is
 # combined monotonically with each MCP tool's client require_approval, so a
 # client that submits "require_approval": "never" still produces an
@@ -20,7 +20,7 @@
 #
 # The pipeline mirrors agentic-loop.yaml (see it for the full lifecycle): a pre-
 # IRR state setup with a Responses store and rehydrate, then an
-# iterative_request_router inference step that pairs openai_mcp_dispatch with the
+# iterative_request_router inference step that pairs openai_mcp_connector with the
 # openai_agentic_loop owner. The store is REQUIRED: a pending approval is
 # correlated on the follow-up turn via previous_response_id, so the floor fails
 # closed (store=false -> 400, no store -> 500) when it cannot persist.
@@ -28,9 +28,9 @@
 # Pipeline ordering (pre-IRR, runs once):
 #   ai_operation -> openai_responses_request (x2) -> openai_tool_parse
 #     -> state_owner -> openai_responses_store -> openai_responses_rehydrate
-#     -> openai_mcp_tool_resolve
+#     -> openai_mcp_connector
 # IRR inference step:
-#   openai_stream_events -> openai_mcp_dispatch (minimum_approval: always)
+#   openai_stream_events -> openai_mcp_connector (minimum_approval: always)
 #     -> openai_agentic_loop -> openai_responses_proxy -> router -> load_balancer
 #
 # Example (client asks for NO approval; the operator floor forces it):
@@ -94,7 +94,6 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
-      - filter: openai_mcp_tool_resolve
 
       - filter: iterative_request_router
         initial_step: inference
@@ -105,7 +104,7 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
-              - filter: openai_mcp_dispatch
+              - filter: openai_mcp_connector
                 # Operator approval floor: force approval for every MCP call in
                 # this pipeline, regardless of the client's per-tool
                 # require_approval. Remove this line to restore client-driven

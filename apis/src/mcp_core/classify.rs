@@ -8,13 +8,13 @@
 //! an MCP call at all and, if so, whether it may execute automatically or must
 //! be returned to the client for approval. It exposes a deliberately narrow
 //! surface — the [`McpDisposition`] enum and the [`classify_mcp`] function —
-//! so the agentic loop owner and every dispatcher (`openai_mcp_dispatch`,
+//! so the agentic loop owner and every dispatcher (`openai_mcp_connector`,
 //! `openai_file_search_dispatch`) can agree on the disposition of a call
 //! without any dispatcher importing another dispatcher's internals.
 //!
 //! The approval-policy helpers ([`parse_approval_policy`], [`requires_approval`])
-//! live here rather than in `openai_mcp_dispatch` so that this module stays
-//! neutral: `classify_mcp` composes them, and `openai_mcp_dispatch` imports them
+//! live here rather than in `openai_mcp_connector` so that this module stays
+//! neutral: `classify_mcp` composes them, and `openai_mcp_connector` imports them
 //! from here for its private [`PendingApproval`] construction.
 //!
 //! [`PendingApproval`]: crate::openai::responses::mcp_dispatch
@@ -27,7 +27,7 @@ use super::naming::{McpToolIndex, McpToolMatch};
 ///
 /// This is intentionally a unit-variant enum: it carries the *decision* only,
 /// never the per-call data (`call_id`/`server_label`/`tool_name`/`arguments`)
-/// that `openai_mcp_dispatch` needs to build a client-visible
+/// that `openai_mcp_connector` needs to build a client-visible
 /// `mcp_approval_request`. That construction stays private to the dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(any(test, feature = "openai-agentic-loop"))]
