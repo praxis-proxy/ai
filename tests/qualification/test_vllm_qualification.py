@@ -65,16 +65,22 @@ class QualificationTest(unittest.TestCase):
             evidence = Path(directory, "native.json")
             evidence.write_text(json.dumps({"outcomes": [["verified file edit", "passed"]]}))
             output = Path(directory, "acceptance.json")
+            search = Path(directory, "search.json")
+            search.write_text(json.dumps({"outcomes": [["cited live search source", "passed"]]}))
             env = {"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2", "VLLM_GPU_MODEL": "checkpoint",
                    "CODEX_VLLM_MODEL": "served", "VLLM_GPU_IMAGE": "image", "CODEX_TOOL_CALL_PARSER": "hermes",
                    "CODEX_REASONING_PARSER": "deepseek_r1", "CODEX_NATIVE": "success",
-                   "CODEX_NATIVE_EVIDENCE": str(evidence), "CODEX_TRANSLATED": "skipped"}
+                   "CODEX_NATIVE_EVIDENCE": str(evidence), "CODEX_TRANSLATED": "skipped",
+                   "CODEX_NATIVE_SEARCH": "success", "CODEX_NATIVE_SEARCH_EVIDENCE": str(search),
+                   "CODEX_TRANSLATED_SEARCH": "failure"}
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                 qualification, "model_revision", return_value=None
             ), mock.patch.object(subprocess, "check_output", return_value="abcd"):
                 qualification.capture_codex(output)
             suite = qualification.acceptance(output, "success", 17, 2, "abcd", "Codex")
-            native, translated, compaction = suite["cases"]
+            native, translated, compaction, native_search, translated_search = suite["cases"]
+            self.assertEqual(native_search["capabilities"]["outcomes"], [["cited live search source", "passed"]])
+            self.assertEqual(translated_search, {"id": "codex_translated_search", "status": "failure"})
             self.assertEqual(suite["cases"][0]["capabilities"]["checkpoint"], "checkpoint")
             self.assertNotIn("checkout_sha", native["capabilities"])
             self.assertEqual(native["capabilities"]["outcomes"], [["verified file edit", "passed"]])

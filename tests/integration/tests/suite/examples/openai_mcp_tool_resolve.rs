@@ -15,7 +15,7 @@ use praxis_test_utils::{
 // -----------------------------------------------------------------------------
 
 #[test]
-fn openai_mcp_tool_resolve_example_passes_through_non_mcp_request() {
+fn openai_mcp_connector_example_passes_through_non_mcp_request() {
     let backend_guard = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 
@@ -38,7 +38,7 @@ fn openai_mcp_tool_resolve_example_passes_through_non_mcp_request() {
 }
 
 #[test]
-fn openai_mcp_tool_resolve_example_rejects_ssrf_url() {
+fn openai_mcp_connector_example_rejects_ssrf_url() {
     let backend_guard = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 
@@ -67,7 +67,7 @@ fn openai_mcp_tool_resolve_example_rejects_ssrf_url() {
 }
 
 #[test]
-fn openai_mcp_tool_resolve_example_passes_through_function_tools() {
+fn openai_mcp_connector_example_passes_through_function_tools() {
     let backend_guard = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 

@@ -2,13 +2,12 @@
 
 This guide runs Codex, Claude Code, OpenCode, and pi inside
 [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) sandboxes while Praxis
-and vLLM keep serving inference from the host. It builds on
-[Run your Code Harness through Praxis and vLLM](cli-vllm-through-praxis.md):
-the vLLM setup, Praxis build, client flags, and troubleshooting there all still
-apply. This guide covers only what the sandbox changes. It was verified against
-OpenShell 0.1.6 with the Podman compute driver, with each harness at the version
-pinned under `tests/integration/fixtures/` completing a file-writing tool turn
-against Qwen3-30B on vLLM.
+and vLLM serve inference from the host. It covers only what the sandbox changes;
+the vLLM setup, Praxis build, client flags, and troubleshooting in
+[Run your Code Harness through Praxis and vLLM](cli-vllm-through-praxis.md)
+still apply. It was verified against OpenShell 0.1.6 with the Podman compute
+driver: each harness, at the version pinned under `tests/integration/fixtures/`,
+completed a file-writing tool turn against Qwen3-30B on vLLM.
 
 ```text
 ┌──────────── OpenShell sandbox ────────────┐
@@ -27,7 +26,7 @@ against Qwen3-30B on vLLM.
    vLLM (local or on-demand endpoint)
 ```
 
-The setup keeps each credential at its own boundary:
+Each credential stays at its own boundary:
 
 | Credential | Held by | Reaches |
 | --- | --- | --- |
@@ -35,34 +34,34 @@ The setup keeps each credential at its own boundary:
 | vLLM key (`VLLM_API_KEY`) | The Praxis process | vLLM only; never enters a sandbox |
 | Client API key placeholders | The harness | Stripped by Praxis |
 
-Sandboxes can reach the two Praxis listeners and nothing else unless you grant
+Sandboxes reach the two Praxis listeners and nothing else unless you grant
 more access.
 
 ## How OpenShell reaches a host gateway
 
 OpenShell 0.1 removed its managed inference route (`inference.local` and the
-`openshell inference` commands). A sandboxed client now calls its provider's
-native API directly, and access comes from a **provider profile** attached to
-the sandbox. Four properties of that model shape this setup:
+`openshell inference` commands). A sandboxed client calls its provider's native
+API directly, with access granted by a provider profile attached to the
+sandbox. That model shapes this setup in four ways:
 
-- **Stock agent profiles don't fit.** The upstream `claude-code` and `codex`
-  profiles allow only `api.anthropic.com` and the OpenAI hosts. Pointing a
-  client's base URL elsewhere does not carry the credential with it, so this
-  guide ships its own profile for the Praxis gateway.
-- **Loopback is never allowed.** OpenShell never authorizes sandbox egress to
-  loopback. Sandboxes reach host services through `host.openshell.internal`,
-  so the Praxis listeners must bind an address the container bridge can reach.
-  Every other Praxis example binds `127.0.0.1`.
-- **Credentials are placeholders.** The sandbox environment carries
-  `openshell:resolve:env:...` values. The OpenShell proxy substitutes the real
-  value only for requests to the profile's endpoints, and only where it inspects
-  HTTP (`protocol: rest`). That includes Basic credentials: the proxy decodes
-  `Authorization: Basic`, substitutes the placeholder, and re-encodes it. So a
-  harness can build `Basic base64("gateway:$GATEWAY_AUTH_PASSWORD")` from the
-  placeholder, and Praxis receives the real password.
-- **`binaries` gates access.** Only the listed executables may use the
-  profile's endpoints. Matching uses real paths, globs are allowed, and child
-  processes inherit the rule.
+- The upstream `claude-code` and `codex` profiles allow only
+  `api.anthropic.com` and the OpenAI hosts, and pointing a client's base URL
+  elsewhere does not carry the credential along. This guide ships its own
+  profile for the Praxis gateway.
+- OpenShell never allows sandbox egress to loopback. Sandboxes reach host
+  services through `host.openshell.internal`, so the Praxis listeners must bind
+  an address the container bridge can reach. Every other Praxis example binds
+  `127.0.0.1`.
+- The sandbox environment carries `openshell:resolve:env:...` placeholders.
+  The OpenShell proxy swaps in the real value only for requests to the
+  profile's endpoints, and only where it inspects HTTP (`protocol: rest`). This
+  works for Basic credentials too: the proxy decodes `Authorization: Basic`,
+  substitutes the placeholder, and re-encodes it, so a harness can build
+  `Basic base64("gateway:$GATEWAY_AUTH_PASSWORD")` from the placeholder and
+  Praxis receives the real password.
+- Only the executables listed in the profile's `binaries` may use its
+  endpoints. Matching uses real paths, globs are allowed, and child processes
+  inherit the rule.
 
 ## 1. Start vLLM and Praxis on the host
 
@@ -75,9 +74,11 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 Start vLLM as in [section 1 of the base guide](cli-vllm-through-praxis.md#1-start-vllm),
 and record `VLLM_URL` and `VLLM_MODEL`.
 
-Copy the sandbox gateway example. It serves Claude Code, OpenCode, and pi on
-port 8080 and Codex on port 8081, all over their native wire APIs, behind one
-`basic_auth` credential. Only the Codex chain transforms the body: its
+Copy the sandbox gateway example, the
+[all-in-one gateway](cli-vllm-through-praxis.md#serving-all-four-clients-from-one-gateway)
+from the base guide. It serves Claude Code, OpenCode, and pi on port 8080 and
+Codex on port 8081 over their native wire APIs, behind one `basic_auth`
+credential. Only the Codex chain transforms the body: its
 `openai_client_tool_compat` step lowers Codex's rich client tools to the vLLM
 tool representation and restores them on the way back.
 
@@ -103,20 +104,20 @@ IPv6 unique-local address, add it to `trusted_private_endpoints` on both
         - "vllm.internal:8000"
 ```
 
-Each entry must name one of that cluster's endpoint hostnames, and the entry
-scopes the exception to that host. Without it, requests fail with
-`upstream hostname resolved to private/reserved IP address`. Do not reach for
-`insecure_options.allow_private_upstreams` here: it disables the private-address
+Each entry must name one of that cluster's endpoint hostnames and exempts only
+that host. Without it, requests fail with
+`upstream hostname resolved to private/reserved IP address`. Avoid
+`insecure_options.allow_private_upstreams`: it disables the private-address
 check for every upstream, including the Codex chain's sub-requests.
 
-The example binds both listeners to `0.0.0.0` because traffic from sandboxes
-arrives on the host's container-bridge interface. Prefer replacing `0.0.0.0`
-with that bridge address before you start Praxis (for example `docker0`'s, or
-Podman's `podman0`), and firewall ports 8080 and 8081 on every other interface
-if you keep the wildcard bind. The gateway password crosses the bridge as plain
-HTTP Basic, so treat this `basic_auth` setup as a development and testing gate:
-put TLS in front of the listeners and a real identity provider behind them
-before exposing either one beyond the bridge.
+The example binds both listeners to `0.0.0.0` because sandbox traffic arrives
+on the host's container-bridge interface. Before starting Praxis, replace
+`0.0.0.0` with that bridge address (for example `docker0`'s, or Podman's
+`podman0`), or keep the wildcard and firewall ports 8080 and 8081 on every
+other interface. The gateway password crosses the bridge as plain HTTP Basic,
+so this `basic_auth` setup is for development and testing. Put TLS in front of
+the listeners and a real identity provider behind them before exposing either
+beyond the bridge.
 
 Set the two secrets in the shell that starts Praxis, then build and start it:
 
@@ -130,11 +131,10 @@ cargo build -p praxis-ai-proxy --no-default-features \
 export PRAXIS_PID=$!
 ```
 
-The Codex chain uses experimental Responses filters, so the stock container
-image rejects this config. To run Praxis in a container instead, build the
-custom image from
-[the base guide](cli-vllm-through-praxis.md#run-praxis-from-a-container-image),
-run it with `--network host`, and change the example's `database_url` to
+The Codex chain uses experimental Responses filters, which the stock container
+image rejects. To run Praxis in a container, use the image from
+[the base guide](cli-vllm-through-praxis.md#run-praxis-from-a-container-image)
+with `--network host`, and change the example's `database_url` to
 `sqlite:///var/lib/praxis/responses.db?mode=rwc`.
 
 ## 2. Create the Praxis gateway provider
@@ -156,7 +156,7 @@ openshell provider create --name praxis --type praxis-gateway \
 ```
 
 `--credential KEY` reads the value from the CLI's environment, so the password
-never appears in the command line. OpenShell stores it and never exports it.
+stays off the command line. OpenShell stores it and never exports it.
 
 ## 3. Build a sandbox image
 
@@ -173,13 +173,12 @@ docker build -f examples/openshell/Containerfile.harnesses -t praxis-harness:loc
   examples/openshell
 ```
 
-The build context is `examples/openshell`, because the repository's
+The build context is `examples/openshell` because the repository's
 `.dockerignore` excludes `examples/`. Build with the container engine your
 OpenShell gateway uses. With Podman, tag the image `localhost/praxis-harness:local`
-and use that reference with `--from`.
-
-The image keeps every harness's settings under `/tmp`, because the default
-sandbox policy makes only `/tmp` and the working directory writable.
+and pass that reference to `--from`. The image keeps every harness's settings
+under `/tmp`, since the default sandbox policy makes only `/tmp` and the working
+directory writable.
 
 `praxis-harness-env` turns the provider's placeholder into each harness's
 gateway configuration and then runs the command you give it:
@@ -214,11 +213,10 @@ key all worked. Delete the sandbox with `openshell sandbox delete praxis-smoke`.
 
 Each command below starts a sandbox with the `praxis` provider attached. For a
 single non-interactive turn, replace the command after `--` with the harness's
-headless form. Add
-`--upload .:/workspace` and drop the trailing command to work on a local
-project; OpenShell does not allow both, so run `praxis-harness-env <harness>`
-from the shell that opens instead. Copy changes back with
-`openshell sandbox download`.
+headless form. To work on a local project, add `--upload .:/workspace` and drop
+the trailing command, since OpenShell does not allow both; then run
+`praxis-harness-env <harness>` from the shell that opens. Copy changes back
+with `openshell sandbox download`.
 
 ### Claude Code
 
@@ -245,13 +243,12 @@ Headless: `praxis-harness-env codex exec --skip-git-repo-check 'reply with OK'`.
 Each sandbox starts with a fresh `CODEX_HOME`, so the stale `app-server` daemon
 described in the base guide cannot carry over between sandboxes.
 
-The generated configuration sets `sandbox_mode = "danger-full-access"`. Codex
-normally wraps each tool command in its own bubblewrap sandbox, but bubblewrap
-cannot create user namespaces inside an OpenShell sandbox. Every command then
-fails with `bwrap: No permissions to create a new namespace`, and the model
-reports success without having changed anything. OpenShell already confines
-the process, so Codex's inner sandbox adds nothing here. The startup warning
-about not creating PATH aliases under `/tmp` is harmless.
+The generated configuration sets `sandbox_mode = "danger-full-access"`, which
+turns off Codex's own bubblewrap sandbox. Bubblewrap cannot create user
+namespaces inside an OpenShell sandbox, so every tool command would fail with
+`bwrap: No permissions to create a new namespace` while the model reports
+success without changing anything. OpenShell already confines the process. The
+startup warning about not creating PATH aliases under `/tmp` is harmless.
 
 ### OpenCode
 
@@ -288,8 +285,8 @@ openshell logs claude --since 5m --source sandbox
 ```
 
 Don't filter with `--level warn`, which hides policy events. OpenShell turns
-denials into draft rules. Review and approve them for anything the harness
-legitimately needs, such as a package registry:
+denials into draft rules; approve the ones the harness needs, such as a package
+registry:
 
 ```console
 openshell rule get claude --status pending
@@ -299,8 +296,7 @@ openshell rule approve claude --chunk-id <chunk-id>
 Approved network rules hot-reload into the running sandbox. Filesystem and
 process policy is fixed when a sandbox is created.
 
-Some denials are expected and harmless, because none of them is needed to
-complete a turn:
+These denials are expected and harmless, since no turn needs them:
 
 - Claude Code sends `HEAD /api/hello` to the gateway as a connectivity probe.
   The profile allows only the inference routes, so the probe is denied.

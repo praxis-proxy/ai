@@ -1767,7 +1767,7 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// markers not derivable from the body alone must be carried across the
 /// replacement. Currently that is the store filter's
 /// [`ResponsesState::store_persist_armed`] flag, which `openai_responses_store`
-/// sets before rehydrate runs. Dropping it here would make `mcp_dispatch`
+/// sets before rehydrate runs. Dropping it here would make `mcp_connector`
 /// falsely reject a continuation-turn `mcp_approval_request` as unresumable,
 /// even though the store is configured and will persist the response.
 ///

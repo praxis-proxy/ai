@@ -1,7 +1,6 @@
 # Get started
 
-Run Praxis AI, send a first request, and choose the client protocol and
-provider path for your deployment. Read these pages in order:
+Read these pages in order:
 
 1. [Quickstart](quickstart.md): run the published container image and forward
    an OpenAI Responses request.

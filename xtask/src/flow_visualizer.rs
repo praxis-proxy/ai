@@ -125,22 +125,22 @@ const FULL_FLOW_KNOBS: &[KnobCheck] = &[
     },
     KnobCheck {
         knob: "mcp_dispatch.max_calls_per_round",
-        source: KnobSource::Filter("openai_mcp_dispatch"),
+        source: KnobSource::Filter("openai_mcp_connector"),
         key: "max_calls_per_round",
     },
     KnobCheck {
         knob: "mcp_dispatch.max_parallel_calls",
-        source: KnobSource::Filter("openai_mcp_dispatch"),
+        source: KnobSource::Filter("openai_mcp_connector"),
         key: "max_parallel_calls",
     },
     KnobCheck {
         knob: "mcp_dispatch.max_result_bytes",
-        source: KnobSource::Filter("openai_mcp_dispatch"),
+        source: KnobSource::Filter("openai_mcp_connector"),
         key: "max_result_bytes",
     },
     KnobCheck {
         knob: "mcp_dispatch.max_total_result_bytes",
-        source: KnobSource::Filter("openai_mcp_dispatch"),
+        source: KnobSource::Filter("openai_mcp_connector"),
         key: "max_total_result_bytes",
     },
     KnobCheck {

@@ -1,30 +1,25 @@
 # Extensions
 
-Praxis AI inherits the full extension system from
-[Praxis core][praxis]. Custom filters implement
-`HttpFilter` or `TcpFilter` from `praxis-filter` and
+Praxis AI inherits the extension system from [Praxis core][praxis]. Custom
+filters implement `HttpFilter` or `TcpFilter` from `praxis-filter` and
 register into the shared `FilterRegistry`.
 
 [praxis]: https://github.com/praxis-proxy/praxis
 
 ## Auto-Discovery (Recommended)
 
-External filter crates can self-register into Praxis AI
-at build time. The operator adds a `Cargo.toml`
-dependency and writes YAML config with zero Rust code
+External filter crates can register themselves into Praxis AI at build time.
+The operator adds a `Cargo.toml` dependency and YAML config, with no Rust code
 changes.
 
 ### How It Works
 
-1. The external crate uses `export_filters!` to declare
-   its filters
-2. The crate's `Cargo.toml` carries a
-   `[package.metadata.praxis-filters]` marker
-3. The Praxis AI server's `build.rs` runs
-   `cargo metadata`, discovers marked crates, and
-   generates registration code
-4. At startup, discovered filters are registered
-   alongside built-ins and AI filters
+1. The external crate declares its filters with `export_filters!`.
+2. Its `Cargo.toml` carries a `[package.metadata.praxis-filters]` marker.
+3. The Praxis AI server's `build.rs` runs `cargo metadata`, finds marked
+   crates, and generates registration code.
+4. At startup, discovered filters are registered alongside built-ins and AI
+   filters.
 
 ### External Crate Setup
 
@@ -101,27 +96,23 @@ filter_chains:
         max_tokens_per_minute: 100000
 ```
 
-Rebuild and run — no other changes needed.
+Rebuild and run.
 
 ### Duplicate Detection
 
-If an external filter name collides with a built-in, AI,
-or another external filter, the server panics at startup
-with a clear error message. Filter names must be unique
-across all sources.
+Filter names must be unique across all sources. If an external filter name
+collides with a built-in, AI, or other external filter, the server panics at
+startup with an error naming the collision.
 
 ## Rust Extensions (Manual Registration)
 
-Compile-time extensions with zero overhead. Implement
-`HttpFilter` from `praxis-filter`, register it, and
-reference it in YAML config. Use this approach when
-building a custom Praxis AI binary with inline filters
-that don't need to be shared as a separate crate.
+Use manual registration for a custom Praxis AI binary with inline filters
+that you do not share as a separate crate. These are compile-time extensions
+with no runtime overhead:
 
-1. Implement `HttpFilter` (`on_request`, `on_response`,
-   body hooks)
-2. Register with `register_filters!`
-3. Reference by name in YAML filter chains
+1. Implement `HttpFilter` (`on_request`, `on_response`, body hooks).
+2. Register it with `register_filters!`.
+3. Reference it by name in YAML filter chains.
 
 ### HTTP Filter
 
@@ -184,26 +175,18 @@ register_filters! {
 
 ### Registration
 
-The `register_filters!` macro uses protocol-prefixed
-syntax:
-
-```rust
-register_filters! {
-    http "model_blocklist" => ModelBlocklist::from_config,
-}
-```
-
-The macro generates a `custom_registry()` function that
-returns a `FilterRegistry` with built-in, AI, and custom
-filters. Use it with the test utilities
-(`start_proxy_with_registry`) or build your own server
-bootstrap from the workspace crates (`praxis-core`,
+`register_filters!` takes protocol-prefixed entries, as in the example above
+(`http "model_blocklist" => ModelBlocklist::from_config`). It generates a
+`custom_registry()` function that returns a `FilterRegistry` with core
+built-in and custom filters. It does not add AI filters; call
+`praxis_ai_filters::register_ai_filters` on that registry for them. Use it
+with the test utilities (`start_proxy_with_registry`) or in your own server
+bootstrap built from the workspace crates (`praxis-core`,
 `praxis-filter`, `praxis-ai-apis`, `praxis-ai-filters`).
 
 ### YAML Config
 
-Any keys placed alongside `filter:` in the filter chain
-entry are passed to `from_config` as a
+Keys next to `filter:` in a filter chain entry reach `from_config` as a
 `serde_yaml::Value`:
 
 ```yaml
@@ -219,78 +202,59 @@ filter_chains:
               methods: ["POST"]
 ```
 
-Custom filters participate identically to built-ins:
-same ordering, context access, and short-circuit
-capability.
-
-See the [filter system documentation](README.md) for
-the AI filter overview.
+Custom filters behave like built-ins: same ordering, context access, and
+short-circuiting. The [filter overview](README.md) covers the AI filters.
 
 ## Best Practices
 
 ### Keep filters stateless when possible
 
-Prefer reading all configuration at construction time
-(in `from_config`) and keeping the filter struct
-immutable. When shared mutable state is required (e.g.
-counters, connection tracking), use atomics or interior
-mutability with minimal lock scope. Filters are shared
-across requests and must be `Send + Sync`.
+Read all configuration in `from_config` and keep the filter struct
+immutable. Filters are shared across requests and must be `Send + Sync`; when
+you need shared mutable state such as counters or connection tracking, use
+atomics or interior mutability with a minimal lock scope.
 
 ### Return early with `Reject`, not panics
 
-Use `FilterAction::Reject(Rejection::status(code))` to
-abort request processing. Never panic inside a filter;
-a panic takes down the worker thread. Return
-`Err(...)` for unexpected failures and let the pipeline
-handle the 500 response.
+Use `FilterAction::Reject(Rejection::status(code))` to stop request
+processing. Never panic inside a filter, because a panic takes down the worker
+thread. Return `Err(...)` for unexpected failures and let the pipeline send
+the 500 response.
 
 ### Declare body access accurately
 
-Only declare `request_body_access()` or
-`response_body_access()` if your filter actually
-inspects or modifies the body. Each declaration changes
-how the pipeline buffers data. `BodyAccess::None` (the
-default) avoids overhead. Use `ReadOnly` if you inspect
-but do not modify, and `ReadWrite` only if you mutate
-chunks in place.
+Declare `request_body_access()` or `response_body_access()` only if the
+filter inspects or modifies the body, since each declaration changes how the
+pipeline buffers data. `BodyAccess::None` (the default) has no overhead. Use
+`ReadOnly` to inspect without modifying, and `ReadWrite` only to mutate chunks
+in place or replace a buffered body.
 
 ### Choose the right body mode
 
-- `Stream`: lowest latency; chunks flow through as they
-  arrive. Best for filters that inspect headers only or
-  process chunks independently.
-- `StreamBuffer`: chunks flow through filters
-  incrementally but forwarding to upstream is deferred
-  until `Release` or end-of-stream. Use when body
-  content influences routing (e.g. model field
-  extraction), when you need the complete body (e.g.
-  guardrail scanning), or when you need to inspect the
-  full body before upstream selection. Set `max_bytes`
-  to avoid unbounded memory growth.
+- `Stream`: lowest latency; chunks pass through as they arrive. Use it for
+  filters that inspect only headers or process chunks independently.
+- `StreamBuffer`: chunks pass through filters incrementally, but forwarding
+  upstream waits until `Release` or end-of-stream. Use it when body content
+  affects routing (for example model field extraction) or when you need the
+  complete body before upstream selection (for example guardrail scanning).
+  Set `max_bytes` to bound memory.
 
 ### Use `extra_request_headers` for metadata
 
-When your filter extracts values from the body or
-computes derived data, promote it to a request header
-via `ctx.extra_request_headers`. This makes the value
-visible to downstream filters (e.g. the router) without
-coupling filters to each other.
+Promote values a filter extracts from the body or derives to a request header
+through `ctx.extra_request_headers`. Downstream filters such as the router can
+then read them without depending on your filter.
 
 ### Provide `from_config` validation
 
-Validate all configuration values in `from_config`
-rather than deferring checks to request time. Fail fast
-at startup with a descriptive error. Parse and
-type-check every field; use `#[serde(default)]` for
-optional fields with sensible defaults.
+Validate every configuration value in `from_config` so bad config fails at
+startup with a descriptive error, not at request time. Parse and type-check
+every field, and use `#[serde(default)]` for optional fields.
 
 ### Test with the integration harness
 
-Use the integration test utilities (`free_port`,
-`start_backend`, `start_proxy_with_registry`) to write
-end-to-end tests for custom filters. Register your
-filter with `FilterFactory::Http(Arc::new(factory))`,
-build a minimal YAML config, and assert on status codes
-and response bodies. See `tests/integration/` for
+Write end-to-end tests with the integration test utilities (`free_port`,
+`start_backend`, `start_proxy_with_registry`). Register the filter with
+`FilterFactory::Http(Arc::new(factory))`, build a minimal YAML config, and
+assert on status codes and response bodies. `tests/integration/` has
 examples.

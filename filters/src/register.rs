@@ -522,7 +522,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
         http "openai_responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
     );
     #[cfg(feature = "openai-mcp-tools")]
-    register_mcp_callout_filters(registry);
+    register_openai_mcp_connector(registry);
     praxis_filter::register_filters!(
         @register registry,
         http "openai_client_tool_compat" => praxis_ai_apis::openai::ClientToolCompatFilter::from_config
@@ -532,53 +532,16 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     register_openai_agentic_filters(registry);
 }
 
-/// Register the two MCP callout filters (`openai_mcp_tool_resolve`,
-/// `openai_mcp_dispatch`).
-///
-/// Neither filter selects the dial target through a pipeline filter: the MCP
-/// subrequest transport stages the SSRF-validated [`StagedUpstream`] into the
-/// per-request extensions and the executor seeds the nested context's upstream
-/// from it before the request phase. A configured `outbound_chain` therefore
-/// carries only the operator's cross-cutting outbound filters.
-///
-/// `openai_mcp_tool_resolve` runs top-level (one-shot `tools/list` discovery
-/// before the agentic loop) and is registered as **chain-binding**: its
-/// configured `outbound_chain` is resolved and prebuilt at pipeline-build time.
-/// Because it binds at top level with a live [`ChainBindingContext`], both an
-/// inline chain and a named reference (resolved against the top-level
-/// `filter_chains`) are supported.
-///
-/// `openai_mcp_dispatch` runs **inside** the `iterative_request_router` step
-/// pipeline (the per-round `tools/call` executor) and is likewise registered as
-/// **chain-binding**. praxis core builds each IRR step with a live
-/// [`ChainBindingContext`], so its inline `outbound_chain` is bound at
-/// step-build time. Outer *named* references remain unavailable inside a step —
-/// IRR supplies each step an empty top-level named-chain map — so a named
-/// reference is rejected and an inline chain (or none) is the supported shape
-/// here. SSRF posture is propagated from the operator's global insecure options
-/// at pipeline finalization.
-///
-/// [`ChainBindingContext`]: praxis_filter::ChainBindingContext
-/// [`StagedUpstream`]: praxis_filter::StagedUpstream
+/// Register the Responses MCP connector with outbound chain binding.
 #[cfg(feature = "openai-mcp-tools")]
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
-fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
+fn register_openai_mcp_connector(registry: &mut FilterRegistry) {
     registry
         .register_chain_binding(
-            "openai_mcp_tool_resolve",
-            ::std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
-                praxis_ai_apis::openai::McpToolResolveFilter::from_config_with_binding(config, ctx)
-            }),
+            "openai_mcp_connector",
+            ::std::sync::Arc::new(praxis_ai_apis::openai::McpConnectorFilter::from_config_with_binding),
         )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_tool_resolve'"));
-    registry
-        .register_chain_binding(
-            "openai_mcp_dispatch",
-            ::std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
-                praxis_ai_apis::openai::McpDispatchFilter::from_config_with_binding(config, ctx)
-            }),
-        )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_dispatch'"));
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_connector'"));
 }
 
 /// Register the selector that every MCP outbound chain auto-injects.
@@ -1027,8 +990,7 @@ provider:
         ("openai_responses_rehydrate", cfg!(feature = "store")),
         ("openai_conversations", cfg!(feature = "openai-conversations")),
         ("openai_responses_compact", cfg!(feature = "openai-compact")),
-        ("openai_mcp_tool_resolve", cfg!(feature = "openai-mcp-tools")),
-        ("openai_mcp_dispatch", cfg!(feature = "openai-mcp-tools")),
+        ("openai_mcp_connector", cfg!(feature = "openai-mcp-tools")),
         (
             "openai_mcp_streaming_selector",
             cfg!(any(
@@ -1050,6 +1012,8 @@ provider:
         for &(name, enabled) in OPTIONAL_FILTERS {
             assert_experimental_registration(&names, name, enabled);
         }
+        assert!(!names.contains(&"openai_mcp_tool_resolve"));
+        assert!(!names.contains(&"openai_mcp_dispatch"));
     }
 
     /// Disabled experimental OpenAI filters fail before a pipeline can serve traffic.

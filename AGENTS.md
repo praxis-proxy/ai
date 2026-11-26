@@ -167,6 +167,24 @@ and [CONTRIBUTING.md] for contribution requirements.
 [development conventions]: https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md
 [CONTRIBUTING.md]: CONTRIBUTING.md
 
+## Documentation
+
+Write docs people read to the end: short, plain, and exact.
+
+- Name the page's reader and the task they finish with it. Keep only what
+  serves that task.
+- Every sentence carries a fact the reader acts on. Leave background the
+  reader already has, change history, restated summaries, and notes about
+  how the page was written to commit messages and PR descriptions.
+- Give each concept one owner page; elsewhere, write one sentence and link
+  to it. Generated filter pages (`cargo xtask generate-filter-docs`) own
+  filter config fields, so link to them instead of restating fields.
+- Keep commands, config blocks, and identifiers exact. Some doc blocks are
+  compared against fixtures by tests.
+- Edit a generated page or region through its generator's source.
+- When updating a page, remove what the change made stale or redundant, so
+  the page stays as short as the last edit left it.
+
 ## Git Workflow
 
 - **Never amend commits** — when addressing PR

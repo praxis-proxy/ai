@@ -1,11 +1,11 @@
 # Embedding AI filters
 
-For operators composing YAML pipelines, use the [capability overview](../filters/README.md).
-This page describes Rust registration and host integration.
+This page covers Rust registration and host integration. For YAML pipelines,
+see the [capability overview](../filters/README.md).
 
 ## Organization
 
-AI filters are organized across two crates:
+AI filters live in two crates:
 
 ```text
 apis/src/                 Provider API integrations
@@ -22,19 +22,17 @@ filters/src/              Cross-provider behavior
   token_usage/            Token counting, headers, and per-tenant metrics
 ```
 
-Praxis AI also inherits all base proxy filters from Praxis core through
-`FilterRegistry::with_builtins()`. This includes routing, load balancing,
-headers, credential injection, JSON-RPC parsing, CORS, compression, IP ACLs,
-and other general proxy behavior. Those filters are intentionally documented
-in the [Praxis core filter reference][praxis-filters], not duplicated here.
+Praxis AI also inherits the base proxy filters from Praxis core through
+`FilterRegistry::with_builtins()`: routing, load balancing, headers,
+credential injection, JSON-RPC parsing, CORS, compression, IP ACLs, and other
+general proxy behavior. The [Praxis core filter reference][praxis-filters]
+documents them.
 
 ## Registration
 
-In-tree AI filters are registered by
-`praxis_ai_filters::register_ai_filters`. Downstream
-consumers that only need AI filters (for example an
-Envoy ExtProc) can depend on `praxis-ai-filters` without
-the proxy crate:
+`praxis_ai_filters::register_ai_filters` registers the in-tree AI filters.
+Consumers that need only AI filters, such as an Envoy ExtProc, can depend on
+`praxis-ai-filters` without the proxy crate:
 
 ```rust
 use praxis_filter::FilterRegistry;
@@ -44,8 +42,7 @@ praxis_ai_filters::register_ai_filters(&mut registry);
 // Or: let registry = praxis_ai_filters::build_ai_registry();
 ```
 
-`praxis-ai-proxy` builds the full registry in three
-ownership layers:
+`praxis-ai-proxy` builds the full registry in three ownership layers:
 
 ```rust
 let mut registry = FilterRegistry::with_builtins();
@@ -53,13 +50,11 @@ praxis_ai_filters::register_ai_filters(&mut registry);
 register_external_filters(&mut registry); // proxy-only
 ```
 
-This keeps core filters, in-tree AI filters, and
-auto-discovered extensions at clear ownership
-boundaries. External filter auto-discovery stays
-proxy-only.
+Core filters, in-tree AI filters, and auto-discovered extensions stay in
+separate layers, and external filter auto-discovery is proxy-only.
 
-Pipelines that use OpenAI store or rehydrate filters
-must also install the response-store extension:
+Pipelines that use OpenAI store or rehydrate filters must also install the
+response-store extension:
 
 ```rust
 pipeline.add_pipeline_extension(
@@ -67,8 +62,7 @@ pipeline.add_pipeline_extension(
 );
 ```
 
-The AI proxy does this in `server/src/pipelines.rs`.
-Other hosts (such as ExtProc) must do the same.
-
+The AI proxy does this in `server/src/pipelines.rs`; other hosts, such as
+ExtProc, must do the same.
 
 [praxis-filters]: https://github.com/praxis-proxy/praxis/tree/main/docs/filters

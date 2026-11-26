@@ -1,12 +1,9 @@
 # Operate Praxis AI
 
-Start with a working [guide](../guides/README.md), then carry its exact binary,
-configuration, credentials, and backend assumptions into deployment.
+Get a [guide](../guides/README.md) working first, then carry its exact binary,
+configuration, credentials, and backend assumptions into deployment. This page
+is the deployment checklist; the section also includes:
 
-This section covers:
-
-- This page: deployment checklist, capacity and observability, troubleshooting,
-  reload, and upgrades.
 - [Capacity planning](capacity-planning.md): file descriptors and admission.
 - [FIPS 140-3 deployment](fips.md).
 - Response store maintenance: [schema migration](store/schema-migration.md) and
@@ -15,40 +12,40 @@ This section covers:
 
 ## Build and deploy
 
-Record the source revision or image digest and enabled features with each
-configuration. The default build selects standard features; managed Responses
-and several identity/token/cloud helpers require explicit opt-ins. An unknown
-filter at startup usually means the selected binary lacks the configured
-feature. Use the [feature table](../features.md#cargo-features) and
-[FIPS deployment guide](fips.md) for the appropriate build.
+Record the source revision or image digest and the enabled features with each
+configuration. The default build has the standard features; managed Responses
+and several identity, token, and cloud helpers need explicit opt-ins. An
+unknown filter at startup usually means the binary was built without that
+feature. Pick the build from the [feature table](../features.md#cargo-features)
+and the [FIPS deployment guide](fips.md).
 
-Run `praxis-ai --validate -c CONFIG` using the deployment binary and environment
-before startup. Validation is not a provider connectivity or permission test.
-Keep Host, TLS SNI, trust roots, endpoint, credentials, and model/deployment
-names consistent. Native loopback recipes deliberately allow private addresses;
-carry that exception into production only for destinations that need it.
+Before startup, run `praxis-ai --validate -c CONFIG` with the deployment binary
+and environment. Validation does not test provider connectivity or permissions.
+Keep Host, TLS SNI, trust roots, endpoint, credentials, and model or deployment
+names consistent. The loopback recipes allow private addresses on purpose; in
+production, allow them only for destinations that need it.
 
-Bind public listeners behind your chosen authentication and TLS boundary.
-Keep admin/metrics endpoints private. Use the [Praxis core deployment docs](https://github.com/praxis-proxy/praxis/tree/main/docs)
-for base listener, transport, container, Kubernetes, and configuration reload
-mechanics; this repository's AI-specific recipes do not replace them.
+Put public listeners behind your authentication and TLS boundary, and keep
+admin and metrics endpoints private. The [Praxis core deployment docs](https://github.com/praxis-proxy/praxis/tree/main/docs)
+cover listeners, transport, containers, Kubernetes, and configuration reload.
 
 ## Capacity and observability
 
 Start with [file-descriptor planning](capacity-planning.md) and the
 [descriptor-budget example](../../examples/configs/file-descriptor-limits.yaml).
 Bound connections, concurrency, request bodies, upstream timeouts, buffered
-responses, SSE events, and tool callout fan-out. Managed loops also need the
+responses, SSE events, and tool callout fan-out. Managed loops also need a
 [retained-payload budget](../architecture/responses-retained-payload.md).
-Do not infer gateway memory sizing or replica scaling rules from model token
-throughput alone. Measure your selected filters, payloads, concurrent streams,
-backend stalls, and tool rounds under sustained load and recovery.
+Model token throughput alone does not tell you gateway memory or replica
+counts; measure your filters, payloads, concurrent streams, backend stalls, and
+tool rounds under sustained load and during recovery.
 
-Use private admin health/readiness/metrics endpoints, access logs, request IDs,
-[token usage](../guides/guardrails.md), and
-[OpenTelemetry](../architecture/opentelemetry.md) where enabled. Token labels are
-not tenant authorization; missing provider usage is not zero billing.
-Avoid collecting prompts, secrets, or tool results in unrestricted debug logs.
+For observability, use the private admin health, readiness, and metrics
+endpoints, access logs, request IDs, [token usage](../guides/token-usage.md),
+and [OpenTelemetry](../architecture/opentelemetry.md) where enabled. Token
+labels are not tenant authorization, and missing provider usage does not mean
+zero billing. Keep prompts, secrets, and tool results out of unrestricted debug
+logs.
 
 ## Troubleshoot by boundary
 
@@ -65,22 +62,23 @@ Avoid collecting prompts, secrets, or tool results in unrestricted debug logs.
 | State unavailable or wrong owner | Store feature/backend, database permissions/migrations, authenticated owner context, local versus provider-owned route |
 | Tools never execute | Model call selection, dispatcher, loop owner/IRR transition, approval, destination access and credentials |
 
-For a reproducible report, include revision/digest, enabled features, redacted
-configuration, request and response shape, streaming terminal outcome, logs
-with request IDs, and the backend actually exercised. Separate fixture replay
-from a live provider or GPU run.
+A reproducible report includes the revision or digest, enabled features,
+redacted configuration, request and response shape, how the stream terminated,
+logs with request IDs, and the backend actually exercised. Say whether the
+result came from fixture replay or a live provider or GPU run.
 
 ## Reload and upgrade
 
-Configuration reload rebuilds filter pipelines; in-memory budgets and local
-routing affinity can reset. Check the relevant filter's lifetime contract and
-do not assume it coordinates replicas. Validate the replacement configuration
-with the intended binary before deployment and exercise affected paths afterward.
+Configuration reload rebuilds filter pipelines, which can reset in-memory
+budgets and local routing affinity. Check each filter's lifetime contract;
+none should be assumed to coordinate across replicas. Validate the new
+configuration with the intended binary before deploying it, and exercise the
+affected paths afterward.
 
-Read release notes and compare your enabled features and configuration against
-the destination version's docs. Review [store migration requirements](store/schema-migration.md)
-and [legacy item repair](store/legacy-item-position-repair.md) before changing
-persisted deployments; retain a tested backup and rollback procedure.
-The [release process](../developing/release.md) is a maintainer workflow, not an operator
-upgrade compatibility promise. Development documentation added here is not
-part of the published v0.10.0 snapshot until separately released and imported.
+Before upgrading, read the release notes and compare your features and
+configuration with the target version's docs. For persisted deployments, read
+the [store migration requirements](store/schema-migration.md) and
+[legacy item repair](store/legacy-item-position-repair.md), and keep a tested
+backup and rollback procedure. The [release process](../developing/release.md)
+is a maintainer workflow and makes no upgrade compatibility promise. These
+Development docs are not part of the published v0.10.0 snapshot until released.

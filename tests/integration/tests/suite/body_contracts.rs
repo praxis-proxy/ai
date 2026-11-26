@@ -260,10 +260,7 @@ fn stateful_filters() -> Vec<&'static str> {
     #[cfg(feature = "openai-file-resolve-filter")]
     filters.push("openai_file_resolve\n  allow_pre_security_callout: true\n  files_api_url: http://127.0.0.1:9");
     #[cfg(feature = "openai-mcp-tools")]
-    filters.extend([
-        "openai_mcp_tool_resolve",
-        "openai_mcp_dispatch\n- filter: openai_responses_proxy",
-    ]);
+    filters.extend(["openai_mcp_connector\n- filter: openai_responses_proxy"]);
     filters
 }
 

@@ -502,7 +502,7 @@ fn delete_cleanup_routes_through_outbound_chain() {
     // covered by `get_stream_headers_carry_session_id` in the transport's own
     // unit tests.
     //
-    // NOTE: The top-level openai_mcp_tool_resolve discovery session has NO
+    // NOTE: The top-level openai_mcp_connector discovery session has NO
     // outbound_chain, so its own DELETE correctly carries no x-mcp-client. We
     // assert on the mcp_dispatch session's DELETE, which DOES route through the
     // chain, and that is the outbound-filter-on-non-POST coverage this test
@@ -571,8 +571,8 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: 5000
         outbound_chain: mcp-egress
       - filter: openai_responses_proxy
       - filter: router
@@ -651,8 +651,8 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: 5000
         outbound_chain: mcp-egress
       - filter: openai_responses_proxy
       - filter: router
@@ -751,8 +751,8 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
+      - filter: openai_mcp_connector
+        discovery_timeout_ms: 5000
         outbound_chain: mcp-egress
       - filter: openai_responses_proxy
       - filter: router

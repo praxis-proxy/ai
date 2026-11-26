@@ -465,7 +465,7 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
 
 /// Whether a filter type is known to be fully contained within replay.
 ///
-/// `openai_mcp_tool_resolve` is not in this list: it can issue a live
+/// `openai_mcp_connector` is not in this list: it can issue a live
 /// `tools/list` callout. Replay admits it only as deferred-connector
 /// sanitization, gated by `filter_is_replay_contained` plus scenario
 /// request inspection in `validate_mcp_resolve_replay_requests`.
@@ -509,7 +509,7 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
 }
 
 /// Whether one filter entry is replay-contained, including literal credentials
-/// and the deferred-only `openai_mcp_tool_resolve` exception.
+/// and the deferred-only `openai_mcp_connector` exception.
 fn filter_is_replay_contained(filter: &FilterEntry) -> bool {
     if filter.filter_type == "credential_injection" {
         return filter.config.as_mapping().is_some_and(has_literal_replay_credentials);
@@ -517,7 +517,7 @@ fn filter_is_replay_contained(filter: &FilterEntry) -> bool {
     if filter.filter_type == "credential_inject" {
         return filter.config.as_mapping().is_some_and(has_literal_provider_credentials);
     }
-    filter.filter_type == "openai_mcp_tool_resolve" || is_replay_contained_filter(filter.filter_type.as_str())
+    filter.filter_type == "openai_mcp_connector" || is_replay_contained_filter(filter.filter_type.as_str())
 }
 
 /// Allows literal fixture credentials without reading the recording process's environment.
@@ -566,7 +566,7 @@ fn has_literal_provider_credentials(config: &serde_yaml::Mapping) -> bool {
             })
 }
 
-/// Rejects `openai_mcp_tool_resolve` fixtures whose requests would eager-list.
+/// Rejects `openai_mcp_connector` fixtures whose requests would eager-list.
 ///
 /// The filter type is admitted so deferred-connector sanitization (no
 /// `tools/list`) can replay. An MCP tool without `defer_loading: true` would
@@ -581,6 +581,13 @@ fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScen
     if resolvers.is_empty() {
         return Ok(());
     }
+    // A replay model's tool_search_call can trigger an MCP exchange on
+    // re-entry, even when the client request declares only deferred tools.
+    if connector_router_can_reenter(config) {
+        return Err(runtime_error(
+            "scenario MCP connector iteration is not replay-contained",
+        ));
+    }
     for turn in &scenario.turns {
         if recorded_body_has_dialing_mcp_tool(&turn.request.body, &resolvers) {
             return Err(runtime_error("scenario MCP listing is not replay-contained"));
@@ -589,7 +596,110 @@ fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScen
     Ok(())
 }
 
-/// Collect every `openai_mcp_tool_resolve` filter object in a config tree.
+/// Detect a route that can run the connector again after it prepares MCP state.
+fn connector_router_can_reenter(config: &Value) -> bool {
+    let named_chains = config["filter_chains"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|chain| Some((chain["name"].as_str()?, chain["filters"].as_array()?.as_slice())))
+        .collect();
+    router_has_connector_reentry(config, &named_chains)
+}
+
+/// Find routers throughout the configuration, including named filter chains.
+fn router_has_connector_reentry<'a>(config: &'a Value, named_chains: &HashMap<&'a str, &'a [Value]>) -> bool {
+    match config {
+        Value::Object(object) => {
+            (config["filter"].as_str() == Some("iterative_request_router")
+                && config["steps"]
+                    .as_array()
+                    .is_some_and(|steps| connector_steps_can_repeat(steps, named_chains)))
+                || object
+                    .values()
+                    .any(|child| router_has_connector_reentry(child, named_chains))
+        },
+        Value::Array(values) => values
+            .iter()
+            .any(|child| router_has_connector_reentry(child, named_chains)),
+        _ => false,
+    }
+}
+
+/// Follow possible transitions from each connector-bearing step.
+fn connector_steps_can_repeat<'a>(steps: &'a [Value], named_chains: &HashMap<&'a str, &'a [Value]>) -> bool {
+    let steps: HashMap<_, _> = steps
+        .iter()
+        .filter_map(|step| Some((step["name"].as_str()?, step)))
+        .collect();
+    let connector_steps: BTreeSet<_> = steps
+        .iter()
+        .filter(|(_, step)| filters_reach_connector(&step["filters"], named_chains, &mut BTreeSet::new()))
+        .map(|(&name, _)| name)
+        .collect();
+    connector_steps.iter().any(|start| {
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![*start];
+        while let Some(name) = pending.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            for next in steps.get(name).into_iter().flat_map(|step| step_result_targets(step)) {
+                if connector_steps.contains(next) {
+                    return true;
+                }
+                pending.push(next);
+            }
+        }
+        false
+    })
+}
+
+/// Read the configured targets of a step's result rules.
+fn step_result_targets(step: &Value) -> impl Iterator<Item = &str> {
+    step["on_result"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule["next"].as_str())
+}
+
+/// Inspect only filters and their inline or named branch chains.
+fn filters_reach_connector<'a>(
+    filters: &'a Value,
+    named_chains: &HashMap<&'a str, &'a [Value]>,
+    visited: &mut BTreeSet<&'a str>,
+) -> bool {
+    chain_reaches_connector(filters.as_array().map_or(&[], Vec::as_slice), named_chains, visited)
+}
+
+/// Follow branch references once per step to bound traversal of chain cycles.
+fn chain_reaches_connector<'a>(
+    filters: &'a [Value],
+    named_chains: &HashMap<&'a str, &'a [Value]>,
+    visited: &mut BTreeSet<&'a str>,
+) -> bool {
+    filters.iter().any(|filter| {
+        filter["filter"].as_str() == Some("openai_mcp_connector")
+            || filter["branch_chains"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|branch| branch["chains"].as_array().into_iter().flatten())
+                .any(|chain| {
+                    if let Some(name) = chain.as_str() {
+                        visited.insert(name)
+                            && named_chains
+                                .get(name)
+                                .is_some_and(|filters| chain_reaches_connector(filters, named_chains, visited))
+                    } else {
+                        filters_reach_connector(&chain["filters"], named_chains, visited)
+                    }
+                })
+    })
+}
+
+/// Collect every `openai_mcp_connector` filter object in a config tree.
 ///
 /// A config can declare more than one resolver (e.g. across chains); the replay
 /// check must consider all of them so a protected resolver in an unused chain
@@ -597,7 +707,7 @@ fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScen
 fn collect_mcp_resolve_filters<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
     match value {
         Value::Object(object) => {
-            if object.get("filter").and_then(Value::as_str) == Some("openai_mcp_tool_resolve") {
+            if object.get("filter").and_then(Value::as_str) == Some("openai_mcp_connector") {
                 out.push(value);
             }
             for child in object.values() {
@@ -3120,7 +3230,6 @@ mod tests {
         }
 
         for path in [
-            "openai/responses/mcp-dispatch.yaml",
             "openai/responses/file-resolve.yaml",
             "openai/responses/compact.yaml",
             "openai/responses/web-search.yaml",
@@ -3193,9 +3302,9 @@ mod tests {
     }
 
     #[test]
-    fn openai_mcp_tool_resolve_is_not_unconditionally_replay_contained() {
+    fn openai_mcp_connector_is_not_unconditionally_replay_contained() {
         assert!(
-            !is_replay_contained_filter("openai_mcp_tool_resolve"),
+            !is_replay_contained_filter("openai_mcp_connector"),
             "eager tools/list must not be treated as unconditionally replay-safe"
         );
     }
@@ -3216,6 +3325,50 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_connector_reentry_that_can_discover_deferred_tools() {
+        let scenario = deferred_mcp_scenario(&json!([
+            {"type": "tool_search"},
+            {"type": "mcp", "connector_id": "corp_drive", "defer_loading": true}
+        ]));
+        let yaml = json!({
+            "filter": "iterative_request_router",
+            "steps": [{
+                "name": "inference",
+                "filters": [{"filter": "openai_mcp_connector"}],
+                "on_result": [{"default": true, "next": "inference"}]
+            }]
+        });
+        let error = super::validate_mcp_resolve_replay_requests(&yaml, &scenario)
+            .expect_err("connector re-entry can open an uncontrolled live callout");
+        assert_eq!(
+            error.to_string(),
+            "scenario MCP connector iteration is not replay-contained"
+        );
+    }
+
+    #[test]
+    fn replay_checks_named_connector_branches_only_on_reentry_paths() {
+        let mut config = json!({
+            "filter_chains": [
+                {"name": "mcp", "filters": [{"filter": "openai_mcp_connector"}]},
+                {"name": "entry", "filters": [{
+                    "filter": "iterative_request_router",
+                    "steps": [
+                        {"name": "prepare", "on_result": [{"next": "inference"}]},
+                        {"name": "inference", "filters": [{
+                            "filter": "router",
+                            "branch_chains": [{"chains": ["mcp"]}]
+                        }], "on_result": [{"done": true}]}
+                    ]
+                }]}
+            ]
+        });
+        assert!(!super::connector_router_can_reenter(&config));
+        config["filter_chains"][1]["filters"][0]["steps"][1]["on_result"] = json!([{"next": "prepare"}]);
+        assert!(super::connector_router_can_reenter(&config));
+    }
+
+    #[test]
     fn replay_rejects_eager_mcp_listing_in_deferred_resolve_fixture() {
         let scenario = deferred_mcp_scenario(&json!([{
             "type": "mcp",
@@ -3224,7 +3377,7 @@ mod tests {
         }]));
 
         let error = load_and_validate_config_source(&scenario)
-            .expect_err("eager MCP tools must not replay through openai_mcp_tool_resolve");
+            .expect_err("eager MCP tools must not replay through openai_mcp_connector");
 
         assert_eq!(error.to_string(), "scenario MCP listing is not replay-contained");
     }
@@ -3238,7 +3391,7 @@ mod tests {
         }]));
 
         let error = load_and_validate_config_source(&scenario)
-            .expect_err("inline MCP server_url listing must not replay through openai_mcp_tool_resolve");
+            .expect_err("inline MCP server_url listing must not replay through openai_mcp_connector");
 
         assert_eq!(error.to_string(), "scenario MCP listing is not replay-contained");
     }

@@ -420,6 +420,49 @@ async fn sse_initialize_without_reply_is_malformed() {
 }
 
 #[tokio::test]
+async fn sse_reply_without_terminating_blank_line_is_discarded() {
+    // SSE dispatches an event only at a blank line; one cut off by EOF is not
+    // an event.
+    let (result, _) = initialize_with(
+        |body| {
+            Reply::closed(http_response(
+                "200 OK",
+                &[("Content-Type", "text/event-stream")],
+                &format!("data: {}", init_result(body, "2025-06-18")),
+            ))
+        },
+        1 << 20,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(McpSessionError::Malformed(_))),
+        "an unterminated event must not complete the handshake: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn sse_reply_accepts_cr_framing_and_bom() {
+    for framing in ["\r", "\r\n"] {
+        let (result, _) = initialize_with(
+            move |body| {
+                let reply = init_result(body, "2025-06-18");
+                Reply::closed(http_response(
+                    "200 OK",
+                    &[("Content-Type", "text/event-stream")],
+                    &format!("\u{feff}event: message{framing}data: {reply}{framing}{framing}"),
+                ))
+            },
+            1 << 20,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_ok(), "{framing:?} framing with a BOM must parse: {result:?}");
+    }
+}
+
+#[tokio::test]
 async fn open_stream_without_reply_times_out() {
     let (result, _) = initialize_with(
         |_body| Reply {

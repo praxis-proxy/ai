@@ -651,6 +651,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_live_search_declaration_maps_to_provider_function() {
+        let request = json!({"model":"test", "input":"search", "tools":[{
+            "type":"web_search", "external_web_access":true,
+            "search_content_types":["text","image"]
+        }]});
+        assert_eq!(map(&request)["tools"][0]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn live_search_rejects_cached_only_and_non_text_declarations() {
+        for options in [
+            json!({"external_web_access":false}),
+            json!({"external_web_access":"true"}),
+            json!({"search_content_types":["image"]}),
+            json!({"search_content_types":[]}),
+            json!({"search_content_types":["text","video"]}),
+        ] {
+            let mut tool = options;
+            tool["type"] = json!("web_search");
+            assert!(map_error(&json!({"model":"test", "tools":[tool]})).contains("web"));
+        }
+    }
+
+    #[test]
     fn web_search_tools_map_to_one_bounded_private_function() {
         for tool_type in [
             "web_search",

@@ -4,7 +4,7 @@
 //! Functional tests for the mcp-approval-floor example config.
 //!
 //! The example ships the operator approval floor
-//! (`openai_mcp_dispatch.minimum_approval: always`) on a complete persisted
+//! (`openai_mcp_connector.minimum_approval: always`) on a complete persisted
 //! agentic Responses pipeline, so these drive the real approval exchange the
 //! example promises: a client that submits `"require_approval": "never"` still
 //! gets an `mcp_approval_request` and runs zero `tools/call` until it approves,
