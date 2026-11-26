@@ -198,7 +198,7 @@ Manually dispatch `vllm-integration.yaml` with `run_codex_acceptance=true`
 and every other `run_*` input false, including `run_compaction_only`. Set
 `codex_model` to the Hugging Face checkpoint ID and
 `codex_served_model_name` to a slash-free alias. This runs the Codex GPU job
-without holding the candidate GPU for the Qwen3-8B full suite. Scheduled and
+without holding the candidate GPU for the Qwen3-8B full suite. The daily Qwen3-8B nightly and
 labeled jobs keep their Qwen3-8B settings. Candidate dispatches use the
 manifest's digest-pinned upstream vLLM image and download the selected
 checkpoint at its resolved Hugging Face revision.
@@ -227,6 +227,30 @@ GPU settings, Codex version, and ordered Praxis filter names by case. The
 report only merges Codex evidence matching its run ID, attempt, and checkout
 SHA. The top-level `not_requested` status on a Codex-only run refers to the
 full Responses suite, not the Codex cases.
+
+#### Opt in to weekly gpt-oss-120b qualification
+
+A repository maintainer can set the Actions variable
+`AWS_GPU_FALLBACK_SUBNET_IDS` to up to two whitespace-separated subnet IDs
+in launch order. Use approved subnets from distinct availability zones in
+the same region and VPC as the primary subnet, reachable with the configured
+runner role and security group. Codex candidate runs try the existing
+primary subnet first and then the configured fallbacks if EC2 rejects the
+launch. If the variable is unset, the runner still uses just the primary
+subnet. The instance type does not change during fallback.
+
+Set `CODEX_GPT_OSS_120B_SCHEDULE=true` to enable the **Codex Candidate GPU
+Qualification** workflow on `main` in `praxis-proxy/ai`, Mondays at
+07:42 UTC. The weekly run uses `openai/gpt-oss-120b` on `p5.4xlarge` with
+tensor parallel size 1 and a 16,384-token context. It runs native Responses
+and compaction only. It uses the same runner cleanup and qualification
+artifact as a manual run, but does not count as a Qwen nightly or release
+Responses qualification. In `qualification.json`, check that
+`suites.codex_acceptance` records success for both `codex_native` and
+`codex_compaction` for the intended checkpoint. A failed launch in every
+configured subnet leaves the candidate unqualified; the next scheduled
+run tries again. Unset the opt-in variable when weekly runs are no longer
+needed.
 
 ### Known model limitation: server-side web search on Qwen3-8B
 
