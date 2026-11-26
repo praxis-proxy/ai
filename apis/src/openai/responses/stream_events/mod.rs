@@ -1500,6 +1500,22 @@ fn append_logical_event(
             }
         }
     }
+    if event.event_type() == "response.output_item.added"
+        && ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(super::web_search_dispatch::has_hosted_web_search)
+        && event
+            .payload()
+            .get("item")
+            .is_some_and(super::web_search_dispatch::private_web_search_call)
+    {
+        local_tools::register_local_tool(
+            &mut state.local_tool_items,
+            event.payload(),
+            local_tools::LocalToolMode::Suppress,
+        );
+    }
     // Mode-aware suppression: Suppress drops all events; NativeHybridPending drops only
     // a still-PENDING output_item.done (EOS synthesizes the completed tail), but passes
     // through terminal done (completed/failed/incomplete) and removes keys (cancels synthesis).

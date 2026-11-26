@@ -6,6 +6,8 @@ upstream. For the gateway to validate requests, keep history, persist state,
 and run tools, you compose the experimental pipeline below; adding
 `openai_responses_proxy` on its own is not enough.
 
+See the [Responses support and qualification table](../conformance/openai-responses-state-conformance.md#responses-support-and-qualification) for state parameters, SDK versions, and the native and translated vLLM test lanes.
+
 ## Prerequisites and build
 
 Follow the [guide prerequisites](README.md). For this local lab you need:

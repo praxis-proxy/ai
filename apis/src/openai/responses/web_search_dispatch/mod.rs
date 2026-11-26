@@ -210,6 +210,8 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// max_query_bytes: 8192
 /// ```
 pub struct WebSearchDispatchFilter {
+    /// Enables function lowering at the native outbound Responses boundary.
+    native_tool_compat: bool,
     /// The search client for executing queries.
     search_client: SearchClient,
     /// Default search context size.
@@ -311,9 +313,11 @@ impl WebSearchDispatchFilter {
             .into());
         }
         let max_calls_per_round = cfg.max_calls_per_round;
+        let native_tool_compat = cfg.native_tool_compat;
         let (validated, watch_handle) = build_config("openai_web_search_dispatch", &cfg.into_shared())?;
         let search_client = SearchClient::from_config("openai_web_search_dispatch", &validated, subrequest_client)?;
         Ok(Box::new(Self {
+            native_tool_compat,
             search_client,
             default_context_size: validated.default_context_size,
             max_calls_per_round,
@@ -706,6 +710,23 @@ impl HttpFilter for WebSearchDispatchFilter {
         ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         ctx.record_ai_metadata(MAX_QUERY_METADATA, self.max_query_bytes.to_string());
 
+        if self.native_tool_compat
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            if state
+                .tools
+                .iter()
+                .any(|tool| tool["type"] == "function" && tool["name"] == "web_search")
+                && has_hosted_web_search(state)
+            {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    "function name web_search conflicts with hosted search",
+                )));
+            }
+            ctx.extensions.insert(NativeWebSearchCompatibility);
+        }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
@@ -1940,3 +1961,81 @@ pub(crate) fn bridge_call_id(source_id: &str, queries: &[&str], index: usize) ->
     }
     format!("ws_{index}_{hash:016x}")
 }
+
+
+/// Expose locally executed search as a function to inference backends.
+pub(crate) fn lower_native_web_search(state: &mut ResponsesState) {
+    let Some(tools) = state.request_body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut changed = false;
+    for tool in tools {
+        if tool
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+        {
+            *tool = crate::openai::translation::chat_completions::synthesized_web_search_tool_responses();
+            changed = true;
+        }
+    }
+    if changed {
+        if state
+            .request_body
+            .get("tool_choice")
+            .and_then(|v| v.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+            && let Some(object) = state.request_body.as_object_mut()
+        {
+            object.insert(
+                "tool_choice".into(),
+                serde_json::json!({"type":"function","name":"web_search"}),
+            );
+        }
+        state.mark_request_body_for_rebuild();
+    }
+}
+
+/// Identify the private inference function that represents hosted search.
+pub(crate) fn private_web_search_call(item: &Value) -> bool {
+    item["type"] == "function_call" && item["name"] == "web_search"
+}
+
+/// Check the canonical tool declarations retained for local dispatch.
+pub(crate) fn has_hosted_web_search(state: &ResponsesState) -> bool {
+    state.tools.iter().any(|t| {
+        t.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    })
+}
+
+/// Restore the private inference call before the agentic owner admits it.
+#[cfg(any(feature = "openai-agentic-loop", test))]
+pub(crate) fn restore_web_search_calls(response: &mut Value) {
+    let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        if private_web_search_call(item) {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("call_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+            if let Ok(restored) = crate::openai::translation::chat_completions::web_search_call_output_item_from_parts(
+                id,
+                arguments,
+                "in_progress",
+            ) {
+                *item = restored;
+            }
+        }
+    }
+}
+
+/// Request-scoped permission to lower hosted search at the native outbound boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeWebSearchCompatibility;
