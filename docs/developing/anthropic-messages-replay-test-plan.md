@@ -6,19 +6,15 @@ Owner: `franciscojavierarceo`
 
 ## What?
 
-Define the Anthropic Messages API shapes Praxis should cover in replay,
-passthrough, and translation tests. The goal is not to reimplement Anthropic's
-full request validator. Praxis should validate only the envelope and fields it
-owns locally, then preserve the request and response bodies as much as possible
-when passing them through.
+The Anthropic Messages API shapes Praxis should cover in replay, passthrough,
+and translation tests. Praxis validates only the envelope and the fields it
+owns, and otherwise preserves request and response bodies; it does not
+reimplement Anthropic's request validator.
 
-This test plan extends the broader Messages API filter proposal in
-[00484_anthropic-messages-api-filters.md](https://github.com/praxis-proxy/enhancements/blob/main/proposals/00484_anthropic-messages-api-filters.md)
-with concrete fixture and test coverage.
+This plan adds fixture and test coverage to the Messages API filter proposal,
+[00484_anthropic-messages-api-filters.md](https://github.com/praxis-proxy/enhancements/blob/main/proposals/00484_anthropic-messages-api-filters.md).
 
 ## Sources
-
-The test plan is based on:
 
 - Anthropic's
   [Messages API documentation](https://platform.claude.com/docs/en/build-with-claude/working-with-messages)
@@ -35,13 +31,13 @@ The test plan is based on:
 - A local aggregate scan of Claude Code JSONL sessions under
   `~/.claude/projects`
 
-The local scan was used only for shape discovery. It should not be copied into
-fixtures verbatim unless the content is reviewed and sanitized first.
+The local scan was for shape discovery only. Do not copy it into fixtures
+unless the content has been reviewed and sanitized.
 
 ## Local Session Inventory
 
-The local Claude Code sessions are dominated by client-tool traffic and are a
-good source for realistic replay shapes:
+The local Claude Code sessions are mostly client-tool traffic, which makes
+them a good source of realistic replay shapes:
 
 - 114 JSONL session files and 10,300 records
 - Message roles: 4,295 assistant records and 3,082 user records
@@ -62,13 +58,12 @@ good source for realistic replay shapes:
 - Tool result content appears as plain strings, `is_error` strings, lists of
   text blocks, and one list containing an image block.
 
-The scan did not find server tool response shapes such as `server_tool_use`.
-Those cases should be curated from public documentation or generated synthetic
-fixtures.
+The scan found no server tool response shapes such as `server_tool_use`, so
+those fixtures come from public documentation or are synthetic.
 
 ## Validation Policy
 
-Praxis should keep Anthropic Messages validation intentionally narrow:
+Praxis keeps Anthropic Messages validation narrow:
 
 - Validate that request bodies are valid JSON objects before downstream filters
   depend on them.
@@ -84,16 +79,14 @@ Praxis should keep Anthropic Messages validation intentionally narrow:
   structure. Generated replay requests and responses may be added next to the
   source records, but source records must not be modified to make the test pass.
 
-For response passthrough, the expected behavior is pure passthrough minus
-Praxis-owned source, protocol, and transport metadata. Content blocks, generated
-JSON, tool calls, thinking blocks, usage fields, stop reasons, and provider
-metadata should not be rewritten on native Anthropic paths.
+Native Anthropic response paths are pure passthrough apart from Praxis-owned
+source, protocol, and transport metadata. Content blocks, generated JSON, tool
+calls, thinking blocks, usage fields, stop reasons, and provider metadata are
+not rewritten.
 
 ## Test Matrix
 
 ### Request Envelope and Classification
-
-Cover these cases with unit or integration tests:
 
 - Minimal Messages request with `model`, `max_tokens`, and one user message.
 - String user content and array-based `text` content.
@@ -107,8 +100,6 @@ Cover these cases with unit or integration tests:
 - Malformed JSON or non-object JSON rejected by the validate filter.
 
 ### Content Blocks
-
-Cover all content block shapes Praxis may see or transform:
 
 - User and assistant `text` blocks.
 - Image blocks with `source.type` values:
@@ -127,12 +118,7 @@ Cover all content block shapes Praxis may see or transform:
   - `document`
   - `search_result`
 
-The current local sessions only show base64 images, so URL, file, document, and
-search-result fixtures should be curated.
-
 ### Tool Definitions
-
-Cover tool definitions that Anthropic accepts and Praxis may transform:
 
 - User-defined tool with `name`, `description`, and `input_schema`.
 - Tool `name` values using the documented alphanumeric, underscore, and hyphen
@@ -165,12 +151,9 @@ Cover tool definitions that Anthropic accepts and Praxis may transform:
   - `tool_search`
   - `mcp_toolset`
 
-Server-tool fixtures should be synthetic unless we capture a real local session
-that includes them.
-
 ### Tool Call Lifecycle
 
-Cover complete tool loops, not only isolated content blocks:
+Cover complete tool loops, not just isolated content blocks:
 
 - Assistant message with a single `tool_use` block and `stop_reason:
   "tool_use"`.
@@ -191,12 +174,12 @@ Cover complete tool loops, not only isolated content blocks:
 - Programmatic tool-calling metadata such as `caller` and `container` when a
   fixture is available.
 
-Ordering requirements should be documented, but Praxis should enforce them only
-where a transformation would otherwise produce an invalid backend request.
+Document ordering requirements, but enforce them only where a transformation
+would otherwise produce an invalid backend request.
 
 ### Response and Stop Reasons
 
-Cover each documented stop reason with either a passthrough fixture or a
+Cover each documented stop reason with a passthrough fixture or a
 translation unit test:
 
 - `end_turn`
@@ -212,9 +195,9 @@ include usage fields and at least one content block with `type: "tool_use"`.
 
 ### Streaming
 
-Streaming replay is deferred until the replay schema can represent SSE
-responses. Unit and integration tests for `anthropic_messages_to_chat_completions_stream` should still
-cover:
+Streaming replay waits until the replay schema can represent SSE responses.
+Unit and integration tests for `anthropic_messages_to_chat_completions_stream`
+still cover:
 
 - Text `content_block_delta` events.
 - Tool call input deltas.
@@ -245,9 +228,9 @@ Use curated fixtures for:
 - `pause_turn`, `refusal`, and `model_context_window_exceeded`.
 - SSE replay once the fixture schema supports it.
 
-Every fixture should include enough assertions to prove the behavior that made
-it worth adding. A fixture that only returns HTTP 200 is insufficient unless the
-shape itself is the regression target.
+Each fixture needs assertions for the behavior it was added to prove. A
+fixture that only checks for HTTP 200 is not enough unless the shape itself
+is the regression target.
 
 ## Priority
 

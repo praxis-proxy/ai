@@ -3,19 +3,18 @@
 Praxis AI treats an outbound target, its resolved socket addresses, and the
 credentials attached to the request as one trust decision. Operator-configured
 HTTP targets are public-only by default. Each request resolves its target once,
-checks every returned address immediately before connecting, and gives those
-same addresses to the transport. A single private, loopback, link-local, or
-otherwise non-public result rejects the whole callout.
+checks every returned address immediately before connecting, and hands those
+same addresses to the transport. One private, loopback, link-local, or other
+non-public result rejects the whole callout.
 
-Private targets require a filter-specific, explicit opt-in. HTTP proxies and
-redirect following are disabled for direct callouts. URL userinfo is rejected,
-and forwarded or configured credentials remain bound to the validated target
-origin.
+Private targets need an explicit opt-in on the filter. Direct callouts disable
+HTTP proxies and redirect following. URL userinfo is rejected, and forwarded or
+configured credentials stay bound to the validated target origin.
 
-Private-target opt-ins allow loopback, private, shared-address-space,
-link-local, and other special-use destinations. They never allow recognized
+A private-target opt-in allows loopback, private, shared-address-space,
+link-local, and other special-use destinations. It never allows recognized
 cloud metadata endpoints, unspecified addresses, or multicast addresses.
-IPv4-mapped IPv6 and well-known-prefix NAT64 forms receive the same verdict as
+IPv4-mapped IPv6 and well-known-prefix NAT64 forms get the same verdict as
 their embedded IPv4 address. GCP ADC is the only exception: its dedicated,
 non-configurable metadata policy accepts recognized metadata addresses (and
 loopback test stubs) only after its authority has been independently restricted.
@@ -41,18 +40,18 @@ loopback test stubs) only after its authority has been independently restricted.
 | `gcp_adc` metadata fetch | Protocol-owned metadata endpoint via `SubRequestClient` | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
 | `gcp_adc` key-file token exchange | Key file `token_uri`, which must be exactly `https://oauth2.googleapis.com/token`, via `SubRequestClient` | None (public-only) | No-follow | Signed `RS256` assertion in the token POST body |
 
-The request-derived `file_url` and MCP transports retain stricter policies:
+The request-derived `file_url` and MCP transports keep stricter policies:
 they resolve once per attempt, validate every address against `AddressPolicy`,
-do not follow redirects, and allow private access only through their narrow
-origin/loopback controls. GCP metadata intentionally allows only Google's two
-protocol-owned metadata addresses via `AddressPolicy::AllowGoogleMetadata`.
+and allow private access only through their narrow origin or loopback controls.
+GCP metadata allows only Google's two protocol-owned metadata addresses via
+`AddressPolicy::AllowGoogleMetadata`.
 
 `external_metering` calls out twice per request, so it resolves its configured
-host through the upstream DNS cache rather than on every call. Every cached
+host through the upstream DNS cache instead of on every call. Every cached
 address is still validated against `AddressPolicy` before connecting.
 
 Upstream cluster connections are not direct callouts. They use the core Praxis
-endpoint and TLS policy instead of these filter-level controls.
+endpoint and TLS policy.
 
 ## Adding a callout
 
@@ -85,18 +84,16 @@ A new filter that opens an outbound HTTP connection must:
 
 ## TLS backend
 
-Production outbound callouts use `SubRequestClient`, which inherits TLS from
-the process-wide Pingora/praxis-tls provider installed at startup
-(`praxis_tls::provider::install`). No per-callout or per-filter TLS backend
-selection is needed — all callouts share the same validated TLS stack as
-upstream cluster connections.
+Production callouts use `SubRequestClient`, which inherits TLS from the
+process-wide Pingora/praxis-tls provider installed at startup
+(`praxis_tls::provider::install`). Callouts and upstream cluster connections
+share that TLS stack, so no filter selects its own TLS backend.
 
 On RHEL/OpenShift FIPS builds, the system OpenSSL provider enforces approved
-cipher suites and algorithms for every outbound connection automatically. The
-FIPS feature set includes `openai-file-resolve-filter` and `aws-sigv4-filter`;
-`openai-mcp-tools` remains excluded because its `store` dependency pulls sha2
-through sqlx, and the response stores and policy engine are excluded for the
-same reason.
+cipher suites and algorithms on every outbound connection. The FIPS feature
+set includes `openai-file-resolve-filter` and `aws-sigv4-filter`. It excludes
+`openai-mcp-tools`, because its `store` dependency pulls sha2 through sqlx, and
+excludes the response stores and policy engine for the same reason.
 
 `reqwest` is a dev/test-only dependency. Test TLS infrastructure
 (`tests/utils/src/net/tls.rs`) uses rustls for mock servers and certificate

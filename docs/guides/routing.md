@@ -1,8 +1,8 @@
 # Route models and providers
 
-Choose one routing owner. A static alias does not require a provider registry;
-a dynamic provider catalog does. Neither choosing an endpoint nor changing the
-model string translates a protocol.
+Pick one filter to own routing: a static alias needs no provider registry, and
+a dynamic provider catalog does. Routing selects an endpoint and may rewrite
+the model string; neither translates the protocol.
 
 ## Start with a static alias
 
@@ -12,19 +12,18 @@ Follow the [guide prerequisites](README.md) and build the standard binary:
 cargo build -p praxis-ai-proxy
 ```
 
-Use the [complete model-to-provider example](../../examples/configs/model-to-provider.yaml).
-It maps `claude-sonnet-4-5` on `/v1/messages` and `/v1/messages/count_tokens`
-to cluster `vertex`, rewriting the body model to
-`claude-sonnet-4-5@20250929`. Unmatched models/paths go to `fallback` unchanged.
-The cluster name `vertex` is just a name here: this example does **not**
-configure Vertex authentication or endpoint translation.
+The [model-to-provider example](../../examples/configs/model-to-provider.yaml)
+maps `claude-sonnet-4-5` on `/v1/messages` and `/v1/messages/count_tokens` to
+cluster `vertex` and rewrites the body model to `claude-sonnet-4-5@20250929`.
+Unmatched models and paths go to `fallback` unchanged. `vertex` is only a
+cluster name: the example configures no Vertex authentication or endpoint
+translation.
 
-Start two backends on `127.0.0.1:9001` and `127.0.0.1:9002`. For inference,
-they must implement the client protocol and serve the appropriate target
-models. Recording HTTP stubs can instead demonstrate selection and rewriting,
-without claiming successful model inference. This local example uses no
-credentials; for real providers add cluster-selected credential injection
-after selection and configure their Host, TLS/SNI, and protocol adapter.
+Start two backends on `127.0.0.1:9001` and `127.0.0.1:9002`. For real
+inference they must speak the client protocol and serve the target models;
+recording HTTP stubs are enough to show selection and rewriting. The example
+uses no credentials. For real providers, add cluster-selected credential
+injection after selection and configure Host, TLS/SNI, and the protocol adapter.
 
 ```console
 ./target/debug/praxis-ai --validate -c examples/configs/model-to-provider.yaml
@@ -40,38 +39,37 @@ curl --fail-with-body http://127.0.0.1:8080/v1/messages \
   -d '{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Expect the first backend to receive the rewritten target model. Repeat with
-`"model":"unmapped-model"` to exercise the second backend; it receives that
-model unchanged. Inspect backend recordings to distinguish selection from a
-provider error about an unavailable model. The response retains the target
-model unless a provider response adapter restores the public ID.
+The first backend should receive the rewritten target model. Repeat with
+`"model":"unmapped-model"` and the second backend receives that model
+unchanged. Check backend recordings to tell a selection problem from a provider
+error about an unavailable model. The response carries the target model unless
+a provider response adapter restores the public ID.
 
-Keep `model_to_provider` before `load_balancer`; do not add a competing router.
-Endpoint health checks and retries belong to the load balancer. An unmatched
-request uses `fallback_upstream`; that setting does not mean automatic retry
-of a failed mapped inference on another provider. See the
-[exact contract](../filters/routing/model_to_provider.md).
+Keep `model_to_provider` before `load_balancer`, with no competing router. The
+load balancer owns endpoint health checks and retries. `fallback_upstream`
+only handles unmatched requests; it does not retry a failed mapped inference on
+another provider. See the [filter contract](../filters/routing/model_to_provider.md).
 
 ## Dynamic selection, failover, and affinity
 
-For a changing provider catalog, start with the complete
+For a changing provider catalog, start from the
 [intelligent routing example](../../examples/configs/intelligent-route-inference.yaml)
-or [overlay configuration](../../examples/configs/intelligent-route-overlay.yaml).
-Use `model_to_header` before `intelligent_route`, selected-provider adapters
-where needed, then `credential_inject` and endpoint selection. The
+or the [overlay configuration](../../examples/configs/intelligent-route-overlay.yaml).
+The order is `model_to_header`, then `intelligent_route`, then selected-provider
+adapters where needed, then `credential_inject` and endpoint selection. The
 [projected-secret example](../../examples/configs/intelligent-route-projected-credentials.yaml)
-shows gateway-owned credentials without embedding keys in YAML. This is a
-different credential mechanism from core `credential_injection`.
+supplies gateway-owned credentials without keys in YAML; `credential_inject` is
+a different mechanism from core `credential_injection`.
 
-Read the [routing reference](../filters/routing/intelligent_route.md) before deploying:
+Before deploying, read the [routing reference](../filters/routing/intelligent_route.md):
 capability matching, admission, serving snapshots, and selection policy all
-constrain eligibility. Session affinity is disabled by default. When enabled,
-it requires `store: local` plus a header or cookie source. Bindings live in
-one filter instance and do not survive restart or coordinate replicas. If a
-bound candidate becomes ineligible, a new eligible candidate can be selected;
-if none is available, the documented result is 404. This is selection failover,
-not a promise to replay an already-started generation or recover a partially
-emitted stream.
+limit which candidates are eligible. Session affinity is off by default and,
+when enabled, requires `store: local` plus a header or cookie source. Bindings
+live in one filter instance, so they are lost on restart and not shared across
+replicas. If a bound candidate becomes ineligible, another eligible one can be
+selected; with none left the request gets 404. This failover happens at
+selection time only and does not replay a started generation or recover a
+partly emitted stream.
 
 For provider-local routing, the [provider-route example](../../examples/configs/provider-route.yaml)
 requires downstream mTLS and `peer_identity_trust` before `provider_route`.
@@ -79,14 +77,13 @@ Never trust routing assertions from an unauthenticated client.
 
 ## Limits and cleanup
 
-Use compatible backend protocols on a shared route, or install an explicitly
-supported adapter. Streaming requires backend support and the appropriate SSE
-adapter for translated routes. Route success does not establish tool support,
-credential validity, or cross-provider semantic equivalence.
+Backends on a shared route must speak compatible protocols, or you install a
+supported adapter. Streaming needs backend support, plus the matching SSE
+adapter on translated routes. A successful route says nothing about tool
+support, credential validity, or whether two providers behave the same.
 
-Stop the proxy and the two test backends with Ctrl+C. Remove only your local
-recordings and temporary configurations. If you added provider keys, unset
-them in the proxy shell. The committed example remains unchanged.
+Stop the proxy and both test backends with Ctrl+C, remove your local recordings
+and temporary configurations, and unset any provider keys in the proxy shell.
 
 ## Filter reference
 

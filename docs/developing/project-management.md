@@ -1,23 +1,18 @@
 # Project Management
 
-All repositories in the `praxis-proxy` organization
-use a consistent workflow for planning, prioritizing,
-and tracking work.
+All repositories in the `praxis-proxy` organization use the same workflow for
+planning, prioritizing, and tracking work.
 
 ## Triage
 
-Every issue goes through triage before it becomes
-accepted work. New issues are automatically labeled
-`triage/needs-triage` when opened. Reviewers review
-incoming issues regularly (typically daily) to assess
-scope, validity, and priority.
+Every issue is triaged before it becomes accepted work. New issues are labeled
+`triage/needs-triage` automatically. Reviewers check incoming issues
+regularly (typically daily) for scope, validity, and priority.
 
-To accept an issue, assign it to a milestone. Milestone
-assignment signals that the issue is understood, scoped,
-and planned for work. A GitHub Actions workflow
-automatically swaps the label to `triage/accepted` when
-a milestone is set. Removing an issue from its milestone
-reverts it to `triage/needs-triage`.
+To accept an issue, assign it to a milestone, which says the issue is
+understood, scoped, and planned. A GitHub Actions workflow then swaps the
+label to `triage/accepted`. Removing the milestone reverts it to
+`triage/needs-triage`.
 
 | Label | Meaning |
 | --- | --- |
@@ -26,52 +21,39 @@ reverts it to `triage/needs-triage`.
 
 ## Bot-Generated Issues
 
-A weekly bot opens issues on the repository to surface
-potential improvements, bugs, or maintenance tasks. These
-issues are labeled `NEED HUMAN REVIEW` and **must not be
-worked on until a reviewer has reviewed them**.
+A weekly bot opens issues suggesting improvements, bugs, or maintenance tasks.
+They are labeled `NEED HUMAN REVIEW` and **must not be worked on until a
+reviewer has reviewed them**.
 
 ### Rules
 
-- **Do not self-assign** a bot-generated issue before it
-  has been reviewed.
-- **Do not submit a PR** for a bot-generated issue before
-  it has been validated by a reviewer.
+- **Do not self-assign** a bot-generated issue before it has been reviewed.
+- **Do not submit a PR** for a bot-generated issue before a reviewer has
+  validated it.
 
 ### Review Process
-
-A reviewer reviews the issue and applies one of the
-following labels:
 
 | Label | Meaning |
 | --- | --- |
 | `NEED HUMAN REVIEW` | Awaiting reviewer review (applied automatically by the bot) |
 | `HUMAN REVIEWED` | A reviewer has validated the issue |
 
-To **approve** an issue, replace the `NEED HUMAN REVIEW`
-label with `HUMAN REVIEWED`. The label history records
-who approved and when.
-
-To **reject** an issue, remove the `NEED HUMAN REVIEW`
-label, leave a comment explaining why, and close the
-issue.
-
-Once an issue is approved, it follows the normal triage
-workflow (milestone assignment, priority, sizing).
+To **approve** an issue, replace the `NEED HUMAN REVIEW` label with
+`HUMAN REVIEWED`; the label history records who approved it and when. To
+**reject** one, remove `NEED HUMAN REVIEW`, comment with the reason, and close
+the issue. Approved issues then follow the normal triage workflow (milestone,
+priority, size).
 
 ## Milestones
 
-Milestones represent a body of work toward a shared
-goal (e.g. a release, a feature area, or a hardening
-pass). Every issue and pull request should belong to
-a milestone. Milestones provide scope boundaries and
-help answer "what ships together?"
+A milestone is a body of work toward a shared goal, such as a release, a
+feature area, or a hardening pass. Every issue and pull request should belong
+to one. Milestones define what ships together.
 
 ## Priority
 
-Every issue should have a priority set via the
-built-in Priority issue field (not labels). Address
-work in priority order:
+Set every issue's priority with the built-in Priority issue field (not
+labels), and work in priority order:
 
 | Priority | Description |
 | --- | --- |
@@ -82,8 +64,8 @@ work in priority order:
 
 ## Size
 
-Every issue should have a size set via the built-in
-Size issue field. Size is a rough effort estimate:
+Set every issue's size, a rough effort estimate, with the built-in Size issue
+field:
 
 | Size | Rough Estimate |
 | --- | --- |
@@ -94,42 +76,31 @@ Size issue field. Size is a rough effort estimate:
 
 ## Project Boards
 
-GitHub project boards visualize the state of work
-across milestones. Use boards to track issues through
-their lifecycle (backlog, in progress, in review,
-done). Boards are the primary tool for stand-ups and
-status checks.
+GitHub project boards track issues across milestones through their lifecycle
+(backlog, in progress, in review, done). They are the main tool for stand-ups
+and status checks.
 
 ## Pull Request Review Assignment
 
-Contributors may have at most three open pull requests ready for
-review in this repository at a time. Drafts are excluded. Opening
-a ready PR or marking a draft ready can take the author over that
-limit. The bot then comments on the PR, fails its limit check, and
-skips reviewer assignment. When the count returns to three or fewer,
-edit or update the waiting PR to refresh the check and reviewer
+Every pull request must link the issue it addresses: `Closes #123` when
+merging completes the issue, `Refs #123` when the issue stays open.
+
+Each contributor may have at most three open pull requests ready for review in
+this repository; drafts do not count. If opening a ready PR or marking a draft
+ready takes the author over the limit, the bot comments on the PR, fails its
+limit check, and assigns no reviewer. Once the count is back to three or
+fewer, edit or update the waiting PR to rerun the check and reviewer
 assignment.
 
-Every pull request must link the issue it addresses. Use
-`Closes #123` when merging the PR completes the issue, or
-`Refs #123` when the issue remains open.
+Within the limit, the bot assigns a reviewer from `ai-reviewers` when a PR is
+opened, edited, synchronized, reopened, or marked ready for review. It never
+picks the PR author, chooses whoever is assigned to the fewest open PRs (ties
+broken at random), keeps an already assigned team reviewer, and never removes
+assignees. See [pull-request-assignees.yaml] for details.
 
-When the author's open PR count is within the limit, the
-bot assigns a reviewer from `ai-reviewers` when a PR is
-opened, edited, synchronized, reopened, or marked ready
-for review. Over-limit PRs receive no automatic reviewer
-assignment. The bot does not randomly assign maintainers.
-A maintainer takes
-ownership deliberately after all required CI checks pass;
-that assignment signals that maintainer review has
-started. Contributors should wait for green CI before
-requesting or expecting maintainer review.
-
-The bot never picks the PR author as reviewer and chooses
-whoever is assigned to the fewest open PRs, with ties
-broken at random. If a reviewer from the team is already
-assigned, that person stays assigned. The bot never
-removes assignees. See [pull-request-assignees.yaml] for
-the details.
+The bot does not randomly assign maintainers. A maintainer takes ownership
+deliberately after all required CI checks pass, and that assignment means
+maintainer review has started. Wait for green CI before requesting or
+expecting maintainer review.
 
 [pull-request-assignees.yaml]: ../../.github/workflows/pull-request-assignees.yaml

@@ -1,47 +1,45 @@
-# OpenTelemetry Routing Semantics
+# OpenTelemetry routing semantics
 
-Praxis AI can add AI routing decisions to the request trace created and
-exported by Praxis core. Build the proxy with:
+Praxis AI can add AI routing decisions to the request trace that Praxis core
+creates and exports. Build the proxy with:
 
 ```sh
 cargo build --release -p praxis-ai-proxy --features opentelemetry
 ```
 
-The feature is disabled by default. It does not install an exporter or parse
+The feature is off by default. It installs no exporter and parses no
 OpenTelemetry environment variables. Configure exporting, propagation,
 sampling, and request lifecycle tracing through Praxis core.
 
-After `intelligent_route` successfully selects a provider, the feature emits a
-short `routing.select` child span. The span contains bounded routing identity,
-admission, locality, rank, tier, and overlay revision attributes. It never
-records request or response bodies, prompts, credentials, authorization
-headers, cookies, or session keys.
+No span from this feature records request or response bodies, prompts,
+credentials, authorization headers, cookies, or session keys. `provider.route`
+also omits raw request identifiers.
 
-After `provider_route` validates the edge-selected candidate and resolves it
-to a provider-local backend cluster, the feature emits a short `provider.route`
-child span. The span records the resolved backend cluster the request was
-routed to; it is not proof that a downstream endpoint, pod, or model server
-successfully served the request. It contains:
+## Routing spans
 
-- `provider.id`: the configured provider-boundary identifier for this
-  listener. This is a configuration value, not necessarily the mTLS peer
-  identity.
+After `intelligent_route` selects a provider, the feature emits a short
+`routing.select` child span with bounded routing identity, admission, locality,
+rank, tier, and overlay revision attributes.
+
+After `provider_route` validates the edge-selected candidate and resolves it to
+a provider-local backend cluster, the feature emits a short `provider.route`
+child span. It records the cluster the request was routed to, which does not
+prove that a downstream endpoint, pod, or model server served the request. Its
+attributes:
+
+- `provider.id`: the configured provider-boundary identifier for this listener.
+  It is a configuration value and may differ from the mTLS peer identity.
 - `provider.backend.cluster`: the configured backend cluster the candidate
   resolved to.
-- `provider.route.model`: the configured model accepted for the resolved
-  route.
+- `provider.route.model`: the configured model accepted for the resolved route.
 - `provider.route.candidate_id`: the edge-selected candidate ID that was
   validated and resolved.
 - `overlay.revision`: present only when the edge supplied a serving overlay
-  revision that passed syntax and trust-boundary validation. It is
-  correlation evidence only, not a provider-local config revision and not an
+  revision that passed syntax and trust-boundary validation. It is correlation
+  evidence only: it is neither a provider-local config revision nor an
   authorization decision.
 
-Like `routing.select`, this span never records request or response bodies,
-prompts, credentials, authorization headers, cookies, session keys, or raw
-request identifiers.
-
-The division of responsibility is intentional:
+Span ownership:
 
 ```text
 Edge Praxis core request span
@@ -60,36 +58,31 @@ Either request span, when its pipeline runs token_rate_limit
   `-- ...
 ```
 
-The routing decision spans are short-lived siblings of the later transport
-span within the same request. The `token_rate_limit` span is the exception:
-it opens at admission and is closed when the response body ends, because its
-`actual_cost` field is only known once provider usage has been read (see
-below). When trace context is propagated between gateways, Praxis core
+The routing spans are short-lived siblings of the later transport span in the
+same request. When trace context is propagated between gateways, Praxis core
 connects the edge provider-hop client span to the provider request span.
 
-Praxis core owns the complete HTTP span lifetime and transport boundaries at
-both the edge and the provider-local listener. Praxis AI records only the
-semantic decisions it makes at each hop. This prevents duplicate request
-roots, conflicting trace propagation, and multiple exporter runtimes.
+Praxis core owns the HTTP span lifetime and transport boundaries at both the
+edge and the provider-local listener. Praxis AI records only the decisions it
+makes at each hop, which avoids duplicate request roots, conflicting trace
+propagation, and multiple exporter runtimes.
 
-Agentic callouts follow the same ownership rule. When a listener enables the
-core `trace_context` filter, Praxis AI projects only its typed `TraceContext`
-into isolated web-search, OGX file-search, OGX file-resolution, and MCP child
+Agentic callouts follow the same rule. When a listener enables the core
+`trace_context` filter, Praxis AI projects only its typed `TraceContext` into
+isolated web-search, OGX file-search, OGX file-resolution, and MCP child
 requests. Praxis core then emits the same `x-request-id` and W3C trace ID with a
 fresh span ID for every outbound hop. No ambient request extensions, provider
 credentials, or MCP authorization assertions are copied into trace fields.
 
 ## Token rate limiting
 
-When the experimental `token_rate_limit` filter and the `opentelemetry`
-feature are both enabled, every request that reaches a matching rule gets a
-request-scoped `token_rate_limit` span. A hierarchy denial, authentication
-miss, or backend error before the rule reservation uses the same span with
-`token_rate_limit.rule` set to `hierarchy:org`, `hierarchy:team`, or
-`hierarchy:user`. It records these bounded fields:
+With the experimental `token_rate_limit` filter and the `opentelemetry` feature
+both enabled, every request that reaches a matching rule gets a request-scoped
+`token_rate_limit` span. A hierarchy denial, authentication miss, or backend
+error before the rule reservation uses the same span. Fields:
 
-- `token_rate_limit.rule`: configured rule name, or `hierarchy:org`, `hierarchy:team`, or
-  `hierarchy:user` for a hierarchy-level outcome.
+- `token_rate_limit.rule`: configured rule name, or `hierarchy:org`,
+  `hierarchy:team`, or `hierarchy:user` for a hierarchy-level outcome.
 - `token_rate_limit.algorithm`: `sliding_window` or `token_bucket`.
 - `token_rate_limit.estimated_cost`: tokens reserved or considered at admission.
 - `token_rate_limit.decision`: `admitted` (reservation made), `denied` (429,
@@ -100,35 +93,22 @@ miss, or backend error before the rule reservation uses the same span with
   `unconfirmed` (explicit fail-open after a mutation may have been dispatched).
   Soft decisions align with `praxis_trl_requests_total{result=…}`.
 - `token_rate_limit.actual_cost`: provider-reported weighted usage, recorded
-  when the response body ends. Absent when the decision was not `admitted`
-or no usage metadata was produced.
+  when the response body ends. Absent when the decision was not `admitted` or
+  no usage metadata was produced.
 
-The Prometheus metric `praxis_trl_quota_source_missing_total{rule}` counts
-shared-quota responses for which PPE produced no decision; `rule` is the
-configured rule name.
+The span opens at admission and closes when the response body ends, because
+`actual_cost` is known only after provider usage has been read. Its lifetime
+therefore covers the streamed response. It does not contain the authenticated
+subject, internal budget key, prompt, body, model, or other request-specific
+identity. Valkey reconciliation runs asynchronously after response processing
+and reports through metrics and accounting logs, not the span.
 
-The token-rate-limit Prometheus metrics include
-`praxis_trl_fail_open_admissions_total{rule,backend,outcome}` for explicit
-`backend.on_failure: open` admissions. `outcome` is `bypassed` when no backend
-mutation was dispatched and `unconfirmed` when a dispatched operation may have
-committed. Fail-open admissions are not included in
-`praxis_trl_backend_errors_total`, which is reserved for failed reservations
-that fail closed with 503, plus reconciliation failures.
-The bounded `backend` vocabulary is `memory` or `shared_kv`; Redis and Valkey
-both use `shared_kv`.
-
-The span is created at admission and dropped when the response body ends,
-so its lifetime covers the streamed response. It does not contain the
-authenticated subject, internal budget key, prompt, body, model, or other
-request-specific identity. Valkey reconciliation runs asynchronously after
-response processing; its success or failure is exposed through metrics and
-accounting logs rather than extending the span further.
-
-Sentinel transport lifecycle is also metrics-only, not additional request-span
-attributes. `praxis_trl_sentinel_discovery_total{phase,result}` records
-bounded initial discovery and generation-fenced rediscovery outcomes;
-`praxis_trl_sentinel_failover_total{outcome}` records proxy-side
-recovery after invalidation. Their labels are fixed vocabularies and contain no
-endpoint, service-name, credential, subject, or bucket-key values. A
-`recovered` failover sample means that the proxy obtained a writable
-connection; it is not evidence that Sentinel promoted a replica.
+Quota-source, fail-open, and Sentinel discovery and failover outcomes are
+metrics only. See the
+[`token_rate_limit` metrics](../filters/control/token_rate_limit.md) for
+`praxis_trl_quota_source_missing_total{rule}`,
+`praxis_trl_fail_open_admissions_total{rule,backend,outcome}`,
+`praxis_trl_sentinel_discovery_total{phase,result}`, and
+`praxis_trl_sentinel_failover_total{outcome}`. Fail-open admissions are not
+counted in `praxis_trl_backend_errors_total`. The `backend` label is `memory`
+or `shared_kv`; Redis and Valkey both report `shared_kv`.

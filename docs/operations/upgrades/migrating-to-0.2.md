@@ -1,14 +1,12 @@
 # Migrating to 0.2.0
 
-Version 0.2.0 moves token usage parsing from
-`praxis-ai-apis` into the private token usage subsystem in
-`praxis-ai-filters`.
+Version 0.2.0 moves token usage parsing from `praxis-ai-apis` into the private
+token usage subsystem in `praxis-ai-filters`.
 
 ## Proxy configuration
 
-No configuration changes are required. The `token_count` and
-`token_usage_headers` filter names, provider values, and metadata
-keys remain unchanged.
+No changes are required. The `token_count` and `token_usage_headers` filter
+names, provider values, and metadata keys are unchanged.
 
 ## Rust API
 
@@ -22,17 +20,16 @@ praxis_ai_apis::token_usage::{
 }
 ```
 
-Provider response parsing now belongs to `TokenCountFilter` and is
-not exposed as a standalone library API. Add the filter to a pipeline
-and select the provider through its YAML configuration. Extracted
-counts remain available through these `HttpFilterContext` metadata
-keys:
+Provider response parsing now lives in `TokenCountFilter` and has no
+standalone library API. Add the filter to a pipeline and select the provider
+in its YAML configuration. Extracted counts are still available through these
+`HttpFilterContext` metadata keys:
 
 - `token.input`
 - `token.output`
 - `token.total`
 
 Custom filters that produce token counts can write the same keys with
-`HttpFilterContext::set_metadata`. Code that requires standalone
-provider parsing must remain on 0.1.x or own that parsing until a new
-public abstraction is introduced.
+`HttpFilterContext::set_metadata`. Code that needs standalone provider parsing
+must stay on 0.1.x or implement the parsing itself until a new public
+abstraction exists.
