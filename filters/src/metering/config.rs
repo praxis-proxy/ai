@@ -68,9 +68,12 @@ pub(super) struct ExternalMeteringConfig {
     #[serde(default)]
     pub provider: Option<String>,
 
-    /// When `true` (default), requests proceed if the metering service
-    /// is unavailable. When `false`, requests are rejected with 503.
-    /// This is the *billing* gate's availability policy.
+    /// When `true` (default), requests proceed when the budget verdict is
+    /// unavailable — the metering service is unreachable, times out, or
+    /// returns an unusable payload. When `false`, such requests are
+    /// rejected with 503. This is the *billing* gate's availability
+    /// policy: with `model_policy_check` enabled, an unavailable model
+    /// verdict still rejects with 503 regardless of this setting.
     #[serde(default = "default_true")]
     pub fail_open: bool,
 
