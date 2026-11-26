@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=3.26,<4", "pytest>=8.0"]
+# dependencies = ["openai>=3.26,<4", "pytest>=8.0", "pyyaml>=6.0"]
 # ///
 """Official OpenAI-client coverage for the Decisions API pass-through."""
 
@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import yaml
 from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -106,21 +107,17 @@ def _decision_response() -> dict:
 
 
 def _config(proxy_port: int, backend_port: int) -> dict:
-    return {
-        "listeners": [{"name": "proxy", "address": f"127.0.0.1:{proxy_port}", "filter_chains": ["main"]}],
-        "filter_chains": [{
-            "name": "main",
-            "filters": [
-                {"filter": "ai_operation"},
-                {"filter": "router", "routes": [{"path_prefix": "/", "cluster": "decisions-backend"}]},
-                {"filter": "load_balancer", "clusters": [{
-                    "name": "decisions-backend", "endpoints": [f"127.0.0.1:{backend_port}"]}]},
-            ],
-        }],
-        "admin": {},
-        "shutdown_timeout_secs": 5,
-        "insecure_options": {"allow_private_endpoints": True},
-    }
+    example = ROOT / "examples/configs/openai/decisions.yaml"
+    config = yaml.safe_load(example.read_text())
+    config["listeners"][0]["address"] = f"127.0.0.1:{proxy_port}"
+    load_balancer = config["filter_chains"][0]["filters"][-1]
+    for cluster in load_balancer["clusters"]:
+        if cluster["name"] == "decisions-backend":
+            cluster["endpoints"] = [f"127.0.0.1:{backend_port}"]
+        else:
+            cluster["endpoints"] = [f"127.0.0.1:{_port()}"]
+    config["shutdown_timeout_secs"] = 5
+    return config
 
 
 @pytest.fixture(scope="module")
@@ -200,11 +197,9 @@ class TestOpenAIDecisionsPassthrough:
         }, "pass-through must not rewrite the request body"
 
     def test_refusal_answers_still_parse(self, client):
-        STATE.script(200, {
-            "model": "gpt-6-luna",
-            "answers": [{"type": "refusal", "name": "damaged"}],
-            "usage": {"input_tokens": 10, "output_tokens": 0, "total_tokens": 10},
-        })
+        response = _decision_response()
+        response["answers"] = [{"type": "refusal", "name": "damaged"}]
+        STATE.script(200, response)
         decision = client.decisions.create(
             model="gpt-6-luna",
             input="Order arrived damaged.",

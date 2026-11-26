@@ -2,10 +2,9 @@
 #
 # Routes OpenAI Decisions API traffic (`POST /v1/decisions`) to a dedicated
 # backend. The `ai_operation` filter classifies the request head — method and
-# path alone, without reading the body — and promotes the
-# `openai_decisions` application protocol to an internal routing header
-# (x-praxis-ai-*) that the branch router matches for cluster selection.
-# Internal headers are stripped before upstream by header hygiene.
+# path alone, without reading the body. The branch's `on_result` condition
+# matches the classifier's published `application_protocol` result,
+# `openai_decisions`, and selects the Decisions backend.
 #
 # The Decisions contract is proxied, not owned: the request body and the
 # response pass through unchanged, and the backend owns validation and the
