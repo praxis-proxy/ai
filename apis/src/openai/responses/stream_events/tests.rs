@@ -7556,3 +7556,36 @@ fn streaming_error_event_reads_nested_error_and_bounds_fields() {
         "content beyond the field bound or in message must not reach logs: {logs}"
     );
 }
+
+#[test]
+fn native_web_search_private_events_are_suppressed_before_terminal_output() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().tools = vec![json!({"type":"web_search"})];
+    StreamEventsFilter::test_filter().arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut output = Vec::new();
+    for (kind, payload) in [
+        (
+            "response.output_item.added",
+            json!({"output_index":0,"item":{"id":"s1","type":"function_call","name":"web_search","arguments":""}}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            json!({"item_id":"s1","delta":"{\"queries\":[\"Rust\"]}"}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            json!({"item_id":"s1","arguments":"{\"queries\":[\"Rust\"]}"}),
+        ),
+        (
+            "response.output_item.done",
+            json!({"output_index":0,"item":{"id":"s1","type":"function_call","name":"web_search"}}),
+        ),
+    ] {
+        super::append_logical_event(&mut state, &mut ctx, responses_event(kind, payload), &mut output);
+        assert!(
+            output.is_empty(),
+            "private search function event escaped before dispatch"
+        );
+    }
+}
