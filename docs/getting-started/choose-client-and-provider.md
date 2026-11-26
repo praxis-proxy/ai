@@ -28,6 +28,8 @@ See [build groups](../features.md#cargo-features).
 | Responses → gateway-managed native Responses or translated Chat | Managed, experimental; [recipe](../guides/managed-responses.md) | `openai-responses`; recipe selects `openai-all,store-sqlite` | Backend and tool credentials are separate; managed restrictions and translation gaps apply |
 | Conversations → local gateway store | Managed, experimental; [state guide](../guides/managed-responses.md#conversations-and-state), [reference](../filters/agents/openai_conversations.md) | `openai-conversations,store-sqlite` or selected PostgreSQL backend | Explicit owner/auth boundary; local CRUD is distinct from forwarding upstream Conversations |
 
+See the [Responses support and qualification table](../conformance/openai-responses-state-conformance.md#responses-support-and-qualification) for state parameters, SDK versions, and the native and translated vLLM test lanes.
+
 The [cloud provider runbook](../guides/providers/README.md) adds credentials,
 endpoint/Host/TLS selection, validation, startup, requests, and cleanup to the
 example configurations. It assumes account permissions, regional model
@@ -48,6 +50,8 @@ availability, and an authorized credential source are already in place. The
   [generated matrix](../conformance/translation-matrix.md) and its source evidence;
   do not interpret a fixture as provider-wide qualification.
 
+For verified CLI edits, permission modes and compaction outcomes by model and API route, see [Coding harness compatibility](../conformance/coding-harness-compatibility.md).
+
 ### Codex CLI qualification
 
 Open the [release you intend to deploy](https://github.com/praxis-proxy/ai/releases)
@@ -56,11 +60,11 @@ and read **Codex CLI capabilities** in its attached `support-report.md`.
 | Capability | Native Responses | Responses → Chat Completions | What the test verifies |
 | --- | --- | --- | --- |
 | Apply a file patch | Release report | Release report | Codex applies the patch, returns tool output through Praxis, and writes the exact expected file. |
+| Cite a live web search | Release report | Release report | Codex completes a turn citing an exact source URL from a successful Tavily search through Praxis. |
 | Compact a session | Release report | Outside test scope | Codex sends a summarization request and resumes with compacted history. |
 | Finish a task after compaction | Release report | Outside test scope | Codex finishes the task and verifies the resulting file. |
 
-All scenarios use HTTP/SSE, disable web search, and run in Codex's full-access
-sandbox. The report gives the outcome for the model tested on that release.
+All scenarios use HTTP/SSE. Edit and compaction disable web search and use full-access sandbox mode. The dedicated search cases enable live web search in read-only mode. The release report gives the outcome for the model tested on that release.
 The matching `support-report.json` records each case's configuration (model
 names, vLLM image, parsers, example configuration) under
 `live_validation.suites.codex_acceptance.cases[].capabilities`, and its live

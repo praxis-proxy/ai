@@ -211,6 +211,24 @@ class SupportReportTest(unittest.TestCase):
                 self.assertIn("| Finish a task after compaction | Unverified | Outside test scope |", markdown)
                 self.assertIn("| Apply a file patch | Unverified | Unverified |", markdown)
 
+    def test_codex_web_search_requires_evidence_on_each_route(self):
+        live = qualification()
+        evidence = {
+            "client_version": "0.170.0", "client_model": "gpt-5.5", "served_model": "qwen3-8b",
+            "checkpoint": "Qwen/Qwen3-8B", "transport": "HTTP", "sandbox": "read-only",
+            "web_search": "live", "example": "client-tool-compat.yaml",
+            "outcomes": [["cited live search source", "passed"]],
+        }
+        cases = live["suites"]["codex_acceptance"]["cases"]
+        cases.extend([
+            {"id": "codex_native_search", "status": "success", "capabilities": evidence},
+            {"id": "codex_translated_search", "status": "skipped"},
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            write_fixtures(directory, qualification_value=live)
+            _, markdown = generate(arguments(directory, qualification=str(Path(directory) / "qualification.json")))
+            self.assertIn("| Cite a live web search | **Verified** | Unverified |", markdown)
+
     def test_provenance_mismatch_refuses_live_claims(self):
         with tempfile.TemporaryDirectory() as directory:
             write_fixtures(directory, qualification_value=qualification(sha="9" * 40))
