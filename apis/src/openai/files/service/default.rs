@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use praxis_ai_store::{DeletionOutcome, FileCatalog, StateOwner};
+use praxis_ai_store::{FileCatalog, StateOwner};
 
 use super::{FileDownload, FileService, FileServiceError, FileUploadSession};
 use crate::openai::files::{FileInfo, FileList, FilePage, FileStore};
@@ -63,9 +63,10 @@ impl FileService for DefaultFileService {
     async fn delete(&self, owner: &StateOwner, id: &str) -> Result<(), FileServiceError> {
         // A file already marked for deletion is reported as not found, like
         // every other hidden file: only the call that hides it succeeds.
-        match self.catalog.mark_for_deletion(owner, id).await? {
-            DeletionOutcome::Marked => Ok(()),
-            DeletionOutcome::AlreadyPending | DeletionOutcome::NotFound => Err(FileServiceError::NotFound),
+        if self.catalog.mark_for_deletion(owner, id).await? {
+            Ok(())
+        } else {
+            Err(FileServiceError::NotFound)
         }
     }
 }
