@@ -9,7 +9,7 @@
 //!
 //! Classifies each round's output by dispatch target to make the
 //! loop decision, but does **not** execute any call — MCP execution
-//! is handled by `openai_mcp_dispatch`, web search by
+//! is handled by `openai_mcp_connector`, web search by
 //! `openai_web_search_dispatch`, and file search by
 //! `openai_file_search_dispatch`. As the sole owner it runs before
 //! every dispatcher in the response phase, so it is the central
@@ -63,7 +63,7 @@
 //! # Filter order
 //!
 //! For tool execution, it must appear after `openai_web_search_dispatch`,
-//! `openai_mcp_dispatch`, and `openai_file_search_dispatch` and before
+//! `openai_mcp_connector`, and `openai_file_search_dispatch` and before
 //! `openai_responses_proxy`. Response filters execute in reverse
 //! order, so the owner parses and classifies each round's output
 //! *before* the dispatchers run, routing every call to the vector the
@@ -83,7 +83,7 @@
 //!         provider: brave
 //!         api_key:
 //!           env_var: WEB_SEARCH_API_KEY
-//!       - filter: openai_mcp_dispatch
+//!       - filter: openai_mcp_connector
 //!       - filter: openai_file_search_dispatch
 //!       - filter: openai_agentic_loop
 //!         max_infer_iters: 10

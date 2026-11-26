@@ -17,7 +17,7 @@ use tracing::{debug, trace};
 
 #[cfg(feature = "openai-mcp-tools")]
 use super::super::{
-    mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
+    mcp_connector::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
     mcp_tool_resolve::has_pending_deferred_discovery,
 };
 use super::{
@@ -82,7 +82,7 @@ const META_STATUS: &str = "responses.status";
 /// `filter_results` for `iterative_request_router` transitions.
 ///
 /// Also extracts `tool_search_call` items into
-/// `ResponsesState.tool_search_calls` so `openai_mcp_dispatch` can
+/// `ResponsesState.tool_search_calls` so `openai_mcp_connector` can
 /// load deferred connectors on the next iteration without forwarding
 /// those items to the inference backend.
 ///
@@ -425,7 +425,7 @@ fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesSt
     // Direct owner tests and pipelines without that optional metadata still
     // need MCP ownership/approval preparation, so only the cap becomes
     // effectively unbounded when the metadata is absent. The operator approval
-    // floor rides on typed request state (set by `openai_mcp_dispatch`), not
+    // floor rides on typed request state (set by `openai_mcp_connector`), not
     // metadata, so a saturated metadata map can never silently drop it.
     #[cfg(feature = "openai-mcp-tools")]
     {
@@ -1370,7 +1370,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
                 // Mirror the buffered collector: a completed hosted
                 // `tool_search_call` is not a valid OpenResponses input item, so
-                // it must not enter `messages`. `openai_mcp_dispatch` consumes
+                // it must not enter `messages`. `openai_mcp_connector` consumes
                 // `tool_search_calls` to list deferred connectors.
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.tool_search_calls.push(assignment);

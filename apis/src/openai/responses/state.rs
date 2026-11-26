@@ -237,7 +237,7 @@ pub(crate) struct ClientToolEcho {
 /// MCP calls (`mcp_call`, `mcp_approval_request`, `mcp_list_tools`) and the
 /// pre-dispatch `function_call` items that encode them are deliberately absent:
 /// the OpenAI Responses API scopes `max_tool_calls` to *built-in* tools and
-/// keeps MCP tools on their own limits (see `openai_mcp_dispatch`'s
+/// keeps MCP tools on their own limits (see `openai_mcp_connector`'s
 /// `max_calls_per_round`). Counting MCP here would let it silently starve the
 /// built-in budget, which the provider contract forbids.
 pub(crate) fn is_builtin_tool_call(item: &serde_json::Value) -> bool {
@@ -530,9 +530,9 @@ pub(crate) struct ResponsesState {
 
     /// Configured MCP connectors waiting for `tool_search` discovery.
     ///
-    /// Populated by `openai_mcp_tool_resolve` when a request uses
+    /// Populated by `openai_mcp_connector` when a request uses
     /// `connector_id` with `defer_loading: true`. Consumed by
-    /// `openai_mcp_dispatch` on a later `tool_search_call` to load
+    /// `openai_mcp_connector` on a later `tool_search_call` to load
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
@@ -544,8 +544,8 @@ pub(crate) struct ResponsesState {
 
     /// Slot policy under which configured MCP connector state was resolved.
     ///
-    /// `openai_mcp_tool_resolve` records this while building MCP state.
-    /// `openai_mcp_dispatch` compares it with its own configuration before
+    /// `openai_mcp_connector` records this while building MCP state.
+    /// `openai_mcp_connector` compares it with its own configuration before
     /// issuing a configured-connector callout, preventing discovery and
     /// execution from silently using different request-scoped credential or
     /// authorization slots. Direct `server_url` entries ignore this field.
@@ -554,7 +554,7 @@ pub(crate) struct ResponsesState {
 
     /// Operator metadata-admission decisions for this request (#1724).
     ///
-    /// Stamped afresh by `openai_mcp_tool_resolve` from operator configuration
+    /// Stamped afresh by `openai_mcp_connector` from operator configuration
     /// (admission mode + connector tool policy), extended through deferred discovery, and
     /// re-enforced at dispatch. Verdicts are typed and operator-owned; client
     /// fields, cached definitions, and restored history never supply admission
@@ -562,7 +562,7 @@ pub(crate) struct ResponsesState {
     #[cfg(feature = "openai-mcp-tools")]
     pub mcp_admission: crate::mcp_core::admission::McpAdmissionDecisions,
 
-    /// Operator approval floor published by `openai_mcp_dispatch` during the
+    /// Operator approval floor published by `openai_mcp_connector` during the
     /// request phase for the `openai_agentic_loop` owner to apply when it
     /// partitions approvals in the response phase of the same IRR iteration.
     ///
@@ -584,7 +584,7 @@ pub(crate) struct ResponsesState {
     /// Resolved MCP tool definitions keyed by `(server_label,
     /// tool_name)`.
     ///
-    /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
+    /// Built by `openai_mcp_connector` from `tools/list` responses.
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
     pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
 
@@ -685,7 +685,7 @@ pub(crate) struct ResponsesState {
 
     /// Server-owned pending MCP approvals emitted during this request.
     ///
-    /// Populated by `mcp_dispatch` when it pauses on an
+    /// Populated by `mcp_connector` when it pauses on an
     /// `mcp_approval_request`, this is drained by the store filter and
     /// persisted as the authoritative record for correlating a later
     /// `mcp_approval_response`. Consent provenance lives here and in the
@@ -697,7 +697,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Set by `openai_responses_store` during the request phase only after it
     /// initializes and registers a backend AND classifies this request as one
-    /// whose response will be persisted. `mcp_dispatch` reads this
+    /// whose response will be persisted. `mcp_connector` reads this
     /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
     /// pipeline-scoped registry membership, it proves the store filter actually
     /// ran and intends to persist THIS response, so it also catches a store
@@ -792,7 +792,7 @@ pub(crate) struct ResponsesState {
     /// `tool_search_call` items from the current inference response.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
-    /// `openai_mcp_dispatch` consumes these to load deferred connector
+    /// `openai_mcp_connector` consumes these to load deferred connector
     /// tools before the next inference round.
     #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
     pub tool_search_calls: Vec<OutputAssignment>,
@@ -843,7 +843,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Each round's model output items and MCP execution results are
     /// appended here so the final response contains the complete
-    /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
+    /// trace. `openai_agentic_loop` writes model items, `mcp_connector`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
 
@@ -904,7 +904,7 @@ pub(crate) struct ResponsesState {
     /// `accumulated_output` (via `agentic_loop::collect_streaming_output_items`),
     /// so keying synthesis on item type alone would fabricate an
     /// `in_progress`/`searching`/`done` lifecycle for a search that never ran.
-    /// `mcp_dispatch` records both the approval-request and result item ids;
+    /// `mcp_connector` records both the approval-request and result item ids;
     /// `web_search` records the id it replaces with executed results.
     pub locally_executed_output_items: HashSet<String>,
 
@@ -1021,7 +1021,7 @@ pub(crate) struct CollectedRound {
 
 /// Internally resolved MCP connector waiting for deferred discovery.
 ///
-/// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`,
+/// The deferred `tools/list` callout is issued later by `openai_mcp_connector`,
 /// so its private/loopback posture is governed by that filter's bound outbound
 /// pipeline (via the per-request `McpCallout`) rather than a field captured here.
 #[derive(Clone)]
@@ -1063,7 +1063,7 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Operator tool policy stamped from connector configuration at resolve time.
     ///
-    /// Deferred discovery runs inside `openai_mcp_dispatch`, which has no access
+    /// Deferred discovery runs inside `openai_mcp_connector`, which has no access
     /// to the resolver's connector configuration, so the policy is carried here —
     /// operator-owned and never derived from server, cached, or client data.
     #[cfg(feature = "openai-mcp-tools")]

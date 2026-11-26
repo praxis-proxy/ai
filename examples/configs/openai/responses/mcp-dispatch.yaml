@@ -1,65 +1,46 @@
-# MCP Dispatch Filter
+# MCP Connector Filter
 # Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
-# Demonstrates the `openai_mcp_dispatch` filter configuration. The
-# filter executes MCP tool calls against upstream MCP servers within
-# the Responses API agentic loop. It identifies MCP tool calls from
-# the model response, checks approval policies, calls `tools/call`
-# on the originating server, and appends the results.
+# Demonstrates discovery and execution timeout configuration for
+# `openai_mcp_connector` inside an inference step. For a loop that executes the
+# model's selected tools, see agentic-loop.yaml.
 #
-# Requires `openai_agentic_loop` (#26) for end-to-end execution. Without
-# it the filter validates its configuration at startup but cannot
-# be triggered at runtime.
-#
-# Pipeline ordering:
-#   tool_parse → mcp_tool_resolve → mcp_dispatch
-#
-# `openai_stream_events` is not part of this minimal dispatch demo: it
-# composes streamed inference rounds into one logical Responses stream and
-# is only valid inside an `iterative_request_router` step. See
-# `agentic-loop.yaml` for the end-to-end streaming loop that pairs
-# `openai_mcp_dispatch` with `openai_stream_events` inside IRR.
-#
-# Configuration:
-#   timeout_ms:      Per-call timeout for tools/call (default: 30000)
-#
-# The `tools/call` callout is dialed through the pipeline's sub-request
-# executor; the MCP transport stages the SSRF-validated dial target itself. This
-# filter is meant to run inside the `iterative_request_router` step pipeline (the
-# per-round executor). praxis core builds each IRR step with a live chain-binding
-# context, so `openai_mcp_dispatch` binds an **inline** `outbound_chain`; it
-# rejects a **named** reference, because IRR supplies each step an empty
-# top-level named-chain map and a named reference cannot resolve there.
-# `openai_mcp_tool_resolve`, a top-level filter, additionally accepts a named
-# reference — see mcp-outbound-chain.yaml.
-#
-# SSRF posture: the outbound MCP callout is validated against the pipeline's
-# `insecure_options.allow_private_upstreams` (default: false). There is no
-# per-filter loopback opt-in; a loopback MCP server requires
-# `allow_private_upstreams: true` globally.
+# The connector uses the filtered subrequest executor for both operations.
+# Private MCP servers require the global allow_private_upstreams option.
 
 listeners:
   - name: ai-gateway
     address: "127.0.0.1:8080"
-    filter_chains: [mcp-dispatch-pipeline]
+    filter_chains: [mcp-connector-pipeline]
 
 filter_chains:
-  - name: mcp-dispatch-pipeline
+  - name: mcp-connector-pipeline
     filters:
+      - filter: ai_operation
+      - filter: openai_responses_request
+        on_invalid: continue
       - filter: openai_tool_parse
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
-      - filter: openai_mcp_dispatch
-        timeout_ms: 30000
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            cluster: "inference"
-      - filter: load_balancer
-        clusters:
-          - name: "inference"
-            endpoints:
-              - "127.0.0.1:3001"
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_mcp_connector
+                discovery_timeout_ms: 5000
+                call_timeout_ms: 30000
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

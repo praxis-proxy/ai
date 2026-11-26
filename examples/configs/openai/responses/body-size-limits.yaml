@@ -5,7 +5,7 @@
 # OpenAI Responses filters that each buffer the request body.
 #
 # Every body-buffering Responses filter (openai_file_resolve,
-# openai_doc_extract, openai_tool_parse, openai_mcp_tool_resolve,
+# openai_doc_extract, openai_tool_parse, openai_mcp_connector,
 # openai_responses_proxy) declares a StreamBuffer body mode with a
 # fixed 64 MiB ceiling. Praxis core merges those per-filter modes per
 # direction, keeping the largest, then clamps the merged mode to the
@@ -77,27 +77,41 @@ filter_chains:
         allow_pre_security_callout: true
         on_unsupported: continue
 
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        on_invalid: continue
+
       - filter: openai_tool_parse
 
-      - filter: openai_mcp_tool_resolve
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_mcp_connector
 
-      - filter: openai_responses_proxy
+              - filter: openai_responses_proxy
 
-      - filter: router
-        routes:
-          - path_prefix: "/v1/responses"
-            cluster: "inference-backend"
-          - path_prefix: "/"
-            cluster: "default-backend"
+              - filter: router
+                routes:
+                  - path_prefix: "/v1/responses"
+                    cluster: "inference-backend"
+                  - path_prefix: "/"
+                    cluster: "default-backend"
 
-      - filter: load_balancer
-        clusters:
-          - name: "inference-backend"
-            endpoints:
-              - "127.0.0.1:3001"
-          - name: "default-backend"
-            endpoints:
-              - "127.0.0.1:3002"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+                  - name: "default-backend"
+                    endpoints:
+                      - "127.0.0.1:3002"
+            on_result:
+              - default: true
+                done: true
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

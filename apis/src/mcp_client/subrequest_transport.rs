@@ -388,7 +388,7 @@ pub(crate) fn build_bare_outbound_pipeline(allow_private: bool) -> Result<Arc<Fi
 /// This bundles the *real* parent subrequest transport and downstream
 /// attributes read off the owning [`HttpFilterContext`] together with the bound
 /// outbound [`FilterPipeline`] the chain-binding MCP filter resolved at build
-/// time. Both `openai_mcp_tool_resolve` and `openai_mcp_dispatch` construct one
+/// time. Both `openai_mcp_connector` and `openai_mcp_connector` construct one
 /// of these per request via [`from_context`](Self::from_context) and thread it
 /// down to
 /// [`list_tools_with_forwarded_headers`](super::list_tools_with_forwarded_headers)/

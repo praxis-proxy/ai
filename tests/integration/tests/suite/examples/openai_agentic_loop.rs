@@ -928,7 +928,7 @@ fn round_trip_captures_tool_and_model_requests() {
             .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id")),
         "ambient identity must not cross the request-selected MCP URL boundary"
     );
-    // The example's openai_mcp_dispatch binds an inline outbound_chain whose
+    // The example's openai_mcp_connector binds an inline outbound_chain whose
     // `headers` filter stamps X-MCP-Client. tools/call is issued only by dispatch
     // (tool_resolve issues initialize/tools/list), so its presence here proves the
     // dispatch outbound_chain is bound and runs on the callout inside the IRR step.
@@ -8079,15 +8079,15 @@ fn load_unified_dispatch_config(
     // outbound pipeline), not a per-filter opt-in, so no `allow_loopback` field
     // is injected.
     let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
+        "              - filter: openai_mcp_connector\n                connectors:\n                  - id: corp_drive\n                    server_url: https://drive-mcp.internal:8443/mcp\n",
         &format!(
-            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
+            "              - filter: openai_mcp_connector\n                forward_headers: [x-tenant-id]\n                connectors:\n                  - id: trusted-mcp\n                    server_url: http://127.0.0.1:{mcp_port}/mcp\n"
         ),
         1,
     );
     let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: project_state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
+        "              - filter: openai_mcp_connector\n",
+        "              - filter: project_state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_connector\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")
@@ -8194,7 +8194,7 @@ fn approval_benign_response() -> String {
 /// The MCP tool definition (approval always required) sent on every turn.
 ///
 /// Re-sending the tools on the follow-up turn is required so
-/// `openai_mcp_tool_resolve` repopulates the tool map for target binding.
+/// `openai_mcp_connector` repopulates the tool map for target binding.
 fn approval_tools(mcp_port: u16) -> serde_json::Value {
     serde_json::json!([{
         "type": "mcp",
@@ -9349,7 +9349,7 @@ fn approval_two_call_response() -> String {
 }
 
 /// The MCP tool definition (both tools, approval always required) re-sent on
-/// every turn so `openai_mcp_tool_resolve` repopulates the tool map on resume.
+/// every turn so `openai_mcp_connector` repopulates the tool map on resume.
 fn approval_two_tools(mcp_port: u16) -> serde_json::Value {
     serde_json::json!([{
         "type": "mcp",
@@ -9605,7 +9605,7 @@ fn approval_without_configured_store_is_rejected() {
 // Operator Approval Floor (issue #1723)
 // -----------------------------------------------------------------------------
 //
-// An operator can set `openai_mcp_dispatch.minimum_approval: always` to require
+// An operator can set `openai_mcp_connector.minimum_approval: always` to require
 // approval for EVERY MCP call, combined monotonically with each client's per-tool
 // policy: `approval_required = operator_floor || client_requires_approval`. A
 // client `require_approval: "never"` can no longer suppress the operator
@@ -9617,7 +9617,7 @@ fn approval_without_configured_store_is_rejected() {
 // a denial executes nothing.
 
 /// Like [`load_approval_config`] but enables the operator approval floor on
-/// `openai_mcp_dispatch` (`minimum_approval: always`).
+/// `openai_mcp_connector` (`minimum_approval: always`).
 fn load_approval_floor_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
@@ -9625,13 +9625,13 @@ fn load_approval_floor_config(proxy_port: u16, model_port: u16, db_url: &str) ->
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     let floored = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                minimum_approval: always\n",
+        "              - filter: openai_mcp_connector\n",
+        "              - filter: openai_mcp_connector\n                minimum_approval: always\n",
         1,
     );
     assert_ne!(
         floored, yaml,
-        "expected to inject minimum_approval into the openai_mcp_dispatch block; its config may have changed"
+        "expected to inject minimum_approval into the openai_mcp_connector block; its config may have changed"
     );
     praxis_core::config::Config::from_yaml(&floored).expect("parse approval-floor config")
 }
@@ -9651,23 +9651,19 @@ fn load_approval_floor_connector_config(
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
-        &format!("          - id: corp_drive\n            server_url: {connector_url}\n"),
-        1,
-    );
+    let yaml = yaml.replacen("https://drive-mcp.internal:8443/mcp", connector_url, 1);
     assert!(
         yaml.contains(&format!("server_url: {connector_url}")),
         "expected to rewrite the corp_drive connector url"
     );
     let floored = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                minimum_approval: always\n",
+        "              - filter: openai_mcp_connector\n",
+        "              - filter: openai_mcp_connector\n                minimum_approval: always\n",
         1,
     );
     assert_ne!(
         floored, yaml,
-        "expected to inject minimum_approval into openai_mcp_dispatch"
+        "expected to inject minimum_approval into openai_mcp_connector"
     );
     praxis_core::config::Config::from_yaml(&floored).expect("parse approval-floor connector config")
 }
@@ -10459,13 +10455,8 @@ fn load_loopback_mcp_config_inner(
     let yaml = patch_web_search_api_key(&yaml);
     let yaml = if forward_headers {
         yaml.replacen(
-            "      - filter: openai_mcp_tool_resolve\n",
-            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
-            1,
-        )
-        .replacen(
-            "              - filter: openai_mcp_dispatch\n",
-            "              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
+            "              - filter: openai_mcp_connector\n",
+            "              - filter: openai_mcp_connector\n                forward_headers: [x-tenant-id]\n",
             1,
         )
     } else {
@@ -10494,11 +10485,11 @@ fn load_loopback_mcp_config_with_connectors(
     let yaml = patch_web_search_api_key(&yaml);
     let connector_yaml: String = connectors
         .iter()
-        .map(|(id, url)| format!("          - id: {id}\n            server_url: {url}\n"))
+        .map(|(id, url)| format!("                  - id: {id}\n                    server_url: {url}\n"))
         .collect();
     let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
-        &format!("      - filter: openai_mcp_tool_resolve\n        connectors:\n{connector_yaml}"),
+        "              - filter: openai_mcp_connector\n                connectors:\n                  - id: corp_drive\n                    server_url: https://drive-mcp.internal:8443/mcp\n",
+        &format!("              - filter: openai_mcp_connector\n                connectors:\n{connector_yaml}"),
         1,
     );
     assert!(

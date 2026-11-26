@@ -65,8 +65,6 @@ filter_chains:
         conversations_table: openai_conversations
         items_table: openai_conversation_items
       - filter: openai_responses_rehydrate
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 4
@@ -77,7 +75,8 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
-              - filter: openai_mcp_dispatch
+              - filter: openai_mcp_connector
+                discovery_timeout_ms: 5000
                 outbound_chain:
                   name: mcp-outbound
                   filters:
@@ -202,7 +201,7 @@ declaration does not mean the gateway has an executor for it. The managed path
 rejects `code_interpreter`, `background:true`, and non-null reusable `prompt`
 references (direct provider-owned passthrough is a separate path). See
 [managed validation](../filters/apis/openai_responses_request.md),
-[MCP dispatch](../filters/agents/openai_mcp_dispatch.md), and
+[MCP connector](../filters/agents/openai_mcp_connector.md), and
 [retained-payload bounds](../architecture/responses-retained-payload.md).
 
 ## Conversations and state
@@ -259,9 +258,8 @@ instead.
 - [`openai_tool_parse`](../filters/apis/openai_tool_parse.md)
 - [`openai_responses_rehydrate`](../filters/agents/openai_responses_rehydrate.md)
 - [`openai_responses_proxy`](../filters/agents/openai_responses_proxy.md)
-- [`openai_mcp_tool_resolve`](../filters/agents/openai_mcp_tool_resolve.md)
+- [`openai_mcp_connector`](../filters/agents/openai_mcp_connector.md)
 - [`openai_agentic_loop`](../filters/agents/openai_agentic_loop.md)
-- [`openai_mcp_dispatch`](../filters/agents/openai_mcp_dispatch.md)
 - [`openai_stream_events`](../filters/apis/openai_stream_events.md)
 - [`openai_responses_store`](../filters/agents/openai_responses_store.md)
 - [`openai_conversations`](../filters/agents/openai_conversations.md)

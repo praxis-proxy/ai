@@ -1931,7 +1931,7 @@ fn is_premature_local_tool_done(ctx: &HttpFilterContext<'_>, event: &ResponsesEv
 ///
 /// `mcp_list_tools` is included because a *deferred* MCP entry (`defer_loading:
 /// true`, or one lacking a `server_url`) is passed through unresolved by
-/// `openai_mcp_tool_resolve`, so the backend performs `tools/list` itself and
+/// `openai_mcp_connector`, so the backend performs `tools/list` itself and
 /// natively streams the discovery lifecycle. Recording those phases keeps a
 /// backend-executed listing's real `output_item.done` from being suppressed as
 /// premature (issue #1022), exactly as native `web_search_call`/`mcp_call`
@@ -1948,7 +1948,7 @@ fn is_local_tool_progress_event(event_type: &str) -> bool {
 /// proxy reconciles — whether locally synthesized (seeded by a tool-dispatch
 /// filter) or streamed natively by the model backend.
 ///
-/// `mcp_list_tools` is such a type. On eager resolution `openai_mcp_tool_resolve`
+/// `mcp_list_tools` is such a type. On eager resolution `openai_mcp_connector`
 /// runs the MCP `tools/list` and seeds the discovery listing into
 /// `accumulated_output` before any inference round (issue #1022), so the backend —
 /// which then only sees the rewritten `type: "function"` tools — never streams it.
@@ -2349,7 +2349,7 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// error keeps the backend's real `output_item.done` from being dropped as
 /// premature (issue #1022). A *local* discovery failure instead takes the
 /// separate `response.mcp_list_tools.failed` terminal-SSE path in
-/// `openai_mcp_tool_resolve` (issue #320) and never reaches this synthesis.
+/// `openai_mcp_connector` (issue #320) and never reaches this synthesis.
 /// `mcp_approval_request` has no dedicated progress events; it surfaces through
 /// `output_item.added`/`output_item.done` alone.
 ///
@@ -2587,7 +2587,7 @@ pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, me
 /// Request-phase completion and dispatch failure have no later upstream
 /// response, so the normal response-body finalizer cannot drain pending
 /// synthesis or flush locally generated output items for them.
-fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Option<Vec<u8>> {
+pub(super) fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Option<Vec<u8>> {
     if !reserve_local_synthesis(ctx) {
         return None;
     }
@@ -2819,7 +2819,7 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
     clippy::too_many_lines,
     reason = "terminal canonicalization reserves before moving and annotating its output"
 )]
-fn canonicalize_logical_response(
+pub(super) fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
 ) -> Result<(), SseParseError> {

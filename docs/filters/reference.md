@@ -86,8 +86,7 @@ Route MCP and A2A traffic, manage Responses and Conversations state, and execute
 | [`openai_doc_extract`](agents/openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
 | [`openai_file_resolve`](agents/openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |
 | [`openai_file_search_dispatch`](agents/openai_file_search_dispatch.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
-| [`openai_mcp_dispatch`](agents/openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
-| [`openai_mcp_tool_resolve`](agents/openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
+| [`openai_mcp_connector`](agents/openai_mcp_connector.md) | Discovers and executes MCP tools for the Responses API agentic loop. |
 | [`openai_responses_compact`](agents/openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
 | [`openai_responses_proxy`](agents/openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](agents/openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |

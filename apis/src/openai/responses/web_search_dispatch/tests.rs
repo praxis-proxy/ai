@@ -2912,7 +2912,7 @@ async fn preflight_skips_when_allowed_tools_names_an_explicit_client_discovery_t
 
 /// Run `on_request_body` for a fresh initial request carrying a caller-built
 /// `ResponsesState` — e.g. one with a populated `mcp_tool_map`, as it would be after
-/// `openai_mcp_tool_resolve` has rewritten MCP tools to functions.
+/// `openai_mcp_connector` has rewritten MCP tools to functions.
 #[cfg(feature = "openai-mcp-tools")]
 async fn run_initial_request_with_state(filter: &dyn HttpFilter, state: ResponsesState) -> FilterAction {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2924,7 +2924,7 @@ async fn run_initial_request_with_state(filter: &dyn HttpFilter, state: Response
 #[cfg(feature = "openai-mcp-tools")]
 #[tokio::test]
 async fn preflight_rejects_when_allowed_tools_names_a_resolved_mcp_function() {
-    // `openai_mcp_tool_resolve` rewrites an MCP selector to a plain `function` and
+    // `openai_mcp_connector` rewrites an MCP selector to a plain `function` and
     // populates `mcp_tool_map`, so `allowed_tools` names only that function. Its MCP
     // continuation re-opens tool_choice and retains the declared web-search tool, so
     // web search is reachable and its unsupported location must be rejected at round 0

@@ -131,7 +131,7 @@ filter in `filters/src/`. Representative filters:
 `openai_responses_to_chat_completions`, `openai_conversations`,
 `openai_stream_events`, `openai_tool_parse`,
 `openai_web_search_dispatch`, `openai_agentic_loop`, and
-`openai_mcp_dispatch`.
+`openai_mcp_connector`.
 
 Source of truth:
 `docs/conformance/specs/openai-openapi.yaml`, the

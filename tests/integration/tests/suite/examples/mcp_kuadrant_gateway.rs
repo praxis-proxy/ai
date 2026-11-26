@@ -33,8 +33,7 @@ fn example_config_loads_and_pipeline_builds() {
     // credential slots); an invalid connector/slot config would fail here.
     let _proxy = start_proxy(&config);
 
-    // The Kuadrant connector + per-user Bearer slot (Topology A) must be wired on
-    // BOTH openai_mcp_tool_resolve and openai_mcp_dispatch.
+    // Discovery and execution share the same Kuadrant target and bearer slot.
     let raw = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/configs/openai/responses/mcp-kuadrant-gateway.yaml"
@@ -44,10 +43,11 @@ fn example_config_loads_and_pipeline_builds() {
         raw.contains("id: trusted-mcp"),
         "connector id trusted-mcp must be declared"
     );
+    assert_eq!(raw.matches("filter: openai_mcp_connector").count(), 1);
     assert_eq!(
         raw.matches("user_credential: mcp_gateway").count(),
-        2,
-        "per-user Bearer slot must be wired on both resolve and dispatch"
+        1,
+        "the connector must declare one per-user bearer slot"
     );
 }
 

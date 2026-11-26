@@ -139,7 +139,7 @@ pipeline:
         note: captures the ogx_files key later injected on the file_search callout; strips + sets the assertion (file_search does not consume it)
       S6:
         state: active
-        note: captures the mcp_gateway key AND the mcp_gateway authorization assertion (x-mcp-authorized); both consumed by openai_mcp_tool_resolve + openai_mcp_dispatch
+        note: captures the mcp_gateway key AND the mcp_gateway authorization assertion (x-mcp-authorized); both consumed by openai_mcp_connector
       S7:
         state: active
         note: captures the brave_search key required by openai_web_search_dispatch; strips + sets the assertion (web_search does not consume it)
@@ -1020,63 +1020,6 @@ pipeline:
       S14:
         state: skipped
         note: native chat direct-services terminal branch; never reached
-  - id: openai_mcp_tool_resolve
-    name: openai_mcp_tool_resolve
-    group: context
-    filter_type: openai_mcp_tool_resolve
-    phase: request-phase; resolves MCP tools/list from operator connectors; gated unless bound_upstream.application_provider=openai
-    config:
-      user_credential: mcp_gateway
-      authorization_assertion: mcp_gateway
-      forward_headers:
-      - x-tenant-id
-      - x-user-id
-      connectors:
-      - id: trusted-mcp
-        server_url: http://127.0.0.1:8001/mcp
-      conditions:
-      - 'unless bound_upstream.application_provider: openai'
-    promotes: calls tools/list on each upstream MCP server; writes mcp_tool_map to ResponsesState; forwards the caller-scoped mcp_gateway credential + opaque authorization assertion and identity headers ONLY to configured connector_id targets, never an arbitrary client server_url
-    scenarios:
-      S1:
-        state: passthrough
-        note: no MCP tool entries
-      S2:
-        state: passthrough
-        note: no MCP tool entries
-      S3:
-        state: passthrough
-        note: no MCP tool entries
-      S4:
-        state: passthrough
-        note: no MCP tool entries
-      S5:
-        state: passthrough
-        note: file_search tool, not MCP
-      S6:
-        state: active
-        note: resolves tools/list from connector trusted-mcp with mcp_gateway credential + authorization assertion; writes mcp_tool_map
-      S7:
-        state: passthrough
-        note: no MCP tool entries
-      S8:
-        state: skipped
-        note: store short-circuited GET
-      S9:
-        state: skipped
-        note: direct-services terminal branch ran first
-      S10:
-        state: passthrough
-        note: 'no MCP tool entries'
-      S11:
-        state: skipped
-        note: direct-services terminal branch ran first
-      S12:
-        state: skipped
-        note: direct-openai terminal branch ran first
-      S13:
-        state: passthrough
-        note: no MCP tool entries
   - id: static_response
     name: static_response (unsupported subpath 404)
     group: routing
@@ -1341,22 +1284,26 @@ pipeline:
       S13:
         state: inert
         note: no web_search_call emitted
-  - id: openai_mcp_dispatch
-    name: openai_mcp_dispatch
+  - id: openai_mcp_connector
+    name: openai_mcp_connector
     group: irr-step
-    filter_type: openai_mcp_dispatch
-    phase: IRR step request-phase dispatcher; no response phase; inert until model emits MCP tool call
+    filter_type: openai_mcp_connector
+    phase: IRR step request phase; discovers tools on the first round and executes assignments on re-entry
     config:
       user_credential: mcp_gateway
       authorization_assertion: mcp_gateway
+      require_connector: true
       forward_headers:
       - x-tenant-id
       - x-user-id
+      connectors:
+      - id: trusted-mcp
+        server_url: http://127.0.0.1:8001/mcp
       max_calls_per_round: 32
       max_parallel_calls: 8
       max_result_bytes: 1048576
       max_total_result_bytes: 8388608
-    promotes: executes MCP calls prepared/classified by the loop owner; forwards the caller-scoped mcp_gateway credential + authorization assertion on each connector call; reconciles results into ResponsesState
+    promotes: expands admitted MCP tools on entry, then executes selections from the loop owner and records results in ResponsesState
     scenarios:
       S1:
         state: inert
@@ -1375,7 +1322,7 @@ pipeline:
         note: file_search, not MCP
       S6:
         state: active
-        note: executes MCP calls via 127.0.0.1:8001/mcp with mcp_gateway credential + assertion (max 8 parallel, byte-capped)
+        note: lists and executes through the same configured connector with caller credentials and bounded results
       S7:
         state: inert
         note: web_search, not MCP
@@ -1915,7 +1862,7 @@ pipeline:
     label: MCP loop
     request: POST /v1/responses tools:[{type:mcp,server_label,server_url,allowed_tools,require_approval:never}]
     entersIRR: true
-    loopRounds: 2+ (mcp_tool_resolve then model emits MCP call, dispatch via 8001, finalize)
+    loopRounds: 2+ (connector lists tools, model selects a call, connector executes it, model resumes)
   - id: S7
     label: Web search
     request: POST /v1/responses; model emits web_search_call (per-user brave_search key required)
@@ -2011,8 +1958,7 @@ pipeline:
     endpoint: http://127.0.0.1:8001/mcp
     connectorId: trusted-mcp
     usedBy:
-    - openai_mcp_tool_resolve (tools/list)
-    - openai_mcp_dispatch (tool calls)
+    - openai_mcp_connector (discovery and tool calls)
     credential: user_credential mcp_gateway (x-user-mcp-key) + opaque authorization_assertion mcp_gateway (x-mcp-authorized); both forwarded ONLY to connector_id trusted-mcp, never a client-supplied server_url
   - name: Files API
     endpoint: http://127.0.0.1:9999
@@ -2092,7 +2038,7 @@ scen_meta:
     - Vector store
     - NeMo Guardrails
   S6:
-    narr: <b>MCP loop.</b> openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span. ai_guardrails checks the result before model re-entry.
+    narr: <b>MCP loop.</b> openai_mcp_connector lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_connector executes it against 127.0.0.1:8001. The connector forwards the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span. ai_guardrails checks the result before model re-entry.
     clusters:
     - inference-backend
     services:
@@ -2314,7 +2260,7 @@ wire:
     resHeaders:
     - 'Content-Type: application/json'
     resBody: "{\n  \"id\": \"resp_2\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"mcpl_9f2c1a7b3d4e5f60\",\n      \"type\": \"mcp_list_tools\",\n      \"server_label\": \"weather\",\n      \"tools\": [\n        {\n          \"name\": \"get_weather\",\n          \"description\": \"Get the weather for a location\",\n          \"input_schema\": {\n            \"type\": \"object\",\n            \"properties\": {\n              \"location\": {\n                \"type\": \"string\"\n              }\n            },\n            \"required\": [\n              \"location\"\n            ],\n            \"additionalProperties\": false\n          }\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"id\": \"fc_1\",\n      \"call_id\": \"call_abc\",\n      \"name\": \"weather__get_weather\",\n      \"arguments\": \"{\\\"location\\\":\\\"SF\\\"}\",\n      \"status\": \"completed\"\n    },\n    {\n      \"type\": \"mcp_call\",\n      \"id\": \"call_abc\",\n      \"approval_request_id\": null,\n      \"server_label\": \"weather\",\n      \"name\": \"get_weather\",\n      \"arguments\": \"{\\\"location\\\":\\\"SF\\\"}\",\n      \"output\": \"mock result for get_weather\"\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_2\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The weather in SF is 72F and sunny.\"\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 11,\n    \"total_tokens\": 41\n  }\n}"
-    notes: 'Distinctive shape: a two-phase agentic loop composed into one buffered Responses object. openai_mcp_tool_resolve first resolves connector_id ''trusted-mcp'' to server_url http://127.0.0.1:8001/mcp, calls tools/list, and seeds one mcp_list_tools item (server_label is the client label ''weather'', not the connector id; tools carry input_schema not inputSchema). The model then emits a function_call (name prefixed ''weather__get_weather''); openai_mcp_dispatch executes it against the same connector and appends the mcp_call record (name is the bare ''get_weather'', server_label ''weather'', id = the call_id, approval_request_id null since require_approval:never, output = the tool result). openai_agentic_loop signals loop, a second inference round returns the assistant message, then done. The mcp_gateway credential (x-user-mcp-key) and authorization assertion (x-mcp-authorized) are forwarded ONLY to the configured connector_id target, never to an arbitrary client server_url; the buffered terminal keeps the last round''s backend response id (resp_2) and sums usage across both rounds (30/11/41).'
+    notes: 'Distinctive shape: a two-phase agentic loop composed into one buffered Responses object. openai_mcp_connector first resolves connector_id ''trusted-mcp'' to server_url http://127.0.0.1:8001/mcp, calls tools/list, and seeds one mcp_list_tools item (server_label is the client label ''weather'', not the connector id; tools carry input_schema not inputSchema). The model then emits a function_call (name prefixed ''weather__get_weather''); openai_mcp_connector executes it against the same connector and appends the mcp_call record (name is the bare ''get_weather'', server_label ''weather'', id = the call_id, approval_request_id null since require_approval:never, output = the tool result). openai_agentic_loop signals loop, a second inference round returns the assistant message, then done. The mcp_gateway credential (x-user-mcp-key) and authorization assertion (x-mcp-authorized) are forwarded ONLY to the configured connector_id target, never to an arbitrary client server_url; the buffered terminal keeps the last round''s backend response id (resp_2) and sums usage across both rounds (30/11/41).'
     provenance:
     - examples/configs/openai/responses/full-flow-agentic.yaml:88-93
     - examples/configs/openai/responses/full-flow-agentic.yaml:414-425
@@ -2327,8 +2273,8 @@ wire:
     - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:56-137
     - apis/src/openai/responses/mcp_tool_resolve/mod.rs:2606-2635
     - apis/src/openai/responses/mcp_tool_resolve/mod.rs:2705-2715
-    - apis/src/openai/responses/mcp_dispatch/mod.rs:1774-1816
-    - apis/src/openai/responses/mcp_dispatch/mod.rs:1630-1716
+    - apis/src/openai/responses/mcp_connector/mod.rs:1774-1816
+    - apis/src/openai/responses/mcp_connector/mod.rs:1630-1716
   S7:
     reqMethod: POST
     reqPath: /v1/responses
@@ -2678,7 +2624,7 @@ timeline:
       - tests/integration/tests/suite/examples/file_search_dispatch.rs:117-125
       - apis/src/openai/responses/file_search_dispatch/citations.rs:209-212
   S6:
-    summary: 'A model-tool-model MCP loop: the gateway resolves MCP tools out of band (initialize/tools/list), lowers them to encoded function tools for round-1 inference, executes the model-selected MCP call via JSON-RPC tools/call, appends the tool result as a function_call_output for round-2 inference, and returns a single composed Responses object. Config STRUCTURE is grounded in full-flow-agentic.yaml (statically validated by full_flow_agentic.rs); WIRE PAYLOADS are faithful trims of the round-trip integration test (openai_agentic_loop.rs), the SSE test (openai_mcp_streaming.rs), the MCP mock-server fixtures (tests/utils agentic/mcp.rs), the mcp_client credential unit tests, and the mcp_dispatch result-construction tests. JSON-RPC id scalars are illustrative/rmcp-generated; only the envelope shapes are grounded.'
+    summary: 'A model-tool-model MCP loop: the gateway resolves MCP tools out of band (initialize/tools/list), lowers them to encoded function tools for round-1 inference, executes the model-selected MCP call via JSON-RPC tools/call, appends the tool result as a function_call_output for round-2 inference, and returns a single composed Responses object. Config STRUCTURE is grounded in full-flow-agentic.yaml (statically validated by full_flow_agentic.rs); WIRE PAYLOADS are faithful trims of the round-trip integration test (openai_agentic_loop.rs), the SSE test (openai_mcp_streaming.rs), the MCP mock-server fixtures (tests/utils agentic/mcp.rs), the mcp_client credential unit tests, and the connector result-construction tests. JSON-RPC id scalars are illustrative/rmcp-generated; only the envelope shapes are grounded.'
     rounds: 2 rounds · MCP tool loop
     steps:
     - n: 1
@@ -2697,13 +2643,13 @@ timeline:
       - examples/configs/openai/responses/full-flow-agentic.yaml:232-242
       - examples/configs/openai/responses/full-flow-agentic.yaml:326-345
     - n: 2
-      round: pre-IRR (mcp_tool_resolve)
+      round: first IRR round (MCP discovery)
       from: gateway
       to: mcp-server
       kind: request
       title: 'MCP handshake: JSON-RPC initialize'
       channel: POST http://127.0.0.1:8001/mcp
-      note: 'openai_mcp_tool_resolve opens a fresh Streamable HTTP transport; rmcp .serve() performs the handshake (mod.rs:403). For the connector target the exchange carries forwarded credentials: Authorization: Bearer <mcp_gateway>, x-mcp-authorized: <assertion>, x-tenant-id/x-user-id (asserted in mcp_client tests). JSON-RPC envelope is standard; the id scalar (0) and params (protocolVersion/capabilities/clientInfo) are rmcp-generated and trimmed — only protocolVersion 2025-03-26 is grounded (mcp.rs:35).'
+      note: 'openai_mcp_connector opens a fresh Streamable HTTP transport; rmcp .serve() performs the handshake (mod.rs:403). For the connector target the exchange carries forwarded credentials: Authorization: Bearer <mcp_gateway>, x-mcp-authorized: <assertion>, x-tenant-id/x-user-id (asserted in mcp_client tests). JSON-RPC envelope is standard; the id scalar (0) and params (protocolVersion/capabilities/clientInfo) are rmcp-generated and trimmed — only protocolVersion 2025-03-26 is grounded (mcp.rs:35).'
       bodyKind: json
       body: '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{…},"clientInfo":{…}}}'
       provenance:
@@ -2715,7 +2661,7 @@ timeline:
       - apis/src/mcp_client/tests.rs:1312-1345
       - apis/src/callout_credentials.rs:45
     - n: 3
-      round: pre-IRR (mcp_tool_resolve)
+      round: first IRR round (MCP discovery)
       from: mcp-server
       to: gateway
       kind: response
@@ -2730,7 +2676,7 @@ timeline:
       - tests/utils/src/agentic/mcp.rs:452-453
       - tests/utils/src/agentic/mcp.rs:461-463
     - n: 4
-      round: pre-IRR (mcp_tool_resolve)
+      round: first IRR round (MCP discovery)
       from: gateway
       to: mcp-server
       kind: request
@@ -2745,20 +2691,20 @@ timeline:
       - apis/src/mcp_client/tests.rs:1280-1290
       - apis/src/mcp_client/tests.rs:1424-1430
     - n: 5
-      round: pre-IRR (mcp_tool_resolve)
+      round: first IRR round (MCP discovery)
       from: mcp-server
       to: gateway
       kind: response
       title: tools/list result (get_weather)
       channel: 200 http://127.0.0.1:8001/mcp
-      note: 'Envelope/key-order grounded in handle_tools_list (mcp.rs:467-497 emits name, inputSchema, then description). The get_weather fixture (name/inputSchema location schema/description) is grounded in the test McpToolFixture at openai_mcp_streaming.rs:88-98 (and identically openai_agentic_loop.rs:282-290). openai_mcp_tool_resolve writes mcp_tool_map to ResponsesState keyed by (server_label, tool_name); discovery also surfaces an mcp_list_tools output item (issue #1022). mcp_dispatch/tests.rs:2112-2116 grounds the resolver-side inputSchema shape (uses a ''city'' schema there).'
+      note: 'Envelope/key-order grounded in handle_tools_list (mcp.rs:467-497 emits name, inputSchema, then description). The get_weather fixture (name/inputSchema location schema/description) is grounded in the test McpToolFixture at openai_mcp_streaming.rs:88-98 (and identically openai_agentic_loop.rs:282-290). openai_mcp_connector writes mcp_tool_map to ResponsesState keyed by (server_label, tool_name); discovery also surfaces an mcp_list_tools output item (issue #1022). mcp_connector/tests.rs:2112-2116 grounds the resolver-side inputSchema shape (uses a ''city'' schema there).'
       bodyKind: json
       body: '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"get_weather","inputSchema":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"],"additionalProperties":false},"description":"Get the weather for a location"}]}}'
       provenance:
       - tests/utils/src/agentic/mcp.rs:467-497
       - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:88-98
       - tests/integration/tests/suite/examples/openai_agentic_loop.rs:282-290
-      - apis/src/openai/responses/mcp_dispatch/tests.rs:2112-2116
+      - apis/src/openai/responses/mcp_connector/tests.rs:2112-2116
     - n: 6
       round: round 1
       from: gateway
@@ -2766,12 +2712,12 @@ timeline:
       kind: request
       title: Round-1 inference carrying the resolved MCP tools
       channel: POST http://127.0.0.1:3001/v1/responses
-      note: The resolver lowers each MCP tool to an encoded function tool named <server_label>__<tool_name> (encode_function_name -> weather__get_weather, mcp_dispatch/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Resolved to inference-backend 127.0.0.1:3001 by the IRR-step load_balancer (cluster_source:bound_upstream).
+      note: The resolver lowers each MCP tool to an encoded function tool named <server_label>__<tool_name> (encode_function_name -> weather__get_weather, mcp_connector/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Resolved to inference-backend 127.0.0.1:3001 by the IRR-step load_balancer (cluster_source:bound_upstream).
       bodyKind: json
       body: '{"model":"gpt-4.1","input":"What is the weather in SF?","parallel_tool_calls":true,"tools":[{"type":"function","name":"weather__get_weather",…}]}'
       provenance:
       - tests/integration/tests/suite/examples/openai_agentic_loop.rs:365-382
-      - apis/src/openai/responses/mcp_dispatch/tests.rs:2124-2126
+      - apis/src/openai/responses/mcp_connector/tests.rs:2124-2126
       - examples/configs/openai/responses/full-flow-agentic.yaml:624-639
     - n: 7
       round: round 1
@@ -2780,41 +2726,41 @@ timeline:
       kind: response
       title: Round-1 response emits the MCP (encoded) tool call
       channel: 200 http://127.0.0.1:3001/v1/responses
-      note: Exact quote of first_response (openai_agentic_loop.rs:250-262, identical at openai_mcp_streaming.rs:58-70). openai_agentic_loop parses this, recognizes weather__get_weather as an MCP call via mcp_tool_map (is_mcp_tool_call, mcp_dispatch/tests.rs:349-353), assigns it to openai_mcp_dispatch, and signals action=loop.
+      note: Exact quote of first_response (openai_agentic_loop.rs:250-262, identical at openai_mcp_streaming.rs:58-70). openai_agentic_loop parses this, recognizes weather__get_weather as an MCP call via mcp_tool_map (is_mcp_tool_call, mcp_connector/tests.rs:349-353), assigns it to openai_mcp_connector, and signals action=loop.
       bodyKind: json
       body: '{"id":"resp_1","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"weather__get_weather","arguments":"{\"location\":\"SF\"}","status":"completed"}]}'
       provenance:
       - tests/integration/tests/suite/examples/openai_agentic_loop.rs:250-262
       - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:58-70
-      - apis/src/openai/responses/mcp_dispatch/tests.rs:349-353
+      - apis/src/openai/responses/mcp_connector/tests.rs:349-353
     - n: 8
-      round: callout (mcp_dispatch)
+      round: IRR re-entry (MCP execution)
       from: gateway
       to: mcp-server
       kind: request
       title: JSON-RPC tools/call get_weather
       channel: POST http://127.0.0.1:8001/mcp
-      note: 'Envelope grounded in the transport test fixture (subrequest_transport.rs:1761 shows tools/call with id:1 and params {name, arguments}); the id scalar is rmcp-generated. openai_mcp_dispatch decodes the encoded name back to the original tool_name get_weather (mcp_dispatch/tests.rs:2158-2189) and forwards the model''s arguments (round-trip test asserts call_body.params.arguments.location == ''SF'', openai_agentic_loop.rs:359-360). The dispatch outbound_chain stamps X-MCP-Client: praxis-ai-gateway (asserted openai_agentic_loop.rs:352-358); for a connector target it also carries Bearer <mcp_gateway> + x-mcp-authorized + x-tenant-id/x-user-id, whereas for a request-supplied server_url the round-trip test asserts x-tenant-id must NOT cross (openai_agentic_loop.rs:342-347).'
+      note: 'Envelope grounded in the transport test fixture (subrequest_transport.rs:1761 shows tools/call with id:1 and params {name, arguments}); the id scalar is rmcp-generated. openai_mcp_connector decodes the encoded name back to the original tool_name get_weather (mcp_connector/tests.rs:2158-2189) and forwards the model''s arguments (round-trip test asserts call_body.params.arguments.location == ''SF'', openai_agentic_loop.rs:359-360). The connector outbound_chain stamps X-MCP-Client: praxis-ai-gateway (asserted openai_agentic_loop.rs:352-358); for a connector target it also carries Bearer <mcp_gateway> + x-mcp-authorized + x-tenant-id/x-user-id, whereas for a request-supplied server_url the round-trip test asserts x-tenant-id must NOT cross (openai_agentic_loop.rs:342-347).'
       bodyKind: json
       body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_weather","arguments":{"location":"SF"}}}'
       provenance:
       - apis/src/mcp_client/subrequest_transport.rs:1761
       - tests/integration/tests/suite/examples/openai_agentic_loop.rs:334-360
-      - apis/src/openai/responses/mcp_dispatch/tests.rs:2158-2189
+      - apis/src/openai/responses/mcp_connector/tests.rs:2158-2189
       - apis/src/mcp_client/mod.rs:716-750
     - n: 9
-      round: callout (mcp_dispatch)
+      round: IRR re-entry (MCP execution)
       from: mcp-server
       to: gateway
       kind: response
       title: tools/call result
       channel: 200 http://127.0.0.1:8001/mcp
-      note: 'Faithful to write_known_tool_result (mcp.rs:653-674): text = format!(''mock result for {name}''). openai_mcp_dispatch converts the content blocks into (a) an mcp_call output item {type:mcp_call, id:call_abc, server_label:weather, name:get_weather, output:''mock result for get_weather''} in accumulated_output and (b) a function_call_output message {type:function_call_output, call_id:call_abc, output:''mock result for get_weather''} for re-entry — both shapes grounded in build_success_result tests (mcp_dispatch/tests.rs:508-556).'
+      note: 'Faithful to write_known_tool_result (mcp.rs:653-674): text = format!(''mock result for {name}''). openai_mcp_connector converts the content blocks into (a) an mcp_call output item {type:mcp_call, id:call_abc, server_label:weather, name:get_weather, output:''mock result for get_weather''} in accumulated_output and (b) a function_call_output message {type:function_call_output, call_id:call_abc, output:''mock result for get_weather''} for re-entry — both shapes grounded in build_success_result tests (mcp_connector/tests.rs:508-556).'
       bodyKind: json
       body: '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"mock result for get_weather"}],"isError":false}}'
       provenance:
       - tests/utils/src/agentic/mcp.rs:653-674
-      - apis/src/openai/responses/mcp_dispatch/tests.rs:508-556
+      - apis/src/openai/responses/mcp_connector/tests.rs:508-556
     - n: 10
       round: round 2
       from: gateway
@@ -2847,13 +2793,13 @@ timeline:
       kind: response
       title: Composed /v1/responses object returned to client
       channel: 200 http://localhost:8080/v1/responses
-      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_dispatch/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_responses_store (yaml:372-379) persists it for GET /v1/responses/{id}.
+      note: Round-trip test asserts response.id == resp_2 (openai_agentic_loop.rs:319-325); the SSE test asserts the returned body contains 'mock result for get_weather' (openai_mcp_streaming.rs:132-136). The single composed object carries the accumulated hosted-tool items (mcp_list_tools + mcp_call, shape grounded mcp_connector/tests.rs:546-556) ahead of the final assistant message; pre-IRR openai_responses_store (yaml:372-379) persists it for GET /v1/responses/{id}.
       bodyKind: json
       body: '{"id":"resp_2","object":"response","status":"completed","output":[…,{"type":"mcp_call","id":"call_abc","server_label":"weather","name":"get_weather","output":"mock result for get_weather"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The weather in SF is 72F and sunny."}]}]}'
       provenance:
       - tests/integration/tests/suite/examples/openai_agentic_loop.rs:319-325
       - tests/integration/tests/suite/examples/openai_mcp_streaming.rs:132-136
-      - apis/src/openai/responses/mcp_dispatch/tests.rs:546-556
+      - apis/src/openai/responses/mcp_connector/tests.rs:546-556
       - examples/configs/openai/responses/full-flow-agentic.yaml:372-379
   S7:
     summary: 'Honest composite: every payload below is quoted/faithful to real repo fixtures/tests, but no single functional test drives full-flow-agentic.yaml''s web_search loop end-to-end with native /v1/responses payloads — the native round-by-round chronology is proven by the sibling agentic-loop.yaml round-trip test (web_search_round_trip_executes_and_re_enters_inference, identical openai_web_search_dispatch Brave dispatcher + same 3001 native backend, config loaded via load_web_search_config which patches the provider base_url to a local mock), while the per-user brave_search slot / x-user-brave-key / fail-closed-401 behavior is proven by web_search_scoped_credentials.rs (against a Chat Completions backend) plus full-flow-agentic.yaml''s own structural guards; hence grounded:false.'
