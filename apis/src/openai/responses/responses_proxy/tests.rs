@@ -1707,8 +1707,11 @@ async fn native_search_lowers_after_rich_client_tool_validation() {
     ));
     let proxy = make_filter();
     assert!(matches!(
-        proxy.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Continue
+        proxy
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap(),
+        SelectedUpstreamBodyOutcome::Continue
     ));
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(outbound["tools"][1]["type"], "function");
