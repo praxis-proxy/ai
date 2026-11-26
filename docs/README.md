@@ -1,9 +1,8 @@
 # Praxis AI Documentation
 
-Run the gateway first, then follow a task guide, and use concepts and
-reference pages when you need detail. These pages describe **Development
-(current main)**. Build features and compatibility can differ from a released
-version; use the documentation snapshot matching your binary or image.
+These pages describe **Development (current main)**. Build features and
+compatibility can differ in a released version, so use the documentation
+snapshot that matches your binary or image.
 
 ## Getting started
 
@@ -16,9 +15,9 @@ version; use the documentation snapshot matching your binary or image.
 
 ## Guides
 
-[All guides](guides/README.md) list prerequisites, a complete configuration,
-verification, and cleanup. [Credential boundaries](guides/README.md#credentials)
-apply to every guide.
+Each of the [guides](guides/README.md) has prerequisites, a complete
+configuration, verification, and cleanup. [Credential boundaries](guides/README.md#credentials)
+apply to all of them.
 
 - Client APIs: [Anthropic Messages](guides/anthropic.md), native and
   translated; [experimental managed Responses and tools](guides/managed-responses.md),
@@ -74,9 +73,6 @@ apply to every guide.
   [provider translation compatibility matrix](conformance/translation-matrix.md).
 
 ## Developing
-
-Contributor and maintainer material: setup, testing, release, and
-documentation evidence.
 
 - [Development setup](developing/getting-started.md),
   [adding filters](developing/adding-filters.md), and

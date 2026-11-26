@@ -35,47 +35,46 @@ Responses, stores or the agentic loop by default:
 | OpenSSL | Alpine's, dynamically linked | UBI's, dynamically linked (`openssl-libs` and `openssl-fips-provider-so`), the validated module on a FIPS host |
 | Published tags | `<version>`, `<major>.<minor>`, `sha-<hash>` (see [image tags](../developing/release.md#image-tags)) | the same with a `-fips` suffix (`0.3.0-fips`) |
 
-A configuration that names one of the excluded filters is rejected at
-startup by the FIPS build, as any unknown filter is. Everything else,
-including the Anthropic Messages translation, guardrails, metering, identity
-and credential filters, the agentic protocol filters, TLS listeners, mTLS,
-SNI, the admin API and hot reload, behaves as in the standard build. What
-blocks each excluded feature, and how far away it is, is tracked in the
-Makefile's FIPS section.
+The FIPS build rejects a configuration that names an excluded filter at
+startup, as it would any unknown filter. Everything else (Anthropic Messages
+translation, guardrails, metering, identity and credential filters, the agentic
+protocol filters, TLS listeners, mTLS, SNI, the admin API and hot reload)
+behaves as in the standard build. The Makefile's FIPS section tracks what
+blocks each excluded feature and how far away it is.
 
 The binary links `libcrypto.so.3` and `libssl.so.3` dynamically. The only
 crates performing security-relevant cryptography in the image are the rustls
-protocol engine and the OpenSSL bindings that delegate every primitive to the
-system library; the rest of the crypto-adjacent crates in the image are
-listed in the exemption table at the end of this page.
+protocol engine and the OpenSSL bindings, which delegate every primitive to the
+system library. [Scope and exemptions](#scope-and-exemptions) lists the other
+crypto-adjacent crates.
 
 For the experimental Responses and Conversations certificate-authenticated
 store profile, use
 `make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,openai-conversations,store-postgres-cert-auth`
 or pass the same list as `--build-arg CARGO_FEATURES=...` to `Containerfile.fips`.
-The agentic loop additionally requires `openai-agentic-loop`.
+The agentic loop also requires `openai-agentic-loop`.
 
-The certificate-only store currently pins SQLx to commit `637e7025` from a
-temporary fork. It preserves independently optional migrations, PostgreSQL
-password authentication, and advisory-lock string hashing, and includes the
-upstream compatibility fix for patched `libsqlite3-sys` 0.39 releases.
-The pin can return to an upstream release after [transact-rs/sqlx#4417],
-[transact-rs/sqlx#4420], and [transact-rs/sqlx#4421] land and are released.
+The certificate-only store pins SQLx to commit `637e7025` of a temporary fork,
+which keeps migrations, PostgreSQL password authentication, and advisory-lock
+string hashing independently optional, and includes the upstream compatibility
+fix for patched `libsqlite3-sys` 0.39 releases. The pin can return to an
+upstream release once [transact-rs/sqlx#4417], [transact-rs/sqlx#4420], and
+[transact-rs/sqlx#4421] land and are released. The cryptographic boundary of
+that store is in
+[PostgreSQL cryptographic boundary](../architecture/postgres-cryptographic-boundary.md).
 
 ## Host prerequisites
 
 - A RHEL 9 host in FIPS mode, enabled at install time or with
   `fips-mode-setup --enable` and a reboot: `cat /proc/sys/crypto/fips_enabled`
   prints `1` and `openssl list -providers` lists `fips`. RHEL 9 is the
-  validated operating environment; the module that runs inside the container
-  is UBI's own `openssl-fips-provider-so`, the host contributes the kernel
-  flag.
-- A container runtime that passes the host's FIPS mode into the container,
-  as podman and CRI-O on RHEL do. The `-fips` image then needs no flag,
-  environment variable or config: the OpenSSL inside it reads the kernel flag
-  and activates the validated provider by itself. On a host that is not in
-  FIPS mode the same image runs with OpenSSL's default provider, and the
-  startup log says so.
+  validated operating environment. The module running inside the container is
+  UBI's own `openssl-fips-provider-so`; the host contributes the kernel flag.
+- A container runtime that passes the host's FIPS mode into the container, as
+  podman and CRI-O on RHEL do. The `-fips` image then needs no flag,
+  environment variable or config: its OpenSSL reads the kernel flag and
+  activates the validated provider itself. On a host not in FIPS mode the same
+  image runs with OpenSSL's default provider, and the startup log says so.
 
 ## Startup: what praxis-ai reports and enforces
 
@@ -99,21 +98,24 @@ installed rustls crypto provider provider=openssl provider_fips=true kernel_fips
   rejected.
 
 Set `PRAXIS_REQUIRE_FIPS=1` (also `true`, `yes`, `on`) in production FIPS
-deployments. It is a check, never a switch: praxis-ai then refuses to start
-unless all three signals are present and positive, naming each one that is
-missing, and refuses any listener TLS configuration that rustls does not
-consider FIPS-approved. A fully attested FIPS deployment requires RHEL 9 or
-a derivative that supports system crypto policies. Upstream connections
-always require Extended Master Secret and share the same provider, so they
-are FIPS whenever the listeners are. Without the variable praxis-ai starts
-either way and only logs the status.
+deployments. It is a check, never a switch. praxis-ai then refuses to start
+unless all three signals are present and positive, naming each missing one, and
+refuses any listener TLS configuration that rustls does not consider
+FIPS-approved. A fully attested FIPS deployment requires RHEL 9 or a derivative
+that supports system crypto policies. Upstream connections always require
+Extended Master Secret and share the same provider, so they are FIPS whenever
+the listeners are. Without the variable, praxis-ai starts either way and only
+logs the status.
 
-The requirement also covers what the binary itself carries: a build that
-registers a filter whose dependencies do their own cryptography outside the
-system OpenSSL (the `policy` filter's plugins, the response store's sqlx)
-refuses `PRAXIS_REQUIRE_FIPS` outright, naming the filters, whatever the
-provider reports. Only the FIPS build, which compiles none of them, can
-honor the variable; the standard image is refused by design.
+The requirement also covers what the binary carries. A build that registers a
+filter whose dependencies do their own cryptography outside the system OpenSSL
+(the `policy` filter's plugins, the response store's sqlx) refuses
+`PRAXIS_REQUIRE_FIPS` outright and names the filters, whatever the provider
+reports. The response store is exempt only in the certificate-only SQLx
+profile: `store-postgres-cert-auth` without `store-postgres`, `store-sqlite`,
+`openai-compact`, or `openai-mcp-tools`. Only the FIPS build, which compiles
+none of the others, can honor the variable; the standard image is refused by
+design.
 
 ```console
 podman run --rm -e PRAXIS_REQUIRE_FIPS=1 ghcr.io/praxis-proxy/ai:0.3.0-fips
@@ -130,8 +132,8 @@ fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL pr
 - **TLS 1.2 requires the Extended Master Secret extension (RFC 7627)** on
   listeners and on upstream connections, in every build and regardless of
   FIPS mode; a TLS 1.2 peer that cannot negotiate it fails the handshake.
-  TLS 1.3 is unaffected. This is what FIPS 140-3 requires of TLS 1.2 key
-  derivation, and rustls counts a configuration as FIPS only with it.
+  TLS 1.3 is unaffected. FIPS 140-3 requires this of TLS 1.2 key derivation,
+  and rustls counts a configuration as FIPS only with it.
 - **The provider offers only what the system OpenSSL can perform.** In FIPS
   mode non-approved algorithms are absent rather than failing later: for
   example the ChaCha20-Poly1305 cipher suites are not offered, MD5 does not
@@ -143,7 +145,7 @@ fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL pr
   mode, since it would have nothing to negotiate.
 - **Random numbers** come from OpenSSL's DRBG (`RAND_priv_bytes`) for every
   TLS operation. Non-security randomness (load-balancer picks, request ids)
-  uses ordinary Rust RNGs, which is fine: they protect nothing.
+  uses ordinary Rust RNGs, which protect nothing.
 - **Digests praxis-ai computes itself** (the Anthropic `user_id` that becomes
   `safety_identifier`, routing descriptor ids, MCP approval fingerprints,
   token-rate-limit bucket keys, overlay content hashes) go through OpenSSL's
@@ -189,25 +191,23 @@ make fips-runtime-probe  # run the FIPS image under PRAXIS_REQUIRE_FIPS=1 and pr
 
 `fips-host-check` states every fact the module's Security Policy requires of
 the host (the kernel flag, `fips=1` on the command line, the `FIPS` crypto
-policy, `fips-mode-setup --check`, the module the host's OpenSSL loads) and
-of the image (the crypto policy podman propagates into it, the build of
-`fips.so` it carries and whether that build is on a CMVP certificate), and
-writes the attestation to `target/fips/` to keep with the deployment record.
+policy, `fips-mode-setup --check`, the module the host's OpenSSL loads) and of
+the image (the crypto policy podman propagates into it, the build of `fips.so`
+it carries and whether that build is on a CMVP certificate). It writes the
+attestation to `target/fips/`; keep it with the deployment record.
 `test-fips-host` runs the suites with `PRAXIS_FIPS_HOST=1`, so a green run
-cannot have happened outside FIPS mode. `test-postgres-fips-host` resolves
-the same feature set on that host and performs a Responses write/read round
-trip against a PostgreSQL container whose only TCP authentication rule is
-`hostssl ... cert`; the URL contains no password and the client presents its
-certificate through native TLS. It also connects to a TLS peer that selects
-SCRAM and requires SQLx to return its password-authentication-disabled error
-without beginning an exchange. `fips-runtime-probe` starts the shipped image
-itself under `PRAXIS_REQUIRE_FIPS=1`, drives raw TLS probes
-against its listener (approved algorithms negotiated, ChaCha20-only and
-X25519-only clients refused), and checks the startup line. The CI `FIPS`
-workflow runs all four on a RHEL 9 runner in FIPS mode for every change;
-a release requires a recorded green `fips-host` run for the exact commit
-being released, and the release workflow attests and probes the exact
-pushed image, pulled back by digest, on the release run itself.
+cannot have happened outside FIPS mode. `test-postgres-fips-host` proves a
+passwordless, certificate-authenticated store round trip and that SQLx refuses
+a SCRAM challenge (details in [The FIPS host run](../developing/fips.md#the-fips-host-run)).
+`fips-runtime-probe` starts the shipped image under `PRAXIS_REQUIRE_FIPS=1`,
+drives raw TLS probes against its listener (approved algorithms negotiated,
+ChaCha20-only and X25519-only clients refused), and checks the startup line.
+
+The CI `FIPS` workflow runs all four on a RHEL 9 runner in FIPS mode for every
+change. A release requires a recorded green `fips-host` run for the exact
+commit being released, and the release workflow attests and probes the exact
+pushed image, pulled back by digest, on the release run itself. See
+[The runner job](../developing/fips.md#the-runner-job).
 
 A hand check of the shipped image remains a two-liner:
 
@@ -218,25 +218,25 @@ podman run --rm -e PRAXIS_REQUIRE_FIPS=1 --entrypoint praxis-ai \
 ```
 
 The second command validates the built-in configuration (pass `-c` with a
-mounted file to validate yours) and exits 0 only when the provider and the
-kernel both report FIPS mode; it prints nothing in that case. The listener
-TLS configurations are checked, and the startup line above is logged, when
-the real workload starts, so run it the same way with `PRAXIS_REQUIRE_FIPS=1`
-and keep that line as evidence.
+mounted file to validate yours) and exits 0, printing nothing, only when the
+provider and the kernel both report FIPS mode. Listener TLS configurations are
+checked, and the startup line above is logged, only when the real workload
+starts, so run it with `PRAXIS_REQUIRE_FIPS=1` too and keep that line as
+evidence.
 
 ## What is validated, and what is not
 
-FIPS 140-3 validates a cryptographic module, not an application. What the
-checks above prove is that praxis-ai routes its cryptography through the
-OpenSSL provider the image carries and behaves as a FIPS deployment must.
-Three facts stay outside what this repository can prove:
+FIPS 140-3 validates a cryptographic module, not an application. The checks
+above prove that praxis-ai routes its cryptography through the OpenSSL provider
+the image carries and behaves as a FIPS deployment must. Three facts stay
+outside what this repository can prove:
 
 - **The module build.** A certificate names one exact build of
   `fips.so`. The pinned UBI 9 images carry a build rebuilt for a CVE fix
   that is still in validation with NIST; `fips-host-check` says so on every
   run (a warning, or a failure under `--require-certified`) rather than
   letting the package name imply a certificate. See
-  the [shared tool’s certified-module inventory](https://github.com/praxis-proxy/cargo-fips-check/blob/a8dae23f90eb77e6890cc86df5ec6cf6da4e2e79/assets/certified-modules.json)
+  the [shared tool's certified-module inventory](https://github.com/praxis-proxy/cargo-fips-check/blob/a8dae23f90eb77e6890cc86df5ec6cf6da4e2e79/assets/certified-modules.json)
   for the builds and sources.
 - **The operating environment.** The certificate lists tested operating
   environments; running elsewhere relies on the CMVP porting rules.
@@ -247,7 +247,9 @@ Three facts stay outside what this repository can prove:
 
 ## Scope and exemptions
 
-Every crypto-adjacent component in the FIPS image, and why it is compliant:
+Every crypto-adjacent component in the FIPS image, and why it is compliant.
+The per-operation record for both builds is the
+[cryptographic operations inventory](../architecture/cryptographic-inventory.md).
 
 | Component | Use | Disposition |
 |---|---|---|
@@ -264,14 +266,11 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
 | Conversations API | Conversations state in PostgreSQL through the certificate-only SQLx profile | compliant through system OpenSSL; the store uses `store-postgres-cert-auth` (no migrations, no password authentication) |
 | SQLite store, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
-| `openai_file_resolve`, `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
+| `openai_file_resolve` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider) | experimental opt-in; not in the default FIPS feature set |
+| `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
 | `gcp_adc` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider); the `key_file` source signs its `RS256` assertion through OpenSSL's EVP signing API | not in the FIPS build (experimental) |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
 | sha2, hmac, aws-sigv4, rcgen (with ring) | test utilities, fixtures, xtask and the `SigV4` test oracle | development only, absent from the shipped binary and its manifest; aws-lc-rs itself is gone from every graph, the policy engine aside |
-
-[transact-rs/sqlx#4417]: https://github.com/transact-rs/sqlx/pull/4417
-[transact-rs/sqlx#4420]: https://github.com/transact-rs/sqlx/pull/4420
-[transact-rs/sqlx#4421]: https://github.com/transact-rs/sqlx/issues/4421
 
 The report and Red Hat's scanner both confirm the last row on every build:
 the embedded crate manifest lists none of the denied crates, and the binary
@@ -280,7 +279,11 @@ defines no symbol of a bundled crypto backend.
 ## Release readiness
 
 The [release checklist](../developing/release.md#pre-release-checklist) includes
-FIPS-specific items. The release workflow's `fips-proof` job blocks
-publication unless a successful `fips-host` run exists for the release
-commit. The release CI evidence table records the FIPS workflow outcome
-alongside every other tracked workflow.
+FIPS-specific items. The release workflow's `fips-proof` job blocks publication
+unless a successful `fips-host` run exists for the release commit, and the
+release CI evidence table records the FIPS workflow outcome alongside every
+other tracked workflow.
+
+[transact-rs/sqlx#4417]: https://github.com/transact-rs/sqlx/pull/4417
+[transact-rs/sqlx#4420]: https://github.com/transact-rs/sqlx/pull/4420
+[transact-rs/sqlx#4421]: https://github.com/transact-rs/sqlx/issues/4421

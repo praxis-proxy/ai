@@ -2,24 +2,20 @@
 
 ## Overview
 
-Praxis AI includes an AI-owned `ext_proc` compatibility layer
-for [`llm-d`](https://github.com/llm-d/llm-d) integration.
-This replaces the abandoned Praxis-side crate publication
-approach (Praxis PR #780). The compatibility layer lives in
-the AI repository, scoped exclusively to `llm-d`, and is not
-a general-purpose Envoy `ext_proc` extension point.
+Praxis AI includes an AI-owned `ext_proc` compatibility layer for
+[`llm-d`](https://github.com/llm-d/llm-d). It replaces the abandoned
+Praxis-side crate publication approach (Praxis PR #780).
 
 ## Crate location and feature
 
 - **Crate path:** `integrations/llmd/ext-proc/`
 - **Package name:** `praxis-ai-llmd-ext-proc`
 - **Feature name:** `llmd-ext-proc`
-- **`publish = false`** - not available on crates.io.
+- **`publish = false`**: not available on crates.io.
 
-Default `praxis-ai-proxy` builds do not link, register, or
-expose the `ext_proc` filter. The filter is registered only
-when the `llmd-ext-proc` feature is enabled on
-`praxis-ai-proxy`.
+Default `praxis-ai-proxy` builds do not link, register, or expose the
+`ext_proc` filter. It is registered only when `praxis-ai-proxy` is built with
+the `llmd-ext-proc` feature.
 
 ## Architecture
 
@@ -36,25 +32,23 @@ OpenAI-compatible request
     -> Chat Completions response
 ```
 
-The mock processor is **not** the real `llm-d` Go EPP. These
-tests prove the transport and routing integration shape, not
-`llm-d` scheduling policy.
+The mock processor is **not** the real `llm-d` Go EPP. The tests prove the
+transport and routing integration, not `llm-d` scheduling policy.
 
 ## Support boundary
 
-- AI-owned, `publish = false`, `llm-d`-only.
-- Not general-purpose Envoy `ext_proc` support.
-- No compatibility or support is promised for non-`llm-d` uses.
-- Native Praxis filters are preferred for general extension work.
-- Other use cases require a maintainer discussion on GitHub.
-- The Grid demo should consume AI with `llmd-ext-proc` enabled
-  for provider-gateway/`llm-d` testing. It should not depend on
-  `praxis-proxy-ext-proc` or Praxis PR #780.
+- AI-owned, `publish = false`, `llm-d`-only. It is not general-purpose Envoy
+  `ext_proc` support, and nothing is promised for non-`llm-d` uses.
+- Prefer native Praxis filters for general extension work. Other use cases
+  need a maintainer discussion on GitHub.
+- The Grid demo should consume AI with `llmd-ext-proc` enabled for
+  provider-gateway/`llm-d` testing, not depend on `praxis-proxy-ext-proc` or
+  Praxis PR #780.
 
 ## Running the tests
 
-Requires Docker or Podman for the `llm-d-inference-sim`
-container (pinned to `v0.10.0`).
+Requires Docker or Podman for the `llm-d-inference-sim` container (pinned to
+`v0.10.0`).
 
 ```console
 cargo test -p praxis-tests-environment \
@@ -75,6 +69,5 @@ The six environment tests:
 
 ## Dependency and build notes
 
-- The AI workspace depends on the published Praxis `0.4.1`
-  crates from crates.io. These include the support APIs needed
-  by the `llm-d` `ext_proc` compatibility layer.
+The AI workspace tracks Praxis core `main` (pinned in `Cargo.lock`), which
+provides the support APIs the `llm-d` `ext_proc` layer needs.
