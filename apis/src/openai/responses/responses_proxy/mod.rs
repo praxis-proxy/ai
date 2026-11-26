@@ -667,6 +667,14 @@ impl HttpFilter for ResponsesProxyFilter {
             trace!("buffering request body chunk");
             return Ok(FilterAction::Continue);
         }
+        if ctx
+            .extensions
+            .get::<super::web_search_dispatch::NativeWebSearchCompatibility>()
+            .is_some()
+            && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+        {
+            super::web_search_dispatch::lower_native_web_search(state);
+        }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
             return Ok(FilterAction::Continue);

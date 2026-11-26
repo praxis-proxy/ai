@@ -724,7 +724,7 @@ impl HttpFilter for WebSearchDispatchFilter {
                     "function name web_search conflicts with hosted search",
                 )));
             }
-            lower_native_web_search(state);
+            ctx.extensions.insert(NativeWebSearchCompatibility);
         }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
@@ -1963,7 +1963,7 @@ pub(crate) fn bridge_call_id(source_id: &str, queries: &[&str], index: usize) ->
 
 
 /// Expose locally executed search as a function to inference backends.
-fn lower_native_web_search(state: &mut ResponsesState) {
+pub(crate) fn lower_native_web_search(state: &mut ResponsesState) {
     let Some(tools) = state.request_body.get_mut("tools").and_then(Value::as_array_mut) else {
         return;
     };
@@ -2029,3 +2029,7 @@ pub(crate) fn restore_web_search_calls(response: &mut Value) {
         }
     }
 }
+
+/// Request-scoped permission to lower hosted search at the native outbound boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeWebSearchCompatibility;
