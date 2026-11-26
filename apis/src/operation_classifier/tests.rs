@@ -1096,17 +1096,11 @@ async fn an_anthropic_match_sets_the_configured_routing_headers() {
 #[tokio::test]
 async fn classifies_model_reads_using_the_client_protocol() {
     let filter = default_filter();
-    for (version, protocol, list, retrieve, param) in [
-        (None, "openai_models", "listModels", "retrieveModel", "model"),
-        (
-            Some("2023-06-01"),
-            "anthropic_models",
-            "models_list",
-            "models_get",
-            "model_id",
-        ),
-        (Some(""), "anthropic_models", "models_list", "models_get", "model_id"),
-    ] {
+    let openai = ("openai_models", "listModels", "retrieveModel", "model");
+    let anthropic = ("anthropic_models", "models_list", "models_get", "model_id");
+    for (version, (protocol, list, retrieve, param)) in
+        [(None, openai), (Some("2023-06-01"), anthropic), (Some(""), anthropic)]
+    {
         for (path, operation, model_id) in [
             ("/v1/models/?limit=2", list, None),
             ("/v1/models/model%3A1/", retrieve, Some("model%3A1")),
@@ -1124,14 +1118,22 @@ async fn classifies_model_reads_using_the_client_protocol() {
             assert_eq!(matched.operation_id, operation);
             assert_eq!(matched.request_body, RequestBody::None);
             assert_eq!(matched.path_parameters.get(request.uri.path(), param), model_id);
-            let formatter = ctx.extensions.get::<ErrorResponseFormatterHandle>().unwrap();
-            let error = praxis_filter::ErrorResponseContext::new("upstream_error", "upstream unavailable", 502);
-            let response = formatter.format(&error);
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            assert!(body["error"]["message"].is_string());
-            assert_eq!(body["type"].as_str(), version.map(|_| "error"));
+            assert_model_error_format(&ctx, version.is_some());
         }
     }
+}
+
+/// Verify proxy errors use the selected client protocol's envelope.
+fn assert_model_error_format(ctx: &HttpFilterContext<'_>, anthropic: bool) {
+    let formatter = ctx.extensions.get::<ErrorResponseFormatterHandle>().unwrap();
+    let error = praxis_filter::ErrorResponseContext::new("upstream_error", "upstream unavailable", 502);
+    let response = formatter.format(&error);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert!(body.pointer("/error/message").is_some_and(serde_json::Value::is_string));
+    assert_eq!(
+        body.get("type").and_then(serde_json::Value::as_str),
+        anthropic.then_some("error")
+    );
 }
 
 /// The shared paths only classify the two HTTP GET operations.
