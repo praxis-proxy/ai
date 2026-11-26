@@ -10,11 +10,11 @@ use crate::operation::{
     ApplicationProtocol, HandlingMode, HttpMethod, OperationSpec, RequestBody, Transport, match_operation,
 };
 
-/// OpenAI operation IDs from the pinned OpenAPI document.
+/// OpenAI operation IDs from the pinned `OpenAPI` document.
 const OPENAI_MODELS: [OperationSpec; 2] =
     model_operations("openai_models", "listModels", "retrieveModel", "/v1/models/{model}");
 
-/// Anthropic operation IDs from the pinned OpenAPI document.
+/// Anthropic operation IDs from the pinned `OpenAPI` document.
 const ANTHROPIC_MODELS: [OperationSpec; 2] =
     model_operations("anthropic_models", "models_list", "models_get", "/v1/models/{model_id}");
 
