@@ -245,12 +245,11 @@ impl HttpFilter for McpFilter {
         // For tools/call: store AuditState in filter_state for response-phase
         //   metrics recording AND audit event emit.
         // AuditState replaces McpMetricsState — it carries start time and
-        //   tool_name (for metrics) plus method, session, tenant (for audit).
+        //   tool_name (for metrics) plus session, tenant (for audit).
         // For all other methods: emit the audit event now (no response follows).
         if matches!(mcp_envelope.method, McpMethod::ToolsCall) {
             ctx.insert_filter_state(AuditState {
                 start: Instant::now(),
-                method: mcp_envelope.method.as_str().to_owned(),
                 tool_name: mcp_envelope.name.unwrap_or_default(),
                 session_id: mcp_envelope.session_id,
                 protocol_version: mcp_envelope.protocol_version,
@@ -274,7 +273,7 @@ impl HttpFilter for McpFilter {
     ) -> Result<FilterAction, FilterError> {
         // ── MCP metrics + audit (response phase) ──────────────────────────
         // AuditState replaced McpMetricsState in the request phase.
-        // It carries start time + tool_name (for metrics) plus method,
+        // It carries start time + tool_name (for metrics) plus
         // session, protocol_version, tenant (for audit).
         // We record Prometheus metrics AND emit the audit event from it.
         if let Some(audit) = ctx.get_filter_state::<AuditState>() {

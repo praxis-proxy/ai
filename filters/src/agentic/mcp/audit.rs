@@ -94,8 +94,6 @@ pub(crate) struct AuditState {
     /// Uses [`std::time::Instant`] so system-clock adjustments never produce
     /// negative or inflated duration values.
     pub start: std::time::Instant,
-    /// MCP method (always `"tools/call"` when stored).
-    pub method: String,
     /// Tool name from `params.name`.
     pub tool_name: String,
     /// MCP session ID from the `Mcp-Session-Id` header, if present.
@@ -207,7 +205,7 @@ pub(crate) fn emit_completed(state: &AuditState, cluster: &str, upstream_status:
     info!(
         target: "praxis_ai::mcp_audit",
         log_type             = "mcp_audit",
-        mcp_method           = state.method.as_str(),
+        mcp_method           = "tools/call",
         mcp_name             = state.tool_name.as_str(),
         mcp_session_id       = state.session_id.as_deref(),
         mcp_protocol_version = state.protocol_version.as_deref(),
@@ -269,8 +267,9 @@ mod tests {
             events: Arc::clone(&targets),
         };
         let subscriber = tracing_subscriber::registry().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let guard = tracing::subscriber::set_default(subscriber);
         f();
+        drop(guard);
         Arc::try_unwrap(targets)
             .expect("only one reference remains")
             .into_inner()
@@ -311,7 +310,6 @@ mod tests {
         let targets = with_captured_events(|| {
             let state = AuditState {
                 start: Instant::now(),
-                method: "tools/call".to_owned(),
                 tool_name: "query_database".to_owned(),
                 session_id: Some("sess_abc".to_owned()),
                 protocol_version: Some("2026-11-05".to_owned()),
@@ -330,7 +328,6 @@ mod tests {
         let targets = with_captured_events(|| {
             let state = AuditState {
                 start: Instant::now(),
-                method: "tools/call".to_owned(),
                 tool_name: "query_database".to_owned(),
                 session_id: None,
                 protocol_version: None,
@@ -348,7 +345,6 @@ mod tests {
     fn duration_ms_is_sane() {
         let state = AuditState {
             start: Instant::now(),
-            method: "tools/call".to_owned(),
             tool_name: "tool".to_owned(),
             session_id: None,
             protocol_version: None,
