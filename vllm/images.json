@@ -16,11 +16,12 @@
     "text": {
       "$comment": [
         "Default image. Qwen3-8B is the model the full GPU Responses suite and the",
-        "Claude Code / Codex acceptance jobs qualify against: the 0.6B CPU model",
-        "cannot drive reliable tool calling. The 8.19B bf16 checkpoint is ~15.3 GiB",
-        "and fits the g5.xlarge A10G (24 GiB) with room for a KV cache.",
+        "Claude Code, Codex, OpenCode, and pi acceptance jobs qualify against; each",
+        "acceptance manifest names this entry as its `baked_image`. The 0.6B CPU",
+        "model cannot drive reliable tool calling. The 8.19B bf16 checkpoint is",
+        "~15.3 GiB and fits the g5.xlarge A10G (24 GiB) with room for a KV cache.",
         "Deliberately unpinned by revision, matching how the suite has always",
-        "served it; set `revision` to freeze it."
+        "served it; set `revision` to freeze it for every lane at once."
       ],
       "tag": "Qwen3-8B",
       "model": "Qwen/Qwen3-8B",

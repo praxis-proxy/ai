@@ -23,10 +23,10 @@
 # gated additionally on a real TAVILY_API_KEY. See `[claude_code.launch.web_search]`.
 #
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
-# GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
-# lightweight `pins` job parses this manifest and exports its runtime values.
-# The acceptance job runs nightly and can also be dispatched independently.
-# `model_revision` is documentary and intentionally NOT a launch flag.
+# GPU runner and serves the same model-baked vLLM image as the full suite (see
+# [vllm]). A lightweight `pins` job parses this manifest and exports its runtime
+# values. The acceptance job runs nightly and can also be dispatched
+# independently.
 
 [claude_code]
 # Version substring asserted from `claude --version`. Both lanes run it: the
@@ -214,9 +214,15 @@ flags = [
 ]
 
 [vllm]
-# Container image pinned by digest for Claude Code acceptance
-# (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
-# Responses suite builds the model-baked image from vllm/Containerfile instead.
+# The backend is pinned in two layers. `base_image` is the immutable vLLM build:
+# the upstream image, by digest, that vllm/Containerfile builds `FROM`.
+# `baked_image` names the entry in vllm/images.json that layers the model weights
+# on top of it; the GPU lane serves that image, the same one the full Responses
+# suite qualifies, so no lane downloads weights at run time. The baked image is a
+# mutable tag checked by its provenance labels, so the lane records the image it
+# actually served (tag, local image ID, and registry digest when pulled) in its
+# acceptance results rather than pinning it here.
+#
 # vLLM v0.32.0 serves the native Anthropic Messages surface (`/v1/messages`,
 # `/v1/messages/count_tokens`) by default, in addition to `/v1/chat/completions`,
 # so one container backs both the native and transformed acceptance paths with no
@@ -224,21 +230,18 @@ flags = [
 # already green with; the 0.6B CPU model cannot drive Claude Code's tool use.
 # Use the CUDA 13 default image: the cu129 variant resolves a CUDA 13 torchcodec
 # wheel that fails to load because libnvrtc.so.13 is absent.
-image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+base_image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+baked_image = "text"
 # Exact served model name. Set via `--served-model-name`; every model-selection
 # surface in the test (--model and the ANTHROPIC_*_MODEL env vars) pins this. A
 # slash-free ALIAS is used deliberately: vLLM's Anthropic client surface cannot
 # address a model name containing "/", and Claude Code addresses that surface.
-# The weights load from the Qwen/Qwen3-8B repo (see [vllm.launch]) and are served
-# under this alias. VALIDATE the alias resolves for Claude Code during qualification.
+# The weights are the ones baked into `baked_image` and are served under this
+# alias. VALIDATE the alias resolves for Claude Code during qualification.
+#
+# The model and its Hugging Face revision are owned by the `baked_image` entry in
+# vllm/images.json, which every GPU lane shares; they are not repeated here.
 served_model_name = "qwen3-8b"
-# HF commit the served weights resolve to. Recorded for reproducibility during
-# qualification (`curl https://huggingface.co/api/models/Qwen/Qwen3-8B | jq -r .sha`,
-# or the snapshot commit-hash dir under the warmed HF cache). Left TBD because a
-# qualification dispatch runs before the revision is known; it is NOT an exported
-# pin, so it does not gate the nightly. A follow-up may additionally pass
-# `--revision <sha>` once recorded.
-model_revision = "TBD-at-qualification"
 # Serving parameters. Claude auto-mode classification needs the full planning
 # window advertised to the client.
 tool_call_parser = "hermes"
@@ -246,8 +249,8 @@ context_length = 32768
 seed = 0
 
 # vLLM launch flags recorded for reproducibility. They mirror the GPU full-suite
-# launch except for its single-request memory tuning, and both jobs load identical
-# Qwen3-8B weights from the shared on-disk HF cache. Native Anthropic Messages
+# launch except for its single-request memory tuning, and both jobs serve the
+# same baked image, so they load identical Qwen3-8B weights. Native Anthropic Messages
 # serving is on by default in this image; no extra flag enables it, and the
 # default OpenAI Chat Completions surface remains available for the transformed
 # path. Thinking is disabled by default for this deterministic coding task:
@@ -260,13 +263,15 @@ seed = 0
 # planning scenario above is the nightly regression guard for exactly that, so
 # changing either flag here is expected to turn it red.
 #
-# `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
-# ready. Do NOT add `--served-model-name` or `--api-key` here; the CI container
-# run appends both separately (from `served_model_name` above and the
-# per-job ephemeral VLLM_API_KEY), and duplicating them would pass the flag twice.
+# `--model` is REQUIRED and must be the baked weights' path inside the image,
+# `/opt/vllm/models/<model>`: a Hugging Face ID would make vLLM download the
+# weights again. Do NOT add `--served-model-name` or `--api-key` here; the CI
+# container run appends both separately (from `served_model_name` above and the
+# per-job ephemeral VLLM_API_KEY), and duplicating them would pass the flag
+# twice. `check-pins` enforces all three.
 [vllm.launch]
 flags = [
-  "--model", "Qwen/Qwen3-8B",
+  "--model", "/opt/vllm/models/Qwen/Qwen3-8B",
   "--max-model-len", "32768",
   "--enable-auto-tool-choice",
   "--tool-call-parser", "hermes",
