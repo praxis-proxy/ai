@@ -19,12 +19,12 @@ Domain handling matches hosted OpenAI where hosted documents it: each list accep
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `native_tool_compat` | bool | no | Lower hosted tools for native function-only Responses backends. |
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
 | `user_credential` | string | no | Optional callout-credential slot id (see [`WebSearchFilterConfig::user_credential`]). |
 | `api_key` | CredentialSource | yes | API key credential source for the search provider: exactly one of `value`, `env_var`, or `file`; see [`CredentialSource`]. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
-| `native_tool_compat` | boolean | no | Lower hosted search to a function for native Responses inference. Default false. |
 | `max_calls_per_round` | integer | no | Hard cap on web-search calls processed from one model response (1..=1024; default: 32). |
 | `max_query_bytes` | integer | no | Maximum UTF-8 bytes accepted for one model-generated search query, after trimming (1..=8192; default: 8192). A blank or oversized query fails the call locally instead of reaching the provider. 8192 is a hard ceiling: admins may lower the bound but cannot raise it. |
 | `base_url` | string | no | Override the provider's default API base URL. |
