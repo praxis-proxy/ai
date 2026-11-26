@@ -195,7 +195,14 @@ pub(crate) fn emit_completed(state: &AuditState, cluster: &str, upstream_status:
         OUTCOME_OK
     };
 
-    let duration_ms = state.start.elapsed().as_millis() as u64;
+    // Compute latency in milliseconds without u128→u64 truncation cast
+    // (cast_possible_truncation is deny). `as_secs()` returns u64;
+    // `subsec_millis()` returns u32 — both fit u64 natively.
+    let elapsed = state.start.elapsed();
+    let duration_ms = elapsed
+        .as_secs()
+        .saturating_mul(1000)
+        .saturating_add(u64::from(elapsed.subsec_millis()));
 
     info!(
         target: "praxis_ai::mcp_audit",

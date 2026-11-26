@@ -83,7 +83,7 @@ pub const METRIC_MCP_FILTER_REJECTIONS_TOTAL: &str = "praxis_mcp_filter_rejectio
 // leaving this struct unused. The struct is retained so the metrics PR
 // (#2030) can be reviewed and merged independently. Once both PRs land,
 // this struct and annotation can be removed.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "retained for independent review of metrics PR #2030; audit.rs uses AuditState instead")]
 pub(crate) struct McpMetricsState {
     /// Monotonic start time for duration measurement.
     ///
