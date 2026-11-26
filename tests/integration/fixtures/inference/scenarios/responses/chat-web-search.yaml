@@ -23,6 +23,8 @@ turns:
           stream: false
           tools:
             - type: web_search
+              external_web_access: true
+              search_content_types: [text, image]
               search_context_size: high
           tool_choice:
             type: web_search

@@ -283,10 +283,14 @@ impl SearchClient {
         // surface at callout time, silently dropping the deferred credential and
         // dialing the provider unauthenticated. Every provider defers a header
         // credential bound to this authority.
-        let base = config
+        // Strip trailing slashes once at construction so `/api` and `/api/`
+        // produce the same provider endpoint when builders append `/…` paths.
+        // Matches `openai/api_client` and `file_search_dispatch` base handling.
+        let base_url = config
             .base_url
             .as_deref()
-            .unwrap_or_else(|| default_base_url(config.provider));
+            .map(|base| base.trim_end_matches('/').to_owned());
+        let base = base_url.as_deref().unwrap_or_else(|| default_base_url(config.provider));
         credential_authority(base)
             .map_err(|e| FilterError::from(format!("{filter_name}: invalid search base URL: {e}")))?;
         Ok(Self {
@@ -295,7 +299,7 @@ impl SearchClient {
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
-            base_url: config.base_url.clone(),
+            base_url,
         })
     }
 
@@ -1368,6 +1372,63 @@ mod tests {
         assert!(
             url.starts_with("http://localhost:9999/"),
             "base_url should override the default You.com URL; got: {url}"
+        );
+    }
+
+    fn client_with_base(provider: SearchProvider, base: &str) -> SearchClient {
+        let config = ValidatedConfig {
+            provider,
+            api_key: test_api_key("test-key"),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
+            base_url: Some(base.into()),
+            user_credential: None,
+        };
+        SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
+    }
+
+    #[test]
+    fn from_config_strips_trailing_slash_on_base_url() {
+        let client = client_with_base(SearchProvider::Tavily, "http://127.0.0.1:9999/api/");
+        assert_eq!(client.effective_base_url(), "http://127.0.0.1:9999/api");
+    }
+
+    #[test]
+    fn trailing_slash_base_url_matches_bare_tavily_path() {
+        let bare = client_with_base(SearchProvider::Tavily, "http://127.0.0.1:9999/api");
+        let trailing = client_with_base(SearchProvider::Tavily, "http://127.0.0.1:9999/api/");
+        let (bare_url, _) = bare.build_tavily_request("q", SearchContextSize::Medium);
+        let (trailing_url, _) = trailing.build_tavily_request("q", SearchContextSize::Medium);
+        assert_eq!(bare_url, trailing_url);
+        assert_eq!(bare_url, "http://127.0.0.1:9999/api/search");
+    }
+
+    #[test]
+    fn trailing_slash_base_url_matches_bare_you_path() {
+        let bare = client_with_base(SearchProvider::You, "http://127.0.0.1:9999/api");
+        let trailing = client_with_base(SearchProvider::You, "http://127.0.0.1:9999/api/");
+        let (bare_url, _) = bare.build_you_request("q", 5, None);
+        let (trailing_url, _) = trailing.build_you_request("q", 5, None);
+        assert_eq!(bare_url, trailing_url);
+        assert_eq!(bare_url, "http://127.0.0.1:9999/api/v1/search");
+    }
+
+    #[test]
+    fn trailing_slash_base_url_matches_bare_brave_path() {
+        let bare = client_with_base(SearchProvider::Brave, "http://127.0.0.1:9999/api");
+        let trailing = client_with_base(SearchProvider::Brave, "http://127.0.0.1:9999/api/");
+        let (bare_url, _) = bare.build_brave_request("q", 5, None);
+        let (trailing_url, _) = trailing.build_brave_request("q", 5, None);
+        assert_eq!(bare_url, trailing_url);
+        assert!(
+            bare_url.starts_with("http://127.0.0.1:9999/api/res/v1/web/search?"),
+            "Brave path must keep a single separator after the base prefix; got {bare_url}"
+        );
+        assert!(
+            !bare_url.contains("/api//"),
+            "Brave must not double the separator after a path-prefix base; got {bare_url}"
         );
     }
 

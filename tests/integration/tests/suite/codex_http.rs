@@ -358,6 +358,241 @@ async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http()
     run_live_codex_apply_patch_workflow(&live, proxy_port, config, example, false).await;
 }
 
+/// Exercise the hosted search declared by the real CLI on each upstream route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_codex_native_live_web_search() {
+    run_codex_web_search(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_codex_translated_live_web_search() {
+    run_codex_web_search(true).await;
+}
+
+async fn run_codex_web_search(translated: bool) {
+    let Some(live) = CodexLiveConfig::from_env() else {
+        return;
+    };
+    assert_pinned_codex_version(&live.codex_bin).await;
+    live.require_egress_isolation_if_demanded();
+    if let Some(namespace) = &live.netns {
+        verify_egress_isolation(namespace);
+    }
+    let key = std::env::var("TAVILY_API_KEY").expect("live search requires TAVILY_API_KEY");
+    assert!(!key.is_empty(), "live search requires a nonempty provider key");
+    let relay = praxis_test_utils::start_tavily_relay();
+    let port = free_port();
+    let (example, config) = codex_search_config(translated, port, &live, &relay.base_url());
+    print_acceptance_filter_chain(&config);
+    let _proxy = start_proxy(&config);
+    let observer = HttpTransportObserver::start_on(port, live.listen_address).await;
+    let workspace = tempfile::tempdir().expect("temporary Codex workspace");
+    let options = CodexRunOptions {
+        web_search: "live",
+        proxy_base_url: &format!("http://{}:{}", live.listen_address, observer.port()),
+        model: CODEX_APPLY_PATCH_MODEL,
+        working_dir: workspace.path(),
+        prompt: "Use the web search tool to find the Rust project's latest stable release announcement. Give its title and cite one exact source URL from the search results on a line by itself. Do not use shell commands.",
+        sandbox: "read-only",
+        execution_timeout: LIVE_CHILD_TIMEOUT,
+        no_proxy: &format!("127.0.0.1,localhost,{}", live.listen_address),
+        netns: live.netns.as_deref(),
+        reasoning_effort: None,
+        tolerate_timeout: false,
+        compaction_limits: None,
+    };
+    let output = run_codex(&live.codex_bin, options).await;
+    // This controlled acceptance prompt contains no user data. Keep provider
+    // credentials out of the retained CLI trace.
+    eprintln!(
+        "Codex search stdout: {}\nstderr: {}",
+        output
+            .stdout
+            .replace(&key, "<REDACTED>")
+            .replace(&live.backend_token, "<REDACTED>"),
+        output
+            .stderr
+            .replace(&key, "<REDACTED>")
+            .replace(&live.backend_token, "<REDACTED>")
+    );
+    assert!(output.status.success(), "Codex search exited unsuccessfully");
+    let captures = relay.captures();
+    assert!(!captures.is_empty(), "Praxis made no Tavily request");
+    let authorization = format!("Bearer {key}");
+    let mut sources = Vec::new();
+    for capture in &captures {
+        assert!(
+            capture.authorization.as_deref() == Some(&authorization),
+            "incorrect Tavily credential"
+        );
+        assert_eq!(capture.status, 200, "Tavily request failed");
+        assert!(
+            capture.request["query"].as_str().is_some_and(|q| !q.trim().is_empty()),
+            "Tavily query must be nonempty"
+        );
+        for result in capture.response["results"].as_array().expect("Tavily results") {
+            let url = result["url"].as_str().expect("Tavily result URL");
+            assert!(
+                url.starts_with("https://") || url.starts_with("http://"),
+                "Tavily result URL must be absolute HTTP(S)"
+            );
+            sources.push(url);
+        }
+    }
+    assert!(
+        completed_codex_answer_cites(&output.stdout, &sources),
+        "completed Codex answer must cite an exact URL returned by Tavily"
+    );
+    record_codex_capabilities(
+        example,
+        &options,
+        observer.assert_http_only(),
+        &[("cited live search source", "passed")],
+    );
+}
+
+/// Add hosted search dispatch and its next-round transition to the tested route.
+fn codex_search_config(
+    translated: bool,
+    port: u16,
+    live: &CodexLiveConfig,
+    relay_url: &str,
+) -> (&'static str, praxis_core::config::Config) {
+    let example = if translated {
+        "openai/responses/client-tool-compat-chat-completions.yaml"
+    } else {
+        "openai/responses/client-tool-compat.yaml"
+    };
+    let yaml = std::fs::read_to_string(example_config_path(example)).expect("Codex example");
+    let patch = if translated {
+        patch_live_codex_config
+    } else {
+        patch_live_native_codex_config
+    };
+    let yaml = patch(
+        &yaml,
+        port,
+        &live.vllm_authority,
+        &live.backend_token,
+        live.database_url.as_deref().expect("live search requires PostgreSQL"),
+    );
+    let yaml = patch_live_apply_patch_model_alias(&yaml, &live.model);
+    let yaml = yaml
+        .replace(
+            "              - filter: openai_agentic_loop",
+            &format!(
+                r#"              - filter: openai_web_search_dispatch
+                provider: tavily
+                api_key:
+                  env_var: TAVILY_API_KEY
+                base_url: {relay_url}
+                outbound_chain:
+                  name: search-outbound
+                  filters:
+                    - filter: request_id
+              - filter: openai_agentic_loop"#
+            ),
+        )
+        .replace(
+            "            on_result:",
+            r#"            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference"#,
+        );
+    let mut config = praxis_core::config::Config::from_yaml(&yaml).expect("managed Codex search configuration");
+    if !translated {
+        let router = config.filter_chains[0]
+            .filters
+            .iter_mut()
+            .find(|f| f.filter_type == "iterative_request_router")
+            .expect("router");
+        let search = router.config["steps"][0]["filters"]
+            .as_sequence_mut()
+            .expect("filters")
+            .iter_mut()
+            .find(|f| f["filter"] == "openai_web_search_dispatch")
+            .expect("search");
+        search["native_tool_compat"] = serde_yaml::Value::Bool(true);
+    }
+    // The gateway contacts the host-side Tavily relay on loopback.
+    config.insecure_options.allow_private_upstreams = true;
+    (example, config)
+}
+
+#[tokio::test]
+async fn codex_search_builds_the_dispatch_loop_on_both_routes() {
+    for translated in [false, true] {
+        let live = CodexLiveConfig {
+            codex_bin: OsString::new(),
+            vllm_authority: "127.0.0.1:8000".into(),
+            model: "qwen3-8b".into(),
+            candidate: false,
+            backend_token: "test-key".into(),
+            database_url: Some("postgres://u:p@127.0.0.1/db".into()),
+            listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            netns: None,
+        };
+        let (_, mut config) = codex_search_config(translated, 18080, &live, "http://127.0.0.1:12345");
+        let router = config.filter_chains[0]
+            .filters
+            .iter_mut()
+            .find(|f| f.filter_type == "iterative_request_router")
+            .expect("iteration router");
+        let step = &mut router.config["steps"][0];
+        assert_eq!(step["on_result"][0]["next"].as_str(), Some("inference"));
+        let dispatcher = step["filters"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|f| f["filter"].as_str() == Some("openai_web_search_dispatch"))
+            .expect("search dispatcher");
+        assert_eq!(dispatcher["api_key"]["env_var"].as_str(), Some("TAVILY_API_KEY"));
+        dispatcher["api_key"] = serde_yaml::from_str("value: synthetic-key").unwrap();
+        let _pipeline = build_pipeline(&config);
+    }
+}
+
+fn completed_codex_answer_cites(stdout: &str, sources: &[&str]) -> bool {
+    let mut cited = false;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        match event["type"].as_str() {
+            Some("item.completed") if event["item"]["type"] == "agent_message" => {
+                cited = event["item"]["text"].as_str().is_some_and(|answer| {
+                    answer
+                        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'))
+                        .any(|word| sources.contains(&word))
+                });
+            },
+            Some("turn.completed") => return cited,
+            Some("turn.failed" | "error") => return false,
+            _ => {},
+        }
+    }
+    false
+}
+
+#[test]
+fn codex_search_requires_a_completed_answer_with_a_returned_source() {
+    let source = "https://example.org/release";
+    let item = |kind, text| serde_json::json!({"type":"item.completed","item":{"type":kind,"text":text}}).to_string();
+    let done = r#"{"type":"turn.completed"}"#;
+    let answer = item("agent_message", source);
+    assert!(completed_codex_answer_cites(&format!("{answer}\n{done}"), &[source]));
+    for trace in [
+        answer.clone(),
+        format!("{}\n{done}", item("command_execution", source)),
+        format!("{}\n{done}", item("agent_message", "https://example.org/releases")),
+        format!("{answer}\n{}\n{done}", item("agent_message", "No source")),
+    ] {
+        assert!(!completed_codex_answer_cites(&trace, &[source]));
+    }
+}
+
 /// Prove a pinned Codex session crosses its own context limit mid-task, performs
 /// the client's inline auto-compaction through Praxis, and still finishes the
 /// coding task against live vLLM.

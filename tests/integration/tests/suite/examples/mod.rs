@@ -37,6 +37,7 @@ mod credential_injection;
 mod decisions;
 mod external_metering;
 mod external_metering_file_key;
+mod external_metering_model_policy;
 #[cfg(feature = "policy-engine")]
 mod external_metering_policy_identity;
 #[cfg(target_os = "linux")]

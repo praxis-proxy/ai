@@ -2479,7 +2479,7 @@ async fn accumulation_terminal_snapshot_charged_against_byte_budget() {
 }
 
 /// Record execution provenance for every item currently in `accumulated_output`,
-/// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search_dispatch`)
+/// mirroring what a dispatch filter (`openai_mcp_connector`, `openai_web_search_dispatch`)
 /// records when it actually executes a tool. Tests that seed `accumulated_output`
 /// with genuinely executed items call this so synthesis is not suppressed by the
 /// provenance gate; the fabricated-lifecycle regression test deliberately does
@@ -2568,7 +2568,7 @@ async fn logical_stream_failed_mcp_call_emits_failed_outcome_event() {
     // #276: a locally executed MCP call that carries an `error` must surface a
     // `response.mcp_call.failed` outcome event, never a `completed` one.
     let (filter, mut ctx) = arm_resumed_round_with_accumulated(
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         vec![json!({
             "type": "mcp_call",
             "id": "mcp_fail_1",
@@ -2605,7 +2605,7 @@ async fn logical_stream_successful_mcp_list_tools_emits_lifecycle_events() {
     // added / in_progress / completed / done events, not only the final
     // response snapshot.
     let (filter, mut ctx) = arm_resumed_round_with_accumulated(
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         vec![json!({
             "type": "mcp_list_tools",
             "id": "mcpl_1",
@@ -2733,7 +2733,7 @@ async fn logical_stream_flushes_index_zero_local_item_on_iteration_zero_resume()
 
 #[test]
 fn is_local_tool_item_recognizes_mcp_list_tools() {
-    // #1022: a successful discovery listing seeded by `openai_mcp_tool_resolve` is a
+    // #1022: a successful discovery listing seeded by `openai_mcp_connector` is a
     // locally generated item the model backend never streams, so the logical stream
     // must own its lifecycle synthesis.
     assert!(
@@ -2750,7 +2750,7 @@ fn is_local_tool_item_recognizes_mcp_list_tools() {
 fn expected_phase_events_covers_mcp_list_tools() {
     // #1022: a successful discovery item owes exactly in_progress then completed;
     // failure takes the separate `mcp_list_tools.failed` path in
-    // `openai_mcp_tool_resolve` (#320) and never reaches synthesis here.
+    // `openai_mcp_connector` (#320) and never reaches synthesis here.
     let item = json!({"type": "mcp_list_tools", "id": "mcpl_1", "error": null});
     assert_eq!(
         super::expected_phase_events(&item),
@@ -2764,7 +2764,7 @@ fn expected_phase_events_covers_mcp_list_tools() {
 
 #[tokio::test]
 async fn logical_stream_synthesizes_mcp_list_tools_discovery_lifecycle_at_iteration_zero() {
-    // #1022: `openai_mcp_tool_resolve` resolves the MCP `tools/list` during
+    // #1022: `openai_mcp_connector` resolves the MCP `tools/list` during
     // `on_request_body`, before any inference round, seeding one `mcp_list_tools`
     // item at `accumulated_output[0]` with `iteration` still 0. The logical stream
     // must synthesize its full lifecycle — output_item.added ->
@@ -2867,7 +2867,7 @@ async fn logical_stream_synthesizes_mcp_list_tools_discovery_lifecycle_at_iterat
 #[tokio::test]
 async fn logical_stream_forwards_backend_native_mcp_list_tools_lifecycle() {
     // #1022 regression: a *deferred* MCP entry (`defer_loading: true`, or one lacking a
-    // `server_url`) is passed through unresolved by `openai_mcp_tool_resolve`, so the
+    // `server_url`) is passed through unresolved by `openai_mcp_connector`, so the
     // model backend performs `tools/list` itself and natively streams the discovery
     // lifecycle for an `mcp_list_tools` item that was NEVER seeded locally (its id is
     // absent from `locally_executed_output_items`). The logical stream must forward the
@@ -4122,7 +4122,7 @@ async fn logical_stream_error_still_flushes_pending_local_items() {
     // items the dispatch filter already executed before terminating with an
     // error, so already-committed tool activity is never silently dropped.
     let (filter, mut ctx) = arm_resumed_round_with_accumulated(
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         vec![json!({"type": "mcp_call", "id": "mcp_pending_1"})],
     )
     .await;
@@ -4167,7 +4167,7 @@ async fn logical_stream_multi_frame_parse_error_still_flushes_pending_local_item
     // client only the terminal error. The chunk must not commit any milestone
     // until it fully parses, so the executed local item still reaches the client.
     let (filter, mut ctx) = arm_resumed_round_with_accumulated(
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         vec![json!({"type": "mcp_call", "id": "mcp_pending_multi"})],
     )
     .await;
@@ -5337,7 +5337,7 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
     ));
     filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
     ctx.filter_results
-        .entry("openai_mcp_dispatch")
+        .entry("openai_mcp_connector")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -5359,7 +5359,7 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
     state.iteration = 1;
     state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_mcp_dispatch");
+    ctx.filter_results.remove("openai_mcp_connector");
     filter.arm(&mut ctx);
 
     assert!(
@@ -7555,4 +7555,37 @@ fn streaming_error_event_reads_nested_error_and_bounds_fields() {
         !logs.contains(ECHOED_SECRET),
         "content beyond the field bound or in message must not reach logs: {logs}"
     );
+}
+
+#[test]
+fn native_web_search_private_events_are_suppressed_before_terminal_output() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().tools = vec![json!({"type":"web_search"})];
+    StreamEventsFilter::test_filter().arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut output = Vec::new();
+    for (kind, payload) in [
+        (
+            "response.output_item.added",
+            json!({"output_index":0,"item":{"id":"s1","type":"function_call","name":"web_search","arguments":""}}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            json!({"item_id":"s1","delta":"{\"queries\":[\"Rust\"]}"}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            json!({"item_id":"s1","arguments":"{\"queries\":[\"Rust\"]}"}),
+        ),
+        (
+            "response.output_item.done",
+            json!({"output_index":0,"item":{"id":"s1","type":"function_call","name":"web_search"}}),
+        ),
+    ] {
+        super::append_logical_event(&mut state, &mut ctx, responses_event(kind, payload), &mut output);
+        assert!(
+            output.is_empty(),
+            "private search function event escaped before dispatch"
+        );
+    }
 }

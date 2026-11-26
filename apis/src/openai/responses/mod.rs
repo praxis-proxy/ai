@@ -47,7 +47,7 @@ pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
 #[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod mcp_dispatch;
+pub(crate) mod mcp_connector;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_tool_resolve;
 pub(crate) mod model_rewrite;
@@ -173,9 +173,7 @@ pub use file_resolve::FileResolveFilter;
 #[cfg(feature = "openai-responses")]
 pub use file_search_dispatch::FileSearchDispatchFilter;
 #[cfg(feature = "openai-mcp-tools")]
-pub use mcp_dispatch::McpDispatchFilter;
-#[cfg(feature = "openai-mcp-tools")]
-pub use mcp_tool_resolve::McpToolResolveFilter;
+pub use mcp_connector::McpConnectorFilter;
 pub use model_rewrite::ModelRewriteFilter;
 #[cfg(feature = "openai-responses")]
 pub use openai_client_tool_compat::ClientToolCompatFilter;

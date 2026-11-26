@@ -1362,12 +1362,17 @@ fn function_tool_name(tool: &Map<String, Value>) -> Option<&str> {
 /// Validate fields understood by the existing local web-search executor.
 fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), TranslationError> {
     for field in tool.keys() {
-        if !matches!(field.as_str(), "type" | "search_context_size" | "user_location") {
+        if !matches!(
+            field.as_str(),
+            "type" | "search_context_size" | "user_location" | "external_web_access" | "search_content_types"
+        ) {
             return Err(TranslationError::InvalidWebSearchTool(format!(
                 "field `{field}` is not supported by openai_web_search_dispatch"
             )));
         }
     }
+
+    validate_live_search_options(tool)?;
 
     if let Some(context_size) = tool.get("search_context_size")
         && !matches!(context_size.as_str(), Some("low" | "medium" | "high"))
@@ -1383,6 +1388,33 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
         && !user_location.is_null()
     {
         validate_web_search_user_location(user_location)?;
+    }
+
+    Ok(())
+}
+
+/// Validate the live text-search options emitted by coding clients.
+fn validate_live_search_options(tool: &Map<String, Value>) -> Result<(), TranslationError> {
+    if tool
+        .get("external_web_access")
+        .is_some_and(|value| value.as_bool() != Some(true))
+    {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "external_web_access must be true for live search".to_owned(),
+        ));
+    }
+    if let Some(types) = tool.get("search_content_types")
+        && !types.as_array().is_some_and(|types| {
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|value| matches!(value.as_str(), Some("text" | "image")))
+                && types.iter().any(|value| value.as_str() == Some("text"))
+        })
+    {
+        return Err(TranslationError::InvalidWebSearchTool(
+            "search_content_types must allow text and contain only text or image".to_owned(),
+        ));
     }
 
     Ok(())
@@ -1452,7 +1484,7 @@ fn validate_web_search_user_location(user_location: &Value) -> Result<(), Transl
 }
 
 /// Build the private Chat Completions representation of hosted web search.
-fn synthesized_web_search_tool() -> Value {
+pub(crate) fn synthesized_web_search_tool() -> Value {
     json!({
         "type": "function",
         "function": {
@@ -1478,6 +1510,16 @@ fn synthesized_web_search_tool() -> Value {
             "strict": true
         }
     })
+}
+
+/// Build the flat Responses declaration from the shared search schema.
+pub(crate) fn synthesized_web_search_tool_responses() -> Value {
+    let mut tool = synthesized_web_search_tool();
+    let mut function = tool.get_mut("function").map(Value::take).unwrap_or_default();
+    if let Some(object) = function.as_object_mut() {
+        object.insert("type".into(), Value::String("function".into()));
+    }
+    function
 }
 
 /// Validate the vector stores that the callout will search.

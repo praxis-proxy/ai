@@ -32,6 +32,10 @@ and stored-response lifecycle behavior in the native Responses pipeline. The
 backend (such as vLLM) owns generation compatibility. See the
 [state conformance boundary](docs/conformance/openai-responses-state-conformance.md).
 
+See the [Responses support and qualification table](docs/conformance/openai-responses-state-conformance.md#responses-support-and-qualification) for state parameters, SDK versions, and the native and translated vLLM test lanes.
+
+For verified CLI edits, permission modes and compaction outcomes by model and API route, see [Coding harness compatibility](docs/conformance/coding-harness-compatibility.md).
+
 ## What can it do?
 
 - **Route by what a request contains.** Classify OpenAI Responses, Chat

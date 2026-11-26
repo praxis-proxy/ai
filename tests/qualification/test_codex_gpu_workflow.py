@@ -355,7 +355,7 @@ class CodexGpuDispatchTest(unittest.TestCase):
             self.assertEqual(result["provenance"]["backend"]["max_model_len"], 24576)
             self.assertEqual(result["provenance"]["backend"]["resolved_revision"], "a" * 40)
             self.assertEqual(result["provenance"]["runner"]["instance_type"], "g6e.12xlarge")
-            self.assertEqual([case["status"] for case in result["cases"]], ["success", "skipped", "failure"])
+            self.assertEqual([case["status"] for case in result["cases"]], ["success", "skipped", "failure", "unexecuted", "unexecuted"])
 
             # The prepare step supplies the baked checkpoint, revision, and image identity.
             baked = {"model": "Qwen/Qwen3-8B", "model_revision": "b" * 40,

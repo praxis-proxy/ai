@@ -653,9 +653,9 @@
             <text x="720" y="133" class="s-mono" fill="#6d8492" font-size="9.5">Brave · per-user brave_search slot</text>
           </g>
           <line x1="636" y1="186" x2="702" y2="186" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
-          <g class="flt" data-fid="openai_mcp_dispatch">
+          <g class="flt" data-fid="openai_mcp_connector">
             <rect x="704" y="166" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
-            <text x="720" y="185" class="s-mono" fill="#e2edf3" font-size="12">openai_mcp_dispatch</text>
+            <text x="720" y="185" class="s-mono" fill="#e2edf3" font-size="12">openai_mcp_connector</text>
             <text x="720" y="201" class="s-mono" fill="#6d8492" font-size="9.5">8001 · mcp_gateway cred + assertion · ≤8∥</text>
           </g>
           <line x1="636" y1="254" x2="702" y2="254" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
@@ -806,7 +806,7 @@ const GROUPS = @@GROUPS@@;
 function filterColor(f){
   if(f.group!=="irr-step") return GROUPS[f.group].c;
   if(f.id==="openai_agentic_loop") return "var(--c-loop)";
-  if(["openai_web_search_dispatch","openai_mcp_dispatch","openai_file_search_dispatch"].includes(f.id)) return "var(--c-dispatch)";
+  if(["openai_web_search_dispatch","openai_mcp_connector","openai_file_search_dispatch"].includes(f.id)) return "var(--c-dispatch)";
   if(f.id==="openai_stream_events") return "var(--c-classification)";
   if(["irr_router","irr_load_balancer","openai_responses_proxy"].includes(f.id)) return "var(--c-backend)";
   return "var(--c-context)";
@@ -827,7 +827,7 @@ function fmtBytes(n){
    ========================================================================= */
 (function renderTiles(){
   const wrap=document.getElementById("tiles");
-  const disp=PIPELINE.filters.filter(f=>["openai_web_search_dispatch","openai_mcp_dispatch","openai_file_search_dispatch"].includes(f.id)).length;
+  const disp=PIPELINE.filters.filter(f=>["openai_web_search_dispatch","openai_mcp_connector","openai_file_search_dispatch"].includes(f.id)).length;
   const tiles=[
     ["Filters",PIPELINE.filters.length,""],
     ["Dispatchers",disp,""],

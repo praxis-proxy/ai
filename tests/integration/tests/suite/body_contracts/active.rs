@@ -139,7 +139,7 @@ async fn mcp_discovery_replaces_only_tools_and_retains_original_tool_order() {
         "\"store\": false",
         "\"tool_choice\":{\"type\":\"mcp\",\"server_label\":\"server\",\"name\":\"inspect\"},\n \"store\": false",
     );
-    let filters = chain("openai_tool_parse\n- filter: openai_mcp_tool_resolve\n- filter: openai_responses_proxy");
+    let filters = chain("openai_tool_parse\n- filter: openai_mcp_connector\n- filter: openai_responses_proxy");
     for chunked in [false, true] {
         let forwarded = super::forward(&filters, "/v1/responses", body.as_bytes(), chunked).await;
         let actual = changed(&body, &forwarded, &["/tools", "/tool_choice"]);
@@ -311,7 +311,7 @@ async fn mcp_dispatch_appends_results_without_reordering_request_fields_or_tools
             mcp.endpoint()
         );
         let body = request(INPUT, &tools);
-        let filters = loop_chain("- filter: openai_mcp_dispatch", "- filter: openai_mcp_tool_resolve\n");
+        let filters = loop_chain("- filter: openai_mcp_connector", "");
         let rounds = super::capture_sequence(&filters, "/v1/responses", body.as_bytes(), chunked, &[], "/v1/responses", vec![
             round(&json!([{"type":"function_call","id":"fc_contract","call_id":"call_contract","name":"server__inspect","arguments":"{\"z\":1,\"a\":2}","status":"completed"}])),
             final_round(),
@@ -419,11 +419,11 @@ pub(super) fn mutation_witnesses() -> Vec<&'static str> {
     vec![
         "openai_doc_extract",
         "openai_file_resolve",
-        "openai_mcp_tool_resolve",
+        "openai_mcp_connector",
         "openai_client_tool_compat",
         "openai_file_search_dispatch",
         "openai_web_search_dispatch",
-        "openai_mcp_dispatch",
+        "openai_mcp_connector",
         "openai_agentic_loop",
         "openai_responses_proxy",
         "openai_responses_rehydrate",
