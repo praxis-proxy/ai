@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_thirty_five_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_six_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
         assert_eq!(nodes.len(), 35, "21 main + 13 IRR-step + 1 fallback filter");
