@@ -1925,8 +1925,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3931,7 +3929,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#16a474adc5002da3db9f49e3c6ec3265626c99d2"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3952,7 +3950,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#16a474adc5002da3db9f49e3c6ec3265626c99d2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3978,7 +3976,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#16a474adc5002da3db9f49e3c6ec3265626c99d2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4012,7 +4010,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#16a474adc5002da3db9f49e3c6ec3265626c99d2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4023,6 +4021,7 @@ dependencies = [
  "http",
  "metrics",
  "metrics-exporter-prometheus",
+ "openssl",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -4042,7 +4041,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#7e07d9fc54213a8b4baf19c636d41333fbbc54bf"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#16a474adc5002da3db9f49e3c6ec3265626c99d2"
 dependencies = [
  "arc-swap",
  "notify 8.2.2",
@@ -4566,7 +4565,7 @@ dependencies = [
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.10.4",

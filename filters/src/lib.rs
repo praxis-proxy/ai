@@ -150,6 +150,7 @@ pub(crate) mod test_utils {
             request_body_bytes: 0,
             request_body_mode: praxis_filter::BodyMode::Stream,
             request_start: std::time::Instant::now(),
+            response_delivery_complete: None,
             response_body_bytes: 0,
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
