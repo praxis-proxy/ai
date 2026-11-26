@@ -186,7 +186,11 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// billing `fail_open` setting and with precedence over budget exhaustion; a
 /// verdict unavailable under a fail-closed gate rejects with 503 and body
 /// `metering system unavailable` — and the model gate is always fail-closed,
-/// so any unavailable model verdict rejects with 503. With model policy
+/// so any unavailable model verdict rejects with 503. A verdict is
+/// unavailable per gate when its key is missing, `null`, wrongly typed, or
+/// duplicated in the entitlement response (duplicate keys read as
+/// unavailable, never as the value that survives the JSON parser's
+/// last-write collapse). With model policy
 /// enabled, a missing trusted
 /// identity rejects with 403 and body `tenant identity required for model
 /// authorization`; an unresolvable model rejects with 403 and body `request
@@ -214,10 +218,10 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 ///
 /// - `modelAllowed: false` rejects with **403** before any provider request, regardless of the billing `fail_open` and
 ///   with precedence over budget exhaustion (`hasAccess: false` still rejects with 429 on its own).
-/// - An unavailable model verdict — missing, `null`, wrongly typed, an unusable payload, a non-2xx response, a timeout,
-///   or a transport error — always rejects with 503 before any provider request: model authorization is fail-closed,
-///   independent of the billing `fail_open`. An explicit `modelAllowed: false` rejection is never affected by either
-///   setting.
+/// - An unavailable model verdict — missing, `null`, wrongly typed, a duplicated `modelAllowed` key, an unusable
+///   payload, a non-2xx response, a timeout, or a transport error — always rejects with 503 before any provider
+///   request: model authorization is fail-closed, independent of the billing `fail_open`. An explicit `modelAllowed:
+///   false` rejection is never affected by either setting.
 /// - Every metered request then needs a trusted tenant identity and a resolvable public model. If the identity comes
 ///   from raw `{prefix}*` request headers, the ingress boundary must delete client-supplied copies and set those
 ///   headers from authenticated data before this filter runs: the filter cannot distinguish client-supplied headers
@@ -1150,6 +1154,10 @@ fn parse_balance_result(body: &[u8], policy: AdmissionPolicy) -> FilterAction {
 /// Parsing is lenient per field: a valid `hasAccess` still decides the budget
 /// gate when `modelAllowed` is missing or wrongly typed, and vice versa. A
 /// body that is not a JSON object at all leaves both gates without verdicts.
+/// A gate whose key appears more than once (in any escape spelling) also
+/// reads as unavailable for that gate: `serde_json`'s object map collapses
+/// duplicate names to the last value, and an ambiguous payload must not
+/// authorize a request through whichever value happens to survive.
 fn parse_balance_verdicts(body: &[u8]) -> BalanceVerdicts {
     if body.is_empty() {
         debug!("balance check returned an empty body");
@@ -1157,10 +1165,7 @@ fn parse_balance_verdicts(body: &[u8]) -> BalanceVerdicts {
     }
 
     match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(serde_json::Value::Object(fields)) => BalanceVerdicts {
-            has_access: fields.get("hasAccess").and_then(serde_json::Value::as_bool),
-            model_allowed: fields.get("modelAllowed").and_then(serde_json::Value::as_bool),
-        },
+        Ok(serde_json::Value::Object(fields)) => verdicts_from_fields(&fields, body),
         Ok(_) => {
             debug!("balance response was valid JSON but not an object");
             BalanceVerdicts::unavailable()
@@ -1170,6 +1175,46 @@ fn parse_balance_verdicts(body: &[u8]) -> BalanceVerdicts {
             BalanceVerdicts::unavailable()
         },
     }
+}
+
+/// Build the per-gate verdicts from a parsed entitlement object.
+///
+/// A body that parsed into a JSON value is valid UTF-8; a defensive failure
+/// still treats both gates as unavailable rather than trusting the collapsed
+/// map alone.
+fn verdicts_from_fields(fields: &serde_json::Map<String, serde_json::Value>, body: &[u8]) -> BalanceVerdicts {
+    let Some(raw) = std::str::from_utf8(body).ok() else {
+        debug!("balance response was not valid UTF-8");
+        return BalanceVerdicts::unavailable();
+    };
+    BalanceVerdicts {
+        has_access: gate_verdict(fields, raw, "hasAccess"),
+        model_allowed: gate_verdict(fields, raw, "modelAllowed"),
+    }
+}
+
+/// Read one gate's verdict from the parsed entitlement fields.
+///
+/// The raw body is rescanned before consulting the map because
+/// `serde_json` collapses duplicate member names to the last value: a gate
+/// whose key appears more than once — in plain or escaped spelling, which
+/// decode to the same member name — is ambiguous and reads as unavailable
+/// for that gate only, exactly as the derived decoder that preceded
+/// per-gate parsing rejected such payloads. A single occurrence keeps its
+/// verdict even when spelled with escapes.
+fn gate_verdict(fields: &serde_json::Map<String, serde_json::Value>, raw: &str, key: &str) -> Option<bool> {
+    let mut scanner = TopLevelKeyScanner::new(raw);
+    let mut seen = false;
+    while let Some(member) = scanner.next_top_level_key() {
+        if key_decodes_to(member, key) {
+            if seen {
+                debug!(gate = key, "balance response has a duplicated gate key");
+                return None;
+            }
+            seen = true;
+        }
+    }
+    fields.get(key).and_then(serde_json::Value::as_bool)
 }
 
 /// Combine both gates' verdicts into one admission decision.
@@ -1619,7 +1664,7 @@ fn extract_model_from_bytes(bytes: &[u8]) -> BodyModel {
     let mut model = None;
 
     while let Some(key) = scanner.next_top_level_key() {
-        if key_decodes_to_model(key) {
+        if key_decodes_to(key, "model") {
             // A second member decoding to `model` is a duplicate key: JSON
             // parsers pick their own winner, so the preflight must not guess
             // which value authorizes the request.
@@ -1647,16 +1692,16 @@ fn extract_model_from_bytes(bytes: &[u8]) -> BodyModel {
     }
 }
 
-/// Compare a raw (still escaped) top-level object key against `"model"`.
+/// Compare a raw (still escaped) top-level object key against a member name.
 ///
 /// JSON member names compare after escape decoding, so an escaped spelling
 /// such as `"\u006dodel"` names the same member as `"model"`. Only a key
 /// containing a backslash can decode differently from its raw text.
-fn key_decodes_to_model(raw: &str) -> bool {
-    if raw == "model" {
+fn key_decodes_to(raw: &str, name: &str) -> bool {
+    if raw == name {
         return true;
     }
-    raw.contains('\\') && serde_json::from_str::<String>(&format!("\"{raw}\"")).is_ok_and(|decoded| decoded == "model")
+    raw.contains('\\') && serde_json::from_str::<String>(&format!("\"{raw}\"")).is_ok_and(|decoded| decoded == name)
 }
 
 /// Incremental scanner over the top-level keys of a JSON object fragment.

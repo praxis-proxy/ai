@@ -724,6 +724,73 @@ fn verdicts_on_unparseable_body_are_all_unavailable() {
     }
 }
 
+#[test]
+fn verdicts_treat_duplicate_gate_keys_as_unavailable() {
+    // serde's object map collapses duplicate names to the last value; an
+    // ambiguous payload must not authorize through the surviving winner.
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": false, "hasAccess": true}"#);
+    assert_eq!(
+        verdicts.has_access, None,
+        "a duplicated hasAccess is unavailable, not the last value"
+    );
+    assert_eq!(verdicts.model_allowed, None);
+
+    // Escape spellings decode to the same member name and count as duplicates.
+    let verdicts = parse_balance_verdicts(br#"{"modelAllowed": true, "model\u0041llowed": false}"#);
+    assert_eq!(
+        verdicts.model_allowed, None,
+        "an escaped duplicate spelling is still a duplicate"
+    );
+    assert_eq!(verdicts.has_access, None);
+}
+
+#[test]
+fn verdicts_duplicate_gate_key_discards_only_that_gate() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": true, "hasAccess": true, "modelAllowed": false}"#);
+    assert_eq!(
+        verdicts.has_access, None,
+        "a duplicated hasAccess is unavailable for the budget gate alone"
+    );
+    assert_eq!(
+        verdicts.model_allowed,
+        Some(false),
+        "a valid modelAllowed survives a duplicated hasAccess"
+    );
+}
+
+#[test]
+fn verdicts_read_a_single_escaped_gate_key() {
+    let verdicts = parse_balance_verdicts(br#"{"has\u0041ccess": true}"#);
+    assert_eq!(
+        verdicts.has_access,
+        Some(true),
+        "one escaped spelling of hasAccess is unambiguous and still a verdict"
+    );
+}
+
+#[test]
+fn balance_response_duplicate_has_access_fail_closed_rejects() {
+    // The last value would admit the request; a duplicate key must not.
+    let body = br#"{"hasAccess": false, "hasAccess": true, "balance": 9000.0}"#;
+    let action = parse_balance_result(body, billing_only(false));
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "a duplicated hasAccess must not admit under fail_open: false"
+    );
+}
+
+#[test]
+fn balance_response_duplicate_model_allowed_rejects_despite_billing_fail_open() {
+    // The model gate is always fail-closed, so a duplicated modelAllowed
+    // must reject even when the billing gate fails open.
+    let body = br#"{"hasAccess": true, "modelAllowed": true, "modelAllowed": false}"#;
+    let action = parse_balance_result(body, model_policy(true));
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "a duplicated modelAllowed must not admit, even with billing fail_open: true"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Model Policy — Request Phase
 // -----------------------------------------------------------------------------
