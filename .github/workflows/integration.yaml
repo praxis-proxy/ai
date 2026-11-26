@@ -426,7 +426,7 @@ jobs:
         run: uv run tests/integration/sdk/openai/test_azure_chat_completions.py -s
 
   # ----------------------------------------------------------------------------
-  # OpenAI Python SDK vs Decisions pass-through (local fake backend)
+  # Decisions pass-through and Models classification (local SDK backends)
   # ----------------------------------------------------------------------------
 
   decisions-sdk:
@@ -452,13 +452,18 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/openai/test_openai_decisions.py
+          cache-dependency-glob: |
+            tests/integration/sdk/openai/test_openai_decisions.py
+            tests/integration/sdk/test_model_operations.py
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
       - name: Run Decisions OpenAI Python SDK tests
         run: uv run tests/integration/sdk/openai/test_openai_decisions.py -s
+
+      - name: Run model operation classification through both SDKs
+        run: uv run tests/integration/sdk/test_model_operations.py -s
 
   # ----------------------------------------------------------------------------
   # Responses/agentic feature-boundary checks
