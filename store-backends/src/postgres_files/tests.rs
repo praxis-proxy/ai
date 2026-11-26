@@ -162,13 +162,31 @@ mod retry {
         assert_eq!(PgFailure::from_code("40P01"), PgFailure::Retryable);
         assert_eq!(PgFailure::from_code("55P03"), PgFailure::Retryable);
         assert_eq!(PgFailure::from_code("57P01"), PgFailure::Retryable);
-        // Unique violation, syntax error, undefined table: not retryable.
-        assert_eq!(PgFailure::from_code("23505"), PgFailure::NonRetryable);
-        assert_eq!(PgFailure::from_code("42601"), PgFailure::NonRetryable);
-        assert_eq!(PgFailure::from_code("42P01"), PgFailure::NonRetryable);
-        // Non-database errors.
-        assert_eq!(classify(&sqlx::Error::PoolTimedOut), PgFailure::Unavailable);
-        assert_eq!(classify(&sqlx::Error::PoolClosed), PgFailure::Unavailable);
+        assert_eq!(
+            PgFailure::from_code("23505"),
+            PgFailure::NonRetryable,
+            "unique violation is not retryable"
+        );
+        assert_eq!(
+            PgFailure::from_code("42601"),
+            PgFailure::NonRetryable,
+            "syntax error is not retryable"
+        );
+        assert_eq!(
+            PgFailure::from_code("42P01"),
+            PgFailure::NonRetryable,
+            "undefined table is not retryable"
+        );
+        assert_eq!(
+            classify(&sqlx::Error::PoolTimedOut),
+            PgFailure::Unavailable,
+            "pool timeout is a non-database error"
+        );
+        assert_eq!(
+            classify(&sqlx::Error::PoolClosed),
+            PgFailure::Unavailable,
+            "closed pool is a non-database error"
+        );
         let io = std::io::Error::other("connection reset by peer");
         assert_eq!(classify(&sqlx::Error::Io(io)), PgFailure::Retryable);
         assert_eq!(classify(&sqlx::Error::RowNotFound), PgFailure::NonRetryable);
@@ -315,6 +333,7 @@ mod operations {
         PgTlsConfig, SslMode,
         postgres_files::{
             PostgresFileCatalog,
+            request::page_sql,
             retry::{PgBackendError, PgFailure, with_retry},
         },
     };
@@ -459,8 +478,10 @@ mod operations {
             ["f1"]
         );
 
-        // Another tenant sees nothing and cannot touch it.
-        assert!(c.get_ready(&other, "f1").await.unwrap().is_none());
+        assert!(
+            c.get_ready(&other, "f1").await.unwrap().is_none(),
+            "another tenant sees nothing and cannot touch the file"
+        );
         assert!(
             c.list_ready(&other, &query(SortDirection::Asc, 10))
                 .await
@@ -595,8 +616,10 @@ mod operations {
         let file = new_file("f1", &a, 100);
         c.create_pending(&file).await.unwrap();
         c.complete_upload(&a, "f1", completion(40, "assistants")).await.unwrap();
-        // A ready row's size is not a reservation.
-        assert!(matches!(c.create_pending(&file).await, Err(CatalogError::Conflict)));
+        assert!(
+            matches!(c.create_pending(&file).await, Err(CatalogError::Conflict)),
+            "a ready row's size is not a reservation"
+        );
 
         c.create_pending(&new_file("f2", &a, 100)).await.unwrap();
         exec(&c, "UPDATE {f} SET state = 'failed' WHERE id = 'f2'").await;
@@ -612,26 +635,40 @@ mod operations {
     async fn reservation_is_capped_by_the_remaining_quota() {
         let c = catalog_with(100).await;
         let a = owner("t1", "alice");
-        // Below the quota the per-file maximum is granted.
-        assert_eq!(c.create_pending(&new_file("f1", &a, 30)).await.unwrap(), 30);
-        // The per-file maximum exceeds the remainder: the remainder is granted.
-        assert_eq!(c.create_pending(&new_file("f2", &a, 500)).await.unwrap(), 70);
-        assert_eq!(usage(&c, "t1").await, 100);
-        // Nothing left: rejected without inserting a row.
-        assert!(matches!(
-            c.create_pending(&new_file("f3", &a, 500)).await,
-            Err(CatalogError::QuotaExceeded)
-        ));
-        assert!(row(&c, "f3").await.is_none());
-        // A zero per-file maximum can never reserve.
-        assert!(matches!(
-            c.create_pending(&new_file("f4", &owner("t2", "bob"), 0)).await,
-            Err(CatalogError::QuotaExceeded)
-        ));
-        // A retry returns the stored grant, not a new decision, after room frees up.
+        assert_eq!(
+            c.create_pending(&new_file("f1", &a, 30)).await.unwrap(),
+            30,
+            "below the quota the per-file maximum is granted"
+        );
+        assert_eq!(
+            c.create_pending(&new_file("f2", &a, 500)).await.unwrap(),
+            70,
+            "a per-file maximum above the remainder is capped to the remainder"
+        );
+        assert_eq!(usage(&c, "t1").await, 100, "both reservations count toward usage");
+        assert!(
+            matches!(
+                c.create_pending(&new_file("f3", &a, 500)).await,
+                Err(CatalogError::QuotaExceeded)
+            ),
+            "nothing left: the reservation is rejected"
+        );
+        assert!(row(&c, "f3").await.is_none(), "a rejected reservation inserts no row");
+        assert!(
+            matches!(
+                c.create_pending(&new_file("f4", &owner("t2", "bob"), 0)).await,
+                Err(CatalogError::QuotaExceeded)
+            ),
+            "a zero per-file maximum can never reserve"
+        );
+        // Free room so a fresh decision would grant more than the stored grant.
         exec(&c, "DELETE FROM {f} WHERE id = 'f1'").await;
-        assert_eq!(c.create_pending(&new_file("f2", &a, 500)).await.unwrap(), 70);
-        assert_eq!(usage(&c, "t1").await, 70);
+        assert_eq!(
+            c.create_pending(&new_file("f2", &a, 500)).await.unwrap(),
+            70,
+            "a retry returns the stored grant, not a new decision"
+        );
+        assert_eq!(usage(&c, "t1").await, 70, "usage keeps the stored grant");
         c.close().await;
     }
 
@@ -642,12 +679,18 @@ mod operations {
         let a = owner("t1", "alice");
         c.create_pending(&new_file("f1", &a, 100)).await.unwrap();
 
-        // Above the reservation: rejected, row untouched.
-        assert!(matches!(
-            c.complete_upload(&a, "f1", completion(101, "assistants")).await,
-            Err(CatalogError::Conflict)
-        ));
-        assert_eq!(row(&c, "f1").await.unwrap(), ("pending".to_owned(), 100));
+        assert!(
+            matches!(
+                c.complete_upload(&a, "f1", completion(101, "assistants")).await,
+                Err(CatalogError::Conflict)
+            ),
+            "a size above the reservation is rejected"
+        );
+        assert_eq!(
+            row(&c, "f1").await.unwrap(),
+            ("pending".to_owned(), 100),
+            "a rejected completion leaves the row untouched"
+        );
 
         let done = FileCompletion {
             bytes: 60,
@@ -657,12 +700,18 @@ mod operations {
         let record = c.complete_upload(&a, "f1", done.clone()).await.unwrap();
         assert_eq!(record.bytes, 60);
         assert_eq!(record.expires_at, Some(record.created_at + 90));
-        // Settled: the row, and so the usage, now holds the actual size.
-        assert_eq!(row(&c, "f1").await.unwrap(), ("ready".to_owned(), 60));
-        assert_eq!(usage(&c, "t1").await, 60);
+        assert_eq!(
+            row(&c, "f1").await.unwrap(),
+            ("ready".to_owned(), 60),
+            "the settled row holds the actual size"
+        );
+        assert_eq!(usage(&c, "t1").await, 60, "usage follows the actual size");
 
-        // Identical retry returns the same record; any difference conflicts.
-        assert_eq!(c.complete_upload(&a, "f1", done.clone()).await.unwrap(), record);
+        assert_eq!(
+            c.complete_upload(&a, "f1", done.clone()).await.unwrap(),
+            record,
+            "an identical retry returns the same record (any difference conflicts)"
+        );
         let mut other = done.clone();
         other.purpose = "batch".to_owned();
         assert!(matches!(
@@ -738,8 +787,7 @@ mod operations {
             c.mark_for_deletion(&a, "e").await.unwrap(),
             DeletionOutcome::AlreadyPending
         );
-        // Marking never changes usage.
-        assert_eq!(usage(&c, "t1").await, 21);
+        assert_eq!(usage(&c, "t1").await, 21, "marking never changes usage");
         c.close().await;
     }
 
@@ -950,8 +998,10 @@ mod operations {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].state, CleanupState::DeletionPending);
         assert_eq!(first[0].owner, owner("t1", "alice"));
-        // Leased: not claimable.
-        assert!(c.claim_cleanup(LONG, 10).await.unwrap().is_empty());
+        assert!(
+            c.claim_cleanup(LONG, 10).await.unwrap().is_empty(),
+            "a leased row is not claimable"
+        );
         // The worker crashed and the lease ran out.
         exec(&c, "UPDATE {f} SET lease_until = 1").await;
         let second = c.claim_cleanup(LONG, 10).await.unwrap();
@@ -971,8 +1021,10 @@ mod operations {
         let stale = claims.iter().find(|claim| claim.id == "f0").unwrap().clone();
         assert!(c.complete_cleanup(&stale).await.unwrap());
         assert_eq!(usage(&c, "t1").await, 10);
-        // The stale worker finishes late: false, nothing released again.
-        assert!(!c.complete_cleanup(&stale).await.unwrap());
+        assert!(
+            !c.complete_cleanup(&stale).await.unwrap(),
+            "a stale worker finishing late releases nothing again"
+        );
         assert_eq!(usage(&c, "t1").await, 10);
         // A claim whose state or key no longer matches purges nothing.
         let other = claims.iter().find(|claim| claim.id == "f1").unwrap();
@@ -1006,8 +1058,10 @@ mod operations {
         c.fail_upload(&alice, &stale.id).await.unwrap();
         exec(&c, "UPDATE {f} SET state = 'deletion_pending'").await;
         let usage_before = usage(&c, "t1").await;
-        // Matches ID, key and state, but not the token.
-        assert!(!c.complete_cleanup(&stale).await.unwrap());
+        assert!(
+            !c.complete_cleanup(&stale).await.unwrap(),
+            "a claim matching ID, key and state but not the token is fenced"
+        );
         assert_eq!(usage(&c, "t1").await, usage_before);
         // The new row purges with its own token.
         exec(&c, "UPDATE {f} SET lease_until = 1").await;
@@ -1023,15 +1077,22 @@ mod operations {
         deletion_pending(&c, &owner("t1", "alice"), 1).await;
         let first = c.claim_cleanup(LONG, 10).await.unwrap();
         assert_eq!(first.len(), 1);
-        // A failed worker does nothing: the held lease keeps the row hidden.
-        assert!(c.claim_cleanup(LONG, 10).await.unwrap().is_empty());
+        assert!(
+            c.claim_cleanup(LONG, 10).await.unwrap().is_empty(),
+            "a failed worker does nothing: the held lease keeps the row hidden"
+        );
         // Once the lease expires another worker reclaims it.
         exec(&c, "UPDATE {f} SET lease_until = 1").await;
         let second = c.claim_cleanup(LONG, 10).await.unwrap();
         assert_eq!(second.len(), 1);
-        // The reclaim fences the first worker.
-        assert_ne!(first[0].claim_token, second[0].claim_token);
-        assert!(!c.complete_cleanup(&first[0]).await.unwrap());
+        assert_ne!(
+            first[0].claim_token, second[0].claim_token,
+            "each claim gets its own token"
+        );
+        assert!(
+            !c.complete_cleanup(&first[0]).await.unwrap(),
+            "the reclaim fences the first worker"
+        );
         assert!(c.complete_cleanup(&second[0]).await.unwrap());
         assert!(!c.complete_cleanup(&second[0]).await.unwrap());
         // Failed rows are claimed too.
@@ -1169,38 +1230,68 @@ mod operations {
         c.close().await;
     }
 
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn listing_uses_list_index_in_both_directions_without_sort() {
-        let c = catalog().await;
-        seed_indexed_table(&c).await;
-        for (cmp, dir) in [(">", "ASC"), ("<", "DESC")] {
-            let plan = explain(
-                &c,
-                &format!(
-                    "SELECT id FROM {{f}} WHERE tenant_id = 'tenant7' AND state = 'ready' \
-                     AND (created_at, id) {cmp} (5000, 'id5007') \
-                     ORDER BY created_at {dir}, id {dir} LIMIT 11"
-                ),
-            )
-            .await;
-            assert_uses(&plan, &c, "_list_idx", true);
-        }
-        c.close().await;
+    /// The plan for the production paging statement, prepared with the bound
+    /// parameter types `list_ready` uses. `generic` forces the generic plan, which
+    /// cannot see the parameter values (the plan a long-lived prepared statement may
+    /// settle on).
+    async fn explain_page(
+        c: &PostgresFileCatalog,
+        order: SortDirection,
+        purpose: Option<&str>,
+        cursor: Option<(i64, &str)>,
+        generic: bool,
+    ) -> String {
+        let sql = page_sql(&c.files, order);
+        let mut tx = c.pool.begin().await.unwrap();
+        let mode = if generic {
+            "force_generic_plan"
+        } else {
+            "force_custom_plan"
+        };
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off; \
+             SET LOCAL plan_cache_mode = {mode}; \
+             PREPARE page(text, text, bigint, text, bigint) AS {sql}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let (cursor_at, cursor_id) = cursor.unzip();
+        let lit = |v: Option<String>| v.unwrap_or_else(|| "NULL".to_owned());
+        let args = format!(
+            "'tenant7', {}, {}, {}, 11",
+            lit(purpose.map(|p| format!("'{p}'"))),
+            lit(cursor_at.map(|v| v.to_string())),
+            lit(cursor_id.map(|v| format!("'{v}'"))),
+        );
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN EXECUTE page({args})")))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        // Prepared statements outlive the transaction on the pooled connection.
+        sqlx::raw_sql("DEALLOCATE page").execute(&mut *tx).await.unwrap();
+        tx.rollback().await.unwrap();
+        plan.join("\n")
     }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn purpose_filtered_listing_still_uses_list_index() {
+    async fn production_listing_uses_list_index_without_sort() {
         let c = catalog().await;
         seed_indexed_table(&c).await;
-        let plan = explain(
-            &c,
-            "SELECT id FROM {f} WHERE tenant_id = 'tenant7' AND state = 'ready' AND purpose = 'x' \
-             ORDER BY created_at, id LIMIT 11",
-        )
-        .await;
-        assert_uses(&plan, &c, "_list_idx", true);
+        for order in [SortDirection::Asc, SortDirection::Desc] {
+            for purpose in [None, Some("x")] {
+                // A late cursor must still seek rather than scan the tenant from the start.
+                for (cursor, generic) in [
+                    (None, false),
+                    (Some((5000, "id5007")), false),
+                    (Some((5000, "id5007")), true),
+                ] {
+                    let plan = explain_page(&c, order, purpose, cursor, generic).await;
+                    assert_uses(&plan, &c, "_list_idx", true);
+                }
+            }
+        }
         c.close().await;
     }
 

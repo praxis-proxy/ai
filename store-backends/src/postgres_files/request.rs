@@ -327,6 +327,25 @@ pub(super) async fn list_ready_impl(
     Ok(Ok(FileRecordPage { data, has_more }))
 }
 
+/// The paging statement: `$1` tenant, `$2` purpose, `$3`/`$4` cursor
+/// `created_at`/`id`, `$5` row limit. The nullable `$2`/`$3` predicates keep one
+/// statement for every filter combination.
+pub(super) fn page_sql(files: &str, order: SortDirection) -> String {
+    // Fixed fragments only: nothing request-controlled is interpolated.
+    let (cmp, dir) = match order {
+        SortDirection::Asc => (">", "ASC"),
+        SortDirection::Desc => ("<", "DESC"),
+    };
+    let visible = visible();
+    format!(
+        "SELECT {RECORD_COLUMNS} FROM {files} \
+         WHERE tenant_id = $1 AND {visible} \
+         AND ($2::text IS NULL OR purpose = $2) \
+         AND ($3::bigint IS NULL OR (created_at, id) {cmp} ($3, $4::text)) \
+         ORDER BY created_at {dir}, id {dir} LIMIT $5"
+    )
+}
+
 /// Fetch `limit + 1` visible rows after `cursor` in the requested order.
 async fn page_rows(
     c: &PostgresFileCatalog,
@@ -335,30 +354,17 @@ async fn page_rows(
     query: &FileListQuery,
     cursor: Option<(i64, &str)>,
 ) -> Result<Vec<PgRow>, PgBackendError> {
-    let files = &c.files;
-    // Fixed fragments only: nothing request-controlled is interpolated.
-    let (cmp, dir) = match query.order {
-        SortDirection::Asc => (">", "ASC"),
-        SortDirection::Desc => ("<", "DESC"),
-    };
-    let visible = visible();
     let limit = i64::from(query.limit);
     let (cursor_at, cursor_id) = cursor.unzip();
-    sqlx::query(AssertSqlSafe(format!(
-        "SELECT {RECORD_COLUMNS} FROM {files} \
-         WHERE tenant_id = $1 AND {visible} \
-         AND ($2::text IS NULL OR purpose = $2) \
-         AND ($3::bigint IS NULL OR (created_at, id) {cmp} ($3, $4::text)) \
-         ORDER BY created_at {dir}, id {dir} LIMIT $5"
-    )))
-    .bind(tenant)
-    .bind(query.purpose.as_deref())
-    .bind(cursor_at)
-    .bind(cursor_id)
-    .bind(limit + 1)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|e| c.pg_err(&e))
+    sqlx::query(AssertSqlSafe(page_sql(&c.files, query.order)))
+        .bind(tenant)
+        .bind(query.purpose.as_deref())
+        .bind(cursor_at)
+        .bind(cursor_id)
+        .bind(limit + 1)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| c.pg_err(&e))
 }
 
 /// `created_at` of the cursor file among all the tenant's rows, so a file
