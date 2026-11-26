@@ -533,6 +533,8 @@ mod operations {
             exec(&c, &format!("UPDATE {{f}} SET created_at = {at} WHERE id = 'f{i}'")).await;
         }
 
+        let page = c.list_ready(&a, &query(SortDirection::Asc, 1)).await.unwrap();
+        assert_eq!((ids(&page), page.has_more), (vec!["f0"], true));
         let page = c.list_ready(&a, &query(SortDirection::Asc, 2)).await.unwrap();
         assert_eq!((ids(&page), page.has_more), (vec!["f0", "f1"], true));
         let mut q = query(SortDirection::Asc, 2);
@@ -861,7 +863,26 @@ mod operations {
         .await
         .expect("other tenant must not wait on t1's lock")
         .unwrap();
-        assert!(!blocked.is_finished(), "t1 must wait for its own lock");
+        // Prove t1's request is parked on the advisory lock, not merely unscheduled.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                       AND wait_event = 'advisory')",
+                )
+                .fetch_one(&c.pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("t1 must wait on its own quota lock");
+        assert!(!blocked.is_finished(), "t1 must still be waiting for its lock");
         held.rollback().await.unwrap();
         blocked.await.unwrap().unwrap();
         assert_oracle(&c).await;
