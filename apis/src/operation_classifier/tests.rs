@@ -117,7 +117,7 @@ fn classifies_open_ended_protocols_and_registry_body_metadata() {
             RequestBody::Json { required: true },
         ),
     ] {
-        let matched = classify(method, path, Transport::Http).unwrap();
+        let matched = classify(method, path, Transport::Http, &http::HeaderMap::new()).unwrap();
         assert_eq!(matched.application_protocol, application_protocol, "{method} {path}");
         assert_eq!(matched.request_body, request_body, "{method} {path}");
     }
@@ -126,7 +126,7 @@ fn classifies_open_ended_protocols_and_registry_body_metadata() {
 #[test]
 fn offset_backed_parameters_survive_request_lifecycle_phases() {
     let path = "/v1/conversations/conv_%E2%9C%93/items/item%2Fraw";
-    let matched = classify("GET", path, Transport::Http).unwrap();
+    let matched = classify("GET", path, Transport::Http, &http::HeaderMap::new()).unwrap();
 
     // Copy the stored value as later request/body hooks do, then recover raw
     // path segments from the still-immutable request URI without cloning it.
@@ -150,7 +150,7 @@ fn conversations_normalization_and_malformed_paths_follow_the_shared_matcher() {
         ("PATCH", "/v1/conversations/conv_1", false),
     ] {
         assert_eq!(
-            classify(method, path, Transport::Http).is_some(),
+            classify(method, path, Transport::Http, &http::HeaderMap::new()).is_some(),
             expected,
             "{method} {path}"
         );
@@ -883,7 +883,6 @@ async fn publishes_anthropic_metadata_and_filter_results() {
 async fn unregistered_anthropic_surfaces_publish_no_match() {
     for (method, path) in [
         ("POST", "/v1/complete"),
-        ("GET", "/v1/models"),
         ("GET", "/v1/messages"),
         ("GET", "/v1/messages/msg_123"),
         // `/v1/files` is deliberately absent: Anthropic and OpenAI share that
@@ -1091,4 +1090,60 @@ async fn an_anthropic_match_sets_the_configured_routing_headers() {
         "{set:?}"
     );
     assert!(set.contains(&("x-praxis-ai-operation", "messages_post")), "{set:?}");
+}
+
+/// Both Models routes publish the client protocol and install its error formatter.
+#[tokio::test]
+async fn classifies_model_reads_using_the_client_protocol() {
+    let filter = default_filter();
+    for (version, protocol, list, retrieve, param) in [
+        (None, "openai_models", "listModels", "retrieveModel", "model"),
+        (
+            Some("2023-06-01"),
+            "anthropic_models",
+            "models_list",
+            "models_get",
+            "model_id",
+        ),
+        (Some(""), "anthropic_models", "models_list", "models_get", "model_id"),
+    ] {
+        for (path, operation, model_id) in [
+            ("/v1/models/?limit=2", list, None),
+            ("/v1/models/model%3A1/", retrieve, Some("model%3A1")),
+        ] {
+            let mut request = req("GET", path);
+            if let Some(version) = version {
+                request
+                    .headers
+                    .insert("anthropic-version", http::HeaderValue::from_static(version));
+            }
+            let mut ctx = make_filter_context(&request);
+            drop(filter.on_request_head(&mut ctx).await.unwrap());
+            let matched = ctx.extensions.get::<AiOperationMatch>().unwrap();
+            assert_eq!(matched.application_protocol.as_str(), protocol);
+            assert_eq!(matched.operation_id, operation);
+            assert_eq!(matched.request_body, RequestBody::None);
+            assert_eq!(matched.path_parameters.get(request.uri.path(), param), model_id);
+            let formatter = ctx.extensions.get::<ErrorResponseFormatterHandle>().unwrap();
+            let error = praxis_filter::ErrorResponseContext::new("upstream_error", "upstream unavailable", 502);
+            let response = formatter.format(&error);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert!(body["error"]["message"].is_string());
+            assert_eq!(body["type"].as_str(), version.map(|_| "error"));
+        }
+    }
+}
+
+/// The shared paths only classify the two HTTP GET operations.
+#[test]
+fn models_do_not_match_unsupported_methods_paths_or_transports() {
+    for (method, path, transport) in [
+        ("HEAD", "/v1/models", Transport::Http),
+        ("POST", "/v1/models", Transport::Http),
+        ("DELETE", "/v1/models/model-1", Transport::Http),
+        ("GET", "/v1/models/model-1/extra", Transport::Http),
+        ("GET", "/v1/models", Transport::WebSocket),
+    ] {
+        assert!(classify(method, path, transport, &http::HeaderMap::new()).is_none());
+    }
 }

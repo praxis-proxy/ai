@@ -5,8 +5,7 @@
 //!
 //! The example branches on the classifier's published filter results, so the
 //! selected backend is the observable proof that a request was classified:
-//! Conversations and Chat Completions each reach their own backend, and
-//! everything else falls through to the default one. These tests assert that
+//! configured protocols reach their designated backends. These tests assert that
 //! routing, plus the boundary properties around the proxy-owned headers.
 //!
 //! `x-praxis-ai-*` uses a reserved prefix, so the protocol layer strips those
@@ -40,6 +39,9 @@ const VECTOR_STORES_MARKER: &str = "{\"selected\":\"vector-stores-backend\"}";
 /// Body returned by the Anthropic Messages backend, proving it was selected.
 const ANTHROPIC_MARKER: &str = "{\"selected\":\"anthropic-backend\"}";
 
+/// Body returned by the OpenAI Models backend, proving it was selected.
+const OPENAI_MODELS_MARKER: &str = "{\"selected\":\"openai-models-backend\"}";
+
 /// Body returned by the Gemini backend, proving it was selected.
 const GEMINI_MARKER: &str = "{\"selected\":\"gemini-backend\"}";
 
@@ -61,6 +63,8 @@ struct Harness {
     _vector_stores: praxis_test_utils::CapturingBackendGuard,
     /// Anthropic Messages backend, which returns [`ANTHROPIC_MARKER`].
     _anthropic: praxis_test_utils::CapturingBackendGuard,
+    /// OpenAI Models backend, which returns [`OPENAI_MODELS_MARKER`].
+    _openai_models: praxis_test_utils::CapturingBackendGuard,
     /// Gemini backend, which returns [`GEMINI_MARKER`].
     _gemini: praxis_test_utils::CapturingBackendGuard,
     /// Bedrock backend, which returns [`BEDROCK_MARKER`].
@@ -77,6 +81,7 @@ fn start() -> Harness {
     let files = start_capturing_backend(FILES_MARKER);
     let vector_stores = start_capturing_backend(VECTOR_STORES_MARKER);
     let anthropic = start_capturing_backend(ANTHROPIC_MARKER);
+    let openai_models = start_capturing_backend(OPENAI_MODELS_MARKER);
     let gemini = start_capturing_backend(GEMINI_MARKER);
     let bedrock = start_capturing_backend(BEDROCK_MARKER);
     let proxy_port = free_port();
@@ -92,6 +97,7 @@ fn start() -> Harness {
             ("127.0.0.1:3006", anthropic.port()),
             ("127.0.0.1:3007", gemini.port()),
             ("127.0.0.1:3008", bedrock.port()),
+            ("127.0.0.1:3009", openai_models.port()),
         ]),
     );
     let proxy = start_proxy(&config);
@@ -102,6 +108,7 @@ fn start() -> Harness {
         _files: files,
         _vector_stores: vector_stores,
         _anthropic: anthropic,
+        _openai_models: openai_models,
         _gemini: gemini,
         _bedrock: bedrock,
         proxy,
@@ -622,6 +629,57 @@ fn anthropic_messages_identity_does_not_depend_on_the_body() {
             parse_body(&raw),
             ANTHROPIC_MARKER,
             "{name} must still select the Anthropic backend"
+        );
+    }
+}
+
+/// Both model reads route based on the client protocol, including a paginated list.
+#[test]
+fn model_reads_select_the_client_protocol_backend() {
+    let h = start();
+    for path in ["/v1/models?limit=2", "/v1/models/model-1"] {
+        for (version, marker) in [
+            ("", OPENAI_MODELS_MARKER),
+            ("anthropic-version: 2023-06-01\r\n", ANTHROPIC_MARKER),
+        ] {
+            let raw = http_send(
+                h.proxy.addr(),
+                &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{version}Connection: close\r\n\r\n"),
+            );
+            assert_eq!(parse_status(&raw), 200, "{path}");
+            assert_eq!(parse_body(&raw), marker, "{path}");
+        }
+    }
+}
+
+/// Native Gemini clients use the same stable Models paths and retain fallback routing.
+#[test]
+fn gemini_model_reads_keep_their_default_route() {
+    let h = start();
+    for (path, headers) in [
+        ("/v1/models", "x-goog-api-key: test\r\n"),
+        ("/v1/models/gemini-test", "x-goog-api-key: test\r\n"),
+        ("/v1/models?key=test", ""),
+        ("/v1/models/gemini-test?%6bey=test", ""),
+        ("/v1/models?access_token=test", ""),
+        (
+            "/v1/models",
+            "Authorization: Bearer test\r\nx-goog-user-project: test-project\r\n",
+        ),
+        ("/v1/models/gemini-test?oauth_token=test", ""),
+        (
+            "/v1/models/gemini-test",
+            "Authorization: Bearer test\r\nx-goog-api-client: google-genai-sdk/test\r\n",
+        ),
+    ] {
+        let raw = http_send(
+            h.proxy.addr(),
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n"),
+        );
+        assert_eq!(parse_status(&raw), 200, "{path}");
+        assert!(
+            echoed(&raw).contains("localhost"),
+            "{path} should reach the header-echoing default backend"
         );
     }
 }

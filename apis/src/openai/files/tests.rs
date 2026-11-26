@@ -143,8 +143,13 @@ fn conformance_files_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation);
-        let matched = classify(operation.method().as_str(), &path, Transport::Http)
-            .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
+        let matched = classify(
+            operation.method().as_str(),
+            &path,
+            Transport::Http,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
         assert_eq!(matched.operation_id, operation.operation_id());
         assert_eq!(
             matched.application_protocol.as_str(),

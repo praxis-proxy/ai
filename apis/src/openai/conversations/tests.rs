@@ -57,7 +57,7 @@ fn build_test_filter() -> OpenaiConversationsFilter {
 
 /// Publish the same generic extension as `ai_operation`.
 fn insert_classifier_matches(ctx: &mut HttpFilterContext<'_>, req: &Request) {
-    if let Some(matched) = classify(req.method.as_str(), req.uri.path(), Transport::Http) {
+    if let Some(matched) = classify(req.method.as_str(), req.uri.path(), Transport::Http, &req.headers) {
         ctx.extensions.insert(matched);
     }
 }
@@ -4497,8 +4497,13 @@ fn conformance_conversations_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation, Some("conv_sync"), Some("item_sync"));
-        let matched = classify(operation.method().as_str(), &path, Transport::Http)
-            .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
+        let matched = classify(
+            operation.method().as_str(),
+            &path,
+            Transport::Http,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
         assert_eq!(
             ConversationOperation::from_operation_id(matched.operation_id),
             Some(operation.operation),
