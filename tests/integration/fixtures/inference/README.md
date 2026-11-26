@@ -382,10 +382,9 @@ The raw-body suite also exercises these conditional paths:
 | `openai_responses_rehydrate` | No previous response or conversation to restore |
 | `openai_doc_extract` | No document content to extract |
 | `openai_file_resolve` | No file references to resolve |
-| `openai_mcp_tool_resolve` | No MCP tools to expand |
 | `openai_file_search_dispatch` | No pending file-search calls, followed by the outbound serializer |
 | `openai_web_search_dispatch` | No pending web-search calls, followed by the outbound serializer |
-| `openai_mcp_dispatch` | No pending MCP calls, followed by the outbound serializer |
+| `openai_mcp_connector` | No MCP tools to expand or pending calls to execute, followed by the outbound serializer |
 | `openai_responses_proxy` | Canonical state needs no outbound rebuild |
 | `openai_client_tool_compat` | Function-only tools and unchanged history, followed by its outbound serializer |
 | `openai_responses_to_chat_completions` | A non-Responses-create request |
