@@ -381,6 +381,10 @@ mod tests {
             );
         });
         assert!(
+            !targets.is_empty(),
+            "expected at least one tracing event, got none"
+        );
+        assert!(
             targets
                 .iter()
                 .all(|t| t == "praxis_ai::mcp_audit"),
@@ -393,6 +397,10 @@ mod tests {
         let targets = with_captured_events(|| {
             emit_non_tool("tools/list", Some("sess_xyz"), Some("2026-11-05"), None);
         });
+        assert!(
+            !targets.is_empty(),
+            "expected at least one tracing event, got none"
+        );
         assert!(
             targets
                 .iter()
@@ -414,6 +422,10 @@ mod tests {
             emit_completed(&state, "analytics-mcp", 200);
         });
         assert!(
+            !targets.is_empty(),
+            "expected at least one tracing event, got none"
+        );
+        assert!(
             targets
                 .iter()
                 .all(|t| t == "praxis_ai::mcp_audit"),
@@ -433,6 +445,10 @@ mod tests {
             };
             emit_completed(&state, "analytics-mcp", 500);
         });
+        assert!(
+            !targets.is_empty(),
+            "expected at least one tracing event, got none"
+        );
         assert!(
             targets
                 .iter()
