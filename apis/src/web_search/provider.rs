@@ -9,7 +9,6 @@
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 use std::{
-    fmt::Write as _,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -191,20 +190,6 @@ fn default_base_url(provider: SearchProvider) -> &'static str {
     }
 }
 
-/// Join a configured search `base_url` with a provider endpoint path (and
-/// optional query string).
-///
-/// Trailing slashes on the base are ignored so equivalent spellings such as
-/// `/api` and `/api/` produce the same final URL when a provider path that
-/// starts with `/` is appended.
-fn join_base_url(base: &str, path_and_query: &str) -> String {
-    debug_assert!(
-        path_and_query.starts_with('/'),
-        "provider endpoint paths must start with '/'"
-    );
-    format!("{}{path_and_query}", base.trim_end_matches('/'))
-}
-
 /// The request header and value prefix a provider carries its API key under.
 ///
 /// Every provider authenticates with a header credential that the executor
@@ -298,10 +283,14 @@ impl SearchClient {
         // surface at callout time, silently dropping the deferred credential and
         // dialing the provider unauthenticated. Every provider defers a header
         // credential bound to this authority.
-        let base = config
+        // Strip trailing slashes once at construction so `/api` and `/api/`
+        // produce the same provider endpoint when builders append `/…` paths.
+        // Matches `openai/api_client` and `file_search_dispatch` base handling.
+        let base_url = config
             .base_url
             .as_deref()
-            .unwrap_or_else(|| default_base_url(config.provider));
+            .map(|base| base.trim_end_matches('/').to_owned());
+        let base = base_url.as_deref().unwrap_or_else(|| default_base_url(config.provider));
         credential_authority(base)
             .map_err(|e| FilterError::from(format!("{filter_name}: invalid search base URL: {e}")))?;
         Ok(Self {
@@ -310,7 +299,7 @@ impl SearchClient {
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
-            base_url: config.base_url.clone(),
+            base_url,
         })
     }
 
@@ -772,12 +761,8 @@ impl SearchClient {
     /// location signal rather than a lat/long fallback.
     fn build_brave_request(&self, query: &str, count: u32, country: Option<&str>) -> (String, SubRequest) {
         let encoded_query = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
-        // Join the static path first so trailing-slash normalization does not
-        // allocate a temporary query String, then append the encoded params.
-        let mut url = join_base_url(self.effective_base_url(), "/res/v1/web/search");
-        // `Write` for `String` is infallible; bind the `Result` so clippy does
-        // not flag `let _ =` on a `#[must_use]` type.
-        let _written = write!(url, "?q={encoded_query}&count={count}");
+        let base = self.effective_base_url();
+        let url = format!("{base}/res/v1/web/search?q={encoded_query}&count={count}");
 
         // The API key is NOT set here: it is staged as an authority-bound
         // `DeferredCredential` (`x-subscription-token`) in `prepare_staged_request`
@@ -841,7 +826,8 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let url = join_base_url(self.effective_base_url(), "/search");
+        let base = self.effective_base_url();
+        let url = format!("{base}/search");
         (
             url,
             SubRequest {
@@ -881,7 +867,8 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let url = join_base_url(self.effective_base_url(), "/v1/search");
+        let base = self.effective_base_url();
+        let url = format!("{base}/v1/search");
         (
             url,
             SubRequest {
@@ -1403,19 +1390,9 @@ mod tests {
     }
 
     #[test]
-    fn join_base_url_strips_trailing_slash_before_provider_path() {
-        assert_eq!(
-            join_base_url("http://127.0.0.1:9999/api", "/search"),
-            "http://127.0.0.1:9999/api/search"
-        );
-        assert_eq!(
-            join_base_url("http://127.0.0.1:9999/api/", "/search"),
-            "http://127.0.0.1:9999/api/search"
-        );
-        assert_eq!(
-            join_base_url("http://127.0.0.1:9999/", "/res/v1/web/search?q=a&count=1"),
-            "http://127.0.0.1:9999/res/v1/web/search?q=a&count=1"
-        );
+    fn from_config_strips_trailing_slash_on_base_url() {
+        let client = client_with_base(SearchProvider::Tavily, "http://127.0.0.1:9999/api/");
+        assert_eq!(client.effective_base_url(), "http://127.0.0.1:9999/api");
     }
 
     #[test]

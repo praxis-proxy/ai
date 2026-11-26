@@ -95,6 +95,55 @@ fn load_test_config_without_stream_events(
     praxis_core::config::Config::from_yaml(&yaml).expect("patched config should parse")
 }
 
+/// Shared Chat Completions fixtures for the model→search→model round trip.
+fn tool_call_then_answer_model_bodies() -> (Value, Value) {
+    (
+        json!({
+            "id": "chatcmpl_search",
+            "object": "chat.completion",
+            "model": "chat-only-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_search_1",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"query\":\"Praxis Proxy latest release\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+        }),
+        json!({
+            "id": "chatcmpl_answer",
+            "object": "chat.completion",
+            "model": "chat-only-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Praxis Proxy has a current release."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 24, "completion_tokens": 8, "total_tokens": 32}
+        }),
+    )
+}
+
+fn brave_search_results_body() -> Value {
+    json!({
+        "web": {"results": [{
+            "title": "Praxis Proxy releases",
+            "url": "https://github.com/praxis-proxy/praxis/releases",
+            "description": "Current Praxis Proxy releases."
+        }]}
+    })
+}
+
 #[test]
 fn web_search_chat_completions_example_builds() {
     let config = load_test_config(free_port(), 19_301, 19_302);
@@ -103,56 +152,14 @@ fn web_search_chat_completions_example_builds() {
 
 #[test]
 fn web_search_chat_completions_completes_model_search_model_round_trip() {
-    let first_response = json!({
-        "id": "chatcmpl_search",
-        "object": "chat.completion",
-        "model": "chat-only-model",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "call_search_1",
-                    "type": "function",
-                    "function": {
-                        "name": "web_search",
-                        "arguments": "{\"query\":\"Praxis Proxy latest release\"}"
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }],
-        "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
-    });
-    let second_response = json!({
-        "id": "chatcmpl_answer",
-        "object": "chat.completion",
-        "model": "chat-only-model",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Praxis Proxy has a current release."},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 24, "completion_tokens": 8, "total_tokens": 32}
-    });
+    let (first_response, second_response) = tool_call_then_answer_model_bodies();
     let model = StatefulCapturingBackend::new(vec![
         (200, first_response.to_string()),
         (200, second_response.to_string()),
     ])
     .start_with_shutdown();
-    let search = StatefulCapturingBackend::new(vec![(
-        200,
-        json!({
-            "web": {"results": [{
-                "title": "Praxis Proxy releases",
-                "url": "https://github.com/praxis-proxy/praxis/releases",
-                "description": "Current Praxis Proxy releases."
-            }]}
-        })
-        .to_string(),
-    )])
-    .start_with_shutdown();
+    let search =
+        StatefulCapturingBackend::new(vec![(200, brave_search_results_body().to_string())]).start_with_shutdown();
     let proxy_port = free_port();
     let config = load_test_config(proxy_port, model.port(), search.port());
     let proxy = start_proxy(&config);
@@ -251,62 +258,21 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
     );
 }
 
-/// A trailing slash on `base_url` must not double the Brave provider path
-/// separator when the managed search callout is built.
+/// A trailing slash on a path-prefix `base_url` (`/api/`) must not double the
+/// Brave provider path separator when the managed search callout is built.
 #[test]
 fn web_search_chat_completions_trailing_slash_base_url_keeps_single_path_separator() {
-    let first_response = json!({
-        "id": "chatcmpl_search",
-        "object": "chat.completion",
-        "model": "chat-only-model",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "call_search_1",
-                    "type": "function",
-                    "function": {
-                        "name": "web_search",
-                        "arguments": "{\"query\":\"Praxis Proxy latest release\"}"
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }],
-        "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
-    });
-    let second_response = json!({
-        "id": "chatcmpl_answer",
-        "object": "chat.completion",
-        "model": "chat-only-model",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Praxis Proxy has a current release."},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 24, "completion_tokens": 8, "total_tokens": 32}
-    });
+    let (first_response, second_response) = tool_call_then_answer_model_bodies();
     let model = StatefulCapturingBackend::new(vec![
         (200, first_response.to_string()),
         (200, second_response.to_string()),
     ])
     .start_with_shutdown();
-    let search = StatefulCapturingBackend::new(vec![(
-        200,
-        json!({
-            "web": {"results": [{
-                "title": "Praxis Proxy releases",
-                "url": "https://github.com/praxis-proxy/praxis/releases",
-                "description": "Current Praxis Proxy releases."
-            }]}
-        })
-        .to_string(),
-    )])
-    .start_with_shutdown();
+    let search =
+        StatefulCapturingBackend::new(vec![(200, brave_search_results_body().to_string())]).start_with_shutdown();
     let proxy_port = free_port();
-    let search_base = format!("http://127.0.0.1:{}/", search.port());
+    // Match the issue reproduction: path prefix with a trailing slash (`/api/`).
+    let search_base = format!("http://127.0.0.1:{}/api/", search.port());
     let config = load_test_config_with_search_base(proxy_port, model.port(), &search_base);
     let proxy = start_proxy(&config);
     let request = json!({
@@ -323,8 +289,8 @@ fn web_search_chat_completions_trailing_slash_base_url_keeps_single_path_separat
     let search_requests = search.requests();
     assert_eq!(search_requests.len(), 1, "managed search should call the provider once");
     assert!(
-        search_requests[0].uri.starts_with("/res/v1/web/search?"),
-        "trailing-slash base_url must keep a single path separator; got {}",
+        search_requests[0].uri.starts_with("/api/res/v1/web/search?"),
+        "trailing-slash path-prefix base_url must keep a single separator; got {}",
         search_requests[0].uri
     );
     assert!(

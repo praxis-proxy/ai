@@ -433,10 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_thirty_five_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_six_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_listener(PIPELINE_LISTENER).expect("listener exists");
-        assert_eq!(nodes.len(), 35, "22 main + 13 IRR-step filters");
+        assert_eq!(
+            nodes.len(),
+            36,
+            "22 main (incl. IRR) + 13 IRR-step filters + 1 unsupported-method static_response"
+        );
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -485,6 +489,7 @@ mod tests {
                 "openai_responses_proxy",
                 "openai_responses_to_chat_completions",
                 "path_rewrite",
+                "static_response",
             ],
             "all main and inference-step filter types must retain their declared order"
         );
@@ -499,9 +504,14 @@ mod tests {
             nodes
                 .iter()
                 .skip(22)
+                .take(13)
                 .all(|node| node.depth == 1 && node.irr_step.as_deref() == Some("inference")),
             "all inference-step filters have depth one and retain their step owner"
         );
+        let trailing = nodes.last().expect("flattened graph is non-empty");
+        assert_eq!(trailing.filter_type, "static_response");
+        assert_eq!(trailing.depth, 0, "unsupported-method chain stays on the main depth");
+        assert!(trailing.irr_step.is_none());
     }
 
     #[test]
