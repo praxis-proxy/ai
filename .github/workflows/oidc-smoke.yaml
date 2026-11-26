@@ -1,0 +1,80 @@
+name: OIDC smoke
+
+on:
+  push:
+    branches: [test-oidc]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: oidc-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: providers-live
+    steps:
+      # ------------------------------------------------------------------
+      # GCP / Vertex AI
+      # ------------------------------------------------------------------
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ secrets.VERTEX_AI_PROJECT }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Vertex AI live call (Gemini generateContent)
+        env:
+          VERTEX_AI_PROJECT: ${{ secrets.VERTEX_AI_PROJECT }}
+          VERTEX_AI_LOCATION: us-central1
+          # Matches the model used by the fake-backend SDK tests
+          # (tests/integration/sdk/openai/test_vertex_gemini_chat_completions.py).
+          GEMINI_MODEL: gemini-2.0-flash
+        run: |
+          set -euo pipefail
+          token=$(gcloud auth application-default print-access-token)
+          echo "::add-mask::$token"
+          response=$(curl -sS -f \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            "https://aiplatform.googleapis.com/v1/projects/${VERTEX_AI_PROJECT}/locations/${VERTEX_AI_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent" \
+            -d '{"contents":[{"parts":[{"text":"Reply with the single word: ok"}]}]}')
+          echo "$response" | jq '{model, text: .candidates[0].content.parts[0].text}'
+
+      # ------------------------------------------------------------------
+      # Azure
+      # ------------------------------------------------------------------
+
+      - name: Authenticate to Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Azure OpenAI live call
+        env:
+          AZURE_OPENAI_RESOURCE: ${{ secrets.AZURE_OPENAI_RESOURCE }}
+          AZURE_OPENAI_RESOURCE_GROUP: ${{ secrets.AZURE_OPENAI_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          # identity -> az CLI -> short-lived account key, masked. The v1
+          # API takes the deployment name as "model" in the body
+          # (https://<resource>.openai.azure.com/openai/v1).
+          key=$(az cognitiveservices account keys list \
+            --name "$AZURE_OPENAI_RESOURCE" \
+            --resource-group "$AZURE_OPENAI_RESOURCE_GROUP" \
+            --query key1 -o tsv)
+          echo "::add-mask::$key"
+          response=$(curl -sS -f \
+            -H "api-key: $key" \
+            -H "Content-Type: application/json" \
+            "https://${AZURE_OPENAI_RESOURCE}.openai.azure.com/openai/v1/chat/completions" \
+            -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Reply with the single word: ok"}]}')
+          echo "$response" | jq '{model: .model, text: .choices[0].message.content}'
