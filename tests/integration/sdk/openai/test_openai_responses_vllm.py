@@ -2822,9 +2822,17 @@ def test_openai_bound_code_interpreter_is_forwarded_unchanged(witness_backend_cl
     )
 
 
-def test_openai_bound_image_input_is_forwarded_unchanged(witness_backend_client):
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"input": WITNESS_IMAGE_INPUT},
+        {"prompt": {"id": "pmpt_sdk", "variables": {"picture": {"type": "input_image", "file_id": "file_sdk"}}}},
+    ],
+    ids=["input", "prompt-variable"],
+)
+def test_openai_bound_image_input_is_forwarded_unchanged(witness_backend_client, body):
     client, forwarded = witness_backend_client
-    request_body = {"model": "gpt-5", "store": False, "input": WITNESS_IMAGE_INPUT}
+    request_body = {"model": "gpt-5", "store": False, **body}
 
     response = client.responses.create(**request_body)
 

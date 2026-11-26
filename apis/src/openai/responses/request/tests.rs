@@ -737,6 +737,20 @@ async fn filter_results_are_published_under_this_filter() {
     );
 }
 
+/// A classifier pass on a text body clears a preceding modality fact.
+#[tokio::test]
+async fn text_classification_clears_previous_modality() {
+    let filter = filter("initialize_state: false\n");
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    ctx.record_ai_metadata("ai.modality", "image");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(ctx.filter_metadata.get("ai.modality"), None);
+}
+
 /// A passthrough chain consumes no state, so it can opt out of building it.
 /// Classification is still published, since routing depends on it.
 #[tokio::test]

@@ -247,7 +247,22 @@ fn detect_content_modality(
     let mut detected = DetectedModalities::default();
 
     match format {
-        AiRequestFormat::Responses => detect_responses_input(obj.get("input"), &mut detected),
+        AiRequestFormat::Responses => {
+            detect_responses_input(obj.get("input"), &mut detected);
+            if !detected.image
+                && let Some(variables) = obj
+                    .get("prompt")
+                    .and_then(|prompt| prompt.get("variables"))
+                    .and_then(serde_json::Value::as_object)
+            {
+                for value in variables.values() {
+                    detect_content_part(value, format, &mut detected);
+                    if detected.image {
+                        break;
+                    }
+                }
+            }
+        },
         AiRequestFormat::AnthropicMessages | AiRequestFormat::ChatCompletions => {
             detect_messages(obj.get("messages"), format, &mut detected);
         },
@@ -379,6 +394,15 @@ fn detect_anthropic_part(part: &serde_json::Value, part_type: Option<&str>, dete
         (Some("image"), Some(source), Some("url")) => detected.image |= has_string(source.get("url")),
         (Some("image"), Some(source), Some("file")) => detected.image |= has_string(source.get("file_id")),
         (Some("document"), Some(source), Some("content")) => detect_content(source.get("content"), format, detected),
+        (Some("web_fetch_tool_result"), ..) => {
+            if let Some(result) = part.get("content")
+                && result.get("type").and_then(serde_json::Value::as_str) == Some("web_fetch_result")
+                && let Some(document) = result.get("content")
+                && document.get("type").and_then(serde_json::Value::as_str) == Some("document")
+            {
+                detect_anthropic_part(document, Some("document"), detected);
+            }
+        },
         (Some("tool_result"), ..) => detect_content(part.get("content"), format, detected),
         _ => {},
     }
@@ -1270,6 +1294,23 @@ mod tests {
         let body = br#"{"input":[{"type":"computer_call_output","call_id":"call_123","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,AAAA"}}]}"#;
 
         assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_detects_only_typed_image_prompt_variables() {
+        let image =
+            br#"{"prompt":{"id":"pmpt_123","variables":{"picture":{"type":"input_image","file_id":"file_123"}}}}"#;
+        let text = br#"{"prompt":{"id":"pmpt_123","variables":{"picture":"data:image/png;base64,AAAA"}}}"#;
+        assert_eq!(classify_request_body(image).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
+    }
+
+    #[test]
+    fn anthropic_detects_images_in_successful_web_fetch_results() {
+        let image = br#"{"max_tokens":128,"messages":[{"content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}}}}]}]}"#;
+        let text = br#"{"max_tokens":128,"messages":[{"content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"content","content":[{"type":"text","text":"data:image/png;base64,AAAA"}]}}}}]}]}"#;
+        assert_eq!(classify_request_body(image).modality, Some(ContentModality::Image));
+        assert_eq!(classify_request_body(text).modality, None);
     }
 
     #[test]

@@ -551,6 +551,8 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
     }
     if let Some(modality) = classified.modality {
         ctx.record_ai_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
+    } else {
+        drop(ctx.filter_metadata.remove(crate::classifier::MODALITY_METADATA_KEY));
     }
 }
 
