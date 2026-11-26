@@ -410,6 +410,19 @@ async fn run_codex_web_search(translated: bool) {
         compaction_limits: None,
     };
     let output = run_codex(&live.codex_bin, options).await;
+    // This controlled acceptance prompt contains no user data. Keep provider
+    // credentials out of the retained CLI trace.
+    eprintln!(
+        "Codex search stdout: {}\nstderr: {}",
+        output
+            .stdout
+            .replace(&key, "<REDACTED>")
+            .replace(&live.backend_token, "<REDACTED>"),
+        output
+            .stderr
+            .replace(&key, "<REDACTED>")
+            .replace(&live.backend_token, "<REDACTED>")
+    );
     assert!(output.status.success(), "Codex search exited unsuccessfully");
     let captures = relay.captures();
     assert!(!captures.is_empty(), "Praxis made no Tavily request");
