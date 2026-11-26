@@ -2012,6 +2012,7 @@ pub(crate) fn has_hosted_web_search(state: &ResponsesState) -> bool {
 }
 
 /// Restore the private inference call before the agentic owner admits it.
+#[cfg(any(feature = "openai-agentic-loop", test))]
 pub(crate) fn restore_web_search_calls(response: &mut Value) {
     let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) else {
         return;
