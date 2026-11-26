@@ -108,6 +108,43 @@ pub(crate) struct AuditState {
 // Outcome vocabulary (closed set — log collectors can filter on these)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Field-length bounds (AGENTS.md § Key Patterns: "bounded classification
+// fields").  Caps prevent body-sized INFO records when an MCP request
+// carries a large `params.name` or unusual header values.
+// ---------------------------------------------------------------------------
+
+/// Maximum byte length for the `mcp_name` audit field.
+///
+/// Tool names are typically short identifiers. 128 bytes is generous for
+/// any realistic name while preventing a 60 KiB `params.name` from
+/// inflating audit records.
+const MAX_AUDIT_NAME_LEN: usize = 128;
+
+/// Maximum byte length for `mcp_session_id` and `mcp_protocol_version`.
+const MAX_AUDIT_FIELD_LEN: usize = 128;
+
+/// Truncate `s` to at most `max_len` bytes at a UTF-8 character boundary.
+/// Returns `None` if the input is `None`.
+fn truncate(s: Option<&str>, max_len: usize) -> Option<&str> {
+    s.map(|v| {
+        if v.len() <= max_len {
+            v
+        } else {
+            // Find the last char boundary at or before max_len
+            let mut end = max_len;
+            while end > 0 && !v.is_char_boundary(end) {
+                end -= 1;
+            }
+            &v[..end]
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Outcome vocabulary (closed set — log collectors can filter on these)
+// ---------------------------------------------------------------------------
+
 /// Request rejected by the filter before reaching any upstream.
 const OUTCOME_REJECTED: &str = "rejected";
 
@@ -140,9 +177,9 @@ pub(crate) fn emit_rejected(
         target: "praxis_ai::mcp_audit",
         log_type             = "mcp_audit",
         mcp_method           = method,
-        mcp_name             = name,
-        mcp_session_id       = session_id,
-        mcp_protocol_version = protocol_version,
+        mcp_name             = truncate(name, MAX_AUDIT_NAME_LEN),
+        mcp_session_id       = truncate(session_id, MAX_AUDIT_FIELD_LEN),
+        mcp_protocol_version = truncate(protocol_version, MAX_AUDIT_FIELD_LEN),
         mcp_outcome          = OUTCOME_REJECTED,
         mcp_rejection_reason = rejection_reason,
         tenant               = tenant,
@@ -170,8 +207,8 @@ pub(crate) fn emit_non_tool(
         target: "praxis_ai::mcp_audit",
         log_type             = "mcp_audit",
         mcp_method           = method,
-        mcp_session_id       = session_id,
-        mcp_protocol_version = protocol_version,
+        mcp_session_id       = truncate(session_id, MAX_AUDIT_FIELD_LEN),
+        mcp_protocol_version = truncate(protocol_version, MAX_AUDIT_FIELD_LEN),
         mcp_outcome          = OUTCOME_INITIATED,
         tenant               = tenant,
         "mcp.call.initiated",
@@ -206,9 +243,9 @@ pub(crate) fn emit_completed(state: &AuditState, cluster: &str, upstream_status:
         target: "praxis_ai::mcp_audit",
         log_type             = "mcp_audit",
         mcp_method           = "tools/call",
-        mcp_name             = state.tool_name.as_str(),
-        mcp_session_id       = state.session_id.as_deref(),
-        mcp_protocol_version = state.protocol_version.as_deref(),
+        mcp_name             = truncate(Some(state.tool_name.as_str()), MAX_AUDIT_NAME_LEN),
+        mcp_session_id       = truncate(state.session_id.as_deref(), MAX_AUDIT_FIELD_LEN),
+        mcp_protocol_version = truncate(state.protocol_version.as_deref(), MAX_AUDIT_FIELD_LEN),
         mcp_outcome          = outcome,
         mcp_upstream_status  = upstream_status,
         mcp_duration_ms      = duration_ms,
@@ -344,8 +381,10 @@ mod tests {
             );
         });
         assert!(
-            !targets.is_empty(),
-            "expected at least one tracing event, got none"
+            targets
+                .iter()
+                .all(|t| t == "praxis_ai::mcp_audit"),
+            "every event must use the dedicated audit target, got: {targets:?}"
         );
     }
 
@@ -355,8 +394,10 @@ mod tests {
             emit_non_tool("tools/list", Some("sess_xyz"), Some("2026-11-05"), None);
         });
         assert!(
-            !targets.is_empty(),
-            "expected at least one tracing event, got none"
+            targets
+                .iter()
+                .all(|t| t == "praxis_ai::mcp_audit"),
+            "every event must use the dedicated audit target, got: {targets:?}"
         );
     }
 
@@ -373,8 +414,10 @@ mod tests {
             emit_completed(&state, "analytics-mcp", 200);
         });
         assert!(
-            !targets.is_empty(),
-            "expected at least one tracing event, got none"
+            targets
+                .iter()
+                .all(|t| t == "praxis_ai::mcp_audit"),
+            "every event must use the dedicated audit target, got: {targets:?}"
         );
     }
 
@@ -391,8 +434,10 @@ mod tests {
             emit_completed(&state, "analytics-mcp", 500);
         });
         assert!(
-            !targets.is_empty(),
-            "expected at least one tracing event, got none"
+            targets
+                .iter()
+                .all(|t| t == "praxis_ai::mcp_audit"),
+            "every event must use the dedicated audit target, got: {targets:?}"
         );
     }
 
@@ -407,6 +452,58 @@ mod tests {
         };
         // No panic / overflow expected
         emit_completed(&state, "cluster", 200);
+    }
+
+    // ── Field-length bounding tests ───────────────────────────────────
+
+    #[test]
+    fn oversized_tool_name_is_truncated_in_audit() {
+        // A tool name longer than MAX_AUDIT_NAME_LEN must be truncated
+        // so that body-sized names do not inflate audit records.
+        let long_name = "a".repeat(300);
+        let output = capture_log_output(|| {
+            emit_rejected(
+                "tools/call",
+                Some(&long_name),
+                Some("sess"),
+                Some("2026-11-05"),
+                Some("acme"),
+                "invalid_params",
+            );
+        });
+        assert!(
+            output.contains("mcp.call.rejected"),
+            "event must be emitted"
+        );
+        // The full 300-char name must NOT appear
+        assert!(
+            !output.contains(&long_name),
+            "oversized tool name should be truncated, got: {output}"
+        );
+        // A truncated prefix MUST appear (first 128 chars)
+        assert!(
+            output.contains(&"a".repeat(super::MAX_AUDIT_NAME_LEN)),
+            "truncated prefix should be present"
+        );
+    }
+
+    #[test]
+    fn normal_tool_name_is_not_truncated() {
+        let name = "query_database";
+        let output = capture_log_output(|| {
+            emit_rejected(
+                "tools/call",
+                Some(name),
+                Some("sess"),
+                Some("2026-11-05"),
+                None,
+                "invalid_params",
+            );
+        });
+        assert!(
+            output.contains(name),
+            "normal-length tool name must appear in full"
+        );
     }
 
     // ── Content-leak regression tests ────────────────────────────────
@@ -456,6 +553,26 @@ mod tests {
         assert!(
             !output.contains(&uri_with_creds),
             "full URI leaked into audit output: {output}"
+        );
+    }
+
+    /// Prove that `McpMethod::ResourcesRead` triggers the `requires_uri()`
+    /// guard that causes mod.rs to pass `name: None` to `emit_rejected`.
+    /// Combined with `rejected_resource_uri_credential_not_logged` above,
+    /// this covers both halves of the URI suppression contract:
+    ///   1. `requires_uri()` → true for resources/read (this test)
+    ///   2. `emit_rejected(…, None, …)` → credential absent (test above)
+    #[test]
+    fn resources_read_requires_uri_guard() {
+        use super::super::envelope::McpMethod;
+        assert!(
+            McpMethod::ResourcesRead.requires_uri(),
+            "resources/read must trigger requires_uri() so mod.rs suppresses the URI"
+        );
+        // tools/call must NOT trigger requires_uri — names are safe to log
+        assert!(
+            !McpMethod::ToolsCall.requires_uri(),
+            "tools/call must not trigger requires_uri()"
         );
     }
 
