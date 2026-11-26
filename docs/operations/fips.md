@@ -155,6 +155,15 @@ fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL pr
   canonicalization itself is protocol text assembly in praxis-ai, checked
   in its tests against the `aws-sigv4` crate, which the binary does not
   link.
+- **MCP gateway session ids** (`mcp` filter with `backend_sessions`) are
+  another: each id carries an HMAC-SHA256 tag (256-bit key, full 256-bit
+  tag) computed and checked through the same EVP signing API, with a
+  constant-time comparison. The key comes from OpenSSL's private DRBG
+  (`RAND_priv_bytes`) and the id's random bytes from its public DRBG
+  (`RAND_bytes`), so on a FIPS host every step runs inside the validated
+  module. If no key can be drawn, the filter fails to build; if the
+  provider refuses the MAC, `initialize` returns a JSON-RPC internal error
+  instead of issuing an unsigned id.
 
 ## Verifying a deployment
 
@@ -251,6 +260,7 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | subtle, zeroize, secrecy | constant-time comparison, wiping, secret wrappers | helpers |
 | policy engine (`policy` filter) | JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build |
 | `aws_sigv4_sign` filter | SHA-256 and HMAC-SHA256 for `SigV4` through OpenSSL (`praxis_ai_apis::hash`) | compliant; the `aws-sigv4` crate (RustCrypto `hmac`/`sha2`) is a test-only dependency |
+| `mcp` filter (`backend_sessions`) | HMAC-SHA256 gateway session ids and their key through OpenSSL (`praxis_ai_apis::hash`) | compliant |
 | PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
 | Conversations API | Conversations state in PostgreSQL through the certificate-only SQLx profile | compliant through system OpenSSL; the store uses `store-postgres-cert-auth` (no migrations, no password authentication) |
 | SQLite store, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |

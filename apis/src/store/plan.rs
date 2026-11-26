@@ -847,9 +847,8 @@ mod tests {
         .expect("filter chain");
         let chains = HashMap::from([("main", filters.as_slice())]);
         let roots = ["main".to_owned()];
-        let error = discover_store_declarations_permissive(&roots, &chains).expect_err(
-            "malformed ttl on conversations must fail closed as a reaper config error",
-        );
+        let error = discover_store_declarations_permissive(&roots, &chains)
+            .expect_err("malformed ttl on conversations must fail closed as a reaper config error");
         let text = error.to_string();
         assert!(
             !text.contains("must retain their rows"),

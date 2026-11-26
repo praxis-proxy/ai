@@ -130,6 +130,8 @@ pub(crate) enum McpBackendError {
     Capacity,
     /// The gateway session was deleted while its handshake ran.
     SessionClosed,
+    /// The gateway session was ended before the handshake started.
+    GatewayEnded,
 }
 
 impl McpBackendError {
@@ -145,6 +147,7 @@ impl McpBackendError {
             Self::UnsupportedVersion => "unsupported_protocol_version",
             Self::Capacity => "session_capacity",
             Self::SessionClosed => "session_closed",
+            Self::GatewayEnded => "gateway_session_ended",
         }
     }
 }
@@ -161,6 +164,7 @@ impl fmt::Display for McpBackendError {
             Self::UnsupportedVersion => f.write_str("backend negotiated an unsupported protocol version"),
             Self::Capacity => f.write_str("backend session capacity exhausted"),
             Self::SessionClosed => f.write_str("gateway session closed during the backend handshake"),
+            Self::GatewayEnded => f.write_str("gateway session ended before the backend handshake"),
         }
     }
 }

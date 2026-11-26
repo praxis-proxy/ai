@@ -206,12 +206,60 @@ reload is left to the backend's own idle expiry. Idle
 entries are swept on traffic, at most once per
 `idle_timeout_ms`.
 
+With `backend_sessions`, the broker accepts only gateway
+`Mcp-Session-Id` values it issued through `initialize`
+and that no `DELETE` has ended. An id carries an issue
+sequence number, random bytes, and their HMAC-SHA256 tag
+under a key drawn from OpenSSL when the filter is built,
+so checking it needs no per-session state. Any request
+carrying another well-formed id, whatever its method
+(`initialize` and `GET` included), gets HTTP `404`, opens
+no backend session, and the client must send a new
+`initialize` without the id; a malformed id gets `400`.
+A `GET` with a live id keeps its `405`.
+
+Ended ids are kept in a list of at most 16384 entries per
+filter instance. When it is full, the lowest entry is
+dropped and every id issued up to it is rejected from then
+on, live or ended: forgetting state can only end ids,
+never revive one. A client whose live id expires this way
+gets `404` and reinitializes.
+
+`DELETE` of an unknown or ended id is a `404`. While the
+gateway session has backend sessions or handshakes created
+with other credentials than the `DELETE`'s, the `DELETE`
+terminates only the caller's own backend sessions and
+answers `409`; the gateway session stays usable, because
+presenting the id alone must not end a session another
+caller is using. Otherwise the `DELETE` ends the id and
+answers `204`. The decision and the end happen under the
+session map lock, which every backend handshake also takes
+before it starts, so a handshake either starts before the
+`DELETE` sees it or never starts: a `tools/call` waiting
+on a handshake when the id ends gets `404` without
+contacting the backend, and one whose handshake the
+`DELETE` cancelled fails with `session_closed` after the
+broker attempts to terminate the new backend session
+(best effort: if that termination fails, the session is
+left to the backend's idle expiry). A config reload or
+restart draws a new key, so every outstanding id gets
+`404` and clients reinitialize. Without
+`backend_sessions`, ids are not signed or checked.
+
+Ownership follows the forwarded credential headers, not a
+caller identity. A client whose token was refreshed, or a
+`policy` filter that mints a new delegated token before
+the broker, presents a different credential, so a `DELETE`
+of its own gateway session answers `409` while backend
+sessions created with the earlier token remain; they are
+left to idle expiry. Binding sessions to an asserted
+identity instead of the credential is tracked in #2191.
+
 Running several broker replicas behind one gateway
-address is not supported yet: gateway sessions and their
-backend mappings live in one broker instance, so clients
-must reach the same replica for a session's lifetime.
-The broker also does not yet track which gateway
-`Mcp-Session-Id` values it issued.
+address is not supported yet: the signing key, the
+ended-id list, and the backend mappings live in one
+broker instance, so clients must reach the same replica
+for a session's lifetime.
 
 ### Filter Results
 
