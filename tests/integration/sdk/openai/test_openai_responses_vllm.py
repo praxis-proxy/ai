@@ -3562,14 +3562,41 @@ class TestOpenAIResponsesVLLM:
             "preprocess + one tool dispatch should produce one re-entry; "
             f"got {len(forwarded)} upstream bodies"
         )
+        extracted = "STREAM-TOOL-410 from attached notes"
+
+        def _input_text_parts(request_input):
+            texts = []
+            if not isinstance(request_input, list):
+                return texts
+            for item in request_input:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "input_text"
+                        and isinstance(part.get("text"), str)
+                    ):
+                        texts.append(part["text"])
+            return texts
+
+        first_texts = _input_text_parts(forwarded[0]["input"])
+        assert any(extracted in text for text in first_texts), (
+            "first upstream body must carry doc_extract input_text with the "
+            f"decoded file bytes; got input_text parts: {first_texts!r}"
+        )
+        reentry_texts = _input_text_parts(forwarded[1]["input"])
         reentry = json.dumps(forwarded[1]["input"])
         assert "Mock Search Result" in reentry, (
             "selected-input rebuild must keep the hosted tool result after "
             f"document preprocessing; re-entry input was: {reentry[:500]}"
         )
-        assert "STREAM-TOOL-410" in reentry or "notes.txt" in reentry, (
-            "re-entry must still carry the preprocessed document text; "
-            f"got: {reentry[:500]}"
+        assert any(extracted in text for text in reentry_texts), (
+            "re-entry must keep the preprocessed input_text (not just the "
+            f"filename); got input_text parts: {reentry_texts!r}"
         )
 
     def test_hosted_web_search_enforces_allowed_domains(self, witness_tool_client):
