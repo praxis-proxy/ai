@@ -28,6 +28,13 @@ pub(crate) mod connector;
 )]
 pub(crate) mod execute;
 pub(crate) mod fingerprint;
+#[cfg_attr(
+    not(any(test, feature = "openai-mcp-tools")),
+    expect(
+        dead_code,
+        reason = "the OpenAI adapter builds its reverse lookup from a borrowed tool map"
+    )
+)]
 pub(crate) mod naming;
 #[cfg_attr(
     not(feature = "openai-mcp-tools"),
