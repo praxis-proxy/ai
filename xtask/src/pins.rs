@@ -112,7 +112,6 @@ fn workspace_root() -> PathBuf {
 /// in `vllm-integration.yaml` names each one.
 fn outputs(manifests: &Manifests) -> Vec<(&'static str, String)> {
     let claude = &manifests.claude.claude_code;
-    let claude_vllm = &manifests.claude.vllm;
     let opencode = &manifests.opencode.opencode;
     let opencode_v2 = &manifests.opencode_v2.opencode;
     let pi = &manifests.pi.pi;
@@ -121,9 +120,6 @@ fn outputs(manifests: &Manifests) -> Vec<(&'static str, String)> {
         ("claude_sha256", claude.sha256.clone()),
         ("claude_version", claude.version.clone()),
         ("claude_platform", claude.platform.clone()),
-        ("vllm_image", claude_vllm.image.clone()),
-        ("vllm_served_model", claude_vllm.served_model_name.clone()),
-        ("vllm_flags", claude_vllm.launch.flags.join(" ")),
         ("opencode_v2_version", opencode_v2.version.clone()),
         ("opencode_v2_platform", opencode_v2.platform.clone()),
         ("pi_version", pi.version.clone()),
@@ -136,8 +132,25 @@ fn outputs(manifests: &Manifests) -> Vec<(&'static str, String)> {
         ("opencode_sha256", opencode.sha256.clone()),
         ("opencode_model", opencode.provider.model_id.clone()),
     ];
+    outputs.extend(backend_outputs(manifests));
+    outputs
+}
+
+/// The `[vllm]` pins each GPU lane launches its container from.
+fn backend_outputs(manifests: &Manifests) -> Vec<(&'static str, String)> {
+    let claude = &manifests.claude.vllm;
+    let codex = &manifests.codex.vllm;
+    let mut outputs = vec![
+        ("vllm_baked_image", claude.baked_image.clone()),
+        ("vllm_served_model", claude.served_model_name.clone()),
+        ("vllm_flags", claude.launch.flags.join(" ")),
+        ("codex_vllm_base_image", codex.base_image.clone()),
+        ("codex_vllm_baked_image", codex.baked_image.clone()),
+        ("codex_vllm_served_model", codex.served_model_name.clone()),
+        ("codex_vllm_flags", codex.launch.flags.join(" ")),
+    ];
     if let Some(vllm) = &manifests.opencode.vllm {
-        outputs.push(("opencode_vllm_image", vllm.image.clone()));
+        outputs.push(("opencode_vllm_baked_image", vllm.baked_image.clone()));
         outputs.push(("opencode_vllm_flags", vllm.launch.flags.join(" ")));
     }
     outputs

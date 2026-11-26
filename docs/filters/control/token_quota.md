@@ -4,18 +4,17 @@ The experimental `token-quota-filter` feature registers the
 `ai/token-quota` host plugin with the Praxis Policy Engine (PPE). It does not
 register a `token_quota` HTTP filter or create a separate CEL policy surface.
 
-`token_count` normalizes the provider's final usage and supplies it to the
+`token_count` normalizes the provider's final usage and passes it to the
 `policy` filter as trusted response context. PPE selects an `llm:` route and
-runs the configured quota plugin on `cmf.llm_output`. The plugin partitions
+runs the configured quota plugin on `cmf.llm_output`. The plugin separates
 cache and reasoning tokens, applies its weights, rounds up, and returns a
 typed result for `token_rate_limit` and `external_metering`.
 
-`token_count` supports `openai`, `anthropic`, `google`, `bedrock`,
-`bedrock_invoke_model`, and `azure` response usage. Quota policy routing has a
-separate request-side requirement: `policy` must see and admit a usable
-top-level `model` in the JSON request body. A model present only in the URL is
-not admitted for this purpose. Missing models fail closed by default through
-the policy filter's `llm.require_model` behavior.
+`token_count` reads `openai`, `anthropic`, `google`, `bedrock`,
+`bedrock_invoke_model`, and `azure` response usage. On the request side,
+`policy` must see and admit a usable top-level `model` in the JSON request
+body; a model only in the URL does not count. Missing models fail closed by
+default through the policy filter's `llm.require_model` behavior.
 
 Configure the PPE plugin in the policy document:
 
@@ -44,13 +43,12 @@ routes:
         - "run(weighted-quota-v1)"
 ```
 
-Different routes can run different plugin instances, so PPE owns formula
-selection by model or route. Backend/provider-specific overrides are not
-currently available and are a follow-up gap. All weights must
-be finite and non-negative. Omitted weights default to `1.0`; `unit` defaults
-to `quota_units` and is not a currency.
+Routes can run different plugin instances, so PPE chooses the formula by
+model or route. Backend- or provider-specific overrides are not available yet.
+Weights must be finite and non-negative; omitted weights default to `1.0`.
+`unit` defaults to `quota_units` and is not a currency.
 
-The proxy chain must be declared in this request order:
+Declare the proxy chain in this request order:
 
 ```yaml
 - filter: token_rate_limit       # optional consumer
@@ -66,22 +64,21 @@ The proxy chain must be declared in this request order:
   max_body_bytes: 1048576       # optional; default JSON capture limit (1 MiB)
 ```
 
-Response hooks run in reverse, producing
-`token_count -> policy/PPE -> consumers`. Metadata-only policy works for JSON
-and streamed responses without exposing response content to the quota plugin.
-`token_count` processes SSE incrementally, but buffers non-streaming JSON up to
-`max_body_bytes` (1 MiB by default). A larger JSON response produces
-`usage_overflow`, and the limiter retains its reservation estimate instead of
-charging actual usage.
+Response hooks run in reverse: `token_count -> policy/PPE -> consumers`.
+Metadata-only policy works for JSON and streamed responses without showing
+response content to the quota plugin. `token_count` processes SSE
+incrementally but buffers non-streaming JSON up to `max_body_bytes` (1 MiB by
+default). A larger JSON response produces `usage_overflow`, and the limiter
+keeps its reservation estimate instead of charging actual usage.
 
 OpenAI Chat Completions streaming requests must set
 `stream_options: {"include_usage": true}` (or use `stream_usage_inject`) so the
-final stream event includes usage. Without that option, the quota result is
-`missing_usage`, and the limiter likewise retains its reservation estimate.
+final stream event includes usage. Otherwise the quota result is
+`missing_usage` and the limiter keeps its reservation estimate.
 
-Shared quota currently requires the policy's default
-`body_access: read_only`; `read_write` response buffering does not yet publish
-the quota result to the limiter. A metadata-only denial is recorded in PPE
-output for the host consumer, but cannot stop a response whose content has
-already been released. The PPE result includes `value`, `formula_id`, `unit`,
-`status`, and the exact normalized `usage` and routing `context` used for audit.
+Shared quota requires the policy's default `body_access: read_only`;
+`read_write` response buffering does not yet publish the quota result to the
+limiter. A metadata-only denial is recorded in PPE output for the host
+consumer but cannot stop a response whose content was already released. For
+audit, the PPE result includes `value`, `formula_id`, `unit`, `status`, and
+the exact normalized `usage` and routing `context` it used.

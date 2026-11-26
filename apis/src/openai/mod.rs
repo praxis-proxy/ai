@@ -11,6 +11,7 @@
 pub(crate) mod api_client;
 pub(crate) mod chat_completions;
 pub(crate) mod conversations;
+pub(crate) mod decisions;
 #[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
 pub(crate) mod error;
 pub(crate) mod error_response_formatter;
@@ -40,6 +41,7 @@ pub use conversations::{
 };
 #[cfg(feature = "openai-conversations")]
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
+pub use decisions::routes::{DecisionsOperation, DecisionsOperationSpec, operation_specs as decisions_operation_specs};
 #[cfg(feature = "openai-files")]
 pub use files::implementation_openapi_json as files_openapi_json;
 pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};

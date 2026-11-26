@@ -19,6 +19,11 @@ inputs:
   subnet-id:
     description: VPC subnet id the instance is launched into.
     required: true
+  fallback-subnet-ids:
+    description: >-
+      Up to two additional subnet IDs, whitespace-separated, in launch order.
+      They must be in the same region and VPC as the primary subnet.
+    required: false
   security-group-id:
     description: Security group id attached to the instance.
     required: true
@@ -88,6 +93,36 @@ runs:
 
         echo "Validated AMI, subnet, and security group for $INSTANCE_TYPE in $AWS_REGION"
 
+    - name: Build EC2 subnet fallback
+      id: subnets
+      if: inputs.fallback-subnet-ids != ''
+      shell: bash
+      env:
+        AWS_GPU_AMI_ID: ${{ inputs.ami-id }}
+        AWS_SUBNET_ID: ${{ inputs.subnet-id }}
+        AWS_SECURITY_GROUP_ID: ${{ inputs.security-group-id }}
+        FALLBACK_SUBNET_IDS: ${{ inputs.fallback-subnet-ids }}
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+
+        primary = os.environ["AWS_SUBNET_ID"]
+        fallback = os.environ["FALLBACK_SUBNET_IDS"].split()
+        subnets = list(dict.fromkeys([primary, *fallback]))
+        subnet_id = re.compile(r"subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+        if len(subnets) > 3 or not all(map(subnet_id.fullmatch, subnets)):
+            raise SystemExit("Expected at most three valid EC2 subnet IDs")
+        configs = [
+            {"imageId": os.environ["AWS_GPU_AMI_ID"], "subnetId": subnet,
+             "securityGroupId": os.environ["AWS_SECURITY_GROUP_ID"]}
+            for subnet in subnets
+        ]
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            print("config=" + json.dumps(configs), file=output)
+        PY
+
     - name: Start EC2 runner
       id: start-ec2-runner
       uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
@@ -98,3 +133,4 @@ runs:
         ec2-instance-type: ${{ inputs.instance-type }}
         subnet-id: ${{ inputs.subnet-id }}
         security-group-id: ${{ inputs.security-group-id }}
+        availability-zones-config: ${{ steps.subnets.outputs.config }}

@@ -1,22 +1,21 @@
 # Screen requests with guardrails
 
-This guide combines the existing [NeMo request-screening example](../../examples/configs/nemo-guardrails.yaml)
-and [token-counting example](../../examples/configs/token-counting.yaml).
-It screens supported Chat Completions text before inference, then extracts
-OpenAI-format usage into metrics. It does not enable response screening.
-To observe the extracted usage, continue with
-[Observe and meter token usage](token-usage.md); to enforce budgets, see
+Screen Chat Completions text with NeMo Guardrails before inference and record
+OpenAI-format usage as metrics. The configuration combines the
+[NeMo request-screening example](../../examples/configs/nemo-guardrails.yaml)
+and the [token-counting example](../../examples/configs/token-counting.yaml).
+Response screening stays off. For reading the usage metrics see
+[Observe and meter token usage](token-usage.md); for budgets see
 [Limit token usage](token-limits.md).
 
 ## Prerequisites and build
 
 Follow the [guide prerequisites](README.md). Start an OpenAI-compatible Chat
-backend at `127.0.0.1:3000`, and NeMo Guardrails **0.24.0+** at
-`127.0.0.1:3001`. Deploy a NeMo configuration and replace `your-config` below
-with its actual ID. The [guardrails reference](../filters/control/ai_guardrails.md)
-describes the service contract and failure modes. Choose known passing and
-blocking prompts from your deployed rails; a generic prompt is not guaranteed
-to trigger a particular policy.
+backend at `127.0.0.1:3000` and NeMo Guardrails 0.24.0+ at `127.0.0.1:3001`.
+Deploy a NeMo configuration and put its ID in place of `your-config` below. The
+[guardrails reference](../filters/control/ai_guardrails.md) covers the service
+contract and failure modes. Pick test prompts your deployed rails are known to
+pass and block; a generic prompt may not trigger any policy.
 
 ```console
 cargo build -p praxis-ai-proxy
@@ -75,11 +74,11 @@ insecure_options:
   allow_private_upstreams: true
 ```
 
-The backend credential belongs only to cluster `backend`; it is not attached
-to NeMo calls. This loopback recipe assumes no NeMo authentication. For a
-protected NeMo service use the [service-account example](../../examples/configs/nemo-guardrails-service-account.yaml)
-with HTTPS and the correct trust roots. Gateway-owned inference secrets also
-require a client authentication gate before exposing this listener externally.
+The backend credential goes only to cluster `backend`, never to NeMo calls.
+This loopback recipe assumes NeMo needs no authentication; for a protected NeMo
+service use the [service-account example](../../examples/configs/nemo-guardrails-service-account.yaml)
+with HTTPS and the correct trust roots. Add client authentication before
+exposing this listener, since it holds a gateway-owned inference secret.
 
 ## Validate, run, and inspect
 
@@ -98,28 +97,24 @@ curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
 curl --fail-with-body http://127.0.0.1:9901/metrics
 ```
 
-For a passing prompt, expect Chat Completions JSON and provider usage.
-After completion, `/metrics` should contain `praxis_ai_prompt_tokens_total`
-and `praxis_ai_output_tokens_total` when usage is supplied and parsed. A
-blocked request returns 403 and must not reach inference; verify backend
-request counts. A changed Chat prompt can be forwarded with masked text;
-non-Chat redaction has narrower support. NeMo errors must not be interpreted
-as a successful policy check. The default failure mode is closed.
+A passing prompt returns Chat Completions JSON with provider usage, and the
+token counters appear in `/metrics` as described in
+[token usage](token-usage.md#verify). A blocked request returns 403 and never
+reaches inference; confirm with backend request counts. When NeMo modifies a
+Chat prompt, the masked text can be forwarded; redaction outside Chat has
+narrower support. A NeMo error is not a passed check: the default failure mode
+is closed.
 
-For streaming, add `"stream":true` to the JSON and `-N` to curl.
-`stream_usage_inject` requests final SSE usage from supporting Chat backends.
-Counts become available when that usage arrives; missing usage or a truncated
-stream cannot provide complete billing evidence. Request screening still
-runs before forwarding. Do not enable response screening for this streaming
-recipe: Chat response-phase screening rejects streaming requests with 422
+For streaming, add `"stream":true` to the JSON and `-N` to curl. Request
+screening still runs before forwarding. Keep response screening off here:
+with `phase.response` enabled, streaming Chat requests are rejected with 422
 until incremental output evaluation is supported.
 
 ## Cleanup
 
-Stop the proxy with Ctrl+C, then stop services you started solely for the
-recipe. Unset `BACKEND_API_KEY` in the proxy shell and `MODEL` in the client
-shell; remove `guardrails-usage.yaml` if no longer needed. Keep the admin
-metrics endpoint private in a deployed service.
+Stop the proxy with Ctrl+C and any services you started for this recipe.
+Unset `BACKEND_API_KEY` in the proxy shell and `MODEL` in the client shell, and
+remove `guardrails-usage.yaml`.
 
 ## Filter reference
 

@@ -712,7 +712,10 @@ async fn filter_results_are_published_under_this_filter() {
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
             "model": "gpt-4.1",
-            "input": "hi",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_image", "file_id": "file_123"}]
+            }],
             "previous_response_id": "resp_1"
         }))
         .unwrap(),
@@ -725,11 +728,27 @@ async fn filter_results_are_published_under_this_filter() {
         .get("openai_responses_request")
         .expect("results belong to the filter that published them");
     assert_eq!(results.get("format"), Some("openai_responses"));
+    assert_eq!(results.get("modality"), Some("image"));
+    assert_eq!(ctx.filter_metadata.get("ai.modality"), Some("image"));
     assert_eq!(
         results.get("mode"),
         Some("stateful"),
         "the routing fact a branch condition matches on"
     );
+}
+
+/// A classifier pass on a text body clears a preceding modality fact.
+#[tokio::test]
+async fn text_classification_clears_previous_modality() {
+    let filter = filter("initialize_state: false\n");
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    ctx.record_ai_metadata("ai.modality", "image");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(ctx.filter_metadata.get("ai.modality"), None);
 }
 
 /// A passthrough chain consumes no state, so it can opt out of building it.
@@ -1252,6 +1271,195 @@ async fn null_prompt_is_allowed() {
     assert!(
         ctx.extensions.get::<ResponsesState>().is_some(),
         "a null prompt is semantically absent and must pass validation"
+    );
+}
+
+/// Build a create body carrying vLLM's `previous_input_messages` extension.
+fn previous_input_messages_body(previous_input_messages: &serde_json::Value, extra: &serde_json::Value) -> Bytes {
+    let mut body = json!({
+        "model": "m",
+        "input": "follow up",
+        "previous_input_messages": previous_input_messages,
+    });
+    if let (Some(target), Some(fields)) = (body.as_object_mut(), extra.as_object()) {
+        target.extend(fields.iter().map(|(key, value)| (key.clone(), value.clone())));
+    }
+    Bytes::from(serde_json::to_vec(&body).unwrap())
+}
+
+/// Assert the canonical `previous_input_messages` rejection envelope.
+fn assert_previous_input_messages_rejection(action: FilterAction) {
+    assert!(
+        matches!(&action, FilterAction::Reject(_)),
+        "a non-empty previous_input_messages must be rejected before inference"
+    );
+    let FilterAction::Reject(rejection) = action else {
+        unreachable!("the assertion above requires a rejection");
+    };
+    assert_eq!(rejection.status, 400, "the rejection must be a client error");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        body,
+        json!({"error": {
+            "type": "invalid_request_error",
+            "code": "unsupported_parameter",
+            "param": "previous_input_messages",
+            "message": "previous_input_messages is not supported on gateway-managed routes; include earlier \
+                        messages in input, or resume stored history with previous_response_id or conversation.",
+        }}),
+        "the rejection must name the member and point callers at input and the stored-history selectors"
+    );
+}
+
+/// Run one managed create carrying caller history, optionally after a facts-only pass.
+async fn assert_managed_owner_rejects_caller_history(extra: &serde_json::Value, pre_routing: bool) {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let history = json!([{"role": "user", "content": "never persisted"}]);
+    let mut body = Some(previous_input_messages_body(&history, extra));
+
+    if pre_routing {
+        let action = filter("initialize_state: false")
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(action, FilterAction::Release),
+            "the facts-only pass must leave the extension to the selected provider"
+        );
+    }
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert_previous_input_messages_rejection(action);
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rejected caller history must not initialize managed state ({extra})"
+    );
+}
+
+/// Caller-supplied history is rejected on first turns and continuations, in both
+/// store modes, with a fresh or cached parse.
+#[tokio::test]
+async fn non_empty_previous_input_messages_is_rejected_by_the_managed_owner() {
+    let shapes = [
+        json!({}),
+        json!({"store": false}),
+        json!({"previous_response_id": "resp_1"}),
+        json!({"previous_response_id": "resp_1", "store": false}),
+        json!({"conversation": "conv_1"}),
+        json!({"stream": true}),
+    ];
+    for extra in &shapes {
+        for pre_routing in [false, true] {
+            assert_managed_owner_rejects_caller_history(extra, pre_routing).await;
+        }
+    }
+}
+
+/// The create endpoint, not the body shape, decides the protocol. A Chat-shaped
+/// body on `POST /v1/responses` still gets managed state and rehydration, so
+/// caller-supplied history is rejected there too.
+#[tokio::test]
+async fn previous_input_messages_is_rejected_on_a_chat_shaped_create_body() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "previous_input_messages": [{"role": "user", "content": "never persisted"}],
+        }))
+        .unwrap(),
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert_previous_input_messages_rejection(action);
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rejected caller history must not initialize managed state"
+    );
+}
+
+/// Any non-null value other than an empty array is caller-supplied history.
+#[tokio::test]
+async fn non_array_previous_input_messages_is_rejected() {
+    for value in [json!("text"), json!({"role": "user"}), json!(false)] {
+        let request = create_request();
+        let mut ctx = classified_context(&request).await;
+        let mut body = Some(previous_input_messages_body(&value, &json!({})));
+        let action = default_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap();
+        assert_previous_input_messages_rejection(action);
+    }
+}
+
+/// Absent, `null`, and `[]` carry no history and are accepted unchanged.
+#[tokio::test]
+async fn empty_previous_input_messages_is_accepted() {
+    let absent = Bytes::from(serde_json::to_vec(&json!({"model": "m", "input": "hi"})).unwrap());
+    let bodies = [
+        absent,
+        previous_input_messages_body(&serde_json::Value::Null, &json!({})),
+        previous_input_messages_body(&json!([]), &json!({})),
+        previous_input_messages_body(&json!([]), &json!({"previous_response_id": "resp_1"})),
+    ];
+    for original in bodies {
+        let request = create_request();
+        let mut ctx = classified_context(&request).await;
+        let mut body = Some(original.clone());
+        let action = default_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(action, FilterAction::Release),
+            "absent, null, and empty previous_input_messages must be accepted"
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some(original.as_ref()),
+            "an accepted request body must be left unchanged"
+        );
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_some(),
+            "an accepted request must initialize managed state"
+        );
+    }
+}
+
+/// A facts-only pass preserves the extension for provider-owned passthrough.
+#[tokio::test]
+async fn previous_input_messages_is_preserved_by_facts_only_passes() {
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let original = previous_input_messages_body(
+        &json!([{"role": "user", "content": "provider-owned"}]),
+        &json!({"previous_response_id": "resp_1"}),
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter("initialize_state: false")
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "facts-only passes must not apply managed history policy"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "facts-only passes must forward previous_input_messages unchanged"
     );
 }
 

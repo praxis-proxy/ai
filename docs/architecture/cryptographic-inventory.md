@@ -3,33 +3,27 @@
 
 # Cryptographic operations inventory
 
-A human-readable inventory of where the Praxis AI proxy performs cryptography in
-production, which provider executes each operation, and its FIPS disposition
-(#1220). This document is the findings record; it is **not** a generated artifact
-and no checker re-derives it. The machine-enforced invariants that keep the
-provider story from silently regressing live in two places:
+Where the Praxis AI proxy performs cryptography in production, which provider
+executes each operation, and its FIPS disposition (#1220). This is a findings
+record maintained by hand: no checker re-derives it, and drift here breaks no
+build. Update it when a cryptographic operation or provider changes. Two guards
+do the enforcing on every PR:
 
-- **Feature-level drift** (a pinned provider rerouting off OpenSSL) is caught by
-  `[[bans.features]]` in [`deny.toml`](../../deny.toml), run on every PR by
-  `cargo deny check` (Supply Chain workflow).
-- **A non-OpenSSL crypto backend crate entering the FIPS image** is caught by
-  `cargo fips-check report`, run on every PR via
-  `make lint` (`fips-deps`) and the FIPS workflow.
+- `[[bans.features]]` in [`deny.toml`](../../deny.toml), run by
+  `cargo deny check` (Supply Chain workflow), catches a pinned provider
+  rerouting off OpenSSL.
+- `cargo fips-check report`, run by `make lint` (`fips-deps`) and the FIPS
+  workflow, catches a non-OpenSSL crypto backend crate entering the FIPS image.
 
-Pinned crate versions below are documentary — `Cargo.lock` is the source of
-truth. Keep this file current by hand when a cryptographic operation or provider
-changes; drift here breaks no build (the guards above do the enforcing).
+Crate versions below are documentary; `Cargo.lock` is the source of truth.
 
 ## Build profiles
 
-The proxy ships two profiles and the inventory tracks both:
-
-- **full** — currently `standard` (`make release` and the published container).
+- **full**: currently `standard` (`make release` and the published container).
   Experimental Responses, the agentic loop and stores require explicit opt-in.
-- **fips** — the reduced FIPS runtime, built `--no-default-features` with
+- **fips**: the reduced FIPS runtime, built `--no-default-features` with
   `aws-sigv4-filter`, shared from `xtask/src/fips.rs::FIPS_FEATURES`.
   The certificate-only PostgreSQL profile is an experimental opt-in.
-
 
 `fips ⊆ full`: the FIPS runtime is a subset of the published image. FIPS itself
 is **host-activated** (see [`docs/operations/fips.md`](../operations/fips.md)); no build feature
@@ -37,27 +31,26 @@ asserts validation.
 
 ## Provider selection
 
-The central decision is **OpenSSL everywhere**:
+The rule is **OpenSSL everywhere**:
 
 - All TLS **except the PostgreSQL store** (data plane, listeners, AI callouts, the
   policy Valkey/Redis store) runs on **rustls with the installed `rustls_openssl`
-  CryptoProvider** — `custom-provider`, no bundled `ring`/`aws-lc-rs` backend.
-  (The PostgreSQL store uses `native-tls`; see the exception below.)
-  The provider is installed process-wide at boot and every subsequent rustls
+  CryptoProvider**: `custom-provider`, no bundled `ring`/`aws-lc-rs` backend.
+  The provider is installed process-wide at boot, so every later rustls
   primitive (suites, key exchange, signatures, digests, MACs, RNG) executes on
   OpenSSL `libcrypto`.
 - All first-party application hashing (AWS SigV4, MCP approval fingerprints,
   routing digests, the Anthropic `safety_identifier`) goes through
   `apis::hash` = **OpenSSL EVP**.
 
-Deliberate exceptions, each scoped and documented below:
+Deliberate exceptions, each scoped in the tables below:
 
 - **aws-lc-rs** executes JWT signature verification only, and only in **full**
-  (via `jsonwebtoken`); it is never the TLS executor and must never gain `fips`.
+  (via `jsonwebtoken`). It is never the TLS executor and must never gain `fips`.
 - **RustCrypto `sha2`/`hmac`** drive PostgreSQL SCRAM and some upstream policy
-  digests (application-side, full-only) — not the OpenSSL EVP seam.
-- **native-tls** backs the PostgreSQL store TLS channel (diverges from the
-  rustls data plane; see #1217), resolving to OpenSSL on Linux and the OS TLS
+  digests (application-side, full-only), outside the OpenSSL EVP seam.
+- `native-tls` backs the PostgreSQL store TLS channel (diverges from the
+  rustls data plane; see #1217). It resolves to OpenSSL on Linux and the OS TLS
   stack on macOS/Windows.
 
 ### Pinned providers
@@ -72,34 +65,34 @@ Deliberate exceptions, each scoped and documented below:
 | `jsonwebtoken` | 11.1.0 | full | — | `aws_lc_rs` |
 | `native-tls` | 0.2.18 | full, fips | — (version pin only) | — |
 
-Only the **forbidden-features** column is machine-enforced — it mirrors the
-`[[bans.features]]` `deny` lists in `deny.toml`. cargo-deny can require an
-enabled feature set with `allow` plus `exact = true`, but that would also reject
-every unlisted feature enabled by future dependency updates. We allow those
-features by design and guard only the backend-changing features. The
-*expected-on* features (e.g. `rustls` `custom-provider`, `rustls_openssl`
-`tls12`) are therefore **not** guarded here: removing one would still pass
-`cargo deny check`. They are load-bearing for the OpenSSL routing and are
-instead exercised by the build and the TLS integration tests.
+Only the **forbidden-features** column is machine-enforced; it mirrors the
+`[[bans.features]]` `deny` lists in `deny.toml`. cargo-deny could require an
+exact feature set (`allow` plus `exact = true`), but that would also reject
+every unlisted feature a future dependency update enables, so only the
+backend-changing features are guarded. Removing an *expected-on* feature (e.g.
+`rustls` `custom-provider`, `rustls_openssl` `tls12`) still passes
+`cargo deny check`. Those features carry the OpenSSL routing and are exercised
+by the build and the TLS integration tests instead.
 
 ## Operations
 
 Disposition legend:
 
-- **non-validated** = a FIPS-approvable algorithm executed by the **system
-  OpenSSL** `libcrypto`; it becomes validated when the operation runs on a
-  FIPS-activated host, so the remediation is host activation (`docs/operations/fips.md`,
+- **non-validated**: a FIPS-approvable algorithm executed by the **system
+  OpenSSL** `libcrypto`. It becomes validated when it runs on a FIPS-activated
+  host, so the remediation is host activation (`docs/operations/fips.md`,
   unless noted).
-- **excluded-from-fips** = the operation executes **outside** the validated
+- **excluded-from-fips**: the operation executes **outside** the validated
   OpenSSL module (in `aws-lc-rs` or RustCrypto) **or** uses a **non-approved**
-  algorithm (MD5, ChaCha20). Host activation **cannot** validate it — the only
+  algorithm (MD5, ChaCha20). Host activation **cannot** validate it; the only
   remedies are *replacing* it with an OpenSSL-backed implementation or
   *excluding/disabling* the feature. Every such operation is confined to the
-  **full** profile and is **absent from the FIPS image**, so it never affects the
-  FIPS build's compliance; the per-row note names the remediation owner.
-- **n/a** = encoding/identity/non-security use, no validated primitive required.
-- **upstream-owned** = implemented and maintained in a Praxis-core/policy crate;
-  its FIPS posture is owned there and is not asserted by this inventory.
+  **full** profile and is **absent from the FIPS image**, so it never affects
+  the FIPS build's compliance. The per-row note names the remediation owner.
+- **n/a**: encoding, identity or non-security use; no validated primitive
+  required.
+- **upstream-owned**: implemented and maintained in a Praxis-core/policy crate,
+  which owns its FIPS posture. This inventory does not assert it.
 
 ### Transport TLS, certificate verification & handshake RNG
 
@@ -169,17 +162,16 @@ Non-secret SHA-256 digests via OpenSSL EVP (`apis::hash`) unless noted.
 
 ## Reviewed non-primitives
 
-Several crypto-family-named crates resolve into the graph but are **not**
-standalone operations — support/trait layers (`digest`, `crypto-common`,
-`const-oid`, `untrusted`), build-host code generators (`*-derive`,
-`openssl-macros`, `tiny-keccak`), FFI companions, and naming coincidences
-(`aws-smithy-*`, `openssl-probe`, `spin`, `blake2` as a non-secret Pingora cache
-key). None executes a security primitive on
-the request path. A crate on the FIPS denylist may never be classified here — a
-denied name is a real primitive and is tracked as an operation or blocked by
-`cargo fips-check report`.
+Several crates with crypto-family names resolve into the graph without being
+operations: support/trait layers (`digest`, `crypto-common`, `const-oid`,
+`untrusted`), build-host code generators (`*-derive`, `openssl-macros`,
+`tiny-keccak`), FFI companions, and naming coincidences (`aws-smithy-*`,
+`openssl-probe`, `spin`, `blake2` as a non-secret Pingora cache key). None
+executes a security primitive on the request path. A crate on the FIPS denylist
+may never be classified here: a denied name is a real primitive, so it is
+tracked as an operation or blocked by `cargo fips-check report`.
 
 `rand_xoshiro` is present through `metrics-util`, but the pinned
 `metrics-exporter-prometheus` uses `AtomicBucketInstant` for histograms and
-never constructs the `AtomicSamplingReservoir` that draws from Xoshiro256**.
-There is no Prometheus sampling RNG operation to inventory.
+never constructs the `AtomicSamplingReservoir` that draws from Xoshiro256**,
+so there is no Prometheus sampling RNG operation to inventory.

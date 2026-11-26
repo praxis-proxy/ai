@@ -112,7 +112,13 @@ fn credential_injection_internal_cluster() {
     );
 }
 
-fn tenant_chat_config(tenant_a_port: u16, tenant_b_port: u16, backend_port: u16) -> praxis_core::config::Config {
+fn tenant_config(
+    (tenant_a_port, tenant_b_port): (u16, u16),
+    backend_port: u16,
+    path: &str,
+    header: &str,
+    prefix: &str,
+) -> praxis_core::config::Config {
     let chains: String = ["alpha", "beta"]
         .into_iter()
         .map(|tenant| {
@@ -127,7 +133,7 @@ fn tenant_chat_config(tenant_a_port: u16, tenant_b_port: u16, backend_port: u16)
             password: fixture
       - filter: router
         routes:
-          - path: /v1/chat/completions
+          - path: {path}
             cluster: {tenant}
       - filter: load_balancer
         clusters:
@@ -136,9 +142,9 @@ fn tenant_chat_config(tenant_a_port: u16, tenant_b_port: u16, backend_port: u16)
       - filter: credential_injection
         clusters:
           - name: {tenant}
-            header: Authorization
+            header: {header}
             value: upstream-{tenant}
-            header_prefix: "Bearer "
+            header_prefix: "{prefix}"
 "#
             )
         })
@@ -164,19 +170,28 @@ insecure_options:
 
 #[test]
 fn chat_completions_requires_tenant_credentials_before_injecting_upstream_key() {
+    assert_tenant_credentials("/v1/chat/completions", "Authorization", "Bearer ");
+}
+
+#[test]
+fn messages_requires_tenant_credentials_before_injecting_upstream_key() {
+    assert_tenant_credentials("/v1/messages", "x-api-key", "");
+}
+
+fn assert_tenant_credentials(path: &str, header: &str, prefix: &str) {
     const ALPHA: &str = "Authorization: Basic YWxwaGE6Zml4dHVyZQ==\r\n";
     const BETA: &str = "Authorization: Basic YmV0YTpmaXh0dXJl\r\n";
     let backend = start_header_echo_backend();
     let tenant_a_port = free_port();
     let tenant_b_port = free_port();
-    let config = tenant_chat_config(tenant_a_port, tenant_b_port, backend.port());
+    let config = tenant_config((tenant_a_port, tenant_b_port), backend.port(), path, header, prefix);
     let _proxy = praxis_test_utils::start_proxy(&config);
     let send = |port, authorization| {
         http_send(
             &format!("127.0.0.1:{port}"),
             &format!(
-                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
-                 {authorization}Content-Type: application/json\r\nContent-Length: 2\r\n\
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+                 {authorization}x-api-key: client-supplied-test-key\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
                  Connection: close\r\n\r\n{{}}"
             ),
         )
@@ -187,13 +202,25 @@ fn chat_completions_requires_tenant_credentials_before_injecting_upstream_key() 
         (tenant_b_port, BETA, ALPHA, "upstream-beta"),
     ] {
         for rejected in ["", "Authorization: Basic aW52YWxpZA==\r\n", other] {
-            assert_eq!(parse_status(&send(port, rejected)), 401);
+            assert_eq!(
+                parse_status(&send(port, rejected)),
+                401,
+                "{path} must reject invalid tenant credentials"
+            );
         }
         let response = send(port, allowed);
-        assert_eq!(parse_status(&response), 200);
+        assert_eq!(parse_status(&response), 200, "{path} must accept the matching tenant");
         let headers = parse_body(&response);
-        assert!(headers.contains(&format!("Bearer {key}")));
-        assert_eq!(headers.matches("Bearer upstream-").count(), 1);
-        assert!(!headers.contains("Basic "));
+        let injected = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter_map(|(name, value)| name.eq_ignore_ascii_case(header).then_some(value.trim()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            injected,
+            [format!("{prefix}{key}")],
+            "{path} must forward exactly one tenant upstream credential"
+        );
+        assert!(!headers.contains("Basic "), "{path} must strip ingress Basic Auth");
     }
 }

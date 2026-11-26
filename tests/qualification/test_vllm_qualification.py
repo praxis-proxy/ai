@@ -469,6 +469,41 @@ class QualificationTest(unittest.TestCase):
             wrong_attempt = qualification.acceptance(path, "success", 17, 3, "a" * 40, "Codex")
             self.assertEqual(wrong_attempt["status"], "unreported")
 
+    def test_acceptance_reports_the_vllm_image_the_lane_served(self):
+        backend = {"image_tag": "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B", "local_image_id": "sha256:abc",
+                   "registry_digest": None, "image_source": "runner", "model": "Qwen/Qwen3-8B"}
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.json"
+            raw.write_text(json.dumps(report()))
+            codex_raw = Path(directory) / "codex-acceptance.json"
+            codex_raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                             "cases": [{"id": "codex_native", "status": "success"}],
+                                             "backend": backend}))
+            finished = qualification.finish(raw, True, "success", "success", "skipped", "success",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=codex_raw)
+        self.assertEqual(finished["suites"]["codex_acceptance"]["backend"], backend)
+        self.assertIn("Codex Acceptance: success (1/1 scenarios succeeded); vLLM image `sha256:abc` (runner).",
+                      qualification.render(finished))
+        # A lane that recorded no image renders as before.
+        self.assertNotIn("backend", finished["suites"]["claude_acceptance"])
+
+    def test_acceptance_only_dispatch_reports_client_outcome_and_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "codex.json"
+            raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                       "cases": [{"id": "codex_native", "status": "failure"}],
+                                       "backend": {"local_image_id": "sha256:abc", "image_source": "registry",
+                                                   "registry_digest": "sha256:def"}}))
+            finished = qualification.finish(None, False, "success", "skipped", "skipped", "failure",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=raw)
+        for detailed in (False, True):
+            rendered = qualification.render(finished, detailed=detailed)
+            self.assertIn("Full Responses GPU suite was not requested", rendered)
+            self.assertIn("Codex Acceptance: failure (0/1 scenarios succeeded); "
+                          "vLLM image `sha256:abc` (registry, digest `sha256:def`).", rendered)
+            self.assertNotIn("Claude Acceptance:", rendered)
+            self.assertNotIn("Native Responses:", rendered)
+
     def test_codex_provenance_is_separate_from_full_suite_and_requires_current_run(self):
         provenance = {
             "codex_version": "0.170.0",

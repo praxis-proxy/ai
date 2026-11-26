@@ -5,63 +5,30 @@ once: the raw JSON body, parsed input, restored history, rewritten model input,
 tool results, streaming events, and a response prepared for storage. Each can
 fit its own size limit while their combined payload grows across inference
 rounds. `openai_agentic_loop.max_retained_bytes` bounds that request's charged
-payload before another representation is created.
+payload before another representation is created. The budget covers the whole
+exchange; a model reply does **not** reset it.
 
-For example, a request with a modest prompt can load earlier messages, receive
-a model tool call, retain a search result, and send that result back to the
-model. The prompt, history, tool result, and response may all be live together.
-The budget follows the whole exchange rather than restarting for each round.
+The ledger distinguishes two payload lifetimes:
 
-The ledger distinguishes two payload lifetimes. **Retained** charges survive
-inference rounds: the prompt, restored history, tool results, and output items
-kept for the final response. Some output items also become input history for
-the next model call. **Round-local** charges cover one round's buffered provider
-body or its raw SSE transport and parsed frames. When the loop decides to run
-another round, it charges the output items that survived and removes the
-round-local charge. The router then discards the round's response before the
-next inference request. The next round reuses the released headroom; retained
-history and output still accumulate toward the limit.
-
-For example, after the first tool call, the result remains in the model-facing
-history and the public output list. The temporary tool transport and the first
-model response need not be charged as if they remained live throughout the
-second tool call. The ledger keeps charges for the result and output list,
-releases the completed round's provider charge, then reserves headroom for the
-second round. A model reply does **not** reset the entire request budget.
-The separate iterative-router buffer reserve remains charged throughout the
-request. On a terminal or failed round, there is no next inference round to
-reuse headroom; the remaining round-local charge ends with the request.
-
-### One request across two rounds
-
-Using the worked example below, the request makes one tool call and finishes
-after the second model reply. The total **falls between rounds** because the
-first provider response's temporary charge is released. Its surviving output
-remains charged.
-
-```mermaid
-flowchart TB
-    A["Start<br/>801.25 KiB charged<br/>Input + router reserve"]
-    B["Round 1 response<br/>1,441.25 KiB charged<br/>Add 640 KiB temporary charge"]
-    C["Continue: charge falls<br/>1,441.25 → 865.25 KiB<br/>Release 640 KiB, keep 64 KiB output"]
-    D["Tool result<br/>885.25 KiB charged<br/>Keep another 20 KiB"]
-    E["Round 2 response<br/>1,525.25 KiB charged<br/>Add 640 KiB temporary charge"]
-    F["Finish<br/>Request ledger ends"]
-    A --> B --> C --> D --> E --> F
-```
-
-The 576 KiB drop at **Continue** is the 640 KiB provider charge released minus
-the 64 KiB output charge retained for later rounds. Response 2 ends the
-request, so its temporary charge stays until the ledger is dropped. If round 2
-also calls a tool, the same release and retain step repeats before round 3.
+- **Retained** charges survive inference rounds: the prompt, restored history,
+  tool results, and output items kept for the final response (some of which
+  also become input history for the next model call). The iterative-router
+  buffer reserve also stays charged for the whole request.
+- **Round-local** charges cover one round's buffered provider body, or its raw
+  SSE transport and parsed frames. When the loop runs another round, it charges
+  the output items that survived and removes the round-local charge; the router
+  then discards the round's response before the next inference request. The
+  next round reuses that headroom while retained history and output keep
+  accumulating. On a terminal or failed round there is no next round, so the
+  round-local charge ends with the request.
 
 ## Scope and configuration
 
 The budget applies to managed `POST /v1/responses` creates on a listener with a
 reachable `openai_agentic_loop`. An explicit `POST /v1/responses/compact` on
-that listener starts its own budget. Other operations such as response fetch
-and delete do not start a request ledger. Filters that are not configured in
-the request path add no charge for their work.
+that listener starts its own budget. Other operations, such as response fetch
+and delete, start no ledger. Filters not configured in the request path add no
+charge.
 
 ```yaml
 - filter: openai_agentic_loop
@@ -69,33 +36,30 @@ the request path add no charge for their work.
   max_retained_bytes: 67108864 # 64 MiB
 ```
 
-`max_retained_bytes` defaults to 64 MiB and accepts values from 4 KiB through
-256 MiB. It cannot be disabled on a configured agentic loop. If several loops
-are reachable on one listener, the smallest configured value applies. The
-default has the same numeric value as core's `MAX_JSON_BODY_BYTES`; these are
-independent limits with different purposes. See the [agentic-loop example] and
-the generated [filter configuration reference].
+`max_retained_bytes` defaults to 64 MiB and accepts 4 KiB through 256 MiB. It
+cannot be disabled on a configured agentic loop. If several loops are reachable
+on one listener, the smallest value applies. The default equals core's
+`MAX_JSON_BODY_BYTES` numerically, but the two are independent limits. See the
+[agentic-loop example] and the generated [filter configuration reference].
 
-`max_infer_iters` is a separate round-trip limit: it defaults to 10 and must
-be between 1 and the core iterative-router ceiling of 100. Raising it permits
-more rounds, but does not reset or enlarge the retained-payload budget.
-Configure the router's `max_iterations` to allow the initial inference step
-plus the intended continuations, as shown in the [agentic-loop example].
+`max_infer_iters` is a separate round-trip limit: default 10, between 1 and the
+core iterative-router ceiling of 100. Raising it permits more rounds but does
+not reset or enlarge the budget. Set the router's `max_iterations` to allow the
+initial inference step plus the intended continuations, as in the
+[agentic-loop example].
 
-At pipeline build, the server installs the policy before request filters run.
-It clamps the listener's raw request-body limit to at most one thirty-second
-of the retained limit, and the buffered iterative-router response limit to at
-most one eighth. With the default, these transport limits are at most 2 MiB
-and 8 MiB respectively. The raw request cap applies to **other routes on the
-same listener too**. A dedicated listener avoids imposing it on unrelated
-traffic. The iterative router must contain the loop in a bounded step.
+At pipeline build, before request filters run, the server clamps the listener's
+raw request-body limit to at most 1/32 of the retained limit and the buffered
+iterative-router response limit to at most 1/8 (2 MiB and 8 MiB at the
+default). The raw request cap applies to **other routes on the same listener
+too**, so use a dedicated listener to keep it off unrelated traffic. The
+iterative router must contain the loop in a bounded step.
 
 ## What the ledger tracks
 
 The ledger charges payloads owned during one budgeted Responses request. A
 reference in the incoming JSON is distinct from content the proxy later loads
-for that reference. Only filters on the configured request path add their
-charges.
+for it.
 
 | Payload | What is charged | Lifetime |
 | --- | --- | --- |
@@ -107,18 +71,18 @@ charges.
 | Kept output and tools | Output items kept for the final response or replay, plus configured MCP discovery and calls, hosted search results, approvals, and model-facing and public tool output. | Kept output and tool results accumulate across rounds; temporary callout reservations can be settled after their owners are dropped. |
 | Rewrites and completion | Configured model rewrites, prompt enrichment, Responses-to-Chat translation, Store input and output projections, and conversation append-back. Explicit compaction has its own budget for restored history and summarization. | Charged while their request-side owners are live. Store adds projections when `store` is omitted or `true`. |
 
-This inventory describes **accounting allowances**, not measured allocations.
-It does not measure process memory or add together separate requests. Per-file,
-body, tool, and Store limits still apply independently.
+Per-file, body, tool, and Store limits still apply independently.
 
 ### How charges are calculated
 
-The transport caps limit bytes received on the wire. The request ledger then
-reserves headroom for overlapping raw, parsed, rewritten, and serialized
-representations. A multiplier is a **conservative accounting allowance**, not
-a count of copies actually made or a measurement of allocated memory. It
+The transport caps limit bytes received on the wire. The ledger then reserves
+headroom for overlapping raw, parsed, rewritten, and serialized
+representations. Every multiplier below is a **conservative accounting
+allowance**, not a count of copies or a measurement of allocated memory: it
 leaves room for JSON objects, collection spare capacity, and temporary values
-that coexist while filters transform a payload.
+that coexist while filters transform a payload. The ledger does not measure
+process RSS, include every allocator overhead, or sum memory across concurrent
+requests.
 
 For a JSON body with `B` wire bytes and `E` counted JSON syntax elements:
 
@@ -132,30 +96,27 @@ For a JSON body with `B` wire bytes and `E` counted JSON syntax elements:
 | MCP server reply | `16 × B + 512 × E` bytes for each JSON body, SSE event `data`, or error body, checked before rmcp parses it | Covers the raw body, SSE framing, rmcp parsing, and result conversion; measured peak is about `8 × B + 250 × E`. Before dispatching `N` calls in a round, the dispatcher reserves a slot of `remaining ÷ 2 ÷ N` per call. Each reply's charge may use half its slot, and its wire limit is that half divided by 16. |
 | Iterative-router response buffer | `3 × (limit ÷ 8)` bytes | Reserves for the core buffer and possible spare capacity before the provider responds. This is 24 MiB at the default 64 MiB limit. |
 
-For a create that restores history, Store receives the remaining ledger
-allowance. Before decoding, each backend preflights raw JSON byte lengths and
-scans the JSON structure. A response or conversation is charged
-`32 × B + 8,192 × E`, where `B` is the serialized JSON payload bytes and
-relevant record identifiers, and `E` counts JSON containers, keys, and scalar
-values. The backend returns the measured charge; rehydration reserves it once
-before it creates replay projections. These values are conservative accounting
-allowances, not measured allocations.
+For a create that restores history, Store receives the remaining allowance.
+Before decoding, each backend preflights raw JSON byte lengths and scans the
+JSON structure. A response or conversation is charged `32 × B + 8,192 × E`,
+where `B` is the serialized JSON payload bytes and relevant record identifiers,
+and `E` counts JSON containers, keys, and scalar values. The backend returns
+the charge, and rehydration reserves it once before creating replay
+projections.
 
 Conversation append-back checks the new items it writes and any legacy prefix
-that must be read and wrapped during its first item append. Existing item rows
-are not read or rebuilt by append-back, so their history is not charged a
-second time at that boundary. Explicit compaction keeps its separate ledger
-and 512× Store-read allowance. These caps apply to charged payload, not the
-entire database or process memory.
+that must be read and wrapped during its first item append. It does not read or
+rebuild existing item rows, so their history is not charged twice. Explicit
+compaction keeps its separate ledger and 512× Store-read allowance. These caps
+apply to charged payload, not the whole database.
 
-`E` counts parts **inside the JSON document**, not physical servers or
-machines. It includes the start of each object or array, each key string,
-and each string, number, boolean, or `null` value. For example,
+`E` counts parts **inside the JSON document**: the start of each object or
+array, each key string, and each string, number, boolean, or `null` value.
+Commas and colons do not count. For example,
 `{"input":"hi","store":false}` has five counted elements: the object,
 the `input` key, the `hi` value, the `store` key, and the `false` value.
-Commas and colons do not count. A scanner counts these elements directly
-from borrowed bytes before JSON parsing. This matters because a short JSON
-body with thousands of tiny values can require substantially more allocated
+A scanner counts them from borrowed bytes before JSON parsing. This matters
+because a short body with thousands of tiny values can need far more allocated
 structure than its wire length suggests.
 
 For example, suppose the configured limit is 64 MiB and a create body is
@@ -165,8 +126,7 @@ The router reserve adds **24 MiB**. With omitted `store`, the Store input
 projection adds the same input charge again. The ledger therefore starts at
 **56 MiB + 5 KiB**, leaving just under **8 MiB** for history, tool work,
 output, and other owners. With `store: false`, it starts at
-**40 MiB + 2.5 KiB**. These are reserved charges,
-not a claim that the process has allocated those exact amounts.
+**40 MiB + 2.5 KiB**.
 
 The same distinction applies to output. A hypothetical 1 KiB buffered
 response with 10 counted JSON elements needs
@@ -177,15 +137,13 @@ round-local charge with `32 × 512` = **16 KiB** of retained charge. With Store,
 it replaces 288 KiB with `(32 + 16) × 512` = **24 KiB**. The next round can use
 the released headroom, while the 16 KiB or 24 KiB continues to count.
 
-Here is a simplified ledger simulation for a two-round request with
-`store: false` and a **2 MiB** limit. Assume a 1 KiB input body with five
-counted JSON elements, two 8 KiB provider responses with 16 counted elements
-each, and 2 KiB of output items kept from the first round. The second round
-finishes the request. The tool result adds an illustrative 20 KiB retained
-charge after its temporary callout allowance is
-settled. An actual tool request also incurs charges for tool declarations,
-dispatch, and any configured request filters. These are **ledger charges**,
-not measured heap usage or a complete HTTP fixture.
+A simplified two-round simulation with `store: false` and a **2 MiB** limit:
+a 1 KiB input body with five counted JSON elements, two 8 KiB provider
+responses with 16 counted elements each, and 2 KiB of output items kept from
+the first round. The second round finishes the request. The tool result adds an
+illustrative 20 KiB retained charge after its temporary callout allowance is
+settled. A real tool request also charges tool declarations, dispatch, and any
+configured request filters; this is not a complete HTTP fixture.
 
 | Step | Retained and fixed reserves | Current round charge | Total charged |
 | --- | ---: | ---: | ---: |
@@ -197,14 +155,14 @@ not measured heap usage or a complete HTTP fixture.
 
 The opening charge is `32 × 1 KiB + 256 × 5` = **33.25 KiB** for input,
 plus `3 × (2 MiB ÷ 8)` = **768 KiB** for the router buffer. Each model response
-adds `64 × 8 KiB + 8,192 × 16` = **640 KiB**. The first continuation
-replaces that charge with `32 × 2 KiB` = **64 KiB** for the output items it
-keeps. If response 1's temporary charge remained alongside those kept items,
-the second response would bring this simplified example to **2,165.25 KiB**,
-above the 2,048 KiB limit. With the release, response 2 is charged at
-**1,525.25 KiB**, while the previous output and tool result continue to
-count. Because response 2 ends the request, its round-local charge is not
-released for another round; it disappears when the request ledger is dropped.
+adds `64 × 8 KiB + 8,192 × 16` = **640 KiB**. The first continuation replaces
+that charge with `32 × 2 KiB` = **64 KiB** for the kept output items, so the
+total falls by 576 KiB. Had response 1's charge stayed, response 2 would bring
+the total to **2,165.25 KiB**, above the 2,048 KiB limit. With the release it
+is **1,525.25 KiB**. Because response 2 ends the request, its round-local
+charge is not released; it disappears when the request ledger is dropped. If
+round 2 also called a tool, the same release-and-retain step would repeat
+before round 3.
 
 Streaming uses the chunk and frame charges in the table instead of the
 buffered-response formula. On continuation, surviving output gets the same
@@ -215,10 +173,10 @@ terminal response adds a separate `4 ×` serialized-output allowance (plus
 filters likewise reserve their specific expansions before creating them and
 can settle temporary headroom after intermediate values are released.
 
-The configured number is a ceiling for the **accounting model**, not a
-promise that a raw body of that size will be accepted. It can be exhausted
-below either transport cap when the request has many JSON elements, restored
-history, tool results, or several simultaneously live payload owners.
+The configured number is a ceiling for the **accounting model**, not a promise
+that a raw body of that size will be accepted. It can be exhausted below either
+transport cap when the request has many JSON elements, restored history, tool
+results, or several payload owners live at once.
 
 ## Request flow and ownership
 
@@ -230,25 +188,18 @@ history, tool results, or several simultaneously live payload owners.
    separate ledger for its Store reads and summarization callout.
 3. `openai_agentic_loop` admits each buffered provider response before parsing
    it. For streaming, `openai_stream_events` charges chunks before assembling
-   frames, then charges completed frames and the terminal response. These
-   per-round provider charges are round-local: when the loop continues to the
-   next round, the loop retains the output the round left in `accumulated_output`
-   and removes its round-local body, transport, and frame charges. The router
-   discards the previous response before the next inference request. Retained
-   input, history, tool results, and output persist across iterative-router
-   rounds.
+   frames, then charges completed frames and the terminal response. On
+   continuation the loop retains the output left in `accumulated_output` and
+   removes the round's body, transport, and frame charges.
 4. Tool dispatchers reserve callout and result headroom before executing
-   calls. The loop owns one canonical output list; dispatchers identify their
+   calls. The loop owns one canonical output list; dispatchers find their
    assigned item by index and ID and update it instead of keeping a second
    full output tree.
 5. Conversation append-back and response persistence account for their own
    retained representations before reporting a completed response.
 
-The ledger reserves conservatively before an allocation or callout and can
-settle temporary headroom after an intermediate value is released. It tracks
-explicitly charged payload owners. It does not measure process RSS, include
-every allocator overhead, or sum memory across concurrent requests. Other
-request limits, transport caps, and operational capacity controls still apply.
+Filters reserve before an allocation or callout and can settle temporary
+headroom once an intermediate value is released.
 
 ## Filter responsibilities
 
@@ -293,10 +244,10 @@ whether a stream has already committed. An exhausted budget does not wait for
 another request, refill over time, or shed a different active request. Each
 new request gets its own ledger and is admitted or rejected on its own work.
 
-The [agentic-loop integration tests] exercise admission before inference,
+The [agentic-loop integration tests] cover admission before inference,
 buffered output overflow, streaming terminal errors, Store and conversation
-behavior, restoration, and tool paths. They test protocol outcomes; they are
-not measurements of whole-process peak memory under concurrent load.
+behavior, restoration, and tool paths. They test protocol outcomes, not
+whole-process peak memory under concurrent load.
 
 [agentic-loop example]: ../../examples/configs/openai/responses/agentic-loop.yaml
 [filter configuration reference]: ../filters/agents/openai_agentic_loop.md

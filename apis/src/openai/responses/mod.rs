@@ -549,6 +549,11 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
             max_output_tokens.to_string(),
         );
     }
+    if let Some(modality) = classified.modality {
+        ctx.record_ai_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
+    } else {
+        drop(ctx.filter_metadata.remove(crate::classifier::MODALITY_METADATA_KEY));
+    }
 }
 
 /// Write boolean presence flags to metadata.
@@ -656,6 +661,9 @@ fn promote_optional_results(
 
     if let Some(max_output_tokens) = classified.max_output_tokens {
         results.set("max_output_tokens", max_output_tokens.to_string())?;
+    }
+    if let Some(modality) = classified.modality {
+        results.set("modality", modality.as_str())?;
     }
 
     Ok(())
