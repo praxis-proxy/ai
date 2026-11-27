@@ -15,9 +15,18 @@ jobs:
   vertex:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     environment: providers-live
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
@@ -79,12 +88,25 @@ jobs:
           jq -e 'any(.candidates[]?.content.parts[]?; (.text | type == "string" and length > 0))' "$response" >/dev/null 2>&1 ||
             { echo "::error::Vertex AI returned no candidate text."; exit 1; }
 
+          PRAXIS_CLOUD_SMOKE_PROVIDER=vertex PRAXIS_CLOUD_SMOKE_MODEL="$GEMINI_MODEL" \
+            PRAXIS_CLOUD_SMOKE_CREDENTIAL="$token" uv run --script \
+            tests/integration/sdk/openai/test_cloud_chat_completions_live.py --tb=no
+
   azure:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     environment: providers-live
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
       - name: Authenticate to Azure
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
@@ -126,3 +148,7 @@ jobs:
           fi
           jq -e 'any(.choices[]?; (.message.content | type == "string" and length > 0))' "$response" >/dev/null 2>&1 ||
             { echo "::error::Azure OpenAI returned no assistant text."; exit 1; }
+
+          PRAXIS_CLOUD_SMOKE_PROVIDER=azure PRAXIS_CLOUD_SMOKE_MODEL="gpt-4o" \
+            PRAXIS_CLOUD_SMOKE_CREDENTIAL="$key" uv run --script \
+            tests/integration/sdk/openai/test_cloud_chat_completions_live.py --tb=no
