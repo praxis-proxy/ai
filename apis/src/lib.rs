@@ -47,8 +47,8 @@ pub use mcp_client::McpStreamingSelectorFilter;
 pub mod mcp_session {
     pub use crate::mcp_client::{
         MAX_LISTING_RESPONSE_BYTES, MAX_PAGES, McpExchangeStage, McpInitializeError, McpListingError, McpListingLimits,
-        McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit, McpStreamingRequested, McpToolPage,
-        paginate_tools,
+        McpListingScope, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit, McpStreamingRequested,
+        McpToolPage, paginate_tools,
     };
 }
 /// Operator admission of MCP tool metadata, for callers that discover tools

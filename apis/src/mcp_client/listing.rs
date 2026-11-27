@@ -20,7 +20,7 @@ use super::measure_tools_json_bytes;
 pub const MAX_PAGES: usize = 100;
 
 /// One page of a `tools/list` result.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct McpToolPage<T> {
     /// Tools on this page.
     pub tools: Vec<T>,

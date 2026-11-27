@@ -56,7 +56,9 @@ use secrecy::{ExposeSecret as _, SecretString};
 pub(crate) use self::subrequest_transport::validate_mcp_target;
 pub use self::{
     listing::{MAX_PAGES, McpListingError, McpListingLimits, McpToolPage, paginate_tools},
-    session::{McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit},
+    session::{
+        McpInitializeError, McpListingScope, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
+    },
     streaming_selector::McpStreamingSelectorFilter,
     subrequest_transport::{McpExchangeStage, McpStreamingRequested},
 };

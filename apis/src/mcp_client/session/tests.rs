@@ -1235,7 +1235,7 @@ async fn more_server_requests_than_the_cap_are_malformed() {
 
     assert_eq!(
         result,
-        half_made(McpSessionError::Malformed("too many server requests during initialize")),
+        half_made(McpSessionError::Malformed("too many server requests")),
         "requests past the cap end the handshake"
     );
     assert_eq!(
@@ -1537,7 +1537,7 @@ async fn sessionless_failure_reports_no_issued_session() {
     assert_eq!(
         result,
         Err(McpInitializeError::from(McpSessionError::Malformed(
-            "initialize stream has no reply"
+            "stream has no reply"
         ))),
         "a sessionless failure reports no session to end"
     );
@@ -1707,5 +1707,231 @@ fn errors_carry_no_server_text() {
     assert!(
         !rendered.contains("secret"),
         "server messages never reach the error text"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// tools/list
+// -----------------------------------------------------------------------------
+
+/// A `tools/list` result for the request the backend received.
+fn tools_result(request: &serde_json::Value, tools: &serde_json::Value, next: Option<&str>) -> String {
+    let mut result = serde_json::json!({ "tools": tools });
+    if let Some(next) = next {
+        result["nextCursor"] = serde_json::json!(next);
+    }
+    serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }).to_string()
+}
+
+/// Start a backend answering `tools/list` with `reply`, built from the
+/// request it received. With `ping_first`, the reply arrives on an SSE stream
+/// after a `ping` the client must answer first.
+async fn listing_backend(
+    ping_first: bool,
+    reply: impl Fn(&serde_json::Value) -> String + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<Received>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let answered = Arc::new(tokio::sync::Notify::new());
+    let reply = Arc::new(reply);
+    let log = Arc::clone(&received);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (log, answered, reply) = (Arc::clone(&log), Arc::clone(&answered), Arc::clone(&reply));
+            tokio::spawn(async move {
+                let Some(request) = read_request(&mut stream).await else {
+                    return;
+                };
+                let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+                log.lock().unwrap().push(request);
+                if body["method"] != "tools/list" {
+                    answered.notify_one();
+                    let _written = stream.write_all(&http_response("202 Accepted", &[], "")).await;
+                    return;
+                }
+                if !ping_first {
+                    let bytes = http_response("200 OK", &[("Content-Type", "application/json")], &reply(&body));
+                    let _written = stream.write_all(&bytes).await;
+                    return;
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _written = stream.write_all(head.as_bytes()).await;
+                let _written = stream
+                    .write_all(sse_chunk(&ping(&serde_json::json!("ping-l"))).as_bytes())
+                    .await;
+                let _flushed = stream.flush().await;
+                answered.notified().await;
+                let _written = stream.write_all(sse_chunk(&reply(&body)).as_bytes()).await;
+                let _flushed = stream.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    (format!("http://{addr}/mcp"), received)
+}
+
+fn object_tool(name: &str) -> serde_json::Value {
+    serde_json::json!({ "name": name, "inputSchema": { "type": "object" } })
+}
+
+async fn list_via(
+    url: &str,
+    scope: McpListingScope<'_>,
+    cursor: Option<&str>,
+) -> Result<McpToolPage<serde_json::Value>, McpSessionError> {
+    session_client(1 << 20)
+        .list_tools(
+            "/mcp",
+            staged(url).await,
+            &callout(Duration::from_secs(5)),
+            scope,
+            cursor.map(str::to_owned),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn session_listing_sends_the_session_and_reads_the_page() {
+    let (url, received) = listing_backend(false, |request| {
+        tools_result(
+            request,
+            &serde_json::json!([object_tool("a"), object_tool("b")]),
+            Some("next"),
+        )
+    })
+    .await;
+    let session = session(Some("s-1"));
+
+    let page = list_via(&url, McpListingScope::Session(&session), Some("c1"))
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = page.tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(page.next_cursor.as_deref(), Some("next"), "the next cursor is returned");
+    let received = received.lock().unwrap();
+    let request = &received[0];
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["method"], "tools/list");
+    assert_eq!(body["params"]["cursor"], "c1", "the cursor is sent");
+    assert!(
+        body["params"].get("_meta").is_none(),
+        "no stateless metadata on a session"
+    );
+    assert!(
+        body["id"].as_str().unwrap().starts_with(TOOLS_LIST_REQUEST_ID_PREFIX),
+        "a fresh id that no client id collides with"
+    );
+    assert_eq!(request.header("mcp-session-id"), Some("s-1"));
+    assert_eq!(request.header("mcp-protocol-version"), Some("2025-06-18"));
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer first"),
+        "credential forwarded"
+    );
+    assert!(request.header("mcp-method").is_none());
+}
+
+#[tokio::test]
+async fn stateless_listing_declares_the_profile() {
+    let (url, received) = listing_backend(false, |request| {
+        tools_result(request, &serde_json::json!([object_tool("a")]), None)
+    })
+    .await;
+
+    let page = list_via(
+        &url,
+        McpListingScope::Stateless {
+            protocol_version: "2026-07-28",
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.tools.len(), 1);
+    assert!(page.next_cursor.is_none(), "the last page has no cursor");
+    let received = received.lock().unwrap();
+    let request = &received[0];
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    let meta = &body["params"]["_meta"];
+    assert_eq!(meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+    assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], CLIENT_NAME);
+    assert!(meta["io.modelcontextprotocol/clientCapabilities"].is_object());
+    assert!(body["params"].get("cursor").is_none(), "the first page sends no cursor");
+    assert_eq!(request.header("mcp-protocol-version"), Some("2026-07-28"));
+    assert_eq!(request.header("mcp-method"), Some("tools/list"));
+    assert!(request.header("mcp-session-id").is_none(), "no session");
+}
+
+#[tokio::test]
+async fn listing_errors_keep_their_class() {
+    let (url, _) = listing_backend(false, |request| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "error": { "code": -32601, "message": "no tools here" },
+        })
+        .to_string()
+    })
+    .await;
+    let session = session(Some("s-1"));
+    assert_eq!(
+        list_via(&url, McpListingScope::Session(&session), None).await,
+        Err(McpSessionError::JsonRpc { code: -32601 }),
+        "a JSON-RPC error keeps its code"
+    );
+
+    let (url, _) = listing_backend(false, |request| {
+        tools_result(request, &serde_json::json!([{ "name": "no_schema" }]), None)
+    })
+    .await;
+    assert_eq!(
+        list_via(&url, McpListingScope::Session(&session), None).await,
+        Err(McpSessionError::Malformed(
+            "tools/list reply is not a tools/list result"
+        )),
+        "a tool without an input schema is not an MCP tool"
+    );
+
+    let (url, _) = listing_backend(false, |_request| {
+        tools_result(&serde_json::json!({ "id": "other" }), &serde_json::json!([]), None)
+    })
+    .await;
+    assert_eq!(
+        list_via(&url, McpListingScope::Session(&session), None).await,
+        Err(McpSessionError::Malformed("tools/list reply id does not match"))
+    );
+}
+
+#[tokio::test]
+async fn ping_during_a_listing_is_answered_with_the_negotiated_version() {
+    let (url, received) = listing_backend(true, |request| {
+        tools_result(request, &serde_json::json!([object_tool("a")]), None)
+    })
+    .await;
+    let session = session(Some("s-1"));
+
+    let page = list_via(&url, McpListingScope::Session(&session), None).await.unwrap();
+
+    assert_eq!(page.tools.len(), 1, "the reply after the ping is read");
+    let received = received.lock().unwrap();
+    let pong = received
+        .iter()
+        .find(|request| !request.body.contains("tools/list"))
+        .expect("the ping is answered");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&pong.body).unwrap(),
+        serde_json::json!({ "jsonrpc": "2.0", "id": "ping-l", "result": {} })
+    );
+    assert_eq!(pong.header("mcp-session-id"), Some("s-1"));
+    assert_eq!(
+        pong.header("mcp-protocol-version"),
+        Some("2025-06-18"),
+        "answers after initialization carry the negotiated version"
     );
 }
