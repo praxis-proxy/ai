@@ -804,6 +804,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: vertex.gemini.response.reasoning_usage
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/thought-usage
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: vertex.gemini.streaming.candidate_limit
     scopes:
       - openai_chat_completions_to_vertexai_gemini

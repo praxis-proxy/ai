@@ -67,10 +67,26 @@ if args[:1] == ["run"] and args[2:4] == ["cargo", "tree"]:
         commands = [call for call in calls if call[0] == "run"]
         for call in commands:
             self.assertEqual(call[:3], ["run", "nightly" if call[3] == "fmt" else "9.8.7", "cargo"])
-        clippy = [call for call in commands if call[3] == "clippy"]
-        self.assertEqual(len(clippy), 3, "default, opt-in and lean Clippy passes must remain")
+        clippy = [call[4:] for call in commands if call[3] == "clippy"]
         for call in clippy:
             self.assertEqual(call[-3:], ["--", "-D", "warnings"])
+        passes = [call[:-3] for call in clippy]
+        opt_in = [args for args in passes
+                  if args[:-1] == ["--workspace", "--all-targets", "--features"]]
+        self.assertEqual(len(opt_in), 1, "expected one workspace opt-in Clippy pass")
+        opt_in_features = opt_in[0][-1].split(",")
+        self.assertIn("praxis-ai-proxy/openai-all", opt_in_features)
+        self.assertIn("praxis-ai-proxy/store-all", opt_in_features)
+        self.assertCountEqual(passes, [
+            ["--workspace", "--all-targets"],
+            opt_in[0],
+            ["-p", "praxis-ai-apis", "--all-targets", "--no-default-features",
+             "--features", "openai-files-s3"],
+            ["-p", "praxis-ai-apis", "--test", "s3_file_store", "--no-default-features",
+             "--features", "openai-files-s3,object_store/aws"],
+            ["-p", "praxis-ai-apis", "-p", "praxis-ai-filters", "-p", "praxis-ai-proxy",
+             "--all-targets", "--no-default-features", "--features", "praxis-ai-proxy/standard"],
+        ])
         self.assertIn(["run", "nightly", "cargo", "fmt", "--all", "--", "--check"], calls)
 
     def test_failed_nightly_refresh_stops_before_any_lint(self):

@@ -28,6 +28,7 @@ WORKFLOWS = (
     ("hosted-passthrough-nightly.yaml", "Hosted passthrough", "Official OpenAI Chat Completions, Embeddings, and Responses, Anthropic Messages, plus Bedrock Runtime Chat Completions SDK checks and Responses translation smoke"),
     ("anthropic-vllm-vision.yaml", "Anthropic vision", "Anthropic SDK image requests on GPU"),
     ("hosted-translation-nightly.yaml", "Hosted translation", "Live Anthropic Messages and OpenAI Responses to official OpenAI Chat Completions, plus Chat Completions to official Anthropic Messages"),
+    ("oidc-smoke.yaml", "Azure and Vertex smoke", "Live OIDC access and gateway Chat Completions and Azure Embeddings SDK checks"),
     ("openai-conformance.yaml", "OpenAI conformance", "Pinned schema and conformance checks"),
     ("openresponses-conformance.yaml", "OpenResponses conformance", "Responses translation against CPU vLLM"),
     ("container.yaml", "Container", "Container build and runtime smoke tests"),

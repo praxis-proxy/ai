@@ -563,6 +563,39 @@ class TestNativePassthrough:
             for block in blocks
         ), "tool_result block must reach the native backend unchanged"
 
+    def test_repeated_top_level_model_is_rejected_before_backend(self, native_client):
+        """A raw body can repeat ``model`` where ``messages.create`` cannot, and
+        the request filter must refuse it instead of forwarding both copies."""
+        duplicate_body = json.dumps({
+            "model": MODEL,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })[:-1].encode() + b',"model":"other-model"}'
+
+        with pytest.raises(BadRequestError) as exc_info:
+            native_client.post(
+                "/v1/messages",
+                cast_to=dict,
+                content=duplicate_body,
+                options={"headers": {"Content-Type": "application/json"}},
+            )
+
+        assert exc_info.value.status_code == 400
+        envelope = exc_info.value.response.json()
+        assert envelope["type"] == "error", "rejection must use the Anthropic error envelope"
+        assert envelope["error"]["type"] == "invalid_request_error", envelope
+        assert "more than one top-level 'model' field" in envelope["error"]["message"], envelope
+        assert NATIVE_STATE.requests == [], "a repeated model must not reach the backend"
+
+        # Control: the same client and route still serve one unambiguous model.
+        response = native_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        assert response.content[0].text == "hello"
+        assert len(NATIVE_STATE.requests) == 1, "the control request must reach the backend once"
+
 
 class TestTranslatedToChatCompletions:
     """Route 2: Anthropic Messages -> Chat Completions (`messages-to-openai.yaml`)."""

@@ -302,6 +302,148 @@ fn current_profile_rejects_oversized_chunked_handshake() {
 }
 
 #[test]
+fn current_profile_handshake_completes_on_sse_reply_that_stays_open() {
+    let weather = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        sse_initialize_held_open: true,
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let started = std::time::Instant::now();
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 5, "weather_get_weather"));
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "the handshake must finish without waiting for the stream to close: {body}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the handshake must not wait for the 5 s handshake timeout"
+    );
+    assert_eq!(
+        weather.session_ids_for("tools/call"),
+        vec![Some("mock-mcp-session-1".to_owned())],
+        "the call must carry the session from the SSE handshake"
+    );
+}
+
+#[test]
+fn current_profile_handshake_answers_backend_ping_before_initialize_result() {
+    // Two replicas behind one cluster, each holding its `initialize` result
+    // until it receives the pong. The default round-robin load balancer picks
+    // by a monotonic counter, so an unpinned pong would be the handshake
+    // chain's next pick and land on the other replica, which rejects the
+    // unknown session and fails the handshake.
+    let ping_backend = || {
+        start_mcp_mock_server_with_config(McpMockConfig {
+            enforce_sessions: true,
+            ping_before_initialize_result: true,
+            tools: vec![McpToolFixture::new("get_weather")],
+            ..McpMockConfig::default()
+        })
+    };
+    let (replica_a, replica_b) = (ping_backend(), ping_backend());
+    let calendar = start_session_backend("create_event");
+    let yaml = session_broker_yaml(&replica_a, &calendar, "").replacen(
+        &format!("endpoints: [\"{}\"]", replica_a.endpoint()),
+        &format!(
+            "endpoints: [\"{}\", \"{}\"]",
+            replica_a.endpoint(),
+            replica_b.endpoint()
+        ),
+        1,
+    );
+    let proxy = start_proxy(&Config::from_yaml(&yaml).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let call = tools_call(&gateway, 7, "weather_get_weather").replacen(
+        "Host: localhost\r\n",
+        "Host: localhost\r\nAuthorization: Bearer ping-token\r\n",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &call);
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "the handshake must complete once the ping is answered: {body}"
+    );
+    let (owner, other) = if replica_a.sessions_minted() == 1 {
+        (&replica_a, &replica_b)
+    } else {
+        (&replica_b, &replica_a)
+    };
+    assert_eq!(
+        other.received_requests().len(),
+        0,
+        "nothing may reach the replica without the session"
+    );
+    let pongs: Vec<_> = owner
+        .received_requests()
+        .into_iter()
+        .filter(|r| r.json_rpc_method.is_none())
+        .collect();
+    assert_eq!(pongs.len(), 1, "the ping is answered once, on the session's replica");
+    let pong: serde_json::Value = serde_json::from_str(&pongs[0].body).unwrap();
+    assert_eq!(
+        pong,
+        serde_json::json!({ "jsonrpc": "2.0", "id": "mock-ping-mock-mcp-session-1", "result": {} }),
+        "the pong echoes the ping id with an empty result"
+    );
+    let header = |name: &str| {
+        pongs[0]
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(
+        header("authorization"),
+        Some("Bearer ping-token"),
+        "credential forwarded"
+    );
+    assert_eq!(header("mcp-session-id"), Some("mock-mcp-session-1"), "session id sent");
+    assert_eq!(
+        replica_a.sessions_minted() + replica_b.sessions_minted(),
+        1,
+        "one backend session"
+    );
+    assert_eq!(
+        owner.session_ids_for("tools/call"),
+        vec![Some("mock-mcp-session-1".to_owned())],
+        "the call carries the session from the pinged handshake"
+    );
+}
+
+#[test]
+fn current_profile_handshake_works_through_a_buffering_outbound_filter() {
+    // `json_body` buffers response bodies, so the handshake reply is read
+    // whole instead of streamed.
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let extra = "outbound_filters:\n            - filter: json_body\n              content_types: [application/json]\n              request_extract:\n                - pointer: /method\n                  metadata: mcp.method";
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, extra)).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 6, "weather_get_weather"));
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "a chain that buffers responses must still complete the handshake: {body}"
+    );
+    assert_eq!(weather.method_count("initialize"), 1, "one handshake");
+}
+
+#[test]
 fn current_profile_tools_call_without_gateway_session_is_rejected() {
     let weather = start_session_backend("get_weather");
     let calendar = start_session_backend("create_event");

@@ -20,6 +20,8 @@ mod pool;
 #[cfg(feature = "_postgres")]
 mod postgres;
 #[cfg(feature = "_postgres")]
+mod postgres_files;
+#[cfg(feature = "_postgres")]
 mod postgres_tls;
 #[cfg(feature = "_postgres")]
 pub mod postgres_url;
@@ -36,6 +38,8 @@ mod sqlite;
 pub use postgres::PostgresResponseStore;
 #[cfg(feature = "_postgres")]
 pub use postgres::to_pg_ssl_mode;
+#[cfg(feature = "_postgres")]
+pub use postgres_files::PostgresFileCatalog;
 #[cfg(feature = "_postgres")]
 pub use postgres_tls::PgTlsConfig;
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]

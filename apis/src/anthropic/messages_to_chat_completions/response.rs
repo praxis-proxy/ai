@@ -110,6 +110,14 @@ fn validate_translatable_response(obj: &Map<String, Value>) -> Result<(), String
     {
         return Err("Chat assistant `tool_calls` must be an array".to_owned());
     }
+    for field in REASONING_FIELDS {
+        if message
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err("Chat response field cannot be translated to Anthropic Messages".to_owned());
+        }
+    }
     if message.get("refusal").is_some_and(|value| !value.is_null())
         || message.get("audio").is_some_and(|value| !value.is_null())
         || message.get("function_call").is_some_and(|value| !value.is_null())
@@ -168,10 +176,33 @@ fn build_content_blocks<'a>(obj: &'a Map<String, Value>) -> Result<Vec<ContentBl
     };
 
     let message = choice.get("message");
+    extract_thinking_block(message, &mut blocks);
     extract_text_block(message, &mut blocks);
     extract_tool_call_blocks(message, &mut blocks)?;
 
     Ok(blocks)
+}
+
+/// Upstream fields carrying assistant reasoning, in preference order.
+///
+/// vLLM prefers `reasoning` and keeps `reasoning_content` as a deprecated
+/// alias; other backends emit only `reasoning_content`. Both spellings carry
+/// output the backend produced and billed, so both are read.
+pub(crate) const REASONING_FIELDS: [&str; 2] = ["reasoning", "reasoning_content"];
+
+/// Extract a thinking content block from the message's reasoning, if any.
+///
+/// The block precedes text and tool calls, matching Anthropic's ordering:
+/// reasoning is emitted before the answer it produced.
+fn extract_thinking_block<'a>(message: Option<&'a Value>, blocks: &mut Vec<ContentBlock<'a>>) {
+    if let Some(reasoning) = REASONING_FIELDS.iter().find_map(|field| {
+        message
+            .and_then(|m| m.get(*field))
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty())
+    }) {
+        blocks.push(ContentBlock::thinking(reasoning));
+    }
 }
 
 /// Extract a text content block from the message if present.
@@ -681,6 +712,68 @@ mod tests {
         assert!(
             parsed["content"].as_array().unwrap().is_empty(),
             "empty content string should not produce a text block"
+        );
+    }
+
+    #[test]
+    fn reasoning_content_becomes_a_leading_thinking_block() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","reasoning_content":"let me think","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#;
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        let content = parsed["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "reasoning then text: {content:?}");
+        let thinking = content.first().unwrap();
+        assert_eq!(thinking.pointer("/type"), Some(&Value::String("thinking".to_owned())));
+        assert_eq!(
+            thinking.pointer("/thinking"),
+            Some(&Value::String("let me think".to_owned()))
+        );
+        assert_eq!(
+            thinking.pointer("/signature"),
+            Some(&Value::String(String::new())),
+            "translated reasoning carries no Anthropic signature"
+        );
+        let text = content.get(1).unwrap();
+        assert_eq!(text.pointer("/type"), Some(&Value::String("text".to_owned())));
+        assert_eq!(text.pointer("/text"), Some(&Value::String("Hello".to_owned())));
+    }
+
+    #[test]
+    fn the_reasoning_field_is_preferred_over_reasoning_content() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","reasoning":"preferred","reasoning_content":"deprecated alias","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#;
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        let content = parsed["content"].as_array().unwrap();
+        assert_eq!(
+            content.first().unwrap().pointer("/thinking"),
+            Some(&Value::String("preferred".to_owned())),
+            "vLLM's current field wins over its deprecated alias"
+        );
+    }
+
+    #[test]
+    fn empty_reasoning_produces_no_thinking_block() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","reasoning_content":"","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#;
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        let content = parsed["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "empty reasoning should not produce a block");
+        assert_eq!(
+            content.first().unwrap().pointer("/type"),
+            Some(&Value::String("text".to_owned()))
+        );
+    }
+
+    #[test]
+    fn non_string_reasoning_is_rejected() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","reasoning_content":7,"content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}"#;
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
+        assert!(
+            error.contains("cannot be translated"),
+            "a non-string reasoning field should fail transformation: {error}"
         );
     }
 

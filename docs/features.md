@@ -106,6 +106,7 @@ tracked in [#1717](https://github.com/praxis-proxy/ai/issues/1717).
 | `store-postgres`, `store-postgres-cert-auth`, `store-sqlite`, `store-all` | `openai_responses_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL; the certificate-only profile omits password authentication) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |
 | `openai-files` | none yet (Files wire contracts, generated OpenAPI, and conformance checks) | `utoipa`; activates `experimental` |
+| `openai-files-s3` | `openai-files`; S3 byte store adapter with OpenSSL signing | `object_store/aws-base` (HTTP transport supplied by caller) |
 | `openai-compact` | `openai_responses_compact` | `tiktoken-rs`, a store backend |
 | `openai-mcp-tools` | `openai_mcp_connector`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
 | `openai-all` | every OpenAI group above, without choosing a store backend | |
@@ -123,6 +124,11 @@ and `basic-auth-filter`. `llmd-ext-proc` and `opentelemetry` are opt-in as
 well. A configuration that names a filter the binary was built without fails
 at startup with an unknown filter type error.
 
+The S3 byte store (`openai-files-s3`) requires an unversioned bucket. Use a
+bucket that has never had versioning enabled and keep it unversioned. The
+store deletes objects by key, which can leave versions behind in buckets with
+versioning enabled or suspended. See [S3 object deletion][s3-delete-object].
+
 ## Extensibility
 
 Custom Rust filters implement the `HttpFilter` trait from `praxis-filter` and
@@ -134,3 +140,4 @@ Start with the [example configurations](../examples/README.md), then use the
 
 [praxis]: https://github.com/praxis-proxy/praxis
 [Responses retained-payload budget]: architecture/responses-retained-payload.md
+[s3-delete-object]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html

@@ -7,8 +7,9 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod session;
 #[cfg_attr(
-    not(feature = "openai-mcp-tools"),
+    all(feature = "mcp", not(feature = "openai-mcp-tools")),
     expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
 )]
 mod session_pool;
@@ -50,10 +51,18 @@ use rmcp::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
-pub use self::streaming_selector::McpStreamingSelectorFilter;
 #[cfg(any(test, feature = "openai-mcp-tools"))]
 pub(crate) use self::subrequest_transport::validate_mcp_target;
+pub use self::{
+    session::{McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit},
+    streaming_selector::McpStreamingSelectorFilter,
+    subrequest_transport::{McpExchangeStage, McpStreamingRequested},
+};
 use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
+#[cfg_attr(
+    not(feature = "mcp"),
+    expect(unused_imports, reason = "the hosted MCP adapters import the rest of the client")
+)]
 pub(crate) use self::{
     session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
@@ -1055,7 +1064,7 @@ fn inject_authorization(
 /// Credential-safe reason attached to every SSRF rejection.
 ///
 /// The subrequest transport's [`ssrf_validate`](subrequest_transport) hook and
-/// the cache-hit [`validate_mcp_target`] check both surface this string on an
+/// the cache-hit `validate_mcp_target` check both surface this string on an
 /// SSRF rejection, so a blocked literal and a blocked DNS-resolved address read
 /// identically to the client without echoing which address matched.
 const SSRF_BLOCK_REASON: &str =

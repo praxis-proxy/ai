@@ -108,14 +108,15 @@ fn session_id_header() -> HeaderName {
 
 /// Request-extension marker that arms the streaming subrequest path.
 ///
-/// Inserted into the callout's [`RequestExtensions`] only by the streaming
-/// entry points ([`McpSubrequestClient::execute_streaming`] and the GET-stream
-/// path). The auto-injected [`McpStreamingSelectorFilter`](super::McpStreamingSelectorFilter)
-/// reads it during `on_request` and, when present, sets the subrequest response
-/// mode to streaming. Its absence keeps every other callout (buffered
+/// The MCP client inserts it into the callout's [`RequestExtensions`] only on
+/// its streaming exchanges (streaming POSTs and the GET stream). The first
+/// filter of the outbound chain, such as the auto-injected
+/// [`McpStreamingSelectorFilter`](super::McpStreamingSelectorFilter), reads it
+/// during `on_request` and, when present, sets the subrequest response mode to
+/// streaming. Its absence keeps every other callout (buffered
 /// `initialize`/`tools/list`/`tools/call`, DELETE) on the unchanged buffered ladder.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct McpStreamingRequested;
+pub struct McpStreamingRequested;
 
 // -----------------------------------------------------------------------------
 // McpTransportError
@@ -457,6 +458,32 @@ impl McpCallout {
         })
     }
 
+    /// Assemble a callout from request-scoped parts captured by a caller that
+    /// binds its own outbound `pipeline`. Every exchange ends by `deadline`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one parameter per request-scoped resource the callout carries"
+    )]
+    pub(super) fn from_parts(
+        client: SubRequestClient,
+        downstream: SubrequestRuntime,
+        pipeline: Arc<FilterPipeline>,
+        depth: u8,
+        trace_context: Option<TraceContext>,
+        deadline: Instant,
+    ) -> Self {
+        let allow_private = pipeline.allow_private_upstreams();
+        Self {
+            client,
+            downstream,
+            pipeline,
+            depth,
+            trace_context,
+            parent_deadline: Some(deadline),
+            allow_private,
+        }
+    }
+
     /// Whether private/loopback MCP destinations are permitted for this callout.
     pub(crate) fn allow_private(&self) -> bool {
         self.allow_private
@@ -535,6 +562,42 @@ fn resolve_callout_depth(iteration_state_depth: Option<u8>, headers: &HeaderMap)
 }
 
 // -----------------------------------------------------------------------------
+// DialTarget
+// -----------------------------------------------------------------------------
+
+/// Places the destination facts a bound outbound chain reads to select the
+/// upstream of one MCP exchange.
+///
+/// Implemented by callers whose MCP server is an operator-configured cluster:
+/// the chain they bind carries the cluster selector and load balancer, so the
+/// transport neither resolves a URL nor stages an upstream itself.
+pub trait McpExchangeStage: Send + Sync {
+    /// Insert this exchange's destination facts into `extensions`.
+    fn stage(&self, extensions: &mut RequestExtensions);
+
+    /// Stage for a message sent while this stage's exchange is still open,
+    /// such as the answer to a request the server sent on its response
+    /// stream. That message must reach the endpoint serving the stream.
+    ///
+    /// Called after the exchange's response head arrived, so the chain has
+    /// already run its response filters and reported the endpoint it dialed.
+    fn follow_up(&self) -> Arc<dyn McpExchangeStage>;
+}
+
+/// How an [`McpSubrequestClient`] reaches its MCP server.
+#[derive(Clone)]
+enum DialTarget {
+    /// Resolve the request URL, validate it against the SSRF policy, and stage
+    /// the resulting upstream. The policy follows the target's provenance:
+    /// [`UrlResolutionPolicy::OperatorCached`] for an operator-configured
+    /// connector, [`UrlResolutionPolicy::ClientPerCall`] for a client-selected
+    /// `server_url` so a client cannot prime or probe the shared DNS cache.
+    Url(UrlResolutionPolicy),
+    /// Let the bound chain select the destination from the staged facts.
+    Chain(Arc<dyn McpExchangeStage>),
+}
+
+// -----------------------------------------------------------------------------
 // McpSubrequestClient
 // -----------------------------------------------------------------------------
 
@@ -561,12 +624,10 @@ pub(crate) struct McpSubrequestClient {
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
-    /// DNS resolution policy for the dial target, chosen by the target's
-    /// provenance: [`UrlResolutionPolicy::OperatorCached`] for an operator-
-    /// configured connector, [`UrlResolutionPolicy::ClientPerCall`] for a
-    /// client-selected `server_url` so a client cannot prime or probe the
-    /// shared operator DNS cache.
-    resolution_policy: UrlResolutionPolicy,
+    /// Wire byte ceiling for control-plane replies and session `DELETE`.
+    control_bytes: usize,
+    /// How each exchange reaches the MCP server.
+    target: DialTarget,
     /// Trusted owner projected only for configured connector exchanges.
     owner: Option<StateOwner>,
     /// Replaceable out-of-band record of a typed classification observed on a
@@ -690,9 +751,35 @@ impl McpSubrequestClient {
             tool_result_bytes,
             budgeted_limits: None,
             step_timeout,
+            control_bytes: MAX_CONTROL_RESPONSE_BYTES,
             stream_cumulative_cap,
-            resolution_policy,
+            target: DialTarget::Url(resolution_policy),
             owner,
+            signal_state: Arc::new(TransportSignalState::new()),
+        }
+    }
+
+    /// Build a client whose exchanges reach the server through the bound
+    /// outbound chain's own destination selection.
+    ///
+    /// The request URI is used in origin form and `stage` places the
+    /// destination facts the chain reads on each exchange. Every reply,
+    /// session `DELETE` included, is bounded to `max_response_bytes`.
+    pub(super) fn for_chain(
+        callout: McpCallout,
+        step_timeout: Duration,
+        max_response_bytes: usize,
+        stage: Arc<dyn McpExchangeStage>,
+    ) -> Self {
+        Self {
+            callout,
+            tool_result_bytes: max_response_bytes,
+            budgeted_limits: None,
+            step_timeout,
+            control_bytes: max_response_bytes,
+            stream_cumulative_cap: max_response_bytes,
+            target: DialTarget::Chain(stage),
+            owner: None,
             signal_state: Arc::new(TransportSignalState::new()),
         }
     }
@@ -741,10 +828,9 @@ impl McpSubrequestClient {
     }
 
     /// Shared control-plane bound for POST replies and session DELETE cleanup.
-    fn control_response_limit(&self) -> usize {
-        self.budgeted_limits.map_or(MAX_CONTROL_RESPONSE_BYTES, |limits| {
-            MAX_CONTROL_RESPONSE_BYTES.min(limits.wire_limit)
-        })
+    pub(super) fn control_response_limit(&self) -> usize {
+        self.budgeted_limits
+            .map_or(self.control_bytes, |limits| self.control_bytes.min(limits.wire_limit))
     }
 
     /// Reject compact JSON trees before rmcp allocates parsed nodes.
@@ -784,31 +870,43 @@ impl McpSubrequestClient {
         StreamableHttpError<McpTransportError>,
     > {
         let deadline = self.callout.deadline(Instant::now(), self.step_timeout);
-        let allow_private = self.callout.allow_private;
-        let target = match prepare_url_target_with_policy(
-            uri,
-            deadline,
-            move |addrs| ssrf_validate(addrs, allow_private),
-            self.resolution_policy,
-        )
-        .await
-        {
-            Ok(target) => target,
-            Err(error) => {
-                if let Some(classification) = prepare_error_signal(&error) {
-                    // First signal wins; the free-standing caller reconstructs the
-                    // typed hard rejection (SSRF or invalid target) after rmcp
-                    // discards the transport error (see `transport_signal_error`).
-                    // Transient failures (DNS, deadline) record nothing and fall
-                    // back to the caller's generic connection error.
-                    signal.get_or_init(|| classification);
-                }
-                return Err(map_prepare_error(&error));
+        let mut extensions = RequestExtensions::default();
+        match &self.target {
+            DialTarget::Url(resolution_policy) => {
+                let allow_private = self.callout.allow_private;
+                let target = match prepare_url_target_with_policy(
+                    uri,
+                    deadline,
+                    move |addrs| ssrf_validate(addrs, allow_private),
+                    *resolution_policy,
+                )
+                .await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        if let Some(classification) = prepare_error_signal(&error) {
+                            // First signal wins; the free-standing caller reconstructs the
+                            // typed hard rejection (SSRF or invalid target) after rmcp
+                            // discards the transport error (see `transport_signal_error`).
+                            // Transient failures (DNS, deadline) record nothing and fall
+                            // back to the caller's generic connection error.
+                            signal.get_or_init(|| classification);
+                        }
+                        return Err(map_prepare_error(&error));
+                    },
+                };
+                let staged = StagedUpstream::from_prepared_target(&target)
+                    .map_err(|_error| StreamableHttpError::Client(McpTransportError::Setup))?;
+                // Stage the validated dial target (and its DNS-failover set) so the
+                // executor seeds the nested context's upstream before the request
+                // phase. The bound outbound pipeline never selects the upstream.
+                extensions.insert(staged);
+                extensions.insert(StagedUpstreamFallback::from_prepared_target(&target));
             },
-        };
-        let staged = StagedUpstream::from_prepared_target(&target)
-            .map_err(|_error| StreamableHttpError::Client(McpTransportError::Setup))?;
-        let fallback = StagedUpstreamFallback::from_prepared_target(&target);
+            // The bound chain selects the destination (cluster, endpoint pin,
+            // TLS, and private-address policy come from that cluster).
+            DialTarget::Chain(stage) => stage.stage(&mut extensions),
+        }
         let origin = origin_form(uri).map_err(StreamableHttpError::Client)?;
 
         let request = SubRequest {
@@ -817,12 +915,6 @@ impl McpSubrequestClient {
             headers,
             body,
         };
-        // Stage the validated dial target (and its DNS-failover set) so the
-        // executor seeds the nested context's upstream before the request phase.
-        // The bound outbound pipeline therefore never has to select the upstream.
-        let mut extensions = RequestExtensions::default();
-        extensions.insert(staged);
-        extensions.insert(fallback);
         if let Some(owner) = self.owner.as_ref() {
             extensions.insert(owner.clone());
         }
@@ -849,7 +941,7 @@ impl McpSubrequestClient {
         clippy::too_many_arguments,
         reason = "method/uri/body/headers/limit describe one dial call"
     )]
-    async fn execute(
+    pub(super) async fn execute(
         &self,
         method: Method,
         uri: &str,
@@ -888,11 +980,9 @@ impl McpSubrequestClient {
     )]
     fn build_post_headers(
         &self,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        session_id: Option<&Arc<str>>,
+        mut headers: HeaderMap,
+        session_id: Option<&str>,
     ) -> Result<HeaderMap, StreamableHttpError<McpTransportError>> {
-        let mut headers = build_request_headers(auth_header, custom_headers)?;
         headers.insert(
             http::header::ACCEPT,
             HeaderValue::from_static("text/event-stream, application/json"),
@@ -1169,6 +1259,77 @@ impl McpSubrequestClient {
             },
         }
     }
+
+    /// Send one JSON-RPC message as a streaming-armed POST and return the
+    /// response head with its body, before any status classification.
+    ///
+    /// `base` carries the caller's headers; the transport adds `Accept`,
+    /// `Content-Type`, and the session id. Pair with
+    /// [`Self::classify_post_response`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "uri, message, session, headers, and signal describe one POST"
+    )]
+    pub(super) async fn send_streaming_post(
+        &self,
+        uri: &str,
+        message: &ClientJsonRpcMessage,
+        session_id: Option<&str>,
+        base: HeaderMap,
+        signal: &Arc<OnceLock<TransportSignal>>,
+    ) -> Result<(SubResponse, Option<Box<dyn StreamingResponseBody>>), StreamableHttpError<McpTransportError>> {
+        let headers = self.build_post_headers(base, session_id)?;
+        let max_response_bytes = self.response_limit(message);
+        let body =
+            serde_json::to_vec(message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
+        self.execute_streaming(
+            Method::POST,
+            uri,
+            Bytes::from(body),
+            headers,
+            streaming_executor_backstop(max_response_bytes),
+            signal,
+        )
+        .await
+    }
+
+    /// Classify a POST response from [`Self::send_streaming_post`] into an rmcp
+    /// post response, streaming SSE bodies and buffering JSON ones.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "response, request, and limits describe one classification"
+    )]
+    pub(super) async fn classify_post_response(
+        &self,
+        response: SubResponse,
+        body: Option<Box<dyn StreamingResponseBody>>,
+        message: &ClientJsonRpcMessage,
+        session_was_attached: bool,
+        max_sse_event_size: usize,
+        signal: Arc<OnceLock<TransportSignal>>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
+        match body {
+            // Blocker 5: praxis buffered anyway; classify the full buffered response.
+            None => classify_buffered_post_response(
+                response,
+                message,
+                session_was_attached,
+                self.budgeted_limits.map(|limits| limits.parse_charge_limit),
+                &signal,
+            ),
+            Some(streaming_body) => {
+                self.classify_streaming_post_response(
+                    response,
+                    streaming_body,
+                    session_was_attached,
+                    self.response_limit(message),
+                    max_sse_event_size,
+                    signal,
+                )
+                .await
+            },
+        }
+    }
 }
 
 impl StreamableHttpClient for McpSubrequestClient {
@@ -1183,7 +1344,8 @@ impl StreamableHttpClient for McpSubrequestClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
         let session_was_attached = session_id.is_some();
-        let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
+        let base = build_request_headers(auth_header, custom_headers)?;
+        let headers = self.build_post_headers(base, session_id.as_deref())?;
         let max_response_bytes = self.response_limit(&message);
         let signal = self.signal_handle();
         let body =
@@ -1300,10 +1462,6 @@ impl StreamableHttpClient for McpSubrequestClient {
         .await
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "streaming + buffered-fallback ladder mirrors post_message structure"
-    )]
     #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     async fn post_message_with_max_sse_event_size(
         &self,
@@ -1323,44 +1481,20 @@ impl StreamableHttpClient for McpSubrequestClient {
                 .await;
         }
 
-        let session_was_attached = session_id.is_some();
-        let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
-        let max_response_bytes = self.response_limit(&message);
+        let base = build_request_headers(auth_header, custom_headers)?;
         let signal = self.signal_handle();
-        let body =
-            serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
-
         let (response, maybe_body) = self
-            .execute_streaming(
-                Method::POST,
-                &uri,
-                Bytes::from(body),
-                headers,
-                streaming_executor_backstop(max_response_bytes),
-                &signal,
-            )
+            .send_streaming_post(&uri, &message, session_id.as_deref(), base, &signal)
             .await?;
-        match maybe_body {
-            // Blocker 5: praxis buffered anyway; classify the full buffered response.
-            None => classify_buffered_post_response(
-                response,
-                &message,
-                session_was_attached,
-                self.budgeted_limits.map(|limits| limits.parse_charge_limit),
-                &signal,
-            ),
-            Some(streaming_body) => {
-                self.classify_streaming_post_response(
-                    response,
-                    streaming_body,
-                    session_was_attached,
-                    max_response_bytes,
-                    max_sse_event_size,
-                    signal,
-                )
-                .await
-            },
-        }
+        self.classify_post_response(
+            response,
+            maybe_body,
+            &message,
+            session_id.is_some(),
+            max_sse_event_size,
+            signal,
+        )
+        .await
     }
 }
 

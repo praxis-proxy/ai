@@ -30,14 +30,27 @@ pub mod hash;
 mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-client")]
+#[cfg_attr(
+    not(feature = "mcp"),
+    expect(dead_code, reason = "the hosted MCP adapters use the rest of the client")
+)]
 pub(crate) mod mcp_client;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp_core;
 /// Outbound MCP chain selector shared by every MCP adapter. Registered under
 /// its historical `openai_mcp_streaming_selector` name for config stability.
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-client")]
 pub use mcp_client::McpStreamingSelectorFilter;
+/// MCP session lifecycle for callers that keep their own session map.
+#[cfg(feature = "mcp-client")]
+pub mod mcp_session {
+    pub use crate::mcp_client::{
+        McpExchangeStage, McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
+        McpStreamingRequested,
+    };
+}
+pub mod model_field;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;
@@ -141,7 +154,7 @@ pub(crate) mod test_utils {
     /// Installs a thread-local subscriber, so parallel tests sharing the
     /// process-wide subscriber are unaffected. Use it to assert that request
     /// or response content never reaches logs.
-    #[cfg(any(feature = "openai-responses", feature = "anthropic-mcp-connector"))]
+    #[cfg(any(feature = "openai-responses", feature = "mcp-client"))]
     pub(crate) fn capture_log_output<F: FnOnce()>(f: F) -> String {
         use std::{
             fmt::Write as _,

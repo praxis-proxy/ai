@@ -107,6 +107,7 @@ The manifest declares **106 features** across **12 scopes**, linked to **82 scen
 | `openai_chat_completions_to_vertexai_gemini` | `vertex.gemini.response.schema_complete` | `synthetic_only` | `vertex/invalid-content` | `synthetic`: `synthetic_only` |
 | `openai_chat_completions_to_vertexai_gemini` | `vertex.gemini.response.fallback_id` | `synthetic_only` | `vertex/fallback-response-id` | `synthetic`: `synthetic_only` |
 | `openai_chat_completions_to_vertexai_gemini` | `vertex.gemini.response.cached_usage` | `synthetic_only` | `vertex/cached-usage` | `synthetic`: `synthetic_only` |
+| `openai_chat_completions_to_vertexai_gemini` | `vertex.gemini.response.reasoning_usage` | `synthetic_only` | `vertex/thought-usage` | `synthetic`: `synthetic_only` |
 | `openai_chat_completions_to_vertexai_gemini` | `vertex.gemini.streaming.candidate_limit` | `synthetic_only` | `vertex/bounded-stream-limits` | `synthetic`: `synthetic_only` |
 | `openai_chat_completions_to_vertexai_gemini` | `vertex.gemini.streaming.tool_slot_limit` | `synthetic_only` | `vertex/bounded-stream-limits` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.error.malformed_success_status` | `synthetic_only` | `messages/malformed-success` | `synthetic`: `synthetic_only` |

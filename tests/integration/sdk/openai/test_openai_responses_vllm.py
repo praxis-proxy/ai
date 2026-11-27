@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27,<1",
-#     "openai>=2.0,<4",
+#     "openai>=2.16,<4",
 #     "pytest>=8.0,<9",
 # ]
 # ///
@@ -3216,6 +3216,46 @@ class TestOpenAIResponsesVLLM:
             )
         assert exc_info.value.status_code == 400, "invalid input item must return 400"
 
+    def test_repeated_top_level_model_is_rejected_before_backend(
+        self, openai_client
+    ):
+        """A raw body can repeat ``model`` where the SDK's dict serialization
+        cannot, and routing must refuse it instead of picking one occurrence."""
+        model = VLLM_MODEL.encode()
+        duplicate_body = (
+            b'{"model":"' + model + b'","input":"hi","model":"' + model + b'"}'
+        )
+        recorded_request_count = len(SimulatorBackendHandler.recorded_requests)
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.post(
+                "/responses",
+                cast_to=dict,
+                content=duplicate_body,
+                options={"headers": {"Content-Type": "application/json"}},
+            )
+
+        assert exc_info.value.status_code == 400
+        error = exc_info.value.response.json()["error"]
+        assert error["type"] == "invalid_request_error", error
+        assert "more than one top-level 'model' field" in error["message"], error
+        if VLLM_TEST_BACKEND == "simulator":
+            assert (
+                len(SimulatorBackendHandler.recorded_requests)
+                == recorded_request_count
+            ), "a repeated model must not be forwarded to the backend"
+
+        # Control: the same client and route still serve one unambiguous model.
+        control = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: ONE-MODEL /no_think",
+            temperature=0,
+            store=False,
+            max_output_tokens=64,
+        )
+        assert control.status == "completed"
+        assert "ONE-MODEL" in control.output_text
+
     @pytest.mark.critical_vllm
     @requires_real_inference
     def test_rehydrated_second_turn(self, openai_client):
@@ -3523,6 +3563,81 @@ class TestOpenAIResponsesVLLM:
             ]
         finally:
             client.conversations.delete(conversation.id)
+
+    def test_preprocessed_input_file_keeps_hosted_tool_results(self, witness_tool_client):
+        """#1907: doc_extract rewrite must not drop agentic tool results on re-entry.
+
+        Sends an inline ``input_file`` through the shipped full-flow graph so
+        ``openai_doc_extract`` rewrites the working history in place while
+        ``state.input`` keeps the client snapshot. The witness then drives a
+        hosted ``web_search`` round; the second upstream body must still carry
+        the search result after selected-input rebuild.
+        """
+        client, forwarded = witness_tool_client
+        file_bytes = b"STREAM-TOOL-410 from attached notes"
+        file_data = "data:text/plain;base64," + base64.b64encode(file_bytes).decode()
+        response = client.responses.create(
+            model="sdk-conversation-tool-stream",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "notes.txt",
+                            "file_data": file_data,
+                        }
+                    ],
+                }
+            ],
+            store=False,
+            tools=[{"type": "web_search"}],
+            max_tool_calls=1,
+            extra_headers={"x-user-brave-key": "controlled-test-only"},
+        )
+        assert response.status == "completed", response
+        assert [item.type for item in response.output] == ["web_search_call", "message"]
+        assert len(forwarded) == 2, (
+            "preprocess + one tool dispatch should produce one re-entry; "
+            f"got {len(forwarded)} upstream bodies"
+        )
+        extracted = "STREAM-TOOL-410 from attached notes"
+
+        def _input_text_parts(request_input):
+            texts = []
+            if not isinstance(request_input, list):
+                return texts
+            for item in request_input:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "input_text"
+                        and isinstance(part.get("text"), str)
+                    ):
+                        texts.append(part["text"])
+            return texts
+
+        first_texts = _input_text_parts(forwarded[0]["input"])
+        assert any(extracted in text for text in first_texts), (
+            "first upstream body must carry doc_extract input_text with the "
+            f"decoded file bytes; got input_text parts: {first_texts!r}"
+        )
+        reentry_texts = _input_text_parts(forwarded[1]["input"])
+        reentry = json.dumps(forwarded[1]["input"])
+        assert "Mock Search Result" in reentry, (
+            "selected-input rebuild must keep the hosted tool result after "
+            f"document preprocessing; re-entry input was: {reentry[:500]}"
+        )
+        assert any(extracted in text for text in reentry_texts), (
+            "re-entry must keep the preprocessed input_text (not just the "
+            f"filename); got input_text parts: {reentry_texts!r}"
+        )
 
     def test_hosted_web_search_enforces_allowed_domains(self, witness_tool_client):
         """Native hosted search drops provider results outside ``allowed_domains`` (#1768).

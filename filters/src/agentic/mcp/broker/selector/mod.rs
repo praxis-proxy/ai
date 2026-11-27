@@ -13,11 +13,18 @@
 //! exchange to a staged endpoint (`notifications/initialized` and `DELETE`
 //! follow the `initialize` that created the session) and reports the endpoint
 //! the `load_balancer` dialed back to the broker.
+//!
+//! As the chain's first filter it also selects a streamed response when the
+//! MCP client asks for one, so an SSE handshake reply is read as it arrives.
 
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_ai_apis::mcp_session::{McpExchangeStage, McpStreamingRequested};
+use praxis_filter::{
+    BodyAccess, BodyMode, BodyRequirement, FilterAction, FilterError, HttpFilter, HttpFilterContext, RequestExtensions,
+    SubRequestResponseMode, parse_filter_config,
+};
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
@@ -43,6 +50,20 @@ impl BrokerBackendCluster {
             pinned_endpoint,
             dialed: Arc::new(OnceLock::new()),
         }
+    }
+}
+
+impl McpExchangeStage for BrokerBackendCluster {
+    fn stage(&self, extensions: &mut RequestExtensions) {
+        extensions.insert(self.clone());
+    }
+
+    /// Pinned to the endpoint this exchange dialed, or to its own pin. With
+    /// neither known the load balancer picks, as it does for the session's
+    /// later exchanges.
+    fn follow_up(&self) -> Arc<dyn McpExchangeStage> {
+        let endpoint = self.dialed.get().cloned().or_else(|| self.pinned_endpoint.clone());
+        Arc::new(Self::new(Arc::clone(&self.cluster), endpoint))
     }
 }
 
@@ -109,6 +130,22 @@ impl HttpFilter for McpBrokerBackendSelectorFilter {
         self.clusters.iter().map(ToString::to_string).collect()
     }
 
+    /// The MCP client streams SSE replies; without this declaration Praxis
+    /// buffers every callout response.
+    fn may_select_streaming_subrequest_response(&self) -> bool {
+        true
+    }
+
+    /// Read-only, so pipeline finalization keeps the response streamed instead
+    /// of clamping it to a size-limited buffered mode.
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly(BodyRequirement::Optional)
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let Some(staged) = ctx.extensions.get::<BrokerBackendCluster>() else {
             return Err(format!("{}: no broker backend cluster staged on this request", Self::NAME).into());
@@ -119,6 +156,9 @@ impl HttpFilter for McpBrokerBackendSelectorFilter {
         let pinned = staged.pinned_endpoint.clone();
         ctx.cluster = Some(Arc::clone(cluster));
         ctx.pinned_endpoint_address = pinned;
+        if ctx.extensions.get::<McpStreamingRequested>().is_some() {
+            ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -239,6 +279,52 @@ mod tests {
             dialed.get().map(AsRef::as_ref),
             Some("10.0.0.3:3001"),
             "the dialed endpoint must reach the broker"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_up_reaches_the_dialed_endpoint() {
+        use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+        let filter = selector();
+        let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let staged = BrokerBackendCluster::new(Arc::from("weather-mcp"), None);
+        ctx.extensions.insert(staged.clone());
+        ctx.upstream = Some(Upstream {
+            address: Arc::from("10.0.0.3:3001"),
+            authority: None,
+            base_path: None,
+            tls: None,
+            connection: Arc::new(ConnectionOptions::default()),
+        });
+        let _action = filter.on_response(&mut ctx).await.unwrap();
+
+        let mut extensions = RequestExtensions::default();
+        staged.follow_up().stage(&mut extensions);
+        let follow_up = extensions.get::<BrokerBackendCluster>().unwrap();
+        assert_eq!(&*follow_up.cluster, "weather-mcp", "the same cluster is dialed");
+        assert_eq!(
+            follow_up.pinned_endpoint.as_deref(),
+            Some("10.0.0.3:3001"),
+            "an answer on an open stream reaches the endpoint serving it"
+        );
+        assert!(follow_up.dialed.get().is_none(), "the follow-up records its own dial");
+    }
+
+    #[test]
+    fn follow_up_keeps_an_existing_pin() {
+        let staged = BrokerBackendCluster::new(Arc::from("weather-mcp"), Some(Arc::from("10.0.0.2:3001")));
+        let mut extensions = RequestExtensions::default();
+        staged.follow_up().stage(&mut extensions);
+        assert_eq!(
+            extensions
+                .get::<BrokerBackendCluster>()
+                .unwrap()
+                .pinned_endpoint
+                .as_deref(),
+            Some("10.0.0.2:3001"),
+            "a pinned exchange's follow-up keeps the pin"
         );
     }
 

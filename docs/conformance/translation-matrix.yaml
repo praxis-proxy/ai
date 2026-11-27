@@ -124,6 +124,7 @@ features:
     label: Token usage accounting
   - id: cache-accounting
     label: Prompt-cache token accounting
+  # Covers reasoning payloads. Provider metadata used to resume a turn is outside this row.
   - id: reasoning-content
     label: Reasoning / thinking content
   - id: request-reasoning-cache-controls
@@ -343,15 +344,20 @@ surfaces:
           counter, so cache-write billing is invisible.
         evidence: apis/src/anthropic/wire.rs:200-214; apis/src/anthropic/messages_to_chat_completions/response.rs:285-309; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1022-1042
       reasoning-content:
-        status: dropped
+        status: translated-lossy
         note: >-
-          Upstream message.reasoning_content is never read on either path, so
-          billed reasoning output vanishes. A non-null finite `refusal` is read
-          and refused (the upstream success is rejected with 500); a non-null
-          streaming delta.refusal emits a terminal Anthropic error instead of
-          being silently dropped.
-        blocker: https://github.com/praxis-proxy/ai/issues/2047
-        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:178-184; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:714-735; apis/src/anthropic/messages_to_chat_completions/response.rs:113-121; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:624-645
+          Upstream message reasoning (the vLLM `reasoning` field, falling back
+          to the deprecated `reasoning_content` alias) is surfaced as a leading
+          Anthropic thinking block on both the finite and the streaming path,
+          so billed reasoning output no longer vanishes. Lossy because the
+          Chat Completions protocol carries no Anthropic signature: the
+          translated block's signature is empty and cannot be replayed to a
+          native Anthropic API. A non-string reasoning field is rejected on
+          the finite path. A non-null finite `refusal` is read and refused
+          (the upstream success is rejected with 500); a non-null streaming
+          delta.refusal emits a terminal Anthropic error instead of being
+          silently dropped.
+        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:110-121; apis/src/anthropic/messages_to_chat_completions/response.rs:186-209; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:806-830; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1160-1240
       request-reasoning-cache-controls:
         status: rejected
         note: >-
@@ -644,12 +650,13 @@ surfaces:
           finish reasons are a hard error, not a silent "stop".
         evidence: apis/src/vertex/gemini/response.rs:467-514
       usage-accounting:
-        status: translated-lossy
+        status: translated
         note: >-
-          completion_tokens comes from candidatesTokenCount, which excludes
-          thoughtsTokenCount, so on thinking models it under-reports billed
-          output and total_tokens no longer equals prompt + completion.
-        evidence: apis/src/vertex/gemini/response.rs:521-534
+          completion_tokens is candidatesTokenCount plus thoughtsTokenCount,
+          matching OpenAI's inclusion of reasoning tokens in completion_tokens.
+          total_tokens keeps Vertex's totalTokenCount, which already counts
+          thoughts, and falls back to prompt + completion when absent.
+        evidence: apis/src/vertex/gemini/response.rs:529-565
       cache-accounting:
         status: translated
         note: >-
@@ -658,16 +665,19 @@ surfaces:
           counts are subsets of the prompt total, so prompt_tokens is
           unchanged; the details object is omitted when Vertex reports no
           cached count.
-        evidence: apis/src/vertex/gemini/response.rs:529-551; apis/src/vertex/gemini/response.rs:138-145; apis/src/vertex/gemini/response.rs:220-226; apis/src/vertex/gemini/response.rs:720-740
+        evidence: apis/src/vertex/gemini/response.rs:529-565; apis/src/vertex/gemini/response.rs:138-145; apis/src/vertex/gemini/response.rs:220-226; apis/src/vertex/gemini/response.rs:733-755
       reasoning-content:
-        status: dropped
+        status: rejected
         note: >-
-          thoughtsTokenCount is discarded, so no
-          completion_tokens_details.reasoning_tokens is emitted. A Part with
-          thought:true fails the response, while a Part carrying only
-          thoughtSignature produces an empty delta and no error.
-        blocker: https://github.com/praxis-proxy/ai/issues/1755
-        evidence: apis/src/vertex/gemini/response.rs:323-325; apis/src/vertex/gemini/response.rs:345-357; apis/src/vertex/gemini/response.rs:521-534; apis/src/vertex/gemini/response.rs:907-909
+          thoughtsTokenCount maps to completion_tokens_details.reasoning_tokens
+          on finite responses and on the trailing include_usage chunk; the
+          details object is omitted when Vertex reports no thought count.
+          Thought text has no Chat Completions field, so a Part with
+          thought:true fails the response. This row covers reasoning payloads.
+          Gemini thoughtSignature is continuation metadata. Function-call
+          signatures round-trip through extra_content.google.thought_signature.
+          The translator omits signatures on text and metadata-only Parts.
+        evidence: apis/src/vertex/gemini/response.rs:354-372; apis/src/vertex/gemini/response.rs:529-565; apis/src/vertex/gemini/response.rs:733-755
       request-reasoning-cache-controls:
         status: rejected
         note: >-
@@ -923,13 +933,11 @@ surfaces:
 # ---------------------------------------------------------------------------
 cross_surface_gaps:
   - id: reasoning-and-cache-tokens-vanish
-    affects: [anthropic-messages-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse]
+    affects: [anthropic-messages-to-chat-completions, chat-completions-to-bedrock-converse]
     summary: >-
-      Reasoning content is silently discarded on the Anthropic and Bedrock
-      paths, and its token count on Vertex. Cache-token counters are discarded
-      entirely on Vertex and Bedrock; Anthropic maps cache reads and loses
-      only the cache-write counter. Customers are billed for tokens the matrix
-      would otherwise claim they receive.
+      The Anthropic and Bedrock translations can silently discard reasoning
+      content. Bedrock drops both cache-token counters, and Anthropic maps
+      cache reads while omitting the cache-write counter.
     blocker: https://github.com/praxis-proxy/ai/issues/2058
 
   - id: oversized-body-generic-413

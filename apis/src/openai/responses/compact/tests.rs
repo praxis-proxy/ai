@@ -1503,6 +1503,33 @@ fn parse_compact_request_body_invalid_json() {
 }
 
 #[test]
+fn parse_compact_request_body_rejects_repeated_model() {
+    // The budgeted `/v1/responses/compact` handoff releases before the request
+    // filter's duplicate check, so compact's own parse must refuse a repeat
+    // instead of collapsing it to the last occurrence.
+    for raw in [
+        &br#"{"model":"gpt-4o","input":"hello","model":"gpt-4.1"}"#[..],
+        &br#"{"model":"gpt-4o","model":"gpt-4o","input":"hello"}"#[..],
+        &br#"{"model":"gpt-4o","m\u006fdel":"gpt-4.1","input":"hello"}"#[..],
+    ] {
+        let body = Some(Bytes::from_static(raw));
+        let Err(FilterAction::Reject(rejection)) = parse_compact_request_body(&body) else {
+            panic!("a repeated model must be refused: {}", String::from_utf8_lossy(raw));
+        };
+        assert_eq!(rejection.status, 400);
+        let error: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            error.pointer("/error/type").and_then(Value::as_str),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            error.pointer("/error/message").and_then(Value::as_str),
+            Some(DUPLICATE_MODEL_MESSAGE)
+        );
+    }
+}
+
+#[test]
 fn parse_compact_request_body_missing_model() {
     // `model` is required by the contract even when content is present.
     let body = Some(Bytes::from(serde_json::to_vec(&json!({"input": "hello"})).unwrap()));

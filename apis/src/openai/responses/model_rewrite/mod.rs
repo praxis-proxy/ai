@@ -28,6 +28,11 @@
 //! body. Sub-resource paths such as `/v1/responses/{id}/cancel` and
 //! every other endpoint are left untouched.
 //!
+//! A body that repeats its top-level `model` is refused with HTTP 400
+//! under every `on_invalid` setting, before any fact is promoted: the
+//! alias would be resolved from one occurrence while a backend could
+//! read another.
+//!
 //! The filter name keeps its `openai_responses_` prefix for config
 //! compatibility even though it now covers Chat Completions too.
 
@@ -67,6 +72,7 @@ use crate::{
     RecordAiMetadata as _,
     classifier::{is_chat_completions_create, is_responses_create},
     json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
+    model_field::{self, DUPLICATE_MODEL_MESSAGE, ParseError},
     promotion::is_promotable_value,
 };
 
@@ -168,13 +174,12 @@ impl ModelRewriteFilter {
             None
         };
 
-        let mut value: serde_json::Value = match serde_json::from_slice(raw) {
-            Ok(v) => v,
-            Err(_) => return Ok(invalid_body_action(self.on_invalid)),
-        };
-
-        let Some(obj) = value.as_object_mut() else {
-            return Ok(invalid_body_action(self.on_invalid));
+        // A repeated top-level model is refused under every `on_invalid`: the
+        // rewrite would pick one occurrence while a backend may read the other.
+        let mut obj = match model_field::parse_object(raw) {
+            Ok(obj) => obj,
+            Err(ParseError::DuplicateModel) => return Ok(duplicate_model_action()),
+            Err(ParseError::Json(_) | ParseError::NotObject) => return Ok(invalid_body_action(self.on_invalid)),
         };
 
         #[cfg(feature = "openai-responses")]
@@ -192,7 +197,7 @@ impl ModelRewriteFilter {
             }
         }
 
-        let result = apply_rewrite(obj, &self.model_aliases, self.default_model.as_deref());
+        let result = apply_rewrite(&mut obj, &self.model_aliases, self.default_model.as_deref());
         promote_facts(ctx, &result, &self.headers);
 
         if !result.mutated {
@@ -210,7 +215,7 @@ impl ModelRewriteFilter {
         #[cfg(feature = "openai-responses")]
         super::request::invalidate_cached_request_parse(ctx);
 
-        serialize_and_update(body, &value, &result, self.name())
+        serialize_and_update(body, &serde_json::Value::Object(obj), &result, self.name())
     }
 }
 
@@ -604,6 +609,16 @@ fn set_filter_result(
     if let Err(err) = results.set(key, value) {
         warn!(error = %err, key, "failed to set model rewrite filter result");
     }
+}
+
+/// Refuse a body whose top-level `model` occurs more than once.
+fn duplicate_model_action() -> FilterAction {
+    debug!("refusing model rewrite for a repeated top-level model");
+    FilterAction::Reject(responses_error_rejection(
+        400,
+        "invalid_request_error",
+        DUPLICATE_MODEL_MESSAGE,
+    ))
 }
 
 /// Map [`OnInvalidBehavior`] to the appropriate [`FilterAction`].

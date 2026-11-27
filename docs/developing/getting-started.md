@@ -5,8 +5,10 @@
 - Rust stable 1.96+
 - Rust nightly
 - CMake 3.31+
-- Docker 29.3.0+ or Podman (for container builds; the FIPS image, its
-  compliance check and Red Hat's scanner need podman on Linux)
+- Docker 29.3.0+ or Podman (for container builds and RustFS S3 integration
+  tests; the FIPS image, its compliance check and Red Hat's scanner need
+  podman on Linux)
+- AWS CLI v2 (for `make test-integration` and `make test-s3-file-store-e2e`)
 - Go 1.26+ (`make fips-scanner`, optional)
 
 Install the development-only Cargo tools used by the Make targets:
@@ -46,14 +48,16 @@ make test
 make test-integration
 ```
 
-The aggregate targets cover more than one suite; CI runs some of them as separate targets:
+CI runs some suites from the local aggregate targets separately.
 
 | Local target | Runs | CI targets |
 | --- | --- | --- |
-| `make test-integration` | store-all suite and its experimental filter permutation | `make test-integration-core`, `make test-integration-experimental` |
+| `make test-integration` | store-all suite, its experimental filter permutation, and live RustFS S3 FileStore tests | `make test-integration-core`, `make test-integration-experimental`, `make test-s3-file-store` |
 | `make test-inference-fixtures` | inference fixtures and the xtask fixture tests | `make test-inference-fixtures-core`, `make test-inference-xtask` |
 | `make test-environment-suite` | `make test-environment`'s environment tests and the llmd-ext-proc integration suite | |
 | `make test-store-features` | feature graph checks, per-group Clippy, and API tests | its `-check`, `-clippy`, and `-test` targets |
+
+The RustFS container requires an available port at `127.0.0.1:9000`.
 
 ### OpenAI SDK Integration Tests (Dual 2.x / 3.x Lanes)
 
@@ -258,11 +262,23 @@ every crate, but cache hits finish in milliseconds. Check hit rates with
 Include benchmark or load-test evidence in PRs that materially change
 request processing, storage, streaming, or protocol parsing costs.
 
-`make bench-model-to-provider` runs the ignored model-to-provider request-body
-benchmark in the release profile; the Tests workflow runs it in its filter job.
-It reports nanoseconds per request over 10,000 iterations for mapped models
-with 64-byte, 1 KiB, and 16 KiB prompts, and an unknown model with 1 KiB and
-16 KiB prompts. Timings cover request-context construction, shared body
-ownership, the filter call, and cleanup, without network or backend latency.
-Shared CI runner timings are informational, not a throughput guarantee or
+Run the model-to-provider request-body benchmark with
+`make bench-model-to-provider`. The Tests workflow runs the same
+command in its filter job. It executes the ignored benchmark in the
+release profile and reports nanoseconds per request over 10,000
+iterations for mapped models with 64-byte, 1 KiB, and 16 KiB prompts,
+plus an unknown model with 1 KiB and 16 KiB prompts.
+
+Run the model-to-header benchmark with `make bench-model-to-header`.
+It isolates the top-level `model` scan that `model_to_header` runs
+before the core JSON extractor reparses the same body, reporting
+nanoseconds per request for both passes at 64-byte, 1 KiB, 16 KiB,
+256 KiB, and 1 MiB prompt sizes. The Tests workflow runs it in the
+same filter job as the model-to-provider benchmark, reusing that
+job's release build.
+
+These timings include request-context construction, shared body
+ownership, the filter call, and cleanup. They measure local filter
+cost without network or backend latency. Shared CI runner timings
+are informational; they are not a throughput guarantee or a fixed
 latency budget.

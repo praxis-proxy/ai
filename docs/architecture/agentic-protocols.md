@@ -129,9 +129,24 @@ tools/call (gateway session G, tool weather_x)
 The handshake runs as a filtered subrequest through a generated outbound chain:
 the `mcp_broker_backend` selector, any `outbound_filters`, and a
 `load_balancer` that references each server cluster by name. Server clusters
-must therefore be declared in top-level `clusters:`. Each reply is bounded by
-`max_response_bytes`; oversized or chunked replies are rejected before the full
-body is retained.
+must therefore be declared in top-level `clusters:`. Each exchange goes through
+the MCP client the hosted MCP paths use (`praxis_ai_apis::mcp_session`): `rmcp`
+builds and decodes the JSON-RPC messages. No `rmcp` service is kept between
+exchanges, so an idle backend session holds no task and no standalone `GET`
+stream. Each reply is bounded by `max_response_bytes`: a decoded body over the
+limit is rejected before it is fully retained, whatever its transfer framing. An `initialize` reply on
+an SSE stream completes when its JSON-RPC response arrives, even if the backend
+keeps the stream open, unless an `outbound_filters` entry buffers response
+bodies.
+
+A backend may send requests on the `initialize` stream before its result and
+wait for the answers. The broker answers `ping` with an empty result and any
+other request with `-32601`, each in a new POST through the same chain with the
+forwarded headers and the issued `Mcp-Session-Id`. It sends no
+`MCP-Protocol-Version`, because no version is negotiated yet. It answers at most
+four requests per handshake. A rejected or undelivered answer fails the
+handshake. With a buffering `outbound_filters` entry, answers go out only after
+the stream ends, so a backend that waits for one times out.
 
 `handshake_timeout_ms` is one budget for the whole handshake. It starts before
 the broker waits on a concurrent handshake for the same pair, time spent in
@@ -141,6 +156,7 @@ fresh budget of the same length.
 
 A backend session exists only on the endpoint that issued it. The broker
 records the endpoint the handshake's `load_balancer` dialed and pins
+answers to server requests on the `initialize` stream,
 `notifications/initialized`, session `DELETE`, and every forwarded call to it
 through core's `pinned_endpoint_address`. The cluster's TLS and connection
 settings still apply, and on a multi-endpoint cluster each session stays on one
@@ -152,9 +168,10 @@ initializes on a reachable replica. Sessionless backends are not pinned.
 If a backend answers `initialize` with a protocol version outside the broker's
 `supported_versions`, the broker never confirms the session: it terminates it
 and returns an `unsupported_protocol_version` error instead of forwarding the
-call. A client `MCP-Protocol-Version` the broker does not support gets HTTP 400
-before any handshake; without the header the broker offers its default
-version. SSE replies go through the shared conforming parser (CR, LF, or CRLF
+call. A session the backend issued in an `initialize` that then failed is
+terminated the same way, without an `MCP-Protocol-Version`. A client
+`MCP-Protocol-Version` the broker does not support gets HTTP 400 before any
+handshake; without the header the broker offers its default version. SSE replies go through the shared conforming parser (CR, LF, or CRLF
 line endings and an optional leading BOM). As the SSE specification requires,
 an event the backend never terminated with a blank line is discarded.
 

@@ -104,6 +104,29 @@ fn model_to_provider_sends_unmapped_model_to_fallback_unchanged() {
 }
 
 #[test]
+fn model_to_provider_rejects_repeated_model_before_any_backend() {
+    let vertex = capturing_backend("vertex-response");
+    let fallback = capturing_backend("fallback-response");
+    let proxy = start_proxy(&config(vertex.port(), fallback.port()));
+
+    for body in [
+        r#"{"model":"claude-sonnet-4-5","messages":[],"model":"unknown-model"}"#,
+        r#"{"model":"claude-sonnet-4-5","model":"claude-sonnet-4-5","messages":[]}"#,
+    ] {
+        let raw = http_send(proxy.addr(), &json_post("/v1/messages", body));
+        assert_eq!(parse_status(&raw), 400, "a repeated model must be refused: {body}");
+    }
+    assert!(
+        vertex.requests().is_empty(),
+        "the mapped backend must not see an ambiguous model"
+    );
+    assert!(
+        fallback.requests().is_empty(),
+        "the fallback backend must not see an ambiguous model"
+    );
+}
+
+#[test]
 fn model_to_provider_ignores_mapped_model_on_unlisted_path() {
     let vertex = capturing_backend("vertex-response");
     let fallback = capturing_backend("fallback-response");

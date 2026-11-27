@@ -12,6 +12,7 @@ mod backend_config;
 #[cfg(feature = "compression")]
 pub mod compression;
 mod factory;
+mod files;
 mod owner;
 mod reaper_config;
 mod registry;
@@ -34,6 +35,10 @@ pub use backend_config::{
 pub use compression::{CompressionAlgorithm, StoreCompressionConfig};
 pub use factory::{
     BackendError, BackendNamespaceKey, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory,
+};
+pub use files::{
+    CatalogError, CleanupClaim, CleanupState, FileCatalog, FileCompletion, FileListQuery, FileRecord, FileRecordPage,
+    NewFile, SortDirection, StoredFile,
 };
 pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use reaper_config::{DEFAULT_SWEEP_BATCH_SIZE, DEFAULT_SWEEP_INTERVAL_SECS, ReaperConfig, ReaperPolicy};

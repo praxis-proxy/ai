@@ -402,7 +402,10 @@ a longer retention (or a store with no `ttl`) still needs, provisioning
 validates physical-table ownership. Within one database, no two stores may
 assign different policies to the same physical table, including TTL-enabled
 versus TTL-disabled; such a configuration is rejected before serving starts.
-The same policy on a shared table is allowed. For independent retention
+The same policy on a shared table is allowed. The same check also applies when one
+listener repeats the same store declaration (same registry name) more than once: every
+declaration must agree on `ttl` / `sweep_interval` / `sweep_batch_size`, including whether
+`ttl` is set at all, before duplicate refs collapse. For independent retention
 policies on one database, give each store a fully disjoint table set or its own
 database.
 

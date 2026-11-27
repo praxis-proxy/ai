@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, error::Error, io};
 use serde_json::{Value, json};
 
 use super::{
-    FileRegistryError, FileServiceError, FileStoreError,
+    CatalogError, FileServiceError, FileStoreError,
     contracts::{DeleteFileResponse, FilePurpose, ListFilesResponse, OpenAiFile},
     implementation_openapi_json,
     routes::{FilesOperationSpec, operation_specs},
@@ -31,11 +31,11 @@ use crate::{
 #[test]
 fn file_service_error_mapping_keeps_client_outcomes() {
     assert!(matches!(
-        FileServiceError::from(FileRegistryError::QuotaExceeded),
+        FileServiceError::from(CatalogError::QuotaExceeded),
         FileServiceError::QuotaExceeded
     ));
     assert!(matches!(
-        FileServiceError::from(FileRegistryError::InvalidCursor),
+        FileServiceError::from(CatalogError::InvalidCursor),
         FileServiceError::InvalidInput(message) if message.contains("after")
     ));
     // A store limit error has no reservation context. The upload session
@@ -45,18 +45,18 @@ fn file_service_error_mapping_keeps_client_outcomes() {
         FileServiceError::Store(FileStoreError::UploadTooLarge)
     ));
 
-    // A registry state conflict is internal until the service decides otherwise.
+    // A catalog state conflict is internal until the service decides otherwise.
     assert!(matches!(
-        FileServiceError::from(FileRegistryError::Conflict),
-        FileServiceError::Registry(FileRegistryError::Conflict)
+        FileServiceError::from(CatalogError::Conflict),
+        FileServiceError::Catalog(CatalogError::Conflict)
     ));
 }
 
 #[test]
 fn file_service_error_mapping_keeps_backend_causes() {
-    let registry = FileServiceError::from(FileRegistryError::Backend(Box::new(io::Error::other("db down"))));
+    let catalog = FileServiceError::from(CatalogError::Backend(Box::new(io::Error::other("db down"))));
     assert_eq!(
-        registry
+        catalog
             .source()
             .and_then(Error::source)
             .map(ToString::to_string)
@@ -143,8 +143,13 @@ fn conformance_files_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation);
-        let matched = classify(operation.method().as_str(), &path, Transport::Http)
-            .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
+        let matched = classify(
+            operation.method().as_str(),
+            &path,
+            Transport::Http,
+            &http::HeaderMap::new(),
+        )
+        .unwrap_or_else(|| panic!("ai_operation did not classify {} {path}", operation.method().as_str()));
         assert_eq!(matched.operation_id, operation.operation_id());
         assert_eq!(
             matched.application_protocol.as_str(),

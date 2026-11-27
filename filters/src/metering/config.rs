@@ -68,9 +68,12 @@ pub(super) struct ExternalMeteringConfig {
     #[serde(default)]
     pub provider: Option<String>,
 
-    /// When `true` (default), requests proceed if the metering service
-    /// is unavailable. When `false`, requests are rejected with 503.
-    /// This is the *billing* gate's availability policy.
+    /// When `true` (default), requests proceed when the budget verdict is
+    /// unavailable — the metering service is unreachable, times out, or
+    /// returns an unusable payload. When `false`, such requests are
+    /// rejected with 503. This is the *billing* gate's availability
+    /// policy: with `model_policy_check` enabled, an unavailable model
+    /// verdict still rejects with 503 regardless of this setting.
     #[serde(default = "default_true")]
     pub fail_open: bool,
 
@@ -89,9 +92,11 @@ pub(super) struct ExternalMeteringConfig {
     /// recorded, since a recorded rewrite leaves the body naming the
     /// provider target) the request body — must agree: conflicting
     /// non-empty sources, or a body `"model"` member that is ambiguous
-    /// (duplicate or escaped key spellings) or undecodable (escaped or
-    /// non-string value), reject with 403 rather than authorizing a
-    /// model the provider does not receive. When identity comes from
+    /// (duplicate key spellings, whether plain or escaped) or undecodable
+    /// (an escaped or non-string value), reject with 403 rather than
+    /// authorizing a model the provider does not receive. A single escaped
+    /// key spelling such as `"\u006dodel"` still names `"model"` and is a
+    /// normal model source. When identity comes from
     /// raw `{prefix}*` request headers, the ingress boundary must strip
     /// client-supplied copies and set the headers from authenticated
     /// data: this filter cannot distinguish client-set headers.
