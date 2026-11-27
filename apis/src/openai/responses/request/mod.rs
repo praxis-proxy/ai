@@ -107,6 +107,8 @@ const PREVIOUS_INPUT_MESSAGES: &str = "previous_input_messages";
 /// `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
 /// `responses.stream`.
+/// Structured image/audio input is published as `modality` metadata and a
+/// branch result; it is never promoted to an HTTP header.
 pub struct OpenaiResponsesRequestFilter {
     /// Classification, promotion, and state configuration.
     config: ResponsesRequestConfig,
@@ -642,9 +644,7 @@ fn handle_unclassifiable(
 /// still read from the body, since routing and state depend on them; only the
 /// protocol identity is fixed by the matched operation.
 fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
-    let mut classified = classify_object(obj);
-    classified.format = AiRequestFormat::Responses;
-    classified
+    classify_object(obj, AiRequestFormat::Responses)
 }
 
 /// The Responses operation the request head resolves to, with its declared

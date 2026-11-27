@@ -253,7 +253,7 @@ def capture_codex(output):
     cases = []
     checkpoint = os.environ.get("CODEX_MODEL") or os.environ.get("VLLM_GPU_MODEL")
     revision = os.environ.get("CODEX_MODEL_REVISION") or model_revision(os.environ.get("CONTAINER_RUNTIME", "docker"), checkpoint)
-    for name in ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION"):
+    for name in ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION", "CODEX_NATIVE_SEARCH", "CODEX_TRANSLATED_SEARCH"):
         case = {"id": name.lower(), "status": os.environ.get(name) or "unexecuted"}
         evidence = read_json(os.environ.get(name + "_EVIDENCE"))
         if isinstance(evidence, dict):

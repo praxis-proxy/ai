@@ -1,9 +1,9 @@
 # Filters
 
-Start with the problem you need to solve. The generated [filter reference](reference.md)
-owns exact settings; this page explains composition. Unless marked optional,
-these capabilities are registered in the default production binary. See
-[build features](../features.md#cargo-features) before selecting an image.
+This page explains how filters compose; the generated
+[filter reference](reference.md) has the exact settings. Capabilities not
+marked optional are registered in the default production binary. Check
+[build features](../features.md#cargo-features) before choosing an image.
 
 ## Choose a capability
 
@@ -26,39 +26,36 @@ these capabilities are registered in the default production binary. See
 
 ## Ordering and boundaries
 
-Request hooks generally follow declared order; response hooks run in reverse.
-Body and header phases are distinct: placing a usage reader later cannot make
+Request hooks generally run in declared order and response hooks in reverse.
+Body and header phases are separate: moving a usage reader later cannot make
 body-derived data available before response headers are sent. Branches and IRR
-steps have their own lifecycle; do not transplant a body filter into a branch
-without checking its declared phase and pipeline validation.
+steps have their own lifecycle, so check a body filter's declared phase and
+pipeline validation before moving it into a branch.
 
-Use the complete examples linked above and run `praxis-ai --validate -c FILE`
-with the selected binary. A valid configuration proves registration and static
-constraints, not backend compatibility, credentials, or successful tool execution.
-Streaming transformations must retain their SSE adapters and bounds; a finite
-JSON translation alone does not establish streaming support.
+Start from the complete examples linked above and run
+`praxis-ai --validate -c FILE` with the binary you will deploy. Validation
+proves registration and static constraints, not backend compatibility,
+credentials, or tool execution. Streaming transformations need their SSE
+adapters and bounds; a finite JSON translation does not imply streaming
+support.
 
 Core routing, load balancing, TLS, authentication, headers, rate limiting,
-CORS, compression, and other base proxy behavior belong to the
-[Praxis core reference][praxis-filters]. AI provider credentials have two distinct
-owners: core `credential_injection` uses a selected cluster, while AI
-`credential_inject` consumes the selected dynamic provider profile. Their
-configuration formats are different.
+CORS, compression, and other base proxy behavior are in the
+[Praxis core reference][praxis-filters]. Provider credentials have two owners
+with different configuration formats: core `credential_injection` uses a
+selected cluster, and AI `credential_inject` uses the selected dynamic
+provider profile.
 
 ## Organization
 
 Generated filter pages live in category folders under `docs/filters/`
 (`apis`, `providers`, `routing`, `control`, `agents`, `observability`, and
-`core`), and the [reference index](reference.md) groups them the same way.
-`cargo xtask generate-filter-docs` assigns each filter to a category; the
+`core`), grouped the same way in the [reference index](reference.md).
+`cargo xtask generate-filter-docs` assigns each filter a category; the
 category table and overrides are in `xtask/src/filter_docs.rs`.
 
-Rust crate layout and host integration are in the
-[embedding guide](../developing/filter-hosts.md#organization).
-
-## Registration
-
-Custom Rust hosts use the [registration instructions](../developing/filter-hosts.md#registration),
+Rust crate layout is in the [embedding guide](../developing/filter-hosts.md#organization).
+Custom Rust hosts follow its [registration instructions](../developing/filter-hosts.md#registration),
 including the response-store pipeline extension when needed.
 
 ## Related documentation

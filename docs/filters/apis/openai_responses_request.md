@@ -15,7 +15,7 @@ On managed paths, rejects `code_interpreter`, `background=true`, and non-null `p
 
 On managed Responses creates, omit `previous_input_messages` or set it to `null` or `[]`, including on the first turn and with `store: false`. Any other value returns HTTP 400. To supply earlier messages yourself, include them in `input`. To resume stored history, use either `previous_response_id` or `conversation`. Provider-owned routes forward `previous_input_messages` unchanged.
 
-Promotes `openai_responses_request.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
+Promotes `openai_responses_request.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`. Structured image/audio input is published as `modality` metadata and a branch result; it is never promoted to an HTTP header.
 
 Extends the shared classification settings with the one option that gates the managed-path lifecycle, so a pre-routing fact publisher and the managed owner can be configured from the same filter.
 

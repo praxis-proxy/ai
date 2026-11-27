@@ -34,7 +34,7 @@
               "store": false,
               "stream": false,
               "tool_choice": {"type": "web_search"},
-              "tools": [{"search_context_size": "high", "type": "web_search"}]
+              "tools": [{"search_context_size": "high", "type": "web_search", "external_web_access": true, "search_content_types": ["text", "image"]}]
             }
           }
         },
@@ -79,7 +79,7 @@
               "temperature": 1.0,
               "text": {"format": {"type": "text"}},
               "tool_choice": {"type": "web_search"},
-              "tools": [{"search_context_size": "high", "type": "web_search"}],
+              "tools": [{"search_context_size": "high", "type": "web_search", "external_web_access": true, "search_content_types": ["text", "image"]}],
               "top_logprobs": 0,
               "top_p": 1.0,
               "truncation": "disabled",

@@ -90,4 +90,7 @@ allow-git = [
     # Temporary: until the certificate-only SQLx feature boundaries are
     # available in an upstream release.
     "https://github.com/praxis-proxy/sqlx",
+    # Temporary: until modelcontextprotocol/rust-sdk#1508 (optional sha2) is
+    # in an rmcp release.
+    "https://github.com/praxis-proxy/mcp-rust-sdk",
 ]

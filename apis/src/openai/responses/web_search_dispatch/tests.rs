@@ -2912,7 +2912,7 @@ async fn preflight_skips_when_allowed_tools_names_an_explicit_client_discovery_t
 
 /// Run `on_request_body` for a fresh initial request carrying a caller-built
 /// `ResponsesState` — e.g. one with a populated `mcp_tool_map`, as it would be after
-/// `openai_mcp_tool_resolve` has rewritten MCP tools to functions.
+/// `openai_mcp_connector` has rewritten MCP tools to functions.
 #[cfg(feature = "openai-mcp-tools")]
 async fn run_initial_request_with_state(filter: &dyn HttpFilter, state: ResponsesState) -> FilterAction {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2924,7 +2924,7 @@ async fn run_initial_request_with_state(filter: &dyn HttpFilter, state: Response
 #[cfg(feature = "openai-mcp-tools")]
 #[tokio::test]
 async fn preflight_rejects_when_allowed_tools_names_a_resolved_mcp_function() {
-    // `openai_mcp_tool_resolve` rewrites an MCP selector to a plain `function` and
+    // `openai_mcp_connector` rewrites an MCP selector to a plain `function` and
     // populates `mcp_tool_map`, so `allowed_tools` names only that function. Its MCP
     // continuation re-opens tool_choice and retains the declared web-search tool, so
     // web search is reachable and its unsupported location must be rejected at round 0
@@ -3815,4 +3815,29 @@ async fn preflight_allows_enforceable_filters() {
             "enforceable filters must pass preflight: {request} -> {action:?}"
         );
     }
+}
+
+#[test]
+fn native_web_search_lowering_preserves_hosted_state_and_restores_calls() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model":"qwen", "tools":[{"type":"web_search","external_web_access":true}],
+        "tool_choice":{"type":"web_search"}
+    }));
+    lower_native_web_search(&mut state);
+    assert_eq!(state.tools[0]["type"], "web_search");
+    assert_eq!(state.request_body["tools"][0]["type"], "function");
+    assert_eq!(state.request_body["tools"][0]["name"], "web_search");
+    assert_eq!(state.request_body["tool_choice"]["name"], "web_search");
+    assert!(state.request_body_requires_rebuild());
+    let once = state.request_body.clone();
+    lower_native_web_search(&mut state);
+    assert_eq!(state.request_body, once);
+    let mut response = serde_json::json!({"output":[{
+        "type":"function_call","id":"search_1","call_id":"search_1",
+        "name":"web_search","arguments":"{\"queries\":[\"Rust release\"]}"
+    }]});
+    restore_web_search_calls(&mut response);
+    assert_eq!(response["output"][0]["type"], "web_search_call");
+    assert_eq!(response["output"][0]["action"]["queries"][0], "Rust release");
+    assert_eq!(response["output"][0]["status"], "in_progress");
 }

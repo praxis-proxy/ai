@@ -132,7 +132,7 @@ impl HttpFilter for OpenaiChatCompletionsRequestFilter {
             None => &[],
         };
 
-        let classified = classify_request_body(bytes);
+        let classified = classify_request_body(bytes, Some(AiRequestFormat::ChatCompletions));
 
         debug!(
             model = ?classified.model,
@@ -186,6 +186,9 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
             if stream { "true" } else { "false" },
         );
     }
+    if let Some(modality) = classified.modality {
+        ctx.record_ai_metadata(crate::classifier::MODALITY_METADATA_KEY, modality.as_str());
+    }
 }
 
 /// Promote classification facts to filter results for branch conditions.
@@ -202,6 +205,9 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &Classifi
 
     if let Some(stream) = classified.stream {
         results.set("stream", if stream { "true" } else { "false" })?;
+    }
+    if let Some(modality) = classified.modality {
+        results.set("modality", modality.as_str())?;
     }
 
     Ok(())

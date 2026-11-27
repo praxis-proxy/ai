@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_mcp_dispatch` filter.
+//! Unit tests for the `openai_mcp_connector` filter.
 
 use std::{
     collections::HashMap,
@@ -14,7 +14,7 @@ use secrecy::SecretString;
 use serde_json::json;
 
 use super::{
-    McpCallResult, McpDispatchFilter, admitted_result_limits, build_error_result, build_success_result,
+    McpCallResult, McpConnectorFilter, admitted_result_limits, build_error_result, build_success_result,
     execute_mcp_calls, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
     is_mcp_tool_call, mcp_call_ids_are_unique_and_new, partition_calls_by_approval, prepare_response_round,
     reserve_mcp_execution, reserve_pending_approval_rows, responses_tool_call,
@@ -41,12 +41,12 @@ use crate::{
     openai::responses::{
         DEFAULT_TENANT_ID,
         agentic_loop::{AgenticLoopFilter, budget::SimpleBudget},
-        mcp_dispatch::{
+        mcp_connector::{
             approval::{
                 ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message,
                 extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
             },
-            config::{McpDispatchConfig, MinimumApproval, build_config},
+            config::{McpConnectorConfig, MinimumApproval, build_config},
         },
         state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
@@ -483,7 +483,7 @@ fn parse_approval_filter_invalid_member_type_fails_closed() {
 #[test]
 fn filter_response_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
-    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    let filter = McpConnectorFilter::from_config(&config).unwrap();
     assert_eq!(
         filter.response_body_access(),
         praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
@@ -493,17 +493,17 @@ fn filter_response_body_access() {
 #[test]
 fn filter_request_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
-    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    let filter = McpConnectorFilter::from_config(&config).unwrap();
     assert_eq!(
         filter.request_body_access(),
-        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+        praxis_filter::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     );
 }
 
 #[test]
 fn filter_response_body_mode() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
-    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    let filter = McpConnectorFilter::from_config(&config).unwrap();
     assert!(
         matches!(filter.response_body_mode(), praxis_filter::BodyMode::Stream),
         "agentic responses must remain stream-compatible"
@@ -513,7 +513,7 @@ fn filter_response_body_mode() {
 #[test]
 fn filter_request_body_mode() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
-    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    let filter = McpConnectorFilter::from_config(&config).unwrap();
     assert!(
         matches!(
             filter.request_body_mode(),
@@ -910,8 +910,8 @@ fn arguments_string_is_parsed_to_object() {
 
 #[test]
 fn config_defaults() {
-    let yaml = serde_yaml::from_str::<McpDispatchConfig>("{}").unwrap();
-    assert_eq!(yaml.timeout_ms, 30_000);
+    let yaml = serde_yaml::from_str::<McpConnectorConfig>("{}").unwrap();
+    assert_eq!(yaml.call_timeout_ms, 30_000);
     assert_eq!(yaml.max_calls_per_round, 32);
     assert_eq!(yaml.max_parallel_calls, 8);
     assert_eq!(yaml.max_result_bytes, TEST_MAX_RESULT_BYTES);
@@ -923,19 +923,19 @@ fn config_rejects_legacy_max_body_bytes() {
     // Raw body size is governed by body_limits, not per-filter. This
     // read-only dispatcher never produced a body, so the knob was removed
     // entirely and is now rejected as an unknown field.
-    let result = serde_yaml::from_str::<McpDispatchConfig>("max_body_bytes: 1024");
+    let result = serde_yaml::from_str::<McpConnectorConfig>("max_body_bytes: 1024");
     assert!(result.is_err(), "legacy max_body_bytes should be rejected");
 }
 
 #[test]
 fn config_custom_timeout() {
-    let yaml = serde_yaml::from_str::<McpDispatchConfig>("timeout_ms: 60000").unwrap();
-    assert_eq!(yaml.timeout_ms, 60_000);
+    let yaml = serde_yaml::from_str::<McpConnectorConfig>("call_timeout_ms: 60000").unwrap();
+    assert_eq!(yaml.call_timeout_ms, 60_000);
 }
 
 #[test]
 fn config_validates_forward_headers() {
-    let cfg = serde_yaml::from_str::<McpDispatchConfig>("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
+    let cfg = serde_yaml::from_str::<McpConnectorConfig>("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
     let validated = build_config(cfg).unwrap();
     assert_eq!(validated.forward_headers, ["x-tenant-id", "x-user-id"]);
 
@@ -944,26 +944,26 @@ fn config_validates_forward_headers() {
         "forward_headers: [authorization]",
         "forward_headers: [x-user-id, X-User-ID]",
     ] {
-        let cfg = serde_yaml::from_str::<McpDispatchConfig>(yaml).unwrap();
+        let cfg = serde_yaml::from_str::<McpConnectorConfig>(yaml).unwrap();
         assert!(build_config(cfg).is_err(), "should reject {yaml}");
     }
 }
 
 #[test]
 fn config_rejects_unknown_fields() {
-    let result = serde_yaml::from_str::<McpDispatchConfig>("unknown_field: true");
+    let result = serde_yaml::from_str::<McpConnectorConfig>("unknown_field: true");
     assert!(result.is_err(), "should reject unknown fields");
 }
 
 #[test]
 fn config_minimum_approval_defaults_to_none() {
-    let cfg = serde_yaml::from_str::<McpDispatchConfig>("{}").unwrap();
+    let cfg = serde_yaml::from_str::<McpConnectorConfig>("{}").unwrap();
     assert!(cfg.minimum_approval.is_none(), "the operator floor is unset by default");
 }
 
 #[test]
 fn config_minimum_approval_always_maps_to_floor() {
-    let cfg = serde_yaml::from_str::<McpDispatchConfig>("minimum_approval: always").unwrap();
+    let cfg = serde_yaml::from_str::<McpConnectorConfig>("minimum_approval: always").unwrap();
     assert_eq!(cfg.minimum_approval, Some(MinimumApproval::Always));
     assert_eq!(cfg.minimum_approval.unwrap().as_floor(), ApprovalFloor::Always);
     assert!(build_config(cfg).is_ok());
@@ -979,7 +979,7 @@ fn config_rejects_non_always_minimum_approval() {
         "minimum_approval: true",
     ] {
         assert!(
-            serde_yaml::from_str::<McpDispatchConfig>(yaml).is_err(),
+            serde_yaml::from_str::<McpConnectorConfig>(yaml).is_err(),
             "should reject {yaml}"
         );
     }
@@ -992,7 +992,7 @@ async fn on_request_body_publishes_configured_minimum_approval() {
     // approvals in the response phase. A struct field (not step metadata) means a
     // saturated metadata map can never silently drop the security floor.
     let yaml: serde_yaml::Value = serde_yaml::from_str("minimum_approval: always").unwrap();
-    let filter = McpDispatchFilter::from_config(&yaml).unwrap();
+    let filter = McpConnectorFilter::from_config(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
     ctx.extensions.insert(ResponsesState::default());
@@ -1034,37 +1034,37 @@ async fn on_request_body_publishes_no_floor_when_unset() {
 
 #[test]
 fn config_rejects_zero_timeout() {
-    let cfg = serde_yaml::from_str::<McpDispatchConfig>("timeout_ms: 0").unwrap();
+    let cfg = serde_yaml::from_str::<McpConnectorConfig>("call_timeout_ms: 0").unwrap();
     let result = build_config(cfg);
-    assert!(result.is_err(), "timeout_ms: 0 should be rejected");
+    assert!(result.is_err(), "call_timeout_ms: 0 should be rejected");
 }
 
 #[test]
 fn config_rejects_zero_call_limits() {
-    let per_round = serde_yaml::from_str::<McpDispatchConfig>("max_calls_per_round: 0").unwrap();
+    let per_round = serde_yaml::from_str::<McpConnectorConfig>("max_calls_per_round: 0").unwrap();
     assert!(build_config(per_round).is_err());
-    let parallel = serde_yaml::from_str::<McpDispatchConfig>("max_parallel_calls: 0").unwrap();
+    let parallel = serde_yaml::from_str::<McpConnectorConfig>("max_parallel_calls: 0").unwrap();
     assert!(build_config(parallel).is_err());
 }
 
 #[test]
 fn config_accepts_absolute_call_limit_ceilings() {
-    let cfg = serde_yaml::from_str::<McpDispatchConfig>("max_calls_per_round: 1024\nmax_parallel_calls: 64").unwrap();
+    let cfg = serde_yaml::from_str::<McpConnectorConfig>("max_calls_per_round: 1024\nmax_parallel_calls: 64").unwrap();
     assert!(build_config(cfg).is_ok());
 }
 
 #[test]
 fn config_rejects_call_limits_above_absolute_ceilings() {
-    let per_round = serde_yaml::from_str::<McpDispatchConfig>("max_calls_per_round: 1025").unwrap();
+    let per_round = serde_yaml::from_str::<McpConnectorConfig>("max_calls_per_round: 1025").unwrap();
     assert!(build_config(per_round).is_err());
-    let parallel = serde_yaml::from_str::<McpDispatchConfig>("max_parallel_calls: 65").unwrap();
+    let parallel = serde_yaml::from_str::<McpConnectorConfig>("max_parallel_calls: 65").unwrap();
     assert!(build_config(parallel).is_err());
 }
 
 #[test]
 fn config_validates_result_byte_limits_and_absolute_ceilings() {
     let valid =
-        serde_yaml::from_str::<McpDispatchConfig>("max_result_bytes: 16777216\nmax_total_result_bytes: 67108864")
+        serde_yaml::from_str::<McpConnectorConfig>("max_result_bytes: 16777216\nmax_total_result_bytes: 67108864")
             .unwrap();
     assert!(build_config(valid).is_ok());
 
@@ -1534,24 +1534,24 @@ fn extract_arguments_malformed_string_passes_through() {
 #[test]
 fn from_config_minimal() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
-    let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_dispatch");
+    let filter = McpConnectorFilter::from_config(&config).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector");
 }
 
 #[test]
 fn from_config_with_all_fields() {
     let config = serde_yaml::from_str::<serde_yaml::Value>(
-        "timeout_ms: 5000\nmax_calls_per_round: 16\nmax_parallel_calls: 4\nmax_result_bytes: 2048\nmax_total_result_bytes: 16384",
+        "call_timeout_ms: 5000\nmax_calls_per_round: 16\nmax_parallel_calls: 4\nmax_result_bytes: 2048\nmax_total_result_bytes: 16384",
     )
     .unwrap();
-    let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.name(), "openai_mcp_dispatch");
+    let filter = McpConnectorFilter::from_config(&config).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_connector");
 }
 
 #[test]
 fn from_config_rejects_zero_timeout() {
-    let config = serde_yaml::from_str::<serde_yaml::Value>("timeout_ms: 0").unwrap();
-    assert!(McpDispatchFilter::from_config(&config).is_err());
+    let config = serde_yaml::from_str::<serde_yaml::Value>("call_timeout_ms: 0").unwrap();
+    assert!(McpConnectorFilter::from_config(&config).is_err());
 }
 
 #[test]
@@ -1564,7 +1564,7 @@ fn from_config_rejects_inline_outbound_chain() {
         "outbound_chain:\n  name: mcp-outbound\n  filters:\n    - filter: headers\n      request_set:\n        - name: x-probe\n          value: v\n",
     )
     .unwrap();
-    let Err(error) = McpDispatchFilter::from_config(&config) else {
+    let Err(error) = McpConnectorFilter::from_config(&config) else {
         panic!("a configured outbound_chain must be rejected by the plain builtin path");
     };
     assert!(
@@ -1578,41 +1578,12 @@ fn from_config_rejects_named_outbound_chain() {
     // The plain-builtin path rejects a named chain for the same reason as an
     // inline one: it has no chain-binding context to resolve it.
     let config = serde_yaml::from_str::<serde_yaml::Value>("outbound_chain: mcp-outbound\n").unwrap();
-    let Err(error) = McpDispatchFilter::from_config(&config) else {
+    let Err(error) = McpConnectorFilter::from_config(&config) else {
         panic!("a named outbound_chain must be rejected");
     };
     assert!(
         error.to_string().contains("chain-binding registration"),
         "error should point at chain-binding registration: {error}"
-    );
-}
-
-#[test]
-fn require_inline_outbound_chain_accepts_none_and_inline() {
-    // The chain-binding path (`from_config_with_binding`) accepts an inline chain
-    // (bound at IRR step-build time) and the omitted case (empty chain).
-    use praxis_core::config::ChainRef;
-    super::config::require_inline_outbound_chain(None).expect("None must be accepted");
-    let inline = ChainRef::Inline {
-        name: "mcp-outbound".to_owned(),
-        filters: Vec::new(),
-    };
-    super::config::require_inline_outbound_chain(Some(&inline)).expect("an inline chain must be accepted");
-}
-
-#[test]
-fn require_inline_outbound_chain_rejects_named() {
-    // A named reference cannot resolve inside the IRR step (empty step-level
-    // named-chain map), so the chain-binding path rejects it up front with a
-    // clear inline-required error.
-    use praxis_core::config::ChainRef;
-    let named = ChainRef::Named("mcp-outbound".to_owned());
-    let Err(error) = super::config::require_inline_outbound_chain(Some(&named)) else {
-        panic!("a named outbound_chain must be rejected");
-    };
-    assert!(
-        error.to_string().contains("must be defined inline"),
-        "error should require an inline chain: {error}"
     );
 }
 
@@ -2139,19 +2110,19 @@ fn process_call_result_image_content_is_preserved() {
 
 fn make_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    McpDispatchFilter::from_config(&yaml).unwrap()
+    McpConnectorFilter::from_config(&yaml).unwrap()
 }
 
 fn make_scoped_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str("authorization_assertion: mcp_gateway").unwrap();
-    McpDispatchFilter::from_config(&yaml).unwrap()
+    McpConnectorFilter::from_config(&yaml).unwrap()
 }
 
 /// A dispatch filter whose per-round MCP cap — and therefore the accepted
 /// approval-response batch size — is `max_calls`.
 fn make_dispatch_filter_with_max_calls(max_calls: usize) -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_calls_per_round: {max_calls}")).unwrap();
-    McpDispatchFilter::from_config(&yaml).unwrap()
+    McpConnectorFilter::from_config(&yaml).unwrap()
 }
 
 /// A dispatch filter whose bound outbound pipeline permits private/loopback
@@ -3724,6 +3695,9 @@ async fn resume_approval_approve_executes_once_and_preserves_call() {
         matches!(result, FilterAction::Continue),
         "approval should resume, not reject"
     );
+
+    let repeated = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(repeated, FilterAction::Continue));
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(

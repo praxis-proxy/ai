@@ -302,6 +302,59 @@ fn current_profile_rejects_oversized_chunked_handshake() {
 }
 
 #[test]
+fn current_profile_handshake_completes_on_sse_reply_that_stays_open() {
+    let weather = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        sse_initialize_held_open: true,
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let started = std::time::Instant::now();
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 5, "weather_get_weather"));
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "the handshake must finish without waiting for the stream to close: {body}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the handshake must not wait for the 5 s handshake timeout"
+    );
+    assert_eq!(
+        weather.session_ids_for("tools/call"),
+        vec![Some("mock-mcp-session-1".to_owned())],
+        "the call must carry the session from the SSE handshake"
+    );
+}
+
+#[test]
+fn current_profile_handshake_works_through_a_buffering_outbound_filter() {
+    // `json_body` buffers response bodies, so the handshake reply is read
+    // whole instead of streamed.
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let extra = "outbound_filters:\n            - filter: json_body\n              content_types: [application/json]\n              request_extract:\n                - pointer: /method\n                  metadata: mcp.method";
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, extra)).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 6, "weather_get_weather"));
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "a chain that buffers responses must still complete the handshake: {body}"
+    );
+    assert_eq!(weather.method_count("initialize"), 1, "one handshake");
+}
+
+#[test]
 fn current_profile_tools_call_without_gateway_session_is_rejected() {
     let weather = start_session_backend("get_weather");
     let calendar = start_session_backend("create_event");
@@ -350,6 +403,77 @@ fn current_profile_delete_terminates_backend_sessions() {
         .filter(|r| r.http_method == "DELETE")
         .collect();
     assert_eq!(deletes.len(), 1, "the backend session must be terminated");
+}
+
+#[test]
+fn current_profile_never_issued_gateway_session_is_not_found() {
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+
+    let raw = http_send(proxy.addr(), &tools_call("mcp-forged", 1, "weather_get_weather"));
+
+    assert_eq!(parse_status(&raw), 404, "a never-issued id must be a 404: {raw}");
+    assert_eq!(
+        weather.method_count("initialize"),
+        0,
+        "a never-issued id must open no backend session"
+    );
+}
+
+#[test]
+fn current_profile_ended_gateway_session_is_not_found_until_reinitialized() {
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+    let delete =
+        format!("DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nMcp-Session-Id: {gateway}\r\nConnection: close\r\n\r\n");
+    assert_eq!(
+        parse_status(&http_send(proxy.addr(), &delete)),
+        204,
+        "DELETE must end the session"
+    );
+
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 1, "weather_get_weather"));
+    assert_eq!(parse_status(&raw), 404, "an ended id must be a 404: {raw}");
+    assert_eq!(
+        weather.method_count("initialize"),
+        0,
+        "an ended id must open no backend session"
+    );
+    let get = format!("GET /mcp HTTP/1.1\r\nHost: localhost\r\nMcp-Session-Id: {gateway}\r\nConnection: close\r\n\r\n");
+    assert_eq!(
+        parse_status(&http_send(proxy.addr(), &get)),
+        404,
+        "a reconnecting GET with an ended id must be a 404"
+    );
+    let reinit =
+        r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}}"#;
+    let raw = http_send(proxy.addr(), &json_post("/mcp", reinit, Some(&gateway)));
+    assert_eq!(
+        parse_status(&raw),
+        404,
+        "initialize carrying an ended id must be a 404: {raw}"
+    );
+
+    let fresh = initialize_gateway(proxy.addr());
+    let raw = http_send(proxy.addr(), &tools_call(&fresh, 2, "weather_get_weather"));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a new initialize must issue a working id: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "the fresh id's call must succeed at the backend: {raw}"
+    );
+    assert_eq!(
+        weather.tool_call_count("get_weather"),
+        1,
+        "only the fresh id's call reaches the backend"
+    );
 }
 
 // -----------------------------------------------------------------------------

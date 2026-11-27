@@ -1,10 +1,12 @@
 # Experimental managed Responses and tools
 
-Choose the owner of Responses state first. [Native forwarding](../getting-started/build-from-source.md)
+Decide first who owns Responses state. [Native forwarding](../getting-started/build-from-source.md)
 needs no managed Responses features and leaves state and hosted tools to the
-upstream. Adding `openai_responses_proxy` alone does not provide a complete
-managed service. Gateway-managed validation, history, persistence, and tool
-execution require an explicitly composed experimental pipeline.
+upstream. For the gateway to validate requests, keep history, persist state,
+and run tools, you compose the experimental pipeline below; adding
+`openai_responses_proxy` on its own is not enough.
+
+See the [Responses support and qualification table](../conformance/openai-responses-state-conformance.md#responses-support-and-qualification) for state parameters, SDK versions, and the native and translated vLLM test lanes.
 
 ## Prerequisites and build
 
@@ -12,29 +14,32 @@ Follow the [guide prerequisites](README.md). For this local lab you need:
 
 - A native `/v1/responses` inference backend on `127.0.0.1:3001` that supports
   function tools, returns complete Responses objects, and implements Responses
-  SSE if you test streaming. A Chat-only backend needs a different adapter chain.
-- A reachable MCP server on `127.0.0.1:8001/mcp`, with a harmless tool you are
-  authorized to call, and a key if that server requires one.
-- A writable working directory for SQLite. Use a fresh scratch directory for
-  testing; history and tool output may contain sensitive content.
+  SSE if you test streaming. A Chat-only backend needs a different adapter
+  chain (see [Conversations and state](#conversations-and-state)).
+- An MCP server on `127.0.0.1:8001/mcp` with a harmless tool you may call, and
+  its key if it requires one.
+- A fresh scratch directory for SQLite, since history and tool output may hold
+  sensitive content. The config below uses `/tmp/praxis-managed-lab`; create
+  it with `mkdir /tmp/praxis-managed-lab`, which fails if an old lab is still
+  there.
 
-Build all experimental OpenAI groups plus SQLite explicitly:
+Build all experimental OpenAI groups plus SQLite:
 
 ```console
 cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
 export BACKEND_API_KEY='<inference-backend-key>'
 ```
 
-This feature selection exceeds the default image. Do not assume the published
-standard image contains these filters. The [feature reference](../features.md#cargo-features)
-explains narrower selections and PostgreSQL alternatives.
+The published standard image does not contain these filters. The
+[feature reference](../features.md#cargo-features) covers narrower selections
+and PostgreSQL.
 
 ## Complete local pipeline
 
-Save as `managed-responses.yaml`. This is a single-owner loopback lab, with
-MCP discovery, bounded model/tool looping, logical SSE composition, local
-Conversations, and SQLite persistence. It has no public ingress authentication.
-Do not expose it as a multi-tenant service without authenticated owner scoping.
+Save as `managed-responses.yaml`. It is a single-owner loopback lab with MCP
+discovery, a bounded model/tool loop, logical SSE composition, local
+Conversations, and SQLite persistence. It has no ingress authentication, so do
+not expose it as a multi-tenant service without authenticated owner scoping.
 
 ```yaml
 listeners:
@@ -53,17 +58,15 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_responses_store
         backend: sqlite
-        database_url: "sqlite://managed-lab.db?mode=rwc"
+        database_url: "sqlite:///tmp/praxis-managed-lab/managed-lab.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
       - filter: openai_conversations
         backend: sqlite
-        database_url: "sqlite://managed-lab.db?mode=rwc"
+        database_url: "sqlite:///tmp/praxis-managed-lab/managed-lab.db?mode=rwc"
         conversations_table: openai_conversations
         items_table: openai_conversation_items
       - filter: openai_responses_rehydrate
-      - filter: openai_mcp_tool_resolve
-        timeout_ms: 5000
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 4
@@ -74,7 +77,8 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
-              - filter: openai_mcp_dispatch
+              - filter: openai_mcp_connector
+                discovery_timeout_ms: 5000
                 outbound_chain:
                   name: mcp-outbound
                   filters:
@@ -115,12 +119,12 @@ insecure_options:
   allow_private_upstreams: true
 ```
 
-The private-address opt-ins permit the local backend and MCP service. Production
-callouts need destination restrictions, TLS, authentication, and an outbound
-policy appropriate to each service. The inference key is injected only into
-the inference cluster. Supply MCP authentication through that tool entry's
-`authorization` field when needed; never put an inference bearer or a static
-catch-all secret into an outbound chain for arbitrary MCP URLs.
+The private-address opt-ins allow the local backend and MCP server. In
+production, each callout needs destination restrictions, TLS, authentication,
+and its own outbound policy. The inference key goes only to the `inference`
+cluster. Pass MCP credentials in the tool entry's `authorization` field; never
+put the inference bearer or a catch-all static secret in an outbound chain that
+reaches arbitrary MCP URLs.
 
 ## Validate and make a first request
 
@@ -138,15 +142,14 @@ curl --fail-with-body http://127.0.0.1:8080/v1/responses \
   -d "{\"model\":\"$MODEL\",\"input\":\"Say hello\",\"store\":true}"
 ```
 
-Expect a completed Responses object containing an ID and output items. Save
-that ID if you want to continue with `previous_response_id`. To test SSE, add
-`"stream":true` and `curl -N`; expect one logical Responses lifecycle ending
-in `response.completed` on success, or an explicit terminal failure. A native
-backend must supply the corresponding wire contract. A valid YAML file does
-not prove any of those runtime behaviors.
+Expect a completed Responses object with an ID and output items. Keep the ID
+to continue with `previous_response_id`. For SSE, add `"stream":true` and
+`curl -N`; expect one logical Responses lifecycle that ends in
+`response.completed`, or an explicit terminal failure. The backend must
+implement the matching wire contract; passing `--validate` does not prove it.
 
-To request a harmless MCP tool, replace the model, tool name, and prompt with
-values from your server, then send:
+To call the MCP tool, replace the model, tool name, and prompt with values from
+your server:
 
 ```console
 curl --fail-with-body http://127.0.0.1:8080/v1/responses \
@@ -164,10 +167,9 @@ curl --fail-with-body http://127.0.0.1:8080/v1/responses \
   }'
 ```
 
-If the model selects that tool, expect an `mcp_approval_request` instead of
-execution. Resume with the returned response ID, the same tools declaration,
-and an input item `{"type":"mcp_approval_response","approval_request_id":"<returned-call-id>","approve":true}`.
-For example, approve with this complete request after replacing placeholders:
+If the model selects the tool, you get an `mcp_approval_request` instead of
+execution. To approve, resume with the returned response ID, the same tools
+declaration, and an `mcp_approval_response` input item:
 
 ```console
 curl --fail-with-body http://127.0.0.1:8080/v1/responses \
@@ -190,66 +192,65 @@ curl --fail-with-body http://127.0.0.1:8080/v1/responses \
   }'
 ```
 
-After approval, expect one authorized tool call, a model continuation, and final
-output. A denial must execute zero tool calls. Verify MCP recordings and
-inference round counts; output text alone does not prove execution. The
-[existing loop example](../../examples/configs/openai/responses/agentic-loop.yaml)
-contains the full approval/denial lifecycle and additional dispatchers.
+After approval, expect one tool call, a model continuation, and final output.
+A denial executes no tool calls. Check MCP server recordings and inference
+round counts, because output text alone does not prove the tool ran. The
+[loop example](../../examples/configs/openai/responses/agentic-loop.yaml) covers
+the full approval and denial lifecycle and more dispatchers.
 
-Client function tools are returned to the client for execution. Recognizing a
-tool declaration does not imply a server executor exists. Managed
-`code_interpreter`, `background:true`, and non-null reusable `prompt`
-references are rejected; direct provider-owned passthrough is a different path.
-See [managed validation](../filters/apis/openai_responses_request.md),
-[MCP dispatch](../filters/agents/openai_mcp_dispatch.md), and
+Client function tools go back to the client to execute; a recognized tool
+declaration does not mean the gateway has an executor for it. The managed path
+rejects `code_interpreter`, `background:true`, and non-null reusable `prompt`
+references (direct provider-owned passthrough is a separate path). See
+[managed validation](../filters/apis/openai_responses_request.md),
+[MCP connector](../filters/agents/openai_mcp_connector.md), and
 [retained-payload bounds](../architecture/responses-retained-payload.md).
 
 ## Conversations and state
 
-With this pipeline running, local Conversations CRUD needs no model call:
+Local Conversations CRUD on this pipeline needs no model call:
 
 ```console
 curl --fail-with-body http://127.0.0.1:8080/v1/conversations \
   -H 'content-type: application/json' -d '{}'
 ```
 
-Expect a Conversation ID. Use it in a subsequent Responses request's
-`conversation` field; completed input/output items append to the owner-scoped
-Conversation. The store and Conversations filters share the database and run
-before rehydration/inference; reverse response order appends the conversation
-turn before storing its successful response. See the
-[exact Conversations contract](../filters/agents/openai_conversations.md) and
-[store lifecycle](../architecture/response-store.md). In the unified example,
-an OpenAI-selected route forwards directly and the provider owns history.
+Pass the returned Conversation ID in a later Responses request's
+`conversation` field; completed input and output items append to that
+owner-scoped Conversation. The store and Conversations filters share one
+database and run before rehydration and inference. In response order they run
+in reverse, so the conversation turn is appended before its successful response
+is stored. See the [Conversations contract](../filters/agents/openai_conversations.md)
+and [store lifecycle](../architecture/response-store.md).
 
-For Chat-only inference, use the complete
+For a Chat-only backend on port 3001, use the complete
 [Responses-to-Chat configuration](../../examples/configs/openai/responses/responses-to-chat-completions.yaml)
-with this build and a Chat backend at port 3001. It provides translation and
-state, not the model/tool loop above. Read its
-[compatibility gaps](../conformance/translation-matrix.md#known-gaps), especially
-continuation history and operations without a Chat equivalent. Do not claim
-WebSocket support from an HTTP POST translation recipe.
+with this build. It provides translation and state but not the model/tool loop
+above. Read its [compatibility gaps](../conformance/translation-matrix.md#known-gaps),
+especially continuation history and operations with no Chat equivalent. This
+HTTP POST recipe does not provide WebSocket support.
 
 ## Expand deliberately
 
 The [unified full-flow example](../../examples/configs/openai/responses/full-flow-agentic.yaml)
-adds provider-owned passthrough, managed providers, hosted web/file search,
-files, compaction, and selected MCP connectors. It also needs the configured
-service endpoints, secrets, and trusted ingress assertions; it is not a
-one-service quickstart. Files API routing does not create a file service;
-file resolution needs a reachable Files API, and file-search dispatch needs a
-vector-store service. Compaction requires a summarization backend. MCP
-classification/brokering and A2A routing are separate protocol capabilities,
-described in [agentic protocols](../architecture/agentic-protocols.md).
+adds provider-owned passthrough (an OpenAI-selected route forwards directly and
+the provider owns history), managed providers, hosted web and file search,
+files, compaction, and selected MCP connectors. Each needs its own service
+endpoint, secrets, and trusted ingress assertions: file resolution needs a
+reachable Files API, file-search dispatch needs a vector-store service, and
+compaction needs a summarization backend. MCP classification and brokering and
+A2A routing are separate capabilities, described in
+[agentic protocols](../architecture/agentic-protocols.md).
 
 ## Cleanup
 
-Stop the proxy before removing lab state. Stop the backend and MCP server only
-if started for this recipe. Unset `BACKEND_API_KEY` in the proxy shell and
-`MODEL` in the client shell. Delete your local `managed-responses.yaml` and,
-only if this was a disposable lab, `managed-lab.db` and its `-wal`/`-shm`
-sidecars. Do not remove a shared or production store. Follow
-[store migrations](../operations/store/schema-migration.md) for deployed state.
+Stop the proxy before removing lab state, and stop the backend and MCP server
+if you started them for this lab. Unset `BACKEND_API_KEY` in the proxy shell and
+`MODEL` in the client shell. Delete `managed-responses.yaml` and, for a
+disposable lab only, `/tmp/praxis-managed-lab` with the database and its
+`-wal`/`-shm` sidecars. For a
+deployed store, follow [store migrations](../operations/store/schema-migration.md)
+instead.
 
 ## Filter reference
 
@@ -259,9 +260,8 @@ sidecars. Do not remove a shared or production store. Follow
 - [`openai_tool_parse`](../filters/apis/openai_tool_parse.md)
 - [`openai_responses_rehydrate`](../filters/agents/openai_responses_rehydrate.md)
 - [`openai_responses_proxy`](../filters/agents/openai_responses_proxy.md)
-- [`openai_mcp_tool_resolve`](../filters/agents/openai_mcp_tool_resolve.md)
+- [`openai_mcp_connector`](../filters/agents/openai_mcp_connector.md)
 - [`openai_agentic_loop`](../filters/agents/openai_agentic_loop.md)
-- [`openai_mcp_dispatch`](../filters/agents/openai_mcp_dispatch.md)
 - [`openai_stream_events`](../filters/apis/openai_stream_events.md)
 - [`openai_responses_store`](../filters/agents/openai_responses_store.md)
 - [`openai_conversations`](../filters/agents/openai_conversations.md)

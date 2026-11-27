@@ -104,7 +104,10 @@ async fn publishes_routing_metadata_and_filter_results() {
         "max_tokens": 64,
         "stream": true,
         "tools": [{"name": "lookup"}],
-        "messages": [{"role": "user", "content": "Hi"}],
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}
+        }]}],
     }))
     .unwrap();
     let (_, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
@@ -114,6 +117,7 @@ async fn publishes_routing_metadata_and_filter_results() {
         ("anthropic_messages_request.stream", "true"),
         ("anthropic_messages_request.max_tokens", "64"),
         ("anthropic_messages_request.has_tools", "true"),
+        ("ai.modality", "image"),
     ] {
         assert_eq!(ctx.filter_metadata.get(key), Some(value), "{key}");
     }
@@ -124,6 +128,7 @@ async fn publishes_routing_metadata_and_filter_results() {
         .expect("results are what on_result branch conditions read");
     assert_eq!(results.get("model"), Some("claude-opus-4-8"));
     assert_eq!(results.get("stream"), Some("true"));
+    assert_eq!(results.get("modality"), Some("image"));
 }
 
 #[tokio::test]

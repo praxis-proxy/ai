@@ -9,47 +9,25 @@
 //! exists the broker forwards the client's request through the main proxy
 //! path so streaming and every main-chain policy still apply.
 //!
-//! [`FilteredMcpBackendClient`] runs each exchange as a filtered subrequest
-//! through the broker's generated outbound chain. The executor bounds the
-//! buffered response before materializing it, so oversized and chunked
-//! handshake replies are rejected without retaining the complete body.
+//! [`FilteredMcpBackendClient`] runs each exchange through
+//! [`McpSessionClient`], the MCP client the hosted MCP paths share: `rmcp`
+//! builds and decodes the JSON-RPC messages, and the filtered subrequest
+//! transport runs them through the broker's generated outbound chain. Replies
+//! are bounded before they are parsed, and an `initialize` reply on an SSE
+//! stream completes when it arrives even if the backend keeps the stream open.
 
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
-use praxis_core::subrequest::SubRequestClient;
-use praxis_filter::{
-    CalloutOutcome, CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, SubRequest,
-    SubResponse, SubrequestRuntime, TraceContext,
-};
-use tracing::debug;
+use http::{HeaderName, HeaderValue};
+use praxis_ai_apis::mcp_session::{McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit};
+use praxis_filter::FilterPipeline;
 
 use super::selector::BrokerBackendCluster;
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Prefix of the JSON-RPC id the broker uses for its own backend `initialize`.
-const INITIALIZE_REQUEST_ID_PREFIX: &str = "praxis-broker-initialize-";
-
-/// Client name the broker reports to backends.
-const CLIENT_NAME: &str = "praxis";
-
-/// Client version the broker reports to backends.
-const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Maximum accepted backend `Mcp-Session-Id` length.
-const MAX_SESSION_ID_LEN: usize = 256;
-
-/// Maximum accepted backend protocol version length.
-const MAX_PROTOCOL_VERSION_LEN: usize = 64;
 
 /// MCP session header.
 pub(crate) const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
@@ -71,21 +49,7 @@ pub(crate) struct BackendTarget<'a> {
 }
 
 /// Request-scoped resources one backend exchange runs with.
-#[derive(Clone)]
-pub(crate) struct BackendCallout {
-    /// Shared sub-request transport.
-    pub client: SubRequestClient,
-    /// Absolute deadline for the exchange.
-    pub deadline: Instant,
-    /// Current sub-request nesting depth.
-    pub depth: u8,
-    /// Downstream client attributes.
-    pub downstream: SubrequestRuntime,
-    /// Operator-allowlisted client headers copied onto the exchange.
-    pub forwarded_headers: HeaderMap,
-    /// Request correlation propagated into the exchange.
-    pub trace_context: Option<TraceContext>,
-}
+pub(crate) type BackendCallout = McpSessionCallout;
 
 /// Result of a successful backend `initialize`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +94,8 @@ pub(crate) enum McpBackendError {
     Capacity,
     /// The gateway session was deleted while its handshake ran.
     SessionClosed,
+    /// The gateway session was ended before the handshake started.
+    GatewayEnded,
 }
 
 impl McpBackendError {
@@ -145,6 +111,7 @@ impl McpBackendError {
             Self::UnsupportedVersion => "unsupported_protocol_version",
             Self::Capacity => "session_capacity",
             Self::SessionClosed => "session_closed",
+            Self::GatewayEnded => "gateway_session_ended",
         }
     }
 }
@@ -161,6 +128,20 @@ impl fmt::Display for McpBackendError {
             Self::UnsupportedVersion => f.write_str("backend negotiated an unsupported protocol version"),
             Self::Capacity => f.write_str("backend session capacity exhausted"),
             Self::SessionClosed => f.write_str("gateway session closed during the backend handshake"),
+            Self::GatewayEnded => f.write_str("gateway session ended before the backend handshake"),
+        }
+    }
+}
+
+impl From<McpSessionError> for McpBackendError {
+    fn from(error: McpSessionError) -> Self {
+        match error {
+            McpSessionError::Timeout => Self::Timeout,
+            McpSessionError::ResponseTooLarge { limit } => Self::ResponseTooLarge { limit },
+            McpSessionError::Rejected { status } => Self::Rejected { status },
+            McpSessionError::JsonRpc { code } => Self::JsonRpc { code },
+            McpSessionError::Malformed(detail) => Self::Malformed(detail),
+            McpSessionError::Transport => Self::Transport,
         }
     }
 }
@@ -205,68 +186,18 @@ pub(crate) trait McpBackendClient: Send + Sync {
 // FilteredMcpBackendClient
 // -----------------------------------------------------------------------------
 
-/// [`McpBackendClient`] backed by filtered subrequests through the broker's
+/// [`McpBackendClient`] backed by [`McpSessionClient`] over the broker's
 /// generated outbound chain.
 pub(crate) struct FilteredMcpBackendClient {
-    /// Generated handshake chain: selector, operator filters, load balancer.
-    pipeline: Arc<FilterPipeline>,
-    /// Buffered response ceiling for each exchange.
-    max_response_bytes: usize,
-    /// Per-exchange step timeout.
-    step_timeout: Duration,
+    /// Shared MCP session client bound to the handshake chain.
+    client: McpSessionClient,
 }
 
 impl FilteredMcpBackendClient {
     /// Build a client over the bound handshake chain.
     pub(crate) fn new(pipeline: Arc<FilterPipeline>, max_response_bytes: usize, step_timeout: Duration) -> Self {
         Self {
-            pipeline,
-            max_response_bytes,
-            step_timeout,
-        }
-    }
-
-    /// Run one exchange, pinned to `pinned_endpoint` when set, and return the
-    /// bounded buffered response with the endpoint address that served it.
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "filtered subrequest executor futures are inherently large"
-    )]
-    async fn exchange(
-        &self,
-        target: BackendTarget<'_>,
-        request: SubRequest,
-        callout: &BackendCallout,
-        pinned_endpoint: Option<&Arc<str>>,
-    ) -> Result<(SubResponse, Option<Arc<str>>), McpBackendError> {
-        let staged = BrokerBackendCluster::new(Arc::clone(target.cluster), pinned_endpoint.cloned());
-        let dialed = Arc::clone(&staged.dialed);
-        let mut extensions = RequestExtensions::default();
-        extensions.insert(staged);
-        if let Some(trace_context) = callout.trace_context.as_ref() {
-            extensions.insert(trace_context.clone());
-        }
-
-        let executor = FilteredSubrequestExecutor::for_callout(
-            callout.client.clone(),
-            callout.downstream.clone(),
-            callout.depth,
-            self.max_response_bytes,
-            self.step_timeout,
-        );
-        let outcome = Box::pin(executor.run_classified(&self.pipeline, &request, extensions, callout.deadline)).await;
-        match outcome {
-            Ok(CalloutOutcome::Response(CalloutResponse::Buffered(response))) => Ok((response, dialed.get().cloned())),
-            Ok(CalloutOutcome::ResponseTooLarge { limit, .. }) => Err(McpBackendError::ResponseTooLarge { limit }),
-            Ok(_) => Err(McpBackendError::Transport),
-            Err(error) => {
-                debug!(error = %error, "mcp broker backend exchange failed");
-                if Instant::now() >= callout.deadline {
-                    Err(McpBackendError::Timeout)
-                } else {
-                    Err(McpBackendError::Transport)
-                }
-            },
+            client: McpSessionClient::new(pipeline, max_response_bytes, step_timeout),
         }
     }
 }
@@ -279,12 +210,20 @@ impl McpBackendClient for FilteredMcpBackendClient {
         protocol_version: &str,
         callout: &BackendCallout,
     ) -> Result<BackendInit, McpBackendError> {
-        let request_id = initialize_request_id();
-        let request = post_request(target, initialize_body(&request_id, protocol_version), callout, None)?;
-        let (response, endpoint) = self.exchange(target, request, callout, None).await?;
-        let mut init = parse_initialize_response(&response, &request_id)?;
-        init.endpoint = endpoint;
-        Ok(init)
+        // Unpinned: the load balancer picks the endpoint, and the selector
+        // records it so later exchanges reach the session's endpoint.
+        let staged = BrokerBackendCluster::new(Arc::clone(target.cluster), None);
+        let dialed = Arc::clone(&staged.dialed);
+        let init = Box::pin(
+            self.client
+                .initialize(target.path, Arc::new(staged), callout, protocol_version),
+        )
+        .await?;
+        Ok(BackendInit {
+            protocol_version: init.protocol_version,
+            session_id: init.session_id,
+            endpoint: dialed.get().cloned(),
+        })
     }
 
     async fn send_initialized(
@@ -293,12 +232,13 @@ impl McpBackendClient for FilteredMcpBackendClient {
         session: &BackendInit,
         callout: &BackendCallout,
     ) -> Result<(), McpBackendError> {
-        let body = Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-        let request = post_request(target, body, callout, Some(session))?;
-        let (response, _endpoint) = self
-            .exchange(target, request, callout, session.endpoint.as_ref())
-            .await?;
-        expect_success(response.status)
+        let stage = Arc::new(pinned_stage(target, session));
+        Box::pin(
+            self.client
+                .send_initialized(target.path, stage, callout, &session_init(session)),
+        )
+        .await
+        .map_err(McpBackendError::from)
     }
 
     async fn terminate(
@@ -307,197 +247,28 @@ impl McpBackendClient for FilteredMcpBackendClient {
         session: &BackendInit,
         callout: &BackendCallout,
     ) -> Result<(), McpBackendError> {
-        let Some(session_id) = session.session_id.as_ref() else {
-            return Ok(());
-        };
-        let mut headers = callout.forwarded_headers.clone();
-        headers.insert(MCP_SESSION_ID, session_id.clone());
-        insert_protocol_version(&mut headers, &session.protocol_version)?;
-        let request = SubRequest {
-            method: Method::DELETE,
-            uri: backend_uri(target)?,
-            headers,
-            body: Bytes::new(),
-        };
-        let (response, _endpoint) = self
-            .exchange(target, request, callout, session.endpoint.as_ref())
-            .await?;
-        // 404 and 405 mean the backend already forgot the session or does not
-        // support client-initiated termination; both leave nothing to clean up.
-        if matches!(response.status, 404 | 405) {
-            return Ok(());
-        }
-        expect_success(response.status)
+        let stage = Arc::new(pinned_stage(target, session));
+        Box::pin(
+            self.client
+                .terminate(target.path, stage, callout, &session_init(session)),
+        )
+        .await
+        .map_err(McpBackendError::from)
     }
 }
 
-// -----------------------------------------------------------------------------
-// Request Builders
-// -----------------------------------------------------------------------------
+/// Destination for an exchange on an existing session: its cluster, pinned to
+/// the endpoint that holds the session.
+fn pinned_stage(target: BackendTarget<'_>, session: &BackendInit) -> BrokerBackendCluster {
+    BrokerBackendCluster::new(Arc::clone(target.cluster), session.endpoint.clone())
+}
 
-/// Build a JSON-RPC POST to the backend endpoint.
-fn post_request(
-    target: BackendTarget<'_>,
-    body: Bytes,
-    callout: &BackendCallout,
-    session: Option<&BackendInit>,
-) -> Result<SubRequest, McpBackendError> {
-    let mut headers = callout.forwarded_headers.clone();
-    headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        http::header::ACCEPT,
-        HeaderValue::from_static("application/json, text/event-stream"),
-    );
-    if let Some(session) = session {
-        if let Some(session_id) = session.session_id.as_ref() {
-            headers.insert(MCP_SESSION_ID, session_id.clone());
-        }
-        insert_protocol_version(&mut headers, &session.protocol_version)?;
+/// The client-side view of a broker backend session.
+fn session_init(session: &BackendInit) -> McpSessionInit {
+    McpSessionInit {
+        protocol_version: session.protocol_version.clone(),
+        session_id: session.session_id.clone(),
     }
-    Ok(SubRequest {
-        method: Method::POST,
-        uri: backend_uri(target)?,
-        headers,
-        body,
-    })
-}
-
-/// Origin-form URI for the backend endpoint.
-fn backend_uri(target: BackendTarget<'_>) -> Result<http::Uri, McpBackendError> {
-    target
-        .path
-        .parse()
-        .map_err(|_e| McpBackendError::Malformed("invalid backend path"))
-}
-
-/// Set the negotiated protocol version on a post-initialize exchange.
-fn insert_protocol_version(headers: &mut HeaderMap, version: &str) -> Result<(), McpBackendError> {
-    let value = HeaderValue::from_str(version).map_err(|_e| McpBackendError::Malformed("invalid protocol version"))?;
-    headers.insert(MCP_PROTOCOL_VERSION, value);
-    Ok(())
-}
-
-/// A fresh JSON-RPC id for one backend `initialize`.
-///
-/// Clients choose the ids of the calls the broker forwards on the same backend
-/// session, and MCP forbids reusing an id within a session. A random id keeps
-/// the broker's own request from colliding with any id a client picks.
-fn initialize_request_id() -> String {
-    format!("{INITIALIZE_REQUEST_ID_PREFIX}{:032x}", rand::random::<u128>())
-}
-
-/// Serialize the broker's backend `initialize` request.
-fn initialize_body(request_id: &str, protocol_version: &str) -> Bytes {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": protocol_version,
-            "capabilities": {},
-            "clientInfo": { "name": CLIENT_NAME, "version": CLIENT_VERSION },
-        },
-    });
-    Bytes::from(body.to_string())
-}
-
-// -----------------------------------------------------------------------------
-// Response Parsing
-// -----------------------------------------------------------------------------
-
-/// Map a non-2xx status to [`McpBackendError::Rejected`].
-fn expect_success(status: u16) -> Result<(), McpBackendError> {
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(McpBackendError::Rejected { status })
-    }
-}
-
-/// Validate an `initialize` reply delivered as JSON or a buffered SSE stream.
-pub(crate) fn parse_initialize_response(
-    response: &SubResponse,
-    request_id: &str,
-) -> Result<BackendInit, McpBackendError> {
-    expect_success(response.status)?;
-    let session_id = backend_session_id(&response.headers)?;
-    let is_sse = response
-        .headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(praxis_ai_apis::is_event_stream_content_type);
-    let message = if is_sse {
-        find_sse_response(&response.body, request_id)?
-    } else {
-        serde_json::from_slice::<serde_json::Value>(&response.body)
-            .map_err(|_e| McpBackendError::Malformed("initialize reply is not JSON"))?
-    };
-    let protocol_version = initialize_result_version(&message, request_id)?;
-    Ok(BackendInit {
-        protocol_version,
-        session_id,
-        endpoint: None,
-    })
-}
-
-/// Read and validate the backend `Mcp-Session-Id` response header.
-fn backend_session_id(headers: &HeaderMap) -> Result<Option<HeaderValue>, McpBackendError> {
-    let mut values = headers.get_all(&MCP_SESSION_ID).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(McpBackendError::Malformed("multiple Mcp-Session-Id headers"));
-    }
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_SESSION_ID_LEN || !bytes.iter().all(|b| (0x21..=0x7E).contains(b)) {
-        return Err(McpBackendError::Malformed("invalid Mcp-Session-Id"));
-    }
-    Ok(Some(value.clone()))
-}
-
-/// Find the JSON-RPC reply to the broker's `initialize` in an SSE body.
-fn find_sse_response(body: &[u8], request_id: &str) -> Result<serde_json::Value, McpBackendError> {
-    praxis_ai_apis::buffered_sse_event_data(body)
-        .iter()
-        .find_map(|data| initialize_reply(data, request_id))
-        .ok_or(McpBackendError::Malformed("initialize stream has no reply"))
-}
-
-/// Parse one SSE event payload when it answers the broker's `initialize`.
-fn initialize_reply(data: &[u8], request_id: &str) -> Option<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
-    (value.get("id").and_then(serde_json::Value::as_str) == Some(request_id)).then_some(value)
-}
-
-/// Extract the negotiated version from an `initialize` JSON-RPC reply.
-fn initialize_result_version(message: &serde_json::Value, request_id: &str) -> Result<Box<str>, McpBackendError> {
-    if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
-        return Err(McpBackendError::Malformed("initialize reply is not JSON-RPC 2.0"));
-    }
-    if message.get("id").and_then(serde_json::Value::as_str) != Some(request_id) {
-        return Err(McpBackendError::Malformed("initialize reply id does not match"));
-    }
-    if let Some(error) = message.get("error") {
-        let code = error
-            .get("code")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or(McpBackendError::Malformed("initialize error has no code"))?;
-        return Err(McpBackendError::JsonRpc { code });
-    }
-    let version = message
-        .get("result")
-        .and_then(|r| r.get("protocolVersion"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or(McpBackendError::Malformed("initialize result has no protocolVersion"))?;
-    if version.is_empty()
-        || version.len() > MAX_PROTOCOL_VERSION_LEN
-        || HeaderValue::from_str(version).is_err()
-        || version.bytes().any(|b| b.is_ascii_control())
-    {
-        return Err(McpBackendError::Malformed("invalid protocolVersion"));
-    }
-    Ok(Box::from(version))
 }
 
 // -----------------------------------------------------------------------------
@@ -506,228 +277,36 @@ fn initialize_result_version(message: &serde_json::Value, request_id: &str) -> R
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    reason = "tests"
-)]
+#[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
-    /// Request id the tests' `initialize` replies answer.
-    const INITIALIZE_REQUEST_ID: &str = "praxis-broker-initialize-test";
-
-    fn parse_initialize_response(response: &SubResponse) -> Result<BackendInit, McpBackendError> {
-        super::parse_initialize_response(response, INITIALIZE_REQUEST_ID)
-    }
-
-    fn response(status: u16, content_type: &str, session: Option<&str>, body: &str) -> SubResponse {
-        let mut headers = HeaderMap::new();
-        headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
-        if let Some(session) = session {
-            headers.insert(MCP_SESSION_ID, HeaderValue::from_str(session).unwrap());
-        }
-        SubResponse {
-            status,
-            version: http::Version::HTTP_11,
-            headers,
-            body: Bytes::from(body.to_owned()),
-        }
-    }
-
-    fn init_reply(version: &str) -> String {
-        format!(r#"{{"jsonrpc":"2.0","id":"{INITIALIZE_REQUEST_ID}","result":{{"protocolVersion":"{version}"}}}}"#)
-    }
-
     #[test]
-    fn json_initialize_captures_session_and_version() {
-        let init = parse_initialize_response(&response(
-            200,
-            "application/json",
-            Some("s-1"),
-            &init_reply("2025-06-18"),
-        ))
-        .unwrap();
-        assert_eq!(init.session_id.unwrap(), "s-1", "session id must be captured");
-        assert_eq!(&*init.protocol_version, "2025-06-18", "version must be captured");
-    }
-
-    #[test]
-    fn sessionless_backend_is_accepted() {
-        let init =
-            parse_initialize_response(&response(200, "application/json", None, &init_reply("2025-03-26"))).unwrap();
-        assert!(init.session_id.is_none(), "backend without a session yields None");
-    }
-
-    #[test]
-    fn sse_initialize_skips_unrelated_events() {
-        let body = format!(
-            ": keepalive\r\n\r\nevent: message\r\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}}\r\n\r\ndata: {}\r\n\r\n",
-            init_reply("2025-06-18")
-        );
-        let init = parse_initialize_response(&response(200, "text/event-stream", Some("s-2"), &body)).unwrap();
-        assert_eq!(&*init.protocol_version, "2025-06-18", "SSE reply must be found");
-    }
-
-    #[test]
-    fn sse_initialize_without_terminal_blank_line_is_rejected() {
-        let body = format!("data: {}", init_reply("2025-06-18"));
-        assert!(
-            parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).is_err(),
-            "an unterminated event is incomplete and must not be accepted"
-        );
-    }
-
-    #[test]
-    fn sse_initialize_accepts_cr_only_framing() {
-        let body = format!("event: message\rdata: {}\r\r", init_reply("2025-06-18"));
-        let init = parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).unwrap();
+    fn session_errors_keep_their_class() {
         assert_eq!(
-            &*init.protocol_version, "2025-06-18",
-            "bare CR line endings must frame events"
+            McpBackendError::from(McpSessionError::ResponseTooLarge { limit: 7 }),
+            McpBackendError::ResponseTooLarge { limit: 7 },
+            "size limit must survive the mapping"
         );
-    }
-
-    #[test]
-    fn sse_initialize_accepts_leading_bom() {
-        let body = format!("\u{feff}data: {}\n\n", init_reply("2025-06-18"));
-        let init = parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).unwrap();
         assert_eq!(
-            &*init.protocol_version, "2025-06-18",
-            "a leading BOM must not hide data:"
+            McpBackendError::from(McpSessionError::Rejected { status: 401 }),
+            McpBackendError::Rejected { status: 401 },
+            "status must survive the mapping"
         );
-    }
-
-    #[test]
-    fn sse_initialize_without_reply_is_malformed() {
-        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n\n";
-        assert!(
-            matches!(
-                parse_initialize_response(&response(200, "text/event-stream", Some("s"), body)),
-                Err(McpBackendError::Malformed(_))
-            ),
-            "stream without reply must be malformed"
-        );
-    }
-
-    #[test]
-    fn non_success_status_is_rejected() {
         assert_eq!(
-            parse_initialize_response(&response(401, "application/json", None, "{}")),
-            Err(McpBackendError::Rejected { status: 401 }),
-            "401 must map to Rejected"
+            McpBackendError::from(McpSessionError::JsonRpc { code: -32602 }),
+            McpBackendError::JsonRpc { code: -32602 },
+            "JSON-RPC code must survive the mapping"
         );
-    }
-
-    #[test]
-    fn json_rpc_error_is_preserved() {
-        let body =
-            format!(r#"{{"jsonrpc":"2.0","id":"{INITIALIZE_REQUEST_ID}","error":{{"code":-32602,"message":"x"}}}}"#);
         assert_eq!(
-            parse_initialize_response(&response(200, "application/json", None, &body)),
-            Err(McpBackendError::JsonRpc { code: -32602 }),
-            "JSON-RPC error code must be preserved"
+            McpBackendError::from(McpSessionError::Timeout).reason(),
+            "timeout",
+            "timeouts stay distinct from transport failures"
         );
-    }
-
-    #[test]
-    fn malformed_json_is_distinct() {
         assert_eq!(
-            parse_initialize_response(&response(200, "application/json", None, "not json"))
-                .unwrap_err()
-                .reason(),
-            "malformed_response",
-            "malformed JSON must be classified"
-        );
-    }
-
-    #[test]
-    fn mismatched_reply_id_is_malformed() {
-        let body = r#"{"jsonrpc":"2.0","id":7,"result":{"protocolVersion":"2025-06-18"}}"#;
-        assert!(
-            matches!(
-                parse_initialize_response(&response(200, "application/json", None, body)),
-                Err(McpBackendError::Malformed(_))
-            ),
-            "reply with another id must be rejected"
-        );
-    }
-
-    #[test]
-    fn invalid_session_id_is_rejected() {
-        let long = "a".repeat(MAX_SESSION_ID_LEN + 1);
-        assert!(
-            parse_initialize_response(&response(
-                200,
-                "application/json",
-                Some(&long),
-                &init_reply("2025-06-18")
-            ))
-            .is_err(),
-            "oversized session id must be rejected"
-        );
-        assert!(
-            parse_initialize_response(&response(
-                200,
-                "application/json",
-                Some("a b"),
-                &init_reply("2025-06-18")
-            ))
-            .is_err(),
-            "session id with space must be rejected"
-        );
-    }
-
-    #[test]
-    fn duplicate_session_headers_are_rejected() {
-        let mut resp = response(200, "application/json", Some("a"), &init_reply("2025-06-18"));
-        resp.headers.append(MCP_SESSION_ID, HeaderValue::from_static("b"));
-        assert!(
-            parse_initialize_response(&resp).is_err(),
-            "ambiguous session id must be rejected"
-        );
-    }
-
-    #[test]
-    fn missing_protocol_version_is_malformed() {
-        let body = format!(r#"{{"jsonrpc":"2.0","id":"{INITIALIZE_REQUEST_ID}","result":{{}}}}"#);
-        assert!(
-            parse_initialize_response(&response(200, "application/json", None, &body)).is_err(),
-            "result without protocolVersion must be rejected"
-        );
-    }
-
-    #[test]
-    fn initialize_body_is_valid_request() {
-        let body: serde_json::Value = serde_json::from_slice(&initialize_body("req-1", "2025-06-18")).unwrap();
-        assert_eq!(body["method"], "initialize", "method must be initialize");
-        assert_eq!(body["id"], "req-1", "the request id must be sent");
-        assert_eq!(body["params"]["protocolVersion"], "2025-06-18", "version must be sent");
-        assert_eq!(
-            body["params"]["clientInfo"]["name"], CLIENT_NAME,
-            "client name must be sent"
-        );
-    }
-
-    #[test]
-    fn initialize_request_ids_are_unique() {
-        let first = initialize_request_id();
-        assert!(
-            first.starts_with(INITIALIZE_REQUEST_ID_PREFIX),
-            "the id must carry the broker prefix"
-        );
-        assert_ne!(first, initialize_request_id(), "each handshake must get its own id");
-    }
-
-    #[test]
-    fn reply_to_another_request_id_is_rejected() {
-        let body =
-            r#"{"jsonrpc":"2.0","id":"praxis-broker-initialize-other","result":{"protocolVersion":"2025-06-18"}}"#;
-        assert!(
-            parse_initialize_response(&response(200, "application/json", None, body)).is_err(),
-            "a reply must answer this handshake's own id"
+            McpBackendError::from(McpSessionError::Transport).reason(),
+            "transport",
+            "transport failures keep their reason"
         );
     }
 
@@ -746,6 +325,32 @@ mod tests {
             unique.len(),
             reasons.len(),
             "every failure class needs a distinct reason"
+        );
+    }
+
+    #[test]
+    fn pinned_stage_targets_the_session_endpoint() {
+        let cluster: Arc<str> = Arc::from("weather-mcp");
+        let target = BackendTarget {
+            cluster: &cluster,
+            path: "/mcp",
+        };
+        let session = BackendInit {
+            protocol_version: Box::from("2025-06-18"),
+            session_id: Some(HeaderValue::from_static("s-1")),
+            endpoint: Some(Arc::from("10.0.0.2:3001")),
+        };
+        let stage = pinned_stage(target, &session);
+        assert_eq!(&*stage.cluster, "weather-mcp", "the session's cluster is dialed");
+        assert_eq!(
+            stage.pinned_endpoint.as_deref(),
+            Some("10.0.0.2:3001"),
+            "later exchanges reach the endpoint holding the session"
+        );
+        assert_eq!(
+            session_init(&session).session_id.unwrap(),
+            "s-1",
+            "the session id is carried to the client"
         );
     }
 }

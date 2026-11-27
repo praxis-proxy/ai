@@ -1,35 +1,14 @@
-# AI Inference
+# AI inference
 
-Body-aware classification, routing, and enrichment
-for AI inference traffic, built on the filter
-pipeline and StreamBuffer body access pattern.
+How Praxis AI classifies, routes, and enriches inference traffic using the
+filter pipeline and `StreamBuffer` body access.
 
 ## Overview
 
-AI inference filters identify the operation from the
-request head, then — for operations that carry one —
-extract routing signals from the body (model, stream
-mode, store flag) and promote them to headers,
-metadata, and filter results for downstream routing via
-branch chains.
-
-Protocol and operation identity come from the request
-head, not the body shape. The `ai_operation` filter
-reads the HTTP method, normalized path, and protocol
-headers alone and publishes a typed match (OpenAI
-Responses, Conversations, Chat Completions, or Anthropic
-Messages, plus the specific operation) before any body
-is read. A matched operation is authoritative over body
-shape: a Chat-Completions-shaped body posted to
-`POST /v1/responses` is still a Responses request.
-
-`openai_responses_request` then runs for matched
-Responses operations. It reads the body only to extract
-facts (model, stream, store, background, mode) and,
-when configured as the managed owner, to initialize
-state. Bodyless operations (fetch, delete, cancel) and
-operations whose body the specification marks optional
-promote operation identity without reading a body.
+AI inference filters identify the operation from the request head, then, for
+operations that carry a body, extract routing signals from it (model, stream
+mode, store flag) and promote them to headers, metadata, and filter results that
+branch chains and the router consume.
 
 ```text
 Request Head (method, path, protocol headers)
@@ -50,80 +29,72 @@ Branch Chains / Router (routing decisions)
 Upstream
 ```
 
-## Classification Pipeline
+## Classification pipeline
 
-### Operation Identity (request head)
+### Operation identity (request head)
 
-The `ai_operation` filter
-(`operation_classifier/mod.rs`) identifies the operation
-from the HTTP method, normalized path, and protocol
-headers alone — the body is never read. Every
-protocol-owned registry (OpenAI Responses,
-Conversations, Chat Completions, Anthropic Messages) is
-consulted through one shared matcher, so a single filter
-recognizes all providers. It publishes a typed
-`AiOperationMatch` in request extensions, plus metadata
-and filter results for branching, before any body-reading
-filter runs. Sub-resource endpoints that lack a body
-(`GET /v1/responses/{id}`,
-`POST /v1/responses/{id}/cancel`, etc.) are matched here
-from the path.
+The `ai_operation` filter (`operation_classifier/mod.rs`) identifies the
+operation from the HTTP method, normalized path, and protocol headers. It never
+reads the body. One shared matcher consults every protocol-owned registry
+(OpenAI Responses, Conversations, Chat Completions, Anthropic Messages), so a
+single filter recognizes all providers. It publishes a typed `AiOperationMatch`
+in request extensions, plus metadata and filter results for branching.
+Bodyless sub-resource endpoints (`GET /v1/responses/{id}`,
+`POST /v1/responses/{id}/cancel`, etc.) are matched here from the path.
 
-### Body Facts
+The filter runs once in the request-head phase, which core executes before any
+downstream filter's buffered body pre-read and before the main request phase.
+A consumer that reads the body under `BodyMode::StreamBuffer` therefore already
+has the match.
 
-The classifier (`classifier/mod.rs`) is a pure function
-with no I/O. For a matched Responses operation,
-`openai_responses_request` parses the request body JSON
-once and returns a `ClassifiedRequest` with the extracted
-facts. The matched operation is authoritative: the format
-fact is forced to Responses regardless of body shape, so
-a Chat-Completions-shaped body on `POST /v1/responses` is
-classified as a Responses request.
+A matched operation is authoritative over body shape: a Chat-Completions-shaped
+body posted to `POST /v1/responses` is still a Responses request.
 
-When no operation forces the format — a request routed on
-body shape alone — the pure classifier falls back to
-shape-based detection precedence:
+### Body facts
 
-1. `input` field present: **Responses API**
+For a matched Responses operation, `openai_responses_request` parses the body
+JSON once through the classifier (`classifier/mod.rs`), a pure function with no
+I/O, and gets a `ClassifiedRequest` with the extracted facts (model, stream,
+store, background, mode). The matched operation forces the format fact to
+Responses. Bodyless operations (fetch, delete, cancel) and operations whose
+body the specification marks optional promote operation identity without
+reading a body.
+
+When no operation forces the format, as with a request routed on body shape
+alone, the classifier falls back to shape detection in this order:
+
+1. `input` field present: Responses API
 2. `messages` + `max_tokens` + Anthropic signals
    (`system` or typed content blocks):
-   **Anthropic Messages API**
-3. `messages` alone: **Chat Completions API**
+   Anthropic Messages API
+3. `messages` alone: Chat Completions API
 4. Valid JSON without recognized fields:
-   **UnknownJson**
-5. Invalid JSON: **InvalidJson**
-6. Non-JSON content type: **NonJson**
+   `UnknownJson`
+5. Invalid JSON: `InvalidJson`
+6. Non-JSON content type: `NonJson`
 
-### Metadata Propagation
+### Metadata propagation
 
-The `openai_responses_request` filter promotes classified
-facts using three channels:
+`openai_responses_request` promotes classified facts on three channels:
 
-- **Filter metadata**: durable key-value pairs
-  (e.g. `openai_responses_request.model`) that
-  persist across Pingora phases. Used for
-  cross-filter communication.
-- **Extra request headers**: added to the upstream
-  request (e.g. `X-Praxis-AI-Format`). Used for
-  header-based routing in the router filter.
-- **Filter results**: written to `FilterResultSet`
-  for branch chain condition evaluation.
+- Filter metadata (e.g. `openai_responses_request.model`): persists across
+  Pingora phases for cross-filter communication.
+- Extra request headers (e.g. `X-Praxis-AI-Format`): added to the upstream
+  request for header-based routing in the router filter.
+- Filter results: written to `FilterResultSet` for branch chain conditions.
 
-All promoted values are validated against a 256-byte
-length limit and checked for control characters
-before propagation.
+Every promoted value is checked against a 256-byte limit and for control
+characters first. See [Routing Facts](routing-facts.md) for which facts routing
+filters may read.
 
-Inside `iterative_request_router` steps, metadata is
-reset for credential isolation but extensions persist.
-Filters that read classifier metadata must have the
-classifier re-run inside their step. See
-`examples/configs/inference/fallback-with-translation.yaml`
-for the full pattern.
+Inside `iterative_request_router` steps, metadata is reset for credential
+isolation but extensions persist, so a filter that reads classifier metadata
+needs the classifier to re-run inside its step. See
+`examples/configs/inference/fallback-with-translation.yaml` for the pattern.
 
-### Stateful vs Stateless
+### Stateful vs stateless
 
-Responses API requests are classified as "stateful"
-when any of these hold:
+A Responses API request is "stateful" when any of these hold:
 
 - `previous_response_id` is present
 - `tools` is present
@@ -131,171 +102,114 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
-`has_prompt_id` detects OpenAI's deprecated reusable prompt
-object (`prompt: { id, version, variables }`). OpenAI retires
-reusable prompts and `v1/prompts` on 2026-11-30; on managed
-paths, clients should move the saved prompt's content into the
-structured `input` form covered by content-policy extraction.
-Top-level `instructions` is not currently included in that
-extraction, so content moved there bypasses managed-path content
-screening. Praxis keeps recognizing the shape for routing while
-OpenAI still supports it.
+Stateful mode affects routing, for example directing the request to clusters
+with response store access.
 
-Requests with `background: true` are rejected before mode
-classification because Praxis does not implement the
-asynchronous Responses lifecycle.
+`has_prompt_id` detects OpenAI's deprecated reusable prompt object
+(`prompt: { id, version, variables }`). OpenAI retires reusable prompts and
+`v1/prompts` on 2026-11-30. On managed paths, clients should move the saved
+prompt's content into the structured `input` form that content-policy
+extraction covers. Top-level `instructions` is not part of that extraction, so
+content moved there skips managed-path content screening. Praxis keeps
+recognizing the shape for routing while OpenAI still supports it.
 
-Stateful mode influences routing decisions (e.g.
-directing to clusters with response store access).
+Requests with `background: true` are rejected before mode classification,
+because Praxis does not implement the asynchronous Responses lifecycle.
 
 For an agentic Responses pipeline, the
-[retained-payload budget](responses-retained-payload.md)
-accounts for input, history, tool results, and output
-across inference rounds.
+[retained-payload budget](responses-retained-payload.md) accounts for input,
+history, tool results, and output across inference rounds.
 
-## StreamBuffer Body Access
+## StreamBuffer body access
 
-StreamBuffer is the key enabler for AI inference
-filters. It accumulates request body chunks and
-defers upstream forwarding until the filter releases
-or end-of-stream:
+`StreamBuffer` accumulates request body chunks and holds back upstream
+forwarding until the filter releases them or the stream ends:
 
-1. Buffer the JSON envelope (model name, parameters,
-   prompt prefix).
+1. Buffer the JSON envelope (model name, parameters, prompt prefix).
 2. Extract routing signals from the buffered bytes.
 3. Select the upstream based on body content.
-4. Release the buffered prefix and stream the
-   remainder.
+4. Release the buffered prefix and stream the remainder.
 
-This peek-then-stream pattern avoids the latency of
-external processor architectures while providing body
-visibility where it matters.
-
-Filters declare body access and
-`BodyMode::StreamBuffer { max_bytes }` to opt in.
-Body writers such as `model_to_provider` and
-`prompt_enrich` use `BodyAccess::ReadWrite` to replace
+This gives filters body visibility without the latency of an external
+processor. Filters opt in by declaring body access and
+`BodyMode::StreamBuffer { max_bytes }`. Body writers such as
+`model_to_provider` and `prompt_enrich` use `BodyAccess::ReadWrite` to replace
 the buffered request before forwarding it.
 
 ## Filters
 
-### `ai_operation`
-
-Identifies the operation from the request head — HTTP
-method, normalized path, and protocol headers — without
-reading the body. Publishes a typed `AiOperationMatch`
-in request extensions plus metadata and filter results
-for branching, so downstream filters know the protocol
-and operation before any body-reading filter runs. Runs
-once in the request-head phase, which core executes
-before any downstream filter's buffered body pre-read and
-before the main request phase, so the match is available
-to a consumer that reads the body under
-`BodyMode::StreamBuffer`. A matched operation is
-authoritative over body shape.
+Configuration for each filter lives on its generated page:
+[`ai_operation`](../filters/core/ai_operation.md),
+[`model_to_header`](../filters/routing/model_to_header.md),
+[`model_to_provider`](../filters/routing/model_to_provider.md),
+[`openai_responses_request`](../filters/apis/openai_responses_request.md),
+[`anthropic_messages_request`](../filters/apis/anthropic_messages_request.md),
+[`anthropic_messages_to_vertexai_anthropic`](../filters/providers/anthropic_messages_to_vertexai_anthropic.md),
+[`prompt_enrich`](../filters/core/prompt_enrich.md), and
+[`openai_responses_store`](../filters/agents/openai_responses_store.md)
+(see also [Response Store](response-store.md)). How they fit together:
 
 ### `model_to_header`
 
-Extracts the `model` field from JSON request bodies
-and promotes it to a configurable header (default
-`X-Model`). Enables header-based routing to
-provider-specific clusters.
-
-Any client-supplied copy of the header is stripped so
-routing cannot be spoofed. When a trusted hop in front
-of Praxis already sets the header, an
-`unless: {headers_present: [...]}` condition on the
-filter skips it entirely, preserving the incoming value.
+Promotes the body `model` field to a configurable header (default `X-Model`)
+for header-based routing to provider-specific clusters. Any client-supplied
+copy of the header is stripped so routing cannot be spoofed. When a trusted hop
+in front of Praxis already sets the header, an
+`unless: {headers_present: [...]}` condition on the filter skips it and keeps
+the incoming value.
 
 ### `model_to_provider`
 
-Maps an exact client model and request path to an existing
-load-balancer cluster and target model. It stages the cluster
-during body pre-read and selects it during the request phase.
-The load balancer chooses endpoints and owns health checks
-and retries. No header-matching router or provider registry
-is needed. This is ordinary cluster selection: it does not
+Maps an exact client model and request path to an existing load-balancer
+cluster and target model. It stages the cluster during body pre-read and
+selects it during the request phase; the load balancer chooses endpoints and
+owns health checks and retries. This is ordinary cluster selection: it does not
 publish the frozen binding read by `bound_upstream` conditions.
 
-Unknown models and paths retain their bodies and select
-`fallback_upstream` when configured. Without a fallback, the
-filter leaves cluster selection unchanged; a subsequent load
-balancer still needs a cluster to forward the request. Normal
-pipeline validation checks mapped and fallback cluster names
-against load-balancer declarations at startup and reload.
-
-The original client model stays in request metadata for
-metering and optional provider response adapters. The filter
-itself leaves responses unchanged. Cluster application-provider
-metadata is optional for routing; an adapter that uses it must
-run after selection and require the appropriate tags.
+Unknown models and paths keep their bodies and select `fallback_upstream` when
+configured. The original client model stays in request metadata for metering
+and optional provider response adapters. An adapter that uses cluster
+application-provider metadata must run after selection and require the
+appropriate tags.
 
 ### `openai_responses_request`
 
-Runs for the Responses operations `ai_operation`
-matched. Reads the request body to extract and promote
-format, model, stream, store, background, and mode to
-headers, metadata, and filter results, parsing the JSON
-once. As the managed owner it also generates
-cryptographically random response and conversation IDs
-with `resp_` and `conv_` prefixes and initializes state.
-Provider-owned parameter combinations pass through
-unchanged. Offers both the pre-read and bound-upstream
-body phases, so a chain can defer it until a logical
-provider is bound, and `initialize_state: false` lets a
-pure routing chain classify without building state. A
-pre-routing facts pass (`initialize_state: false`) always
-caches its one parse for a later managed owner, which
-re-validates the cached body before reuse so an
-intervening body rewrite is never reused stale; on a chain
-with no managed owner that request-scoped cache is simply
-released, unused, when the request ends.
+As the managed owner, it generates cryptographically random response and
+conversation IDs with `resp_` and `conv_` prefixes and initializes state.
+Provider-owned parameter combinations pass through unchanged. It offers both
+the pre-read and bound-upstream body phases, so a chain can defer it until a
+logical provider is bound. With `initialize_state: false` it classifies for a
+pure routing chain without building state, and caches its one parse for a
+later managed owner. That owner re-validates the cached body before reuse, so
+it never reuses a body that an intervening filter rewrote. On a chain with no
+managed owner, the request-scoped cache is released unused when the request
+ends.
 
 ### `anthropic_messages_request`
 
-Owns the Anthropic create-message body. The Messages
-registry decides the operation from the request head, then
-the body is deserialized once for envelope validation,
-routing facts, and canonical state.
+Owns the Anthropic create-message body. The Messages registry decides the
+operation from the request head, then the body is deserialized once for
+envelope validation, routing facts, and canonical state.
 
 ### `anthropic_messages_to_vertexai_anthropic`
 
-Translates the Anthropic wire format only after the load
-balancer selects a cluster tagged with HTTP
-`application_provider: vertex`. Its selected-upstream body
-hook receives the buffered body already rewritten by
-`model_to_provider`; provider selection and public-to-target
-model mapping stay in that earlier filter.
-
-The exact target model, including any snapshot suffix, moves
-into the Messages URL or stays in the count-tokens body.
-Responses restore the public model recorded by the mapper,
-including `message_start` frames processed incrementally.
-Without that metadata the target model is the response
-identity. Other selected providers and untagged clusters
-pass through without Vertex translation. The
+Translates the Anthropic wire format only after the load balancer selects a
+cluster tagged with HTTP `application_provider: vertex`. Its selected-upstream
+body hook receives the body already rewritten by `model_to_provider`, which
+keeps provider selection and public-to-target model mapping. The exact target
+model, including any snapshot suffix, moves into the Messages URL or stays in
+the count-tokens body. Responses restore the public model recorded by the
+mapper, including `message_start` frames processed incrementally. Other
+providers and untagged clusters pass through without Vertex translation. The
 [Vertex example](../../examples/configs/vertex/messages-to-anthropic.yaml)
 includes both aliases and a separate fallback upstream.
 
-### `prompt_enrich`
-
-Injects system or user messages into
-OpenAI-compatible chat completion request bodies.
-Static configured messages are prepended or appended
-to the `messages` array. Uses `BodyAccess::ReadWrite`.
-
 ### `credential_injection`
 
-Per-cluster API key injection with client credential
-stripping. Supports inline values and environment
-variable sources.
+Per-cluster API key injection with client credential stripping, from inline
+values or environment variables.
 
-### `openai_responses_store`
-
-Persists non-streaming Responses API responses. See
-[Response Store](response-store.md) for details.
-
-## Key Files
+## Key files
 
 - `apis/src/operation_classifier/mod.rs`:
   `AiOperationFilter` (request-head operation identity)

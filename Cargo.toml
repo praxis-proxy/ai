@@ -61,7 +61,10 @@ regex = "1.13.1"
 # provider (praxis_tls::provider::install). `rustls-no-provider` avoids
 # compiling aws-lc-rs into test binaries.
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
-rmcp = { version = "3.9.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
+# Temporary pin while modelcontextprotocol/rust-sdk#1508 (sha2 behind the
+# default `skill-digest` feature) is upstreamed: rmcp 3.12.0 plus that change
+# on the praxis-proxy/mcp-rust-sdk `main` branch. Keeps `sha2` out of FIPS builds.
+rmcp = { version = "3.12.0", git = "https://github.com/praxis-proxy/mcp-rust-sdk.git", rev = "a9d12a293e2d345333d1a136e6881d8834ddfa6b", default-features = false, features = ["client", "transport-streamable-http-client"] }
 # Without default features: `aws_lc_rs` on by default would silently link
 # aws-lc-rs into every test binary, and `prefer-post-quantum` implies
 # `aws_lc_rs`. The provider is whatever the process installed.

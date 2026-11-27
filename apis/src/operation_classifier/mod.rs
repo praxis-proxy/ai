@@ -26,8 +26,9 @@
 //!
 //! Every protocol-owned registry is consulted through the shared matcher, so
 //! OpenAI and Anthropic operations are recognized by one filter. The classifier
-//! holds no provider-specific matching logic: a registry is added by listing it
-//! here, not by branching on its provider.
+//! selects the client protocol for the shared Models routes from the
+//! `anthropic-version` header, defaulting to OpenAI. Requests marked with
+//! Google credential markers keep their existing Gemini Models routing.
 //!
 //! A matched operation is published three ways: a typed
 //! [`AiOperationMatch`] in request extensions for downstream filters,
@@ -46,6 +47,7 @@
 //! decision this filter does not make.
 
 mod config;
+mod models;
 
 #[cfg(test)]
 mod tests;
@@ -64,7 +66,7 @@ use crate::{
     gemini::routes as gemini_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
-        files::routes as files_routes, responses::routes as responses_routes,
+        decisions::routes as decisions_routes, files::routes as files_routes, responses::routes as responses_routes,
         vector_stores::routes as vector_stores_routes,
     },
     operation::{ApplicationProtocol, OperationEntry, PathParameterOffsets, RequestBody, RouteParams, Transport},
@@ -74,6 +76,15 @@ use crate::{
 const FILTER_NAME: &str = "ai_operation";
 
 /// Classifies supported AI operations from the request head.
+///
+/// Native Gemini requests retain their fallback route when they carry
+/// `x-goog-api-key`, `Authorization` with `x-goog-user-project` or
+/// `x-goog-api-client`, or a `key`, `access_token`, or `oauth_token` query parameter.
+/// For other requests to `GET /v1/models` and `GET /v1/models/{model_id}`,
+/// `anthropic-version` selects `anthropic_models`. Without that header the
+/// filter selects `openai_models`. This uses the client request independently
+/// of the upstream provider. The filter leaves version validation, model
+/// responses, and pagination to the selected handler.
 pub struct AiOperationFilter {
     /// Validated configuration.
     config: ValidatedConfig,
@@ -135,7 +146,12 @@ impl AiOperationFilter {
         let transport = request_transport(method, &ctx.request.headers);
         let path = ctx.request.uri.path();
 
-        if let Some(matched) = classify(method, path, transport) {
+        let path_and_query = ctx
+            .request
+            .uri
+            .path_and_query()
+            .map_or(path, http::uri::PathAndQuery::as_str);
+        if let Some(matched) = classify(method, path_and_query, transport, &ctx.request.headers) {
             debug!(
                 method,
                 path,
@@ -278,21 +294,24 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> 
 /// matched separately because transport is part of its operation identity: it is
 /// the only protocol reachable over a `WebSocket` upgrade.
 ///
-/// Registered path spaces do not overlap — OpenAI serves `/v1/responses`,
-/// `/v1/conversations`, `/v1/chat/completions`, `/v1/files`, and
-/// `/v1/vector_stores`, Anthropic serves `/v1/messages`, Gemini serves
-/// `/v1{,beta}/models/{model}:{action}`, and Bedrock serves
-/// `/model/{model_id}/{action}` — so at most one registry can match one head,
-/// and the order below does not decide between protocols.
-pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<AiOperationMatch> {
+/// OpenAI and Anthropic share the Models paths. Header presence selects the
+/// client protocol there; every other registry matches independently.
+pub(crate) fn classify(
+    method: &str,
+    path: &str,
+    transport: Transport,
+    headers: &http::HeaderMap,
+) -> Option<AiOperationMatch> {
     let http_match = (transport == Transport::Http).then(|| {
         classify_conversation(method, path)
             .or_else(|| classify_chat_completions(method, path))
+            .or_else(|| classify_decisions(method, path))
             .or_else(|| classify_files(method, path))
             .or_else(|| classify_vector_stores(method, path))
             .or_else(|| classify_anthropic_messages(method, path))
             .or_else(|| classify_gemini(method, path))
             .or_else(|| classify_bedrock(method, path))
+            .or_else(|| models::classify(method, path, headers))
     });
     http_match
         .flatten()
@@ -307,6 +326,11 @@ fn classify_conversation(method: &str, path: &str) -> Option<AiOperationMatch> {
 /// Match one Chat Completions operation.
 fn classify_chat_completions(method: &str, path: &str) -> Option<AiOperationMatch> {
     chat_completions_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Decisions operation.
+fn classify_decisions(method: &str, path: &str) -> Option<AiOperationMatch> {
+    decisions_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Anthropic Messages operation.

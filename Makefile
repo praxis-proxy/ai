@@ -38,12 +38,15 @@ APIS_EXPERIMENTAL_FEATURES := vertex-anthropic,anthropic-mcp-connector
 PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the explicit lean (`standard`) proxy graph.
 # openssl-sys is not on the list: praxis performs all cryptography through the
-# system OpenSSL, so its bindings are part of every build by design.
-LEAN_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls rmcp sse-stream \
+# system OpenSSL, so its bindings are part of every build by design. rmcp and
+# sse-stream are not on it either: the `mcp` broker's backend sessions use the
+# shared MCP client (praxis-ai-apis `mcp-client`: rmcp's client model and
+# Streamable HTTP trait, no HTTP client or TLS stack).
+LEAN_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls \
 	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
 # Upper bound on crates (name@version, normal + build edges, host target) in the
-# explicit lean graph. Linux hosts measure 431, macOS 435 with Cargo.lock.
-LEAN_GRAPH_BUDGET ?= 435
+# explicit lean graph. macOS measures 438 with Cargo.lock.
+LEAN_GRAPH_BUDGET ?= 438
 STORE_BACKEND_FREE_FEATURES := standard,openai-all
 STORE_POSTGRES_FEATURES := standard,openai-all,store-postgres
 STORE_POSTGRES_CERT_AUTH_FEATURES := openai-responses,store-postgres-cert-auth

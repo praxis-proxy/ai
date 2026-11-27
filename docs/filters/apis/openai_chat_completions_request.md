@@ -7,7 +7,7 @@ Publishes body facts for native Chat Completions create requests to durable meta
 
 ## Configuration Notes
 
-The filter is a transparent fact producer: it reads the model from the buffered body and never rejects a request, so it carries no `on_invalid` behavior and no promotion headers — only the buffer bound.
+The filter is a transparent fact producer: it reads the model and structured content modality from the buffered body and never rejects a request, so it carries no `on_invalid` behavior and no promotion headers — only the buffer bound. Modality is published as durable metadata and a branch result, not an HTTP header.
 
 ## Configuration
 

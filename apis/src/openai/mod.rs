@@ -11,6 +11,7 @@
 pub(crate) mod api_client;
 pub(crate) mod chat_completions;
 pub(crate) mod conversations;
+pub(crate) mod decisions;
 #[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
 pub(crate) mod error;
 pub(crate) mod error_response_formatter;
@@ -40,6 +41,7 @@ pub use conversations::{
 };
 #[cfg(feature = "openai-conversations")]
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
+pub use decisions::routes::{DecisionsOperation, DecisionsOperationSpec, operation_specs as decisions_operation_specs};
 #[cfg(feature = "openai-files")]
 pub use files::implementation_openapi_json as files_openapi_json;
 pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};
@@ -52,6 +54,8 @@ pub use responses::AgenticLoopFilter;
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use responses::FileResolveFilter;
+#[cfg(feature = "openai-mcp-tools")]
+pub use responses::McpConnectorFilter;
 #[cfg(feature = "openai-responses-openapi")]
 pub use responses::implementation_openapi_json as responses_openapi_json;
 /// Hidden entry points used by the workspace's Responses initialization benchmark.
@@ -65,8 +69,6 @@ pub use responses::{
     responses_proxy::ResponsesProxyFilter, responses_to_chat_completions::ResponsesToChatCompletionsFilter,
     stream_events::StreamEventsFilter,
 };
-#[cfg(feature = "openai-mcp-tools")]
-pub use responses::{McpDispatchFilter, McpToolResolveFilter};
 pub use responses::{
     ModelRewriteFilter, ToolParseFilter,
     routes::{

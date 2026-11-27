@@ -17,6 +17,9 @@ on:
       - "store-backends/**"
       - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/openai/decisions/**"
+      - "apis/src/operation_classifier/**"
+      - "examples/configs/openai/decisions.yaml"
       - "apis/src/mcp_core/**"
       - "apis/src/mcp_client/**"
       - "apis/src/openai/translation/**"
@@ -93,6 +96,10 @@ on:
         required: false
         default: false
         type: boolean
+      codex_search_only:
+        description: With run_codex_acceptance, run only native and translated live search
+        type: boolean
+        default: false
       run_codex_acceptance:
         description: >-
           Run pinned Codex through native Responses and translated Chat paths
@@ -255,6 +262,9 @@ jobs:
             'store-backends/' \
             'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/openai/decisions/' \
+            'apis/src/operation_classifier/' \
+            'examples/configs/openai/decisions.yaml' \
             'apis/src/mcp_core/' \
             'apis/src/mcp_client/' \
             'apis/src/openai/translation/' \
@@ -497,6 +507,84 @@ jobs:
   # `run_live_vllm` dispatches, and vllm-full-suite labels run the *complete*
   # suite on a real GPU instead (see the gpu-* jobs below).
   # ----------------------------------------------------------------------------
+
+  vllm-decisions-cpu:
+    name: Live vLLM CPU Decisions and System One
+    needs: [changes]
+    if: |
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VLLM_DECISIONS_MODEL: Qwen/Qwen3-0.6B
+      PRAXIS_DECISIONS_URL: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start vLLM CPU with Qwen3-0.6B
+        uses: ./.github/actions/start-vllm
+        with:
+          image: docker.io/vllm/vllm-openai-cpu:v0.34.0@sha256:1640fdc27ae499572f611ffd4dc55e0b07ce97608f33566d5834c98671b115d4
+          model: ${{ env.VLLM_DECISIONS_MODEL }}
+          model-path: ${{ env.VLLM_DECISIONS_MODEL }}
+          device-args: --shm-size=2g --cap-add=SYS_NICE
+          tool-call-parser: ""
+          reasoning-parser: ""
+          max-model-len: "2048"
+          extra-args: --revision c1899de289a04d12100db370d81485cdf75e47ca --dtype float32
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
+        with:
+          cache-suffix: vllm-decisions-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
+
+      - name: Wait for vLLM
+        uses: ./.github/actions/wait-vllm
+
+      - name: Start Praxis with the Decisions example
+        run: |
+          # System One follows the example's general passthrough route.
+          sed -e 's/127.0.0.1:3001/127.0.0.1:8000/' -e 's/127.0.0.1:3002/127.0.0.1:8000/'             examples/configs/openai/decisions.yaml > "$RUNNER_TEMP/decisions.yaml"
+          nohup target/debug/praxis-ai -c "$RUNNER_TEMP/decisions.yaml" > "$RUNNER_TEMP/praxis-decisions.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/praxis-decisions.pid"
+          for _ in {1..30}; do
+            if curl --fail --silent --max-time 2 "$PRAXIS_DECISIONS_URL/v1/models" > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/praxis-decisions.log"
+          exit 1
+
+      - name: Test OpenAI Decisions through Praxis
+        id: decisions
+        run: uv run tests/integration/sdk/openai/test_openai_decisions_vllm.py -k test_decisions_api
+
+      - name: Test TypeSafe System One through Praxis
+        if: ${{ !cancelled() && (steps.decisions.outcome == 'success' || steps.decisions.outcome == 'failure') }}
+        run: uv run tests/integration/sdk/openai/test_openai_decisions_vllm.py -k test_system_one
+
+      - name: Collect logs and stop services
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/praxis-decisions.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/praxis-decisions.pid")" || true
+            cat "$RUNNER_TEMP/praxis-decisions.log"
+          fi
+          docker logs vllm || true
+          docker rm -f vllm || true
 
   vllm-live-cpu:
     needs: [changes]
@@ -1778,7 +1866,7 @@ jobs:
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
         id: codex_native
-        if: ${{ !inputs.run_compaction_only }}
+        if: ${{ !inputs.run_compaction_only && !inputs.codex_search_only }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1807,7 +1895,7 @@ jobs:
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
         if: >-
-          always() && !cancelled() && !inputs.run_compaction_only &&
+          always() && !cancelled() && !inputs.run_compaction_only && !inputs.codex_search_only &&
           env.CODEX_SKIP_TRANSLATED != 'true' &&
           steps.codex_vllm_preflight.outcome == 'success' &&
           steps.codex_namespace.outcome == 'success' &&
@@ -1836,9 +1924,37 @@ jobs:
           grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
             "$RUNNER_TEMP/codex-acceptance-translated.log"
 
+      - name: Run Codex live web search (native)
+        id: codex_native_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: bash .github/scripts/codex_web_search.sh native
+
+      - name: Run Codex live web search (translated)
+        id: codex_translated_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' && env.CODEX_SKIP_TRANSLATED != 'true' }}
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: bash .github/scripts/codex_web_search.sh translated
+
       - name: Run Codex native-Responses compaction acceptance test (once, no retry)
         id: codex_compaction
-        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.codex_search_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1904,6 +2020,8 @@ jobs:
         env:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
+          CODEX_NATIVE_SEARCH: ${{ steps.codex_native_search.outcome }}
+          CODEX_TRANSLATED_SEARCH: ${{ steps.codex_translated_search.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
           CODEX_MODEL: >-
             ${{ env.CODEX_CANDIDATE_MODEL || steps.vllm_image.outputs.model }}
@@ -1920,7 +2038,7 @@ jobs:
           filter_chains = {}
           missing_chains = []
           prefix = "Codex acceptance filter chain: "
-          for path in ("native", "translated", "compaction"):
+          for path in ("native", "translated", "compaction", "native_search", "translated_search"):
               name = f"codex_{path}"
               status = statuses[name]
               log = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"codex-acceptance-{path}.log"

@@ -34,8 +34,10 @@ mod client_tool_compat_chat_completions;
 #[cfg(feature = "store-sqlite")]
 mod compact;
 mod credential_injection;
+mod decisions;
 mod external_metering;
 mod external_metering_file_key;
+mod external_metering_model_policy;
 #[cfg(feature = "policy-engine")]
 mod external_metering_policy_identity;
 #[cfg(target_os = "linux")]
@@ -88,6 +90,7 @@ mod model_to_header;
 mod model_to_header_body_limits;
 mod model_to_header_trust_existing;
 mod model_to_provider;
+mod multimodal_routing;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
 #[cfg(feature = "store-sqlite")]
 mod openai_agentic_loop;
