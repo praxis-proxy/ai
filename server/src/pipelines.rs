@@ -1262,6 +1262,73 @@ filter_chains:
     }
 
     #[test]
+    fn mcp_broker_example_validates_without_router() {
+        let config = mcp_broker_config();
+        let pipelines = resolve_mcp_broker(&config).expect("the shipped broker example must pass startup validation");
+        assert!(pipelines.get("default").is_some(), "the MCP listener must be built");
+    }
+
+    #[test]
+    fn mcp_broker_rejects_undefined_clusters() {
+        let mut config = mcp_broker_config();
+        config.filter_chains[0].filters[0].config["servers"][1]["cluster"] = "missing-mcp".into();
+
+        let error = resolve_mcp_broker(&config)
+            .err()
+            .expect("an undefined broker target must fail startup validation");
+        assert!(error.to_string().contains("'missing-mcp'"), "{error}");
+    }
+
+    #[test]
+    fn mcp_broker_rejects_competing_router() {
+        let mut config = mcp_broker_config();
+        let router =
+            serde_yaml::from_str("filter: router\nroutes:\n  - path_prefix: /\n    cluster: weather-mcp\n").unwrap();
+        config.filter_chains[0].filters.insert(1, router);
+
+        let error = resolve_mcp_broker(&config)
+            .err()
+            .expect("a router must not overwrite the broker's cluster selection");
+        assert!(
+            error.to_string().contains("multiple cluster-selecting filters"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mcp_broker_current_profile_does_not_select_clusters() {
+        let mut config = mcp_broker_config();
+        let broker = &mut config.filter_chains[0].filters[0].config;
+        broker["protocol_profile"] = "current".into();
+        let mapping = broker.as_mapping_mut().unwrap();
+        mapping.remove(serde_yaml::Value::from("cache_scope"));
+        mapping.remove(serde_yaml::Value::from("cache_ttl_ms"));
+
+        let error = resolve_mcp_broker(&config)
+            .err()
+            .expect("the current profile does not route tools/call");
+        assert!(
+            error.to_string().contains("load_balancer without a preceding"),
+            "{error}"
+        );
+
+        let router =
+            serde_yaml::from_str("filter: router\nroutes:\n  - path_prefix: /\n    cluster: weather-mcp\n").unwrap();
+        config.filter_chains[0].filters[1].config["clusters"]
+            .as_sequence_mut()
+            .unwrap()
+            .truncate(1);
+        config.filter_chains[0].filters.insert(1, router);
+
+        let pipelines = resolve_mcp_broker(&config)
+            .expect("the current profile must not require its unused calendar cluster or conflict with the router");
+        assert!(
+            pipelines.get("default").is_some(),
+            "the current-profile listener must be built"
+        );
+    }
+
+    #[test]
     fn build_registry_hands_policy_filters_the_shared_connector() {
         // Build-time contract for `policy` filters: pipeline construction must
         // hand the proxy's shared sub-request connector to the registry it
@@ -2053,6 +2120,26 @@ filter_chains:
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    /// Load the shipped stateless broker example without validation skips.
+    fn mcp_broker_config() -> Config {
+        Config::from_yaml(include_str!("../../examples/configs/mcp-stateless-broker.yaml")).unwrap()
+    }
+
+    /// Exercise production startup validation with the real MCP filter registered.
+    fn resolve_mcp_broker(config: &Config) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
+        let client = test_client();
+        let mut registry = FilterRegistry::with_builtins();
+        praxis_ai_filters::register_ai_filters(&mut registry, Some(&client));
+        resolve_pipelines(
+            config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &client,
+        )
+    }
 
     /// Empty health registry for tests without health checks.
     fn empty_health_registry() -> HealthRegistry {
