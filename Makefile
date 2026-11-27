@@ -319,11 +319,15 @@ test-anthropic-sdk-v2:
 	uv run --with "anthropic==2.3.0" --with "pytest>=8.0" \
 		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=2.x
 
-# Every ignored test in praxis-ai-apis is a PostgreSQL store contract, so
-# --ignored alone selects them all: no name filter can drop one silently.
+# Every ignored test in praxis-ai-apis's library is a PostgreSQL store
+# contract, so --ignored alone selects them all: no name filter can drop one
+# silently. --lib keeps out the ignored RustFS E2E tests in
+# apis/tests/s3_file_store.rs, which `openai-files-s3` (needed here for the
+# in-memory byte store) would otherwise build; they need RUSTFS_S3_* and run in
+# test-s3-file-store-e2e. Keep every other ignored test out of apis/src.
 # Backend history regressions run the same way with only PostgreSQL enabled.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features openai-all,openai-files-s3,store-all -- --ignored $(if $(V),--nocapture)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,openai-files-s3,store-all --lib -- --ignored $(if $(V),--nocapture)
 	cargo test -p praxis-ai-store-backends --no-default-features --features postgres \
 		-- --ignored $(if $(V),--nocapture)
 
