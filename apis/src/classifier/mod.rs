@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn empty_body() {
-        let result = classify_request_body(b"").unwrap();
+        let result = classify_request_body(b"", None).unwrap();
 
         assert_eq!(result.format, AiRequestFormat::NonJson, "empty body should be non_json");
     }
