@@ -71,7 +71,7 @@ impl FileService for DefaultFileService {
     }
 }
 
-#[cfg(all(test, feature = "_store-postgres"))]
+#[cfg(all(test, feature = "_store-postgres", feature = "openai-files-s3"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -92,6 +92,7 @@ mod tests {
 
     use std::{sync::Arc, time::Duration};
 
+    use object_store::memory::InMemory;
     use praxis_ai_store::{FileCatalog, FileCompletion, NewFile, SslMode, StateOwner};
     use praxis_ai_store_backends::{PgTlsConfig, PostgresFileCatalog};
     use sqlx::{AssertSqlSafe, PgPool};
@@ -99,7 +100,7 @@ mod tests {
     use super::DefaultFileService;
     use crate::openai::files::{
         FileInfo, FileList, FileListOrder, FilePurpose, FileService as _, FileServiceError,
-        store::unavailable::UnavailableFileStore,
+        store::object_store_adapter::ObjectStoreFileStore,
     };
 
     /// Per-tenant quota, far above anything the tests store.
@@ -132,7 +133,7 @@ mod tests {
             let catalog = Arc::new(PostgresFileCatalog::new(&url, &table, &tls, None, LIMIT).await.unwrap());
             let pool = PgPool::connect(&url).await.unwrap();
             let dyn_catalog: Arc<dyn FileCatalog> = Arc::<PostgresFileCatalog>::clone(&catalog);
-            let service = DefaultFileService::new(dyn_catalog, Arc::new(UnavailableFileStore));
+            let service = DefaultFileService::new(dyn_catalog, Arc::new(ObjectStoreFileStore::new(InMemory::new())));
             Self {
                 catalog,
                 service,

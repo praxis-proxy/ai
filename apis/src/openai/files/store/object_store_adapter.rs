@@ -22,7 +22,7 @@ const DEFAULT_MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 const MIN_ZERO_COPY_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Common Files byte operations over a configured object store.
-pub(super) struct ObjectStoreFileStore {
+pub(crate) struct ObjectStoreFileStore {
     /// The configured store behind a provider-independent interface.
     store: Arc<dyn ObjectStore>,
 }
@@ -30,7 +30,7 @@ pub(super) struct ObjectStoreFileStore {
 impl ObjectStoreFileStore {
     /// Wrap a configured object store.
     #[must_use]
-    pub(super) fn new(store: impl ObjectStore) -> Self {
+    pub(crate) fn new(store: impl ObjectStore) -> Self {
         Self { store: Arc::new(store) }
     }
 

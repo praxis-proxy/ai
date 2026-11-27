@@ -323,7 +323,7 @@ test-anthropic-sdk-v2:
 # --ignored alone selects them all: no name filter can drop one silently.
 # Backend history regressions run the same way with only PostgreSQL enabled.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all -- --ignored $(if $(V),--nocapture)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,openai-files-s3,store-all -- --ignored $(if $(V),--nocapture)
 	cargo test -p praxis-ai-store-backends --no-default-features --features postgres \
 		-- --ignored $(if $(V),--nocapture)
 
