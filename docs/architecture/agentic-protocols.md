@@ -120,9 +120,16 @@ tools/call (gateway session G, tool weather_x)
   +-- forward tools/call with Mcp-Session-Id B
   |   through the main chain (streams, policies apply)
   |
-  +-- backend 404 --> drop (G, weather); the next call
+  +-- backend 404 --> drop (G, weather); answer this call with
+                      a session_expired error; the next call
                       runs a fresh handshake
 ```
+
+The backend's `404` is about its own session, so it never reaches the client:
+on the gateway session it would tell the client to reinitialize. The call is
+answered with HTTP `200` and a `-32603` JSON-RPC error carrying
+`data.server` and `data.reason: session_expired`. The gateway session and its
+other backend sessions stay usable, and the client may resend the call.
 
 #### Handshake
 
@@ -160,9 +167,9 @@ answers to server requests on the `initialize` stream,
 `notifications/initialized`, session `DELETE`, and every forwarded call to it
 through core's `pinned_endpoint_address`. The cluster's TLS and connection
 settings still apply, and on a multi-endpoint cluster each session stays on one
-replica. A `502` from the pinned endpoint drops the mapping like a `404`. So
-does a proxy `502` or `504` for a call that got no backend response at all
-(refused connection, reset, TLS failure, or timeout), so the next call
+replica. A `502` from the pinned endpoint drops the mapping and passes
+through. So does a proxy `502` or `504` for a call that got no backend response
+at all (refused connection, reset, TLS failure, or timeout), so the next call
 initializes on a reachable replica. Sessionless backends are not pinned.
 
 If a backend answers `initialize` with a protocol version outside the broker's

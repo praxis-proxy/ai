@@ -273,13 +273,14 @@ async fn route(filter: &McpBrokerFilter, req: &praxis_filter::Request, tool: &st
     }
 }
 
-/// Route a call, then deliver an upstream response with `status`.
+/// Route a call, deliver an upstream response with `status`, and return the
+/// response hook's action.
 async fn route_with_response(
     filter: &McpBrokerFilter,
     req: &praxis_filter::Request,
     tool: &str,
     status: http::StatusCode,
-) {
+) -> FilterAction {
     let mut ctx = crate::test_utils::make_filter_context(req);
     ctx.current_filter_id = Some(0);
     let mut body = Some(call_body(tool));
@@ -289,9 +290,19 @@ async fn route_with_response(
     ctx.response_header = Some(&mut response);
     let response_action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Release), "call must be forwarded");
-    assert!(
-        matches!(response_action, FilterAction::Continue),
-        "response must pass through"
+    response_action
+}
+
+/// Assert `action` replaces a backend `404` with the session-expired error.
+fn assert_session_expired(action: &FilterAction) {
+    let (status, body) = rejection_json(action);
+    assert_eq!(status, 200, "a backend 404 must not reach the client");
+    assert_eq!(body["id"], 9, "request id must be echoed");
+    assert_eq!(body["error"]["code"], -32603, "session expiry must be -32603");
+    assert_eq!(
+        body["error"]["data"],
+        serde_json::json!({ "server": "weather", "reason": "session_expired" }),
+        "the error must name the server and the reason"
     );
 }
 
@@ -512,9 +523,10 @@ async fn backend_404_invalidates_and_next_call_reinitializes() {
     let gw_1 = issue(&filter).await;
     let req = call_request(Some(gw_1.as_str()), None);
 
-    route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await;
+    let expired = route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await;
     let next = route(&filter, &req, "weather_get_weather").await;
 
+    assert_session_expired(&expired);
     assert_eq!(
         mock.count("initialize"),
         2,
@@ -524,6 +536,74 @@ async fn backend_404_invalidates_and_next_call_reinitializes() {
         header(&next, "mcp-session-id"),
         Some("backend-2"),
         "the new session must be used"
+    );
+}
+
+#[tokio::test]
+async fn backend_404_after_reuse_is_answered_as_session_expired() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
+    let reused = route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::OK).await;
+
+    let expired = route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await;
+
+    assert!(matches!(reused, FilterAction::Continue), "a 200 must pass through");
+    assert_session_expired(&expired);
+    assert_eq!(mock.count("initialize"), 1, "the expired call must not be retried");
+}
+
+#[tokio::test]
+async fn late_backend_404_keeps_the_newer_session() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
+    let mut late = crate::test_utils::make_filter_context(&req);
+    late.current_filter_id = Some(0);
+    let mut body = Some(call_body("weather_get_weather"));
+    let forwarded = filter.on_request_body(&mut late, &mut body, true).await.unwrap();
+    assert!(matches!(forwarded, FilterAction::Release), "call must be forwarded");
+    drop(route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await);
+    route(&filter, &req, "weather_get_weather").await;
+
+    let mut response = crate::test_utils::make_response();
+    response.status = http::StatusCode::NOT_FOUND;
+    late.response_header = Some(&mut response);
+    let expired = filter.on_response(&mut late).await.unwrap();
+    let next = route(&filter, &req, "weather_get_weather").await;
+
+    assert_session_expired(&expired);
+    assert_eq!(
+        mock.count("initialize"),
+        2,
+        "a 404 for the replaced session must not drop the newer one"
+    );
+    assert_eq!(
+        header(&next, "mcp-session-id"),
+        Some("backend-2"),
+        "the newer session must stay mapped"
+    );
+}
+
+#[tokio::test]
+async fn failed_handshake_after_backend_404_is_structured() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
+    drop(route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await);
+    *mock.initialize_error.lock().unwrap() = Some(McpBackendError::Timeout);
+
+    let failed = route(&filter, &req, "weather_get_weather").await;
+
+    let (status, body) = rejection_json(&failed.action);
+    assert_eq!(status, 200, "a failed handshake must not end the gateway session");
+    assert_eq!(body["id"], 9, "request id must be echoed");
+    assert_eq!(
+        body["error"]["data"]["reason"], "timeout",
+        "failure class must be reported"
     );
 }
 
@@ -555,9 +635,10 @@ async fn backend_502_invalidates_and_next_call_reinitializes() {
     let gw_1 = issue(&filter).await;
     let req = call_request(Some(gw_1.as_str()), None);
 
-    route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::BAD_GATEWAY).await;
+    let passed = route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::BAD_GATEWAY).await;
     let next = route(&filter, &req, "weather_get_weather").await;
 
+    assert!(matches!(passed, FilterAction::Continue), "a 502 must pass through");
     assert_eq!(
         mock.count("initialize"),
         2,
@@ -618,9 +699,10 @@ async fn successful_response_keeps_mapping() {
     let gw_1 = issue(&filter).await;
     let req = call_request(Some(gw_1.as_str()), None);
 
-    route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::OK).await;
+    let passed = route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::OK).await;
     route(&filter, &req, "weather_get_weather").await;
 
+    assert!(matches!(passed, FilterAction::Continue), "a 200 must pass through");
     assert_eq!(mock.count("initialize"), 1, "a 200 must not invalidate the session");
 }
 

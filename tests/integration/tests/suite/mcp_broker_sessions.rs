@@ -136,24 +136,136 @@ fn current_profile_backend_404_reinitializes_on_next_call() {
 
     weather.expire_sessions();
     let expired = http_send(proxy.addr(), &tools_call(&gateway, 2, "weather_get_weather"));
+
+    assert_backend_session_expired(&expired, 2);
+    assert_eq!(
+        weather.tool_call_count("get_weather"),
+        2,
+        "the expired call must be dispatched once, not retried"
+    );
+    assert_eq!(weather.sessions_minted(), 1, "the handshake waits for the next call");
+
     let recovered = http_send(proxy.addr(), &tools_call(&gateway, 3, "weather_get_weather"));
 
-    assert_eq!(parse_status(&expired), 404, "the backend 404 must reach the client");
     assert_eq!(
         parse_status(&recovered),
         200,
-        "the next call must reinitialize: {recovered}"
+        "the next call on the same gateway session must reinitialize: {recovered}"
     );
     assert_eq!(weather.sessions_minted(), 2, "a fresh backend session must be created");
     assert_eq!(
-        weather
-            .session_ids_for("tools/call")
-            .last()
-            .cloned()
-            .flatten()
-            .as_deref(),
-        Some("mock-mcp-session-2"),
+        weather.session_ids_for("tools/call"),
+        ["mock-mcp-session-1", "mock-mcp-session-1", "mock-mcp-session-2"].map(|id| Some(id.to_owned())),
         "the recovered call must use the new backend session"
+    );
+}
+
+#[test]
+fn current_profile_backend_404_on_first_forwarded_call_keeps_gateway_session() {
+    let weather = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        expire_sessions_once_initialized: true,
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let expired = http_send(proxy.addr(), &tools_call(&gateway, 1, "weather_get_weather"));
+
+    assert_backend_session_expired(&expired, 1);
+    assert_eq!(
+        weather.tool_call_count("get_weather"),
+        1,
+        "the expired call must be dispatched once, not retried"
+    );
+
+    let next = http_send(proxy.addr(), &tools_call(&gateway, 2, "weather_get_weather"));
+
+    assert_backend_session_expired(&next, 2);
+    assert_eq!(weather.sessions_minted(), 2, "the next call must run a fresh handshake");
+    let other = http_send(proxy.addr(), &tools_call(&gateway, 3, "cal_create_event"));
+    assert_eq!(
+        parse_status(&other),
+        200,
+        "the gateway session must stay usable: {other}"
+    );
+}
+
+#[test]
+fn current_profile_backend_404_leaves_other_backend_sessions_in_use() {
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+    for (id, tool) in [(1, "weather_get_weather"), (2, "cal_create_event")] {
+        let raw = http_send(proxy.addr(), &tools_call(&gateway, id, tool));
+        assert_eq!(parse_status(&raw), 200, "{tool} must succeed: {raw}");
+    }
+
+    weather.expire_sessions();
+    let expired = http_send(proxy.addr(), &tools_call(&gateway, 3, "weather_get_weather"));
+    let other = http_send(proxy.addr(), &tools_call(&gateway, 4, "cal_create_event"));
+
+    assert_backend_session_expired(&expired, 3);
+    assert_eq!(
+        parse_status(&other),
+        200,
+        "the calendar call must succeed on the same gateway session: {other}"
+    );
+    assert_eq!(
+        calendar.method_count("initialize"),
+        1,
+        "the calendar session must not be reinitialized"
+    );
+    assert_eq!(
+        calendar.session_ids_for("tools/call"),
+        vec![Some("mock-mcp-session-1".to_owned()); 2],
+        "both calendar calls must use the original backend session"
+    );
+}
+
+#[test]
+fn current_profile_failed_handshake_after_backend_404_keeps_gateway_session() {
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+    assert_eq!(
+        parse_status(&http_send(
+            proxy.addr(),
+            &tools_call(&gateway, 1, "weather_get_weather")
+        )),
+        200
+    );
+    weather.expire_sessions();
+    assert_backend_session_expired(
+        &http_send(proxy.addr(), &tools_call(&gateway, 2, "weather_get_weather")),
+        2,
+    );
+    let weather_endpoint = weather.endpoint();
+    drop(weather);
+    wait_until_refused(&weather_endpoint);
+
+    let failed = http_send(proxy.addr(), &tools_call(&gateway, 3, "weather_get_weather"));
+    let other = http_send(proxy.addr(), &tools_call(&gateway, 4, "cal_create_event"));
+
+    assert_eq!(
+        parse_status(&failed),
+        200,
+        "a failed handshake is a JSON-RPC error: {failed}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&failed)).unwrap();
+    assert_eq!(body["id"], 3, "client request id must be preserved: {body}");
+    assert_eq!(
+        body["error"]["message"], "backend session initialization failed",
+        "the fresh handshake failure must be reported: {body}"
+    );
+    assert_eq!(
+        parse_status(&other),
+        200,
+        "the gateway session must stay usable: {other}"
     );
 }
 
@@ -627,6 +739,23 @@ insecure_options:
         weather = weather.endpoint(),
         calendar = calendar.endpoint(),
     )
+}
+
+/// Assert `raw` answers call `id` with the broker's backend-session-expired
+/// error instead of the backend's `404`.
+fn assert_backend_session_expired(raw: &str, id: u64) {
+    assert_eq!(parse_status(raw), 200, "a backend 404 must not reach the client: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(raw)).unwrap();
+    assert_eq!(body["id"], id, "client request id must be preserved: {body}");
+    assert_eq!(
+        body["error"]["code"], -32603,
+        "backend session expiry must be -32603: {body}"
+    );
+    assert_eq!(
+        body["error"]["data"],
+        serde_json::json!({ "server": "weather", "reason": "session_expired" }),
+        "the error must name the server and the reason: {body}"
+    );
 }
 
 /// Wait until a stopped mock no longer accepts connections on `endpoint`.
