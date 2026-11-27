@@ -1,6 +1,6 @@
 # MCP Session Broker (current profile)
 #
-# Static-catalog MCP broker for stateful backends. Clients
+# MCP broker for stateful backends with runtime tool discovery. Clients
 # initialize with Praxis and receive a gateway
 # Mcp-Session-Id. On the first tools/call for each backend
 # server, the broker runs the backend initialize and
@@ -18,6 +18,12 @@
 # use answers 409 and leaves it usable. Ownership follows the
 # forwarded credential, so a client whose token was refreshed
 # gets 409 until its older backend sessions expire.
+#
+# The weather server's tools come from its own tools/list
+# (discover: true), listed inside the caller's backend session
+# with the caller's forwarded credential and cached per caller.
+# Its static entry overrides the listed description of
+# get_weather. The calendar server keeps a static catalog.
 #
 # The handshake runs as a filtered subrequest through a
 # generated outbound chain whose load_balancer references
@@ -52,19 +58,22 @@ filter_chains:
           handshake_timeout_ms: 5000
           max_response_bytes: 1048576
           forward_headers: [authorization]
+        discovery:
+          max_entries: 4096
+          max_age_ms: 300000
+          idle_timeout_ms: 600000
+          max_concurrency: 8
+          max_tools: 512
         servers:
           - name: weather
             cluster: weather-mcp
             path: /mcp
             tool_prefix: "weather_"
+            discover: true
+            tool_policy: allow_all
             tools:
               - name: get_weather
                 description: Get current weather
-                inputSchema:
-                  type: object
-                  properties:
-                    city:
-                      type: string
           - name: calendar
             cluster: calendar-mcp
             path: /mcp

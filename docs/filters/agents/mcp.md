@@ -21,6 +21,8 @@ In the current profile, `tools/call` returns `-32601` unless `backend_sessions` 
 
 With `backend_sessions`, `initialize` issues signed gateway session ids, and a request carrying a well-formed id the broker did not issue, or one a `DELETE` ended, gets HTTP `404` on every method; the client sends a new `initialize` without the header. A malformed header (empty, too long, or with characters outside visible ASCII) gets `400`. A `DELETE` that would end a session still holding backend sessions created with other credentials answers `409` and leaves it usable. Ownership follows the forwarded credential, so a caller whose token was refreshed or re-minted gets `409` on its own session until the older backend sessions expire.
 
+A server with `discover: true` contributes the tools its own `tools/list` returns, fetched with the caller's forwarded credential (inside the caller's backend session in the current profile, which needs `backend_sessions`), vetted under the server's `tool_policy`, and cached per caller. A static `tools:` entry with a discovered tool's name overrides its description or hides it (`hidden: true`). A server whose discovery fails keeps the caller's last good tools for it.
+
 Supports two protocol profiles: `current` (session-based, default) and `stateless` (MCP 2026-07-28, configurable). Version and cache fields are derived from the selected profile when omitted.
 
 ## Configuration
@@ -48,6 +50,16 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `cache_scope` | `public` \| `private` | no | Cache scope for stateless responses. Requires `protocol_profile: stateless`. |
 | `cache_ttl_ms` | integer | no | Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`. |
 | `default_version` | string | no | Fallback MCP protocol version. When omitted, derived from the profile. |
+| `discovery` | object | no | Runtime tool discovery settings for servers with `discover: true`. |
+| `discovery.forward_headers` | string[] | no | Request headers copied from the client request onto discovery exchanges. Stateless profile only. |
+| `discovery.idle_timeout_ms` | integer | no | Time after which a cached listing no request has read is dropped, in milliseconds. |
+| `discovery.max_age_ms` | integer | no | Age after which a caller's tools for a server are rediscovered, in milliseconds. A failed rediscovery keeps serving the older listing. |
+| `discovery.max_concurrency` | integer | no | Servers discovered concurrently for one request. |
+| `discovery.max_entries` | integer | no | Maximum cached `(caller, server)` tool listings. |
+| `discovery.max_response_bytes` | integer | no | Response body ceiling for each `tools/list` page, in bytes. Stateless profile only. |
+| `discovery.max_tools` | integer | no | Maximum tools one server may list. |
+| `discovery.outbound_filters` | FilterEntry[] | no | Extra filters run on each discovery subrequest before the broker's generated `load_balancer`. Stateless profile only. |
+| `discovery.timeout_ms` | integer | no | Budget for discovering every server one request needs, in milliseconds. Stateless profile only. |
 | `invalid_tool_policy` | `reject_server` \| `filter_out` | no | Behavior when a tool has an invalid schema. |
 | `path` | string | no | Public MCP path handled by Praxis. |
 | `protocol_profile` | `current` \| `stateless` | no | Protocol profile governing session semantics and header requirements for this broker instance. |
@@ -55,12 +67,15 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `servers[].name` | string | yes | Unique server name. |
 | `servers[].cluster` | string | yes | Backend cluster name. |
 | `servers[].path` | string | no | Backend MCP path. |
+| `servers[].discover` | bool | no | Discover this server's tools from its `tools/list`. |
 | `servers[].tool_prefix` | string | no | Tool prefix for this server. |
-| `servers[].tools` | object[] | no | Statically defined tools. |
+| `servers[].tool_policy` | `allow_all` \| `read_only` | no | Which discovered tools the server may expose. Requires `discover`. |
+| `servers[].tools` | object[] | no | Statically defined tools. With `discover`, an entry named like a discovered tool overrides its description or hides it. |
 | `servers[].tools[].name` | string | yes | Tool name on the backend. |
 | `servers[].tools[].description` | string | no | Optional description. |
 | `servers[].tools[].inputSchema` | any | no | Optional input schema. `schema` is accepted as a local shorthand. |
 | `servers[].tools[].annotations` | any | no | Optional tool annotations. |
+| `servers[].tools[].hidden` | bool | no | Hide the discovered tool of this name. Requires `discover` on the server. |
 | `supported_versions` | string[] | no | Protocol versions accepted during negotiation. When omitted, derived from the profile. |
 
 ## Examples

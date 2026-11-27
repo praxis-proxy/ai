@@ -233,6 +233,14 @@ struct ForwardedCall {
 /// refreshed or re-minted gets `409` on its own session until the older
 /// backend sessions expire.
 ///
+/// A server with `discover: true` contributes the tools its own `tools/list`
+/// returns, fetched with the caller's forwarded credential (inside the
+/// caller's backend session in the current profile, which needs
+/// `backend_sessions`), vetted under the server's `tool_policy`, and cached
+/// per caller. A static `tools:` entry with a discovered tool's name
+/// overrides its description or hides it (`hidden: true`). A server whose
+/// discovery fails keeps the caller's last good tools for it.
+///
 /// # YAML
 ///
 /// ```yaml
