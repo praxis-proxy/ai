@@ -1254,6 +1254,7 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
@@ -1369,6 +1370,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
@@ -1455,9 +1457,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 106, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 82, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 87, "manifest recording inventory count");
+        assert_eq!(report.features_total, 107, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 83, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 88, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1469,6 +1471,7 @@ mod tests {
                 "messages/basic-stream",
                 "messages/degrade-features",
                 "messages/empty-string-tool-arguments",
+                "messages/first-chunk-usage-stream",
                 "messages/invalid-tool-id",
                 "messages/malformed-success",
                 "messages/malformed-tool-arguments",
@@ -1545,7 +1548,7 @@ mod tests {
                 "vertex/thought-usage",
             ]
         );
-        assert_eq!(manifest.features.len(), 106, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 107, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1619,6 +1622,10 @@ mod tests {
                 (
                     &"messages.streaming.usage".to_owned(),
                     &vec!["messages/basic-stream".to_owned()]
+                ),
+                (
+                    &"messages.streaming.usage_first_chunk".to_owned(),
+                    &vec!["messages/first-chunk-usage-stream".to_owned()]
                 ),
                 (
                     &"messages.error.upstream".to_owned(),
@@ -2163,6 +2170,26 @@ mod tests {
                 "messages.response.text",
                 "messages.streaming.usage",
             ],
+            "Say hello in one sentence.",
+            true,
+            BodyKind::Sse,
+            200,
+            &[
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+        );
+        let first_chunk_usage =
+            InferenceScenario::load(&root.join("scenarios/messages/first-chunk-usage-stream.yaml")).unwrap();
+        assert_scenario(
+            &first_chunk_usage,
+            "messages/first-chunk-usage-stream",
+            "Prompt usage carried by the first upstream JSON chunk is reported in message_start; later chunks report through the final message_delta.",
+            &["messages.streaming.usage_first_chunk"],
             "Say hello in one sentence.",
             true,
             BodyKind::Sse,
