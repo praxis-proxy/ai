@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod listing;
 mod session;
 #[cfg_attr(
     all(feature = "mcp", not(feature = "openai-mcp-tools")),
@@ -54,6 +55,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 #[cfg(any(test, feature = "openai-mcp-tools"))]
 pub(crate) use self::subrequest_transport::validate_mcp_target;
 pub use self::{
+    listing::{MAX_PAGES, McpListingError, McpListingLimits, McpToolPage, paginate_tools},
     session::{McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit},
     streaming_selector::McpStreamingSelectorFilter,
     subrequest_transport::{McpExchangeStage, McpStreamingRequested},
@@ -101,7 +103,7 @@ pub(crate) struct McpConnectorContext<'a> {
 /// server, amplified across concurrently resolved servers). This bounds that
 /// union. It is deliberately generous relative to a realistic listing (128
 /// tools averaging 32 KiB) so well-behaved servers are never rejected.
-pub(super) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
+pub const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
 
 /// Per-call ceilings reserved by the Responses request-wide budget before a
 /// budgeted MCP side effect. Budgeted calls use fresh sessions so an older
@@ -435,7 +437,7 @@ pub(crate) async fn list_tools_with_forwarded_headers_budgeted(
     // control ceiling before deserialization, so an untrusted server cannot
     // exhaust proxy memory before `max_tools` (a count-only limit) is ever
     // evaluated. Across pagination the decoded listing is additionally
-    // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
+    // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_peer_tools`).
     let display_url = parse_display_url(server_url);
     let resolution_policy = mcp_resolution_policy(connector_context.is_some());
     let owner = connector_context.map(|context| context.owner.clone());
@@ -478,7 +480,7 @@ pub(crate) async fn list_tools_with_forwarded_headers_budgeted(
         let listing_limit = budget.map_or(MAX_LISTING_RESPONSE_BYTES, |(_, limit)| {
             limit.min(MAX_LISTING_RESPONSE_BYTES)
         });
-        let tools = Box::pin(paginate_tools(client, max_tools, listing_limit, &display_url))
+        let tools = Box::pin(paginate_peer_tools(client, max_tools, listing_limit, &display_url))
             .await
             .map_err(|err| transport_signal_error(&signal, &display_url).unwrap_or(err))?;
         tools_to_json(tools)
@@ -870,50 +872,46 @@ async fn close_fresh_session(
     }
 }
 
-/// Cap on pagination rounds to prevent infinite loops from
-/// servers returning empty pages with valid cursors.
-const MAX_PAGES: usize = 100;
-
-/// Paginate `tools/list`, bounded by [`MAX_LISTING_RESPONSE_BYTES`]
-/// (cumulative decoded size), `max_tools` (count), and [`MAX_PAGES`].
+/// Paginate `tools/list` over an rmcp peer, bounded by
+/// [`MAX_LISTING_RESPONSE_BYTES`] (cumulative decoded size), `max_tools`
+/// (count), and [`MAX_PAGES`].
 ///
 /// Each page body is already capped to the control-response ceiling
 /// before deserialization, but a server can still return many
 /// near-ceiling pages; the cumulative byte budget bounds that
 /// amplification independently of the tool count.
-async fn paginate_tools(
+async fn paginate_peer_tools(
     client: &Peer<RoleClient>,
     max_tools: usize,
     max_listing_bytes: usize,
     url: &McpDisplayUrl,
 ) -> Result<Vec<rmcp::model::Tool>, McpClientError> {
-    let mut all_tools = Vec::new();
-    let mut total_bytes: usize = 0;
-    let mut cursor = None;
-    for _ in 0..MAX_PAGES {
+    let limits = McpListingLimits {
+        max_tools,
+        max_bytes: max_listing_bytes,
+    };
+    let fetch_page = |cursor| async move {
         let params = PaginatedRequestParams::default().with_cursor(cursor);
-        let page = Box::pin(client.list_tools(Some(params)))
-            .await
-            .map_err(|_source| McpClientError::ListTools { url: url.clone() })?;
-        accumulate_listing_bytes(&mut total_bytes, &page.tools, max_listing_bytes, url)?;
-        all_tools.extend(page.tools);
-        if all_tools.len() > max_tools {
-            return Err(McpClientError::TooManyTools {
+        Box::pin(client.list_tools(Some(params))).await.map(|page| McpToolPage {
+            tools: page.tools,
+            next_cursor: page.next_cursor,
+        })
+    };
+    Box::pin(paginate_tools(limits, fetch_page))
+        .await
+        .map_err(|error| match error {
+            McpListingError::Page(_source) => McpClientError::ListTools { url: url.clone() },
+            McpListingError::TooManyTools { count, max } => McpClientError::TooManyTools {
                 url: url.clone(),
-                count: all_tools.len(),
-                max: max_tools,
-            });
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(all_tools),
-        }
-    }
-    Err(McpClientError::TooManyTools {
-        url: url.clone(),
-        count: all_tools.len(),
-        max: max_tools,
-    })
+                count,
+                max,
+            },
+            McpListingError::TooLarge { bytes, max } => McpClientError::ListingTooLarge {
+                url: url.clone(),
+                bytes,
+                max,
+            },
+        })
 }
 
 // -----------------------------------------------------------------------------
@@ -1177,24 +1175,4 @@ fn measure_tools_json_bytes<T: serde::Serialize + ?Sized>(tools: &T) -> usize {
             Ok(()) | Err(_) => counter.count,
         }
     })
-}
-
-/// Add one page's decoded size to the running listing total and reject the
-/// whole operation once it crosses [`MAX_LISTING_RESPONSE_BYTES`], so
-/// pagination cannot multiply the per-page ceiling.
-fn accumulate_listing_bytes(
-    total_bytes: &mut usize,
-    tools: &[rmcp::model::Tool],
-    max_listing_bytes: usize,
-    url: &McpDisplayUrl,
-) -> Result<(), McpClientError> {
-    *total_bytes = total_bytes.saturating_add(measure_tools_json_bytes(tools));
-    if *total_bytes > max_listing_bytes {
-        return Err(McpClientError::ListingTooLarge {
-            url: url.clone(),
-            bytes: *total_bytes,
-            max: max_listing_bytes,
-        });
-    }
-    Ok(())
 }
