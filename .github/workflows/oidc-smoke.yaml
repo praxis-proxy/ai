@@ -27,8 +27,8 @@ jobs:
       - name: Vertex AI live call (Gemini generateContent)
         env:
           VERTEX_AI_PROJECT: ${{ secrets.VERTEX_AI_PROJECT }}
-          VERTEX_AI_LOCATION: us-central1
-          GEMINI_MODEL: ${{ vars.VERTEX_GEMINI_MODEL || 'gemini-2.0-flash' }}
+          VERTEX_AI_LOCATION: global
+          GEMINI_MODEL: ${{ vars.VERTEX_GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
         run: |
           set -euo pipefail
           token=$(gcloud auth application-default print-access-token)
