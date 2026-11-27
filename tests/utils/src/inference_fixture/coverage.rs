@@ -1457,9 +1457,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 106, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 82, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 87, "manifest recording inventory count");
+        assert_eq!(report.features_total, 107, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 83, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 88, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1548,7 +1548,7 @@ mod tests {
                 "vertex/thought-usage",
             ]
         );
-        assert_eq!(manifest.features.len(), 106, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 107, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
