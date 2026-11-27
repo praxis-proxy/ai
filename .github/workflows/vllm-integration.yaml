@@ -527,6 +527,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
+        with:
+          cache-suffix: vllm-decisions-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
+
+      # Keep model warmup from competing with Cargo on the hosted CPU runner.
       - name: Start vLLM CPU with Qwen3-0.6B
         uses: ./.github/actions/start-vllm
         with:
@@ -539,18 +551,8 @@ jobs:
           max-model-len: "2048"
           extra-args: --revision c1899de289a04d12100db370d81485cdf75e47ca --dtype float32
 
-      - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@4c5423e4197eadfe606d0397bed190e65ad86cf2 # v0.7.0
-        with:
-          cache-suffix: vllm-decisions-cargo
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
-
-      - name: Build Praxis
-        run: cargo build --locked -p praxis-ai-proxy
-
       - name: Wait for vLLM
+        id: wait-vllm
         uses: ./.github/actions/wait-vllm
 
       - name: Start Praxis with the Decisions example
@@ -575,6 +577,12 @@ jobs:
       - name: Test TypeSafe System One through Praxis
         if: ${{ !cancelled() && (steps.decisions.outcome == 'success' || steps.decisions.outcome == 'failure') }}
         run: uv run tests/integration/sdk/openai/test_openai_decisions_vllm.py -k test_system_one
+
+      - name: Collect vLLM startup diagnostics
+        if: failure() && steps.wait-vllm.outcome == 'failure'
+        run: |
+          docker inspect --format '{{json .State}}' vllm || true
+          sudo dmesg | grep -Ei 'oom-kill|out of memory|killed process' || true
 
       - name: Collect logs and stop services
         if: always()
