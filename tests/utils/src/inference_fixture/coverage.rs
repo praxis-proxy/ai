@@ -1317,6 +1317,7 @@ mod tests {
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["messages_to_chat_completions"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
@@ -1451,11 +1452,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 105, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 81, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 86, "manifest recording inventory count");
+        assert_eq!(report.features_total, 106, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 82, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 87, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1540,9 +1542,10 @@ mod tests {
                 "vertex/cached-usage",
                 "vertex/fallback-response-id",
                 "vertex/invalid-content",
+                "vertex/thought-usage",
             ]
         );
-        assert_eq!(manifest.features.len(), 105, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 106, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1927,6 +1930,10 @@ mod tests {
                 (
                     &"vertex.gemini.response.cached_usage".to_owned(),
                     &vec!["vertex/cached-usage".to_owned()]
+                ),
+                (
+                    &"vertex.gemini.response.reasoning_usage".to_owned(),
+                    &vec!["vertex/thought-usage".to_owned()]
                 ),
                 (
                     &"vertex.gemini.streaming.candidate_limit".to_owned(),
