@@ -5,6 +5,7 @@
 """Opt-in Azure and Vertex Chat Completions smoke through Praxis."""
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -26,7 +27,7 @@ def identifier(name):
 
 
 def gateway_config(provider, model, port):
-    if provider == "azure":
+    if provider in {"azure", "azure-embeddings"}:
         host = identifier("AZURE_OPENAI_RESOURCE") + ".openai.azure.com"
         filters = [
             {"filter": "path_rewrite", "replace": {
@@ -36,6 +37,11 @@ def gateway_config(provider, model, port):
             {"filter": "openai_chat_completions_to_azureai_chat_completions",
              "api_version": "2024-10-21"},
         ]
+        if provider == "azure-embeddings":
+            filters = [{"filter": "path_rewrite", "replace": {
+                "pattern": "^/v1/embeddings$",
+                "replacement": "/openai/v1/embeddings",
+            }}]
         header, prefix = "api-key", ""
     else:
         host = "aiplatform.googleapis.com"
@@ -81,7 +87,7 @@ def live_client(tmp_path):
     provider = os.getenv("PRAXIS_CLOUD_SMOKE_PROVIDER")
     if not provider:
         pytest.skip("Enable a live cloud provider explicitly")
-    assert provider in {"azure", "vertex"}
+    assert provider in {"azure", "azure-embeddings", "vertex"}
     model = identifier("PRAXIS_CLOUD_SMOKE_MODEL")
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -162,6 +168,34 @@ def test_invalid_output_limit_returns_bad_request(live_client):
             model=model, max_completion_tokens=-1,
             messages=[{"role": "user", "content": "Reply with OK."}],
         )
+    assert error.value.status_code == 400
+    assert isinstance(error.value.body, dict)
+    assert isinstance(error.value.body.get("message"), str)
+
+
+def test_azure_embeddings_batch(live_client):
+    client, deployment, provider = live_client
+    assert provider == "azure-embeddings"
+    response = client.embeddings.create(
+        model=deployment,
+        input=["A blue sky.", "A deep ocean."],
+        dimensions=64,
+        encoding_format="float",
+    )
+    assert [item.index for item in response.data] == [0, 1]
+    for item in response.data:
+        assert len(item.embedding) == 64
+        assert all(math.isfinite(value) for value in item.embedding)
+    assert response.data[0].embedding != response.data[1].embedding
+    assert response.usage.prompt_tokens > 0
+    assert response.usage.total_tokens == response.usage.prompt_tokens
+
+
+def test_azure_embeddings_rejects_invalid_dimensions(live_client):
+    client, deployment, provider = live_client
+    assert provider == "azure-embeddings"
+    with pytest.raises(BadRequestError) as error:
+        client.embeddings.create(model=deployment, input="Hello.", dimensions=-1)
     assert error.value.status_code == 400
     assert isinstance(error.value.body, dict)
     assert isinstance(error.value.body.get("message"), str)
