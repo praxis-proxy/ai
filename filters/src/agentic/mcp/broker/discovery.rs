@@ -395,7 +395,6 @@ fn count_failure(server: &str, reason: &'static str) {
 
 /// How a `tools/list` page is sent.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "read once McpSessionClient sends tools/list"))]
 pub(crate) enum ListingScope<'a> {
     /// Inside the caller's backend session (current profile).
     Session(&'a BackendInit),
