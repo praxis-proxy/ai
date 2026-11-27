@@ -57,6 +57,14 @@ impl McpExchangeStage for BrokerBackendCluster {
     fn stage(&self, extensions: &mut RequestExtensions) {
         extensions.insert(self.clone());
     }
+
+    /// Pinned to the endpoint this exchange dialed, or to its own pin. With
+    /// neither known the load balancer picks, as it does for the session's
+    /// later exchanges.
+    fn follow_up(&self) -> Arc<dyn McpExchangeStage> {
+        let endpoint = self.dialed.get().cloned().or_else(|| self.pinned_endpoint.clone());
+        Arc::new(Self::new(Arc::clone(&self.cluster), endpoint))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -271,6 +279,52 @@ mod tests {
             dialed.get().map(AsRef::as_ref),
             Some("10.0.0.3:3001"),
             "the dialed endpoint must reach the broker"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_up_reaches_the_dialed_endpoint() {
+        use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+        let filter = selector();
+        let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let staged = BrokerBackendCluster::new(Arc::from("weather-mcp"), None);
+        ctx.extensions.insert(staged.clone());
+        ctx.upstream = Some(Upstream {
+            address: Arc::from("10.0.0.3:3001"),
+            authority: None,
+            base_path: None,
+            tls: None,
+            connection: Arc::new(ConnectionOptions::default()),
+        });
+        let _action = filter.on_response(&mut ctx).await.unwrap();
+
+        let mut extensions = RequestExtensions::default();
+        staged.follow_up().stage(&mut extensions);
+        let follow_up = extensions.get::<BrokerBackendCluster>().unwrap();
+        assert_eq!(&*follow_up.cluster, "weather-mcp", "the same cluster is dialed");
+        assert_eq!(
+            follow_up.pinned_endpoint.as_deref(),
+            Some("10.0.0.3:3001"),
+            "an answer on an open stream reaches the endpoint serving it"
+        );
+        assert!(follow_up.dialed.get().is_none(), "the follow-up records its own dial");
+    }
+
+    #[test]
+    fn follow_up_keeps_an_existing_pin() {
+        let staged = BrokerBackendCluster::new(Arc::from("weather-mcp"), Some(Arc::from("10.0.0.2:3001")));
+        let mut extensions = RequestExtensions::default();
+        staged.follow_up().stage(&mut extensions);
+        assert_eq!(
+            extensions
+                .get::<BrokerBackendCluster>()
+                .unwrap()
+                .pinned_endpoint
+                .as_deref(),
+            Some("10.0.0.2:3001"),
+            "a pinned exchange's follow-up keeps the pin"
         );
     }
 

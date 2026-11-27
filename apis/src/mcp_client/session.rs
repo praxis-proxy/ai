@@ -31,9 +31,9 @@ use praxis_filter::{
 };
 use rmcp::{
     model::{
-        ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest, Implementation, InitializeRequest,
-        InitializeRequestParams, InitializedNotification, JsonRpcMessage, ProtocolVersion, RequestId,
-        ServerJsonRpcMessage, ServerResult,
+        ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest, ClientResult, ErrorCode,
+        ErrorData, Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification, JsonRpcMessage,
+        JsonRpcRequest, ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerRequest, ServerResult,
     },
     transport::streamable_http_client::StreamableHttpError,
 };
@@ -67,6 +67,14 @@ const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
 
 /// MCP protocol version header.
 const MCP_PROTOCOL_VERSION: HeaderName = HeaderName::from_static("mcp-protocol-version");
+
+/// Most server requests answered while one `initialize` reply is read.
+///
+/// Before `notifications/initialized` MCP lets a server send only pings (and
+/// logging, which is a notification). One ping checks liveness; a few more
+/// cover a server that pings again while it waits. Each answer is a separate
+/// POST, so the cap bounds the outbound requests one handshake can trigger.
+const MAX_SERVER_REQUESTS: usize = 4;
 
 // -----------------------------------------------------------------------------
 // Types
@@ -141,6 +149,35 @@ impl fmt::Display for McpSessionError {
 
 impl std::error::Error for McpSessionError {}
 
+/// A failed `initialize`, with the session the server issued before it failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpInitializeError {
+    /// Why the exchange failed.
+    pub error: McpSessionError,
+    /// `Mcp-Session-Id` from the response head, when the exchange failed
+    /// after the server issued one. That session exists on the server and is
+    /// never confirmed, so the caller ends it with
+    /// [`McpSessionClient::terminate_issued`].
+    pub issued_session: Option<HeaderValue>,
+}
+
+impl From<McpSessionError> for McpInitializeError {
+    fn from(error: McpSessionError) -> Self {
+        Self {
+            error,
+            issued_session: None,
+        }
+    }
+}
+
+impl fmt::Display for McpInitializeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for McpInitializeError {}
+
 // -----------------------------------------------------------------------------
 // McpSessionClient
 // -----------------------------------------------------------------------------
@@ -175,31 +212,45 @@ impl McpSessionClient {
     ///
     /// # Errors
     ///
-    /// Returns [`McpSessionError`] on timeout, transport failure, an
-    /// oversized reply, a non-success status, a JSON-RPC error, or a reply
-    /// that is not a valid `initialize` result.
+    /// Returns [`McpInitializeError`] on timeout, transport failure, an
+    /// oversized reply, a non-success status, a JSON-RPC error, a reply that
+    /// is not a valid `initialize` result, or a failed answer to a server
+    /// request. It carries the session the server issued, if any.
     pub async fn initialize(
         &self,
         path: &str,
         stage: Arc<dyn McpExchangeStage>,
         callout: &McpSessionCallout,
         protocol_version: &str,
-    ) -> Result<McpSessionInit, McpSessionError> {
+    ) -> Result<McpSessionInit, McpInitializeError> {
         let callout = &self.bounded(callout);
-        let transport = self.transport(stage, callout);
-        let exchange = self.initialize_exchange(&transport, path, callout, protocol_version);
-        Box::pin(within(callout.deadline, exchange)).await
+        let transport = self.transport(Arc::clone(&stage), callout);
+        // Set once the response head is accepted, so a failure after it,
+        // the deadline included, still reports the session to end.
+        let issued = OnceLock::new();
+        let exchange = self.initialize_exchange(&transport, &stage, path, callout, protocol_version, &issued);
+        let result = Box::pin(within(callout.deadline, exchange)).await;
+        result.map_err(|error| McpInitializeError {
+            error,
+            issued_session: issued.get().cloned(),
+        })
     }
 
     /// POST `initialize` and read the session id and negotiated version from
     /// the reply, whether it arrives as JSON or on an SSE stream.
     #[expect(clippy::large_stack_frames, reason = "executor futures are inherently large")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transport, stage, path, callout, version, and issued-session cell describe one exchange"
+    )]
     async fn initialize_exchange(
         &self,
         transport: &McpSubrequestClient,
+        stage: &Arc<dyn McpExchangeStage>,
         path: &str,
         callout: &McpSessionCallout,
         protocol_version: &str,
+        issued: &OnceLock<HeaderValue>,
     ) -> Result<McpSessionInit, McpSessionError> {
         let request_id = RequestId::String(Arc::from(initialize_request_id()?));
         let message = &initialize_message(protocol_version, request_id.clone())?;
@@ -210,7 +261,19 @@ impl McpSessionClient {
                 .await
                 .map_err(classify)?;
         let (response, body, session_id) = accept_initialize_head(response, body).await?;
-        let reply = read_initialize_reply(&response, body, self.max_response_bytes)
+        if let Some(session_id) = session_id.as_ref() {
+            // A cheap `Bytes` handle, kept so a failed handshake can end it.
+            let _first = issued.set(session_id.clone());
+        }
+        let mut responder = ServerRequestResponder {
+            client: self,
+            path,
+            stage,
+            callout,
+            session_id: session_id.as_ref(),
+            answered: 0,
+        };
+        let reply = read_initialize_reply(&response, body, self.max_response_bytes, &mut responder)
             .await
             .map_err(|error| past_deadline(error, callout.deadline))?;
         Ok(McpSessionInit {
@@ -272,9 +335,41 @@ impl McpSessionClient {
         let Some(session_id) = session.session_id.as_ref() else {
             return Ok(());
         };
+        let headers = session_headers(&callout.forwarded_headers, Some(session_id), &session.protocol_version)?;
+        Box::pin(self.delete_session(path, stage, callout, headers)).await
+    }
+
+    /// Terminate a session the server issued in an `initialize` that failed.
+    ///
+    /// Sends no `MCP-Protocol-Version`: MCP sets it to the negotiated version,
+    /// and none was negotiated before the `initialize` result arrived.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpSessionError`] as [`Self::terminate`] does.
+    pub async fn terminate_issued(
+        &self,
+        path: &str,
+        stage: Arc<dyn McpExchangeStage>,
+        callout: &McpSessionCallout,
+        session_id: &HeaderValue,
+    ) -> Result<(), McpSessionError> {
+        let mut headers = callout.forwarded_headers.clone();
+        headers.insert(MCP_SESSION_ID, session_id.clone());
+        Box::pin(self.delete_session(path, stage, callout, headers)).await
+    }
+
+    /// Send the session `DELETE` with `headers`. A `404` (session already
+    /// gone) or `405` (no client-initiated termination) leaves nothing to end.
+    async fn delete_session(
+        &self,
+        path: &str,
+        stage: Arc<dyn McpExchangeStage>,
+        callout: &McpSessionCallout,
+        headers: HeaderMap,
+    ) -> Result<(), McpSessionError> {
         let callout = &self.bounded(callout);
         let transport = self.transport(stage, callout);
-        let headers = session_headers(&callout.forwarded_headers, Some(session_id), &session.protocol_version)?;
         let signal = Arc::new(OnceLock::new());
         let exchange = async {
             let response = Box::pin(transport.execute(
@@ -345,6 +440,120 @@ impl McpSessionClient {
             },
             _ => past_deadline(McpSessionError::Transport, deadline),
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Server Requests
+// -----------------------------------------------------------------------------
+
+/// Answers the requests a server sends on the `initialize` response stream.
+///
+/// MCP lets a server send requests on that stream before its response, and
+/// a ping receiver must answer. A server may hold its `initialize` result
+/// until its ping is answered, so each answer is sent and accepted before
+/// the stream is read further.
+struct ServerRequestResponder<'a> {
+    /// Client whose chain, limits, and error mapping the answers use.
+    client: &'a McpSessionClient,
+    /// MCP endpoint path the `initialize` was sent to.
+    path: &'a str,
+    /// Stage of the `initialize` exchange; answers follow its endpoint.
+    stage: &'a Arc<dyn McpExchangeStage>,
+    /// The `initialize` callout: credentials, correlation, and deadline.
+    callout: &'a McpSessionCallout,
+    /// `Mcp-Session-Id` from the `initialize` response head.
+    session_id: Option<&'a HeaderValue>,
+    /// Server requests answered so far.
+    answered: usize,
+}
+
+impl ServerRequestResponder<'_> {
+    /// Handle the message in one SSE event: a response or error is the
+    /// reply, a request is answered, and a notification or an event without
+    /// data is skipped.
+    async fn next_reply(&mut self, data: &[u8]) -> Result<Option<ServerJsonRpcMessage>, McpSessionError> {
+        if data.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        match parse_reply(data)? {
+            JsonRpcMessage::Request(request) => {
+                Box::pin(self.answer(&request)).await?;
+                Ok(None)
+            },
+            JsonRpcMessage::Notification(_) => Ok(None),
+            reply => Ok(Some(reply)),
+        }
+    }
+
+    /// POST the answer to `request` and wait for the server to accept it.
+    ///
+    /// The answer goes through the same bound chain, so operator outbound
+    /// filters and credential injection apply, with the forwarded headers
+    /// that created the session, its `Mcp-Session-Id`, and the endpoint
+    /// serving the stream. It shares the `initialize` deadline.
+    ///
+    /// No `MCP-Protocol-Version` header is sent. MCP requires it on requests
+    /// after initialization, carrying the negotiated version, and none is
+    /// negotiated until the `initialize` result arrives. The offered version
+    /// is not a substitute: a server that will select an older one may treat
+    /// it as unsupported, and MCP then requires `400 Bad Request`. A server
+    /// without the header identifies the version from the session or assumes
+    /// `2025-03-26`, which defines `ping`.
+    async fn answer(&mut self, request: &JsonRpcRequest<ServerRequest>) -> Result<(), McpSessionError> {
+        self.answered = self.answered.saturating_add(1);
+        if self.answered > MAX_SERVER_REQUESTS {
+            return Err(McpSessionError::Malformed("too many server requests during initialize"));
+        }
+        let message = server_request_answer(request);
+        let session_id = self
+            .session_id
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_error| McpSessionError::Malformed("invalid Mcp-Session-Id"))
+            })
+            .transpose()?;
+        let transport = self.client.transport(self.stage.follow_up(), self.callout);
+        let signal = transport.signal_handle();
+        let deadline = self.callout.deadline;
+        let headers = self.callout.forwarded_headers.clone();
+        let (response, body) =
+            Box::pin(transport.send_streaming_post(self.path, &message, session_id, headers, &signal))
+                .await
+                .map_err(|error| self.client.classify(&error, &signal, deadline))?;
+        let (response, body) = reject_unsuccessful(response, body)
+            .await
+            .map_err(|error| past_deadline(error, deadline))?;
+        discard_within(&response, body, self.client.max_response_bytes)
+            .await
+            .map_err(|error| past_deadline(error, deadline))
+    }
+}
+
+/// The client's answer to a server request: an empty result for `ping`, as
+/// MCP requires, and JSON-RPC `-32601` (method not found) for any other
+/// method. This client declares no capabilities, so sampling, roots,
+/// elicitation, and unknown methods are all unavailable here.
+fn server_request_answer(request: &JsonRpcRequest<ServerRequest>) -> ClientJsonRpcMessage {
+    let id = request.id.clone();
+    if is_ping(&request.request) {
+        ClientJsonRpcMessage::response(ClientResult::empty(()), id)
+    } else {
+        ClientJsonRpcMessage::error(
+            ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "Method not found", None),
+            Some(id),
+        )
+    }
+}
+
+/// Whether a server request is `ping`, including one whose extra members
+/// made it parse as a custom request.
+fn is_ping(request: &ServerRequest) -> bool {
+    match request {
+        ServerRequest::PingRequest(_) => true,
+        ServerRequest::CustomRequest(custom) => custom.method == "ping",
+        _ => false,
     }
 }
 
@@ -469,12 +678,14 @@ async fn accept_initialize_head(
 /// A JSON body is parsed whole. An SSE body is read with the crate's
 /// conforming SSE parser, which ignores unknown fields and discards an event
 /// cut off at end of stream. Reading stops at the first response or error
-/// event, so a backend may keep the stream open after it, and the events
-/// before it are skipped without logging their contents.
+/// event, so a backend may keep the stream open after it. Server requests
+/// before it are answered through `responder`, and notifications are
+/// skipped; none of their contents is logged.
 async fn read_initialize_reply(
     response: &SubResponse,
     body: Option<Box<dyn StreamingResponseBody>>,
     limit: usize,
+    responder: &mut ServerRequestResponder<'_>,
 ) -> Result<ServerJsonRpcMessage, McpSessionError> {
     let content_type = response
         .headers
@@ -487,10 +698,10 @@ async fn read_initialize_reply(
         return Err(McpSessionError::Malformed("unexpected content type"));
     }
     let Some(mut body) = body else {
-        return buffered_reply(&response.body, is_sse, limit);
+        return Box::pin(buffered_reply(&response.body, is_sse, limit, responder)).await;
     };
     let reply = if is_sse {
-        stream_sse_reply(&mut body, limit).await
+        Box::pin(stream_sse_reply(&mut body, limit, responder)).await
     } else {
         collect_json_reply(&mut body, limit).await
     };
@@ -500,7 +711,19 @@ async fn read_initialize_reply(
 
 /// The reply in a body the chain buffered. The executor bounded it only by the
 /// looser streaming backstop, so the exact limit is checked here.
-fn buffered_reply(body: &[u8], is_sse: bool, limit: usize) -> Result<ServerJsonRpcMessage, McpSessionError> {
+///
+/// The chain delivers the body only after the stream ended, so an answer
+/// sent now cannot unblock the server: one that holds its result until a
+/// ping is answered never ends the stream, and the executor ends the
+/// exchange at its deadline with a synthesized `504`. Server requests in a
+/// delivered body are still answered, in order, before the reply is
+/// returned, because MCP requires an answer.
+async fn buffered_reply(
+    body: &[u8],
+    is_sse: bool,
+    limit: usize,
+    responder: &mut ServerRequestResponder<'_>,
+) -> Result<ServerJsonRpcMessage, McpSessionError> {
     if body.len() > limit {
         return Err(McpSessionError::ResponseTooLarge { limit });
     }
@@ -508,17 +731,19 @@ fn buffered_reply(body: &[u8], is_sse: bool, limit: usize) -> Result<ServerJsonR
         return parse_reply(body);
     }
     for data in crate::buffered_sse_event_data(body) {
-        if let Some(reply) = sse_reply(&data)? {
+        if let Some(reply) = responder.next_reply(&data).await? {
             return Ok(reply);
         }
     }
     Err(McpSessionError::Malformed("initialize stream has no reply"))
 }
 
-/// Read SSE events until the first JSON-RPC response or error.
+/// Read SSE events until the first JSON-RPC response or error, answering
+/// server requests as they arrive.
 async fn stream_sse_reply(
     body: &mut Box<dyn StreamingResponseBody>,
     limit: usize,
+    responder: &mut ServerRequestResponder<'_>,
 ) -> Result<ServerJsonRpcMessage, McpSessionError> {
     // The parser stores an `event:` value lossily decoded, and each invalid
     // byte becomes a three-byte U+FFFD, so three times the read limit covers
@@ -535,7 +760,7 @@ async fn stream_sse_reply(
             .parse_chunk(within)
             .map_err(|_overflow| McpSessionError::ResponseTooLarge { limit })?;
         for frame in frames {
-            if let Some(reply) = sse_reply(&frame.data)? {
+            if let Some(reply) = responder.next_reply(&frame.data).await? {
                 return Ok(reply);
             }
         }
@@ -575,11 +800,14 @@ async fn discard_within(
     result
 }
 
-/// A transport failure at or past `deadline` is the executor ending the
-/// exchange there, so it is a timeout.
+/// A transport failure, or a `504`, at or past `deadline` is the executor
+/// ending the exchange there, so it is a timeout. The executor answers a
+/// request whose response head misses the deadline with a synthesized `504`.
 fn past_deadline(error: McpSessionError, deadline: Instant) -> McpSessionError {
     match error {
-        McpSessionError::Transport if Instant::now() >= deadline => McpSessionError::Timeout,
+        McpSessionError::Transport | McpSessionError::Rejected { status: 504 } if Instant::now() >= deadline => {
+            McpSessionError::Timeout
+        },
         other => other,
     }
 }
@@ -610,16 +838,6 @@ async fn next_chunk(body: &mut Box<dyn StreamingResponseBody>, limit: usize) -> 
             McpSessionError::Transport
         }
     })
-}
-
-/// The message in one SSE event when it is a response or error; other
-/// messages, and events without data, are skipped.
-fn sse_reply(data: &[u8]) -> Result<Option<ServerJsonRpcMessage>, McpSessionError> {
-    if data.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
-    }
-    let message = parse_reply(data)?;
-    Ok(matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)).then_some(message))
 }
 
 /// Parse one JSON-RPC message from the server.
