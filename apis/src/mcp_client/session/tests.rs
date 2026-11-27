@@ -179,6 +179,10 @@ impl McpExchangeStage for StagedBackend {
     fn stage(&self, extensions: &mut RequestExtensions) {
         extensions.insert(StagedUpstream(self.0.clone()));
     }
+
+    fn follow_up(&self) -> Arc<dyn McpExchangeStage> {
+        Arc::new(Self(self.0.clone()))
+    }
 }
 
 async fn staged(url: &str) -> Arc<dyn McpExchangeStage> {
@@ -303,7 +307,8 @@ async fn initialize_via(
     let url = format!("http://{addr}/mcp");
     let result = client
         .initialize("/mcp", staged(&url).await, &callout(timeout), "2025-06-18")
-        .await;
+        .await
+        .map_err(|failure| failure.error);
     let received = received.lock().unwrap().clone();
     (result, received)
 }
@@ -425,7 +430,7 @@ async fn sse_initialize_without_reply_is_malformed() {
             Reply::closed(http_response(
                 "200 OK",
                 &[("Content-Type", "text/event-stream")],
-                "data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":9}\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n\n",
             ))
         },
         1 << 20,
@@ -875,9 +880,482 @@ async fn unreachable_backend_is_a_transport_failure() {
     // The executor answers a refused dial with a synthesized 502.
     assert_eq!(
         result,
-        Err(McpSessionError::Rejected { status: 502 }),
+        Err(McpInitializeError::from(McpSessionError::Rejected { status: 502 })),
         "a refused dial must fail without a session"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Server Requests During initialize
+// -----------------------------------------------------------------------------
+
+/// How the ping backend answers each POST that is not `initialize`.
+#[derive(Clone, Copy)]
+enum AnswerReply {
+    /// `202 Accepted`, as MCP requires for an accepted response.
+    Accepted,
+    /// A complete response with this status line.
+    Status(&'static str),
+    /// `202 Accepted` after this delay.
+    After(Duration),
+    /// No response; the connection stays open.
+    Never,
+}
+
+/// A backend whose `initialize` stream carries server requests.
+#[derive(Clone)]
+struct PingScript {
+    /// Server request events written before the `initialize` result.
+    requests: Vec<String>,
+    /// Hold the result until every request was answered.
+    wait_for_answers: bool,
+    /// How the answer POSTs are answered.
+    answer: AnswerReply,
+    /// End the stream after the result instead of holding it open.
+    close_after_result: bool,
+}
+
+impl PingScript {
+    fn waiting(requests: Vec<String>) -> Self {
+        Self {
+            requests,
+            wait_for_answers: true,
+            answer: AnswerReply::Accepted,
+            close_after_result: false,
+        }
+    }
+}
+
+/// A `ping` request with `id`.
+fn ping(id: &serde_json::Value) -> String {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }).to_string()
+}
+
+/// One HTTP/1.1 chunk carrying one SSE event with `data`.
+fn sse_chunk(data: &str) -> String {
+    let event = format!("data: {data}\n\n");
+    format!("{:x}\r\n{event}\r\n", event.len())
+}
+
+/// Start a backend that serves `initialize` on an SSE stream with `script`'s
+/// server requests and records every request, answer POSTs included.
+async fn ping_backend(script: PingScript) -> (String, Arc<Mutex<Vec<Received>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let answered = Arc::new(tokio::sync::Notify::new());
+    let log = Arc::clone(&received);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (log, answered, script) = (Arc::clone(&log), Arc::clone(&answered), script.clone());
+            tokio::spawn(async move {
+                let Some(request) = read_request(&mut stream).await else {
+                    return;
+                };
+                let body = request.body.clone();
+                let is_initialize = serde_json::from_str::<serde_json::Value>(&body).unwrap()["method"] == "initialize";
+                log.lock().unwrap().push(request);
+                if is_initialize {
+                    serve_initialize(&mut stream, &body, &script, &answered).await;
+                } else {
+                    answered.notify_one();
+                    serve_answer(&mut stream, script.answer).await;
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/mcp"), received)
+}
+
+/// Write the `initialize` stream: the server requests, then the result.
+async fn serve_initialize(
+    stream: &mut tokio::net::TcpStream,
+    body: &str,
+    script: &PingScript,
+    answered: &tokio::sync::Notify,
+) {
+    // A stream that ends closes its connection, so the pool does not reuse it
+    // for an answer this backend would never read.
+    let connection = if script.close_after_result {
+        "Connection: close\r\n"
+    } else {
+        ""
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: s-ping\r\n{connection}\
+         Transfer-Encoding: chunked\r\n\r\n"
+    );
+    let _written = stream.write_all(head.as_bytes()).await;
+    for request in &script.requests {
+        let _written = stream.write_all(sse_chunk(request).as_bytes()).await;
+        let _flushed = stream.flush().await;
+        if script.wait_for_answers {
+            answered.notified().await;
+        }
+    }
+    let _written = stream
+        .write_all(sse_chunk(&init_result(body, "2025-06-18")).as_bytes())
+        .await;
+    if script.close_after_result {
+        let _written = stream.write_all(b"0\r\n\r\n").await;
+    }
+    let _flushed = stream.flush().await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+}
+
+/// Answer one answer POST as scripted.
+async fn serve_answer(stream: &mut tokio::net::TcpStream, reply: AnswerReply) {
+    let bytes = match reply {
+        AnswerReply::Accepted => http_response("202 Accepted", &[], ""),
+        AnswerReply::Status(status) => http_response(status, &[("Content-Type", "text/plain")], "no"),
+        AnswerReply::After(delay) => {
+            tokio::time::sleep(delay).await;
+            http_response("202 Accepted", &[], "")
+        },
+        AnswerReply::Never => {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            return;
+        },
+    };
+    let _written = stream.write_all(&bytes).await;
+    let _flushed = stream.flush().await;
+}
+
+/// Run `initialize` with `client` against a ping backend.
+async fn initialize_pinged(
+    client: McpSessionClient,
+    script: PingScript,
+    timeout: Duration,
+) -> (Result<McpSessionInit, McpInitializeError>, Vec<Received>) {
+    let (url, received) = ping_backend(script).await;
+    let result = client
+        .initialize("/mcp", staged(&url).await, &callout(timeout), "2025-06-18")
+        .await;
+    let received = received.lock().unwrap().clone();
+    (result, received)
+}
+
+/// A failure after the ping backend issued its session, which the caller
+/// must still terminate.
+fn half_made(error: McpSessionError) -> Result<McpSessionInit, McpInitializeError> {
+    Err(McpInitializeError {
+        error,
+        issued_session: Some(HeaderValue::from_static("s-ping")),
+    })
+}
+
+/// The answer POSTs a ping backend received, in order.
+fn answers(received: &[Received]) -> Vec<&Received> {
+    received
+        .iter()
+        .filter(|request| !request.body.contains("\"initialize\""))
+        .collect()
+}
+
+#[tokio::test]
+async fn ping_before_the_result_is_answered_on_the_session() {
+    let script = PingScript::waiting(vec![ping(&serde_json::json!("ping-1"))]);
+    let (result, received) = initialize_pinged(session_client(1 << 20), script, Duration::from_secs(5)).await;
+
+    let init = result.unwrap();
+    assert_eq!(init.session_id.unwrap(), "s-ping", "the session is established");
+    let answers = answers(&received);
+    assert_eq!(answers.len(), 1, "the ping is answered once");
+    let pong = answers[0];
+    assert_eq!(pong.method, "POST", "the answer is a new POST");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&pong.body).unwrap(),
+        serde_json::json!({ "jsonrpc": "2.0", "id": "ping-1", "result": {} }),
+        "the pong echoes the ping id with an empty result"
+    );
+    assert_eq!(
+        pong.header("authorization"),
+        Some("Bearer first"),
+        "credential forwarded"
+    );
+    assert_eq!(pong.header("mcp-session-id"), Some("s-ping"), "the session id is sent");
+    assert_eq!(
+        pong.header("content-type"),
+        Some("application/json"),
+        "the body is JSON"
+    );
+    assert!(
+        pong.header("mcp-protocol-version").is_none(),
+        "no version is negotiated before the initialize result"
+    );
+}
+
+#[tokio::test]
+async fn numeric_ping_ids_are_echoed() {
+    let script = PingScript::waiting(vec![ping(&serde_json::json!(42))]);
+    let (result, received) = initialize_pinged(session_client(1 << 20), script, Duration::from_secs(5)).await;
+
+    assert!(result.is_ok(), "the handshake must complete: {result:?}");
+    let body: serde_json::Value = serde_json::from_str(&answers(&received)[0].body).unwrap();
+    assert_eq!(body["id"], 42, "a numeric id keeps its type");
+}
+
+#[tokio::test]
+async fn ping_with_params_is_still_a_ping() {
+    let ping = r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":{"_meta":{"k":"v"}}}"#.to_owned();
+    let (result, received) = initialize_pinged(
+        session_client(1 << 20),
+        PingScript::waiting(vec![ping]),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(result.is_ok(), "the handshake must complete: {result:?}");
+    let body: serde_json::Value = serde_json::from_str(&answers(&received)[0].body).unwrap();
+    assert_eq!(
+        body["result"],
+        serde_json::json!({}),
+        "a ping with params gets an empty result"
+    );
+}
+
+#[tokio::test]
+async fn other_server_requests_get_method_not_found() {
+    let roots = r#"{"jsonrpc":"2.0","id":7,"method":"roots/list"}"#.to_owned();
+    let custom = r#"{"jsonrpc":"2.0","id":"x","method":"vendor/probe","params":{}}"#.to_owned();
+    let (result, received) = initialize_pinged(
+        session_client(1 << 20),
+        PingScript::waiting(vec![roots, custom]),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(result.is_ok(), "the handshake must complete: {result:?}");
+    let bodies: Vec<serde_json::Value> = answers(&received)
+        .iter()
+        .map(|request| serde_json::from_str(&request.body).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2, "each request is answered");
+    for (body, id) in bodies.iter().zip([serde_json::json!(7), serde_json::json!("x")]) {
+        assert_eq!(body["id"], id, "the answer echoes the request id");
+        assert_eq!(body["error"]["code"], -32601, "the method is not available: {body}");
+        assert!(body.get("result").is_none(), "an error carries no result");
+    }
+}
+
+#[tokio::test]
+async fn unanswered_pong_post_times_out_at_the_deadline() {
+    // The backend sends its result without waiting, but never answers the
+    // pong POST. Answers are sent before the stream is read further, so the
+    // handshake ends at its deadline.
+    let script = PingScript {
+        wait_for_answers: false,
+        answer: AnswerReply::Never,
+        ..PingScript::waiting(vec![ping(&serde_json::json!(1))])
+    };
+    let started = Instant::now();
+    let (result, received) = initialize_pinged(session_client(1 << 20), script, Duration::from_millis(500)).await;
+
+    assert_eq!(
+        result,
+        half_made(McpSessionError::Timeout),
+        "an unanswered pong POST is a timeout"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4), "the deadline ends the wait");
+    assert_eq!(answers(&received).len(), 1, "the pong was sent");
+}
+
+#[tokio::test]
+async fn rejected_pong_post_fails_the_handshake() {
+    for (status, code) in [("400 Bad Request", 400), ("503 Service Unavailable", 503)] {
+        let script = PingScript {
+            answer: AnswerReply::Status(status),
+            ..PingScript::waiting(vec![ping(&serde_json::json!(1))])
+        };
+        let (result, _) = initialize_pinged(session_client(1 << 20), script, Duration::from_secs(5)).await;
+
+        assert_eq!(
+            result,
+            half_made(McpSessionError::Rejected { status: code }),
+            "a rejected pong fails the handshake with its status"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pong_to_an_unreachable_endpoint_fails_the_handshake() {
+    /// Stages the backend for `initialize` and a closed port for answers.
+    struct DeadFollowUp(Upstream, Arc<dyn McpExchangeStage>);
+    impl McpExchangeStage for DeadFollowUp {
+        fn stage(&self, extensions: &mut RequestExtensions) {
+            extensions.insert(StagedUpstream(self.0.clone()));
+        }
+
+        fn follow_up(&self) -> Arc<dyn McpExchangeStage> {
+            Arc::clone(&self.1)
+        }
+    }
+
+    let (url, received) = ping_backend(PingScript::waiting(vec![ping(&serde_json::json!(1))])).await;
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = format!("http://{}/mcp", closed.local_addr().unwrap());
+    drop(closed);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let target = prepare_url_target_with_policy(&url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::ClientPerCall)
+        .await
+        .unwrap();
+    let stage = Arc::new(DeadFollowUp(
+        StagedUpstream::from_prepared_target(&target).unwrap().0,
+        staged(&dead).await,
+    ));
+
+    let result = session_client(1 << 20)
+        .initialize("/mcp", stage, &callout(Duration::from_secs(5)), "2025-06-18")
+        .await;
+
+    // The executor answers a refused dial with a synthesized 502.
+    assert_eq!(
+        result,
+        half_made(McpSessionError::Rejected { status: 502 }),
+        "an undeliverable pong fails the handshake"
+    );
+    assert!(
+        answers(&received.lock().unwrap()).is_empty(),
+        "the pong is dialed to the follow-up stage, not the stream's backend"
+    );
+}
+
+#[tokio::test]
+async fn more_server_requests_than_the_cap_are_malformed() {
+    let pings = (0..=MAX_SERVER_REQUESTS).map(|n| ping(&serde_json::json!(n))).collect();
+    let (result, received) = initialize_pinged(
+        session_client(1 << 20),
+        PingScript::waiting(pings),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        half_made(McpSessionError::Malformed("too many server requests during initialize")),
+        "requests past the cap end the handshake"
+    );
+    assert_eq!(
+        answers(&received).len(),
+        MAX_SERVER_REQUESTS,
+        "only the capped requests are answered"
+    );
+}
+
+#[tokio::test]
+async fn ping_round_trip_stays_within_the_deadline() {
+    let script = PingScript {
+        answer: AnswerReply::After(Duration::from_secs(10)),
+        ..PingScript::waiting(vec![ping(&serde_json::json!(1))])
+    };
+    let started = Instant::now();
+    let (result, _) = initialize_pinged(session_client(1 << 20), script, Duration::from_millis(500)).await;
+
+    assert_eq!(
+        result,
+        half_made(McpSessionError::Timeout),
+        "a slow pong ends at the deadline"
+    );
+    // The pong would take 10s; the handshake must end near its 500ms budget.
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the pong does not extend the handshake budget: {:?}",
+        started.elapsed()
+    );
+
+    let script = PingScript {
+        answer: AnswerReply::After(Duration::from_millis(100)),
+        ..PingScript::waiting(vec![ping(&serde_json::json!(1))])
+    };
+    let started = Instant::now();
+    let (result, _) = initialize_pinged(session_client(1 << 20), script, Duration::from_secs(2)).await;
+    assert!(result.is_ok(), "a pong within the budget completes: {result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the whole exchange fits the deadline"
+    );
+}
+
+#[tokio::test]
+async fn ping_events_count_toward_the_size_limit() {
+    let padded = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{"_meta":{{"pad":"{}"}}}}}}"#,
+        "p".repeat(4096)
+    );
+    let (result, received) = initialize_pinged(
+        session_client(2048),
+        PingScript::waiting(vec![padded]),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        half_made(McpSessionError::ResponseTooLarge { limit: 2048 }),
+        "bytes before the reply still count"
+    );
+    assert!(answers(&received).is_empty(), "a ping past the limit is not answered");
+}
+
+#[tokio::test]
+async fn buffering_chain_answers_pings_after_the_stream_ends() {
+    // A chain that buffers delivers the stream only after it ends; the server
+    // here did not wait, so the result is present and the ping still answered.
+    let script = PingScript {
+        wait_for_answers: false,
+        close_after_result: true,
+        ..PingScript::waiting(vec![ping(&serde_json::json!("late"))])
+    };
+    let (result, received) = initialize_pinged(buffering_client(1 << 20), script, Duration::from_secs(5)).await;
+
+    assert!(result.is_ok(), "the buffered handshake completes: {result:?}");
+    let body: serde_json::Value = serde_json::from_str(&answers(&received)[0].body).unwrap();
+    assert_eq!(body["id"], "late", "the buffered ping is answered");
+}
+
+#[tokio::test]
+async fn buffering_chain_times_out_on_a_server_waiting_for_its_pong() {
+    let script = PingScript::waiting(vec![ping(&serde_json::json!(1))]);
+    let (result, received) = initialize_pinged(buffering_client(1 << 20), script, Duration::from_millis(500)).await;
+
+    // The buffered response head never arrives, so the executor ends the
+    // exchange at its deadline with a synthesized 504, as before this change.
+    assert_eq!(
+        result,
+        Err(McpInitializeError::from(McpSessionError::Rejected { status: 504 })),
+        "the stream never ends"
+    );
+    assert!(
+        answers(&received).is_empty(),
+        "nothing can be answered before the stream ends"
+    );
+}
+
+#[test]
+fn ping_content_is_not_logged() {
+    const MARKER: &str = "secret-ping-marker";
+    let ping =
+        format!(r#"{{"jsonrpc":"2.0","id":"{MARKER}","method":"ping","params":{{"_meta":{{"m":"{MARKER}"}}}}}}"#);
+    let mut result = None;
+    let logs = crate::test_utils::capture_log_output(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        result = Some(runtime.block_on(initialize_pinged(
+            session_client(1 << 20),
+            PingScript::waiting(vec![ping]),
+            Duration::from_secs(5),
+        )));
+    });
+
+    let (result, received) = result.unwrap();
+    assert!(result.is_ok(), "the handshake must complete: {result:?}");
+    assert!(answers(&received)[0].body.contains(MARKER), "the pong echoes the id");
+    assert!(!logs.contains(MARKER), "ping content must not reach logs: {logs}");
 }
 
 // -----------------------------------------------------------------------------
@@ -986,6 +1464,82 @@ async fn terminate_sends_delete_with_session_credentials() {
         request.header("authorization"),
         Some("Bearer first"),
         "credential forwarded"
+    );
+}
+
+#[tokio::test]
+async fn terminate_issued_sends_delete_without_a_version() {
+    let (url, received) = scripted_backend(vec![Reply::closed(http_response("204 No Content", &[], ""))]).await;
+
+    session_client(1 << 20)
+        .terminate_issued(
+            "/mcp",
+            staged(&url).await,
+            &callout(Duration::from_secs(5)),
+            &HeaderValue::from_static("s-half"),
+        )
+        .await
+        .unwrap();
+
+    let request = received.lock().unwrap()[0].clone();
+    assert_eq!(request.method, "DELETE", "termination is a DELETE");
+    assert_eq!(
+        request.header("mcp-session-id"),
+        Some("s-half"),
+        "session id must be sent"
+    );
+    assert!(
+        request.header("mcp-protocol-version").is_none(),
+        "no version was negotiated for an issued session"
+    );
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer first"),
+        "credential forwarded"
+    );
+}
+
+#[tokio::test]
+async fn terminate_issued_reports_other_failures() {
+    let (url, _) = scripted_backend(vec![Reply::closed(http_response("500 Internal Server Error", &[], ""))]).await;
+
+    let result = session_client(1 << 20)
+        .terminate_issued(
+            "/mcp",
+            staged(&url).await,
+            &callout(Duration::from_secs(5)),
+            &HeaderValue::from_static("s-half"),
+        )
+        .await;
+
+    assert_eq!(result, Err(McpSessionError::Rejected { status: 500 }), "status is kept");
+}
+
+#[tokio::test]
+async fn sessionless_failure_reports_no_issued_session() {
+    // A head without a session id leaves nothing on the server to end.
+    let (plain, _) = scripted_backend(vec![Reply::closed(http_response(
+        "200 OK",
+        &[("Content-Type", "text/event-stream")],
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n\n",
+    ))])
+    .await;
+
+    let result = session_client(1 << 20)
+        .initialize(
+            "/mcp",
+            staged(&plain).await,
+            &callout(Duration::from_secs(5)),
+            "2025-06-18",
+        )
+        .await;
+
+    assert_eq!(
+        result,
+        Err(McpInitializeError::from(McpSessionError::Malformed(
+            "initialize stream has no reply"
+        ))),
+        "a sessionless failure reports no session to end"
     );
 }
 

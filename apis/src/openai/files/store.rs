@@ -8,6 +8,13 @@ use bytes::Bytes;
 
 use super::FileStream;
 
+#[cfg(feature = "openai-files-s3")]
+mod object_store_adapter;
+#[cfg(feature = "openai-files-s3")]
+mod s3;
+#[cfg(feature = "openai-files-s3")]
+pub use s3::S3FileStore;
+
 /// Failures while writing or reading file bytes.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -25,14 +32,14 @@ pub enum FileStoreError {
 /// Only [`Self::finish`] publishes a complete object under the storage key.
 /// Dropping an unfinished writer must not publish an object; implementations
 /// must arrange eventual cleanup of any uncommitted backend state. The service
-/// retains the registry reservation until byte deletion is confirmed.
+/// retains the catalog reservation until byte deletion is confirmed.
 #[async_trait]
 pub trait FileStoreWriter: Send {
     /// Move one chunk to the store without buffering the entire file. Apply
     /// backpressure and reject an upload as soon as it exceeds the reserved
     /// limit passed to [`FileStore::begin_write`]. The service checks the same
-    /// limit before calling this method so it can report the correct client
-    /// error for either a quota or per-file bound.
+    /// limit before calling this method so it reports the client
+    /// error itself.
     ///
     /// # Errors
     ///
@@ -44,7 +51,7 @@ pub trait FileStoreWriter: Send {
     /// Commit the complete object and return the actual number of bytes
     /// written, no greater than the reserved limit. A successful return means
     /// the object is durable. On failure, abort or remove partial bytes where
-    /// possible; the pending registry entry and reservation remain eligible
+    /// possible; the pending catalog entry and reservation remain eligible
     /// for reaper cleanup after an uncertain commit.
     ///
     /// # Errors
@@ -54,7 +61,7 @@ pub trait FileStoreWriter: Send {
 
     /// Discard an unfinished upload and remove partial bytes where possible.
     /// The service calls this after a malformed form or failed chunk write;
-    /// its registry reservation remains charged until deletion is confirmed.
+    /// its catalog reservation remains charged until deletion is confirmed.
     ///
     /// # Errors
     ///
@@ -64,15 +71,14 @@ pub trait FileStoreWriter: Send {
 
 /// Byte storage independent of file metadata and HTTP transport.
 ///
-/// Keys come from trusted pending registry entries, never client filenames.
+/// Keys come from trusted pending catalog entries, never client filenames.
 /// A store implementation may use temporary objects or multipart upload
 /// internally; the writer commits them only on successful completion.
 #[async_trait]
 pub trait FileStore: Send + Sync {
-    /// Start a byte write to `key` with the capacity `reserved_bytes` returned
-    /// by [`super::FileRegistry::create_pending`]. The service creates the
-    /// pending registry entry before calling this method and never opens a
-    /// writer when the reservation is zero.
+    /// Start a byte write to `key` with the capacity `reserved_bytes` reserved
+    /// by [`praxis_ai_store::FileCatalog::create_pending`]. The service creates
+    /// the pending catalog entry before calling this method.
     ///
     /// # Errors
     ///
@@ -93,9 +99,9 @@ pub trait FileStore: Send + Sync {
     async fn read(&self, key: &str) -> Result<FileStream<FileStoreError>, FileStoreError>;
 
     /// Physically remove `key`. Deleting an absent object succeeds so reapers
-    /// can retry safely after a crash or a registry failure. A successful
-    /// return lets the registry release the retained charge in
-    /// [`super::FileRegistry::complete_cleanup`].
+    /// can retry safely after a crash or a catalog failure. A successful
+    /// return lets the catalog release the retained charge in
+    /// [`praxis_ai_store::FileCatalog::complete_cleanup`].
     ///
     /// # Errors
     ///

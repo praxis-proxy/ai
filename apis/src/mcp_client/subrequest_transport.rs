@@ -574,6 +574,14 @@ fn resolve_callout_depth(iteration_state_depth: Option<u8>, headers: &HeaderMap)
 pub trait McpExchangeStage: Send + Sync {
     /// Insert this exchange's destination facts into `extensions`.
     fn stage(&self, extensions: &mut RequestExtensions);
+
+    /// Stage for a message sent while this stage's exchange is still open,
+    /// such as the answer to a request the server sent on its response
+    /// stream. That message must reach the endpoint serving the stream.
+    ///
+    /// Called after the exchange's response head arrived, so the chain has
+    /// already run its response filters and reported the endpoint it dialed.
+    fn follow_up(&self) -> Arc<dyn McpExchangeStage>;
 }
 
 /// How an [`McpSubrequestClient`] reaches its MCP server.

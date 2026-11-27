@@ -532,20 +532,34 @@ fn validate_finish_reason(reason: Option<&str>) -> Result<(), String> {
 /// OpenAI's `prompt_tokens_details.cached_tokens` inclusion in
 /// `prompt_tokens`, so it maps without adjusting the prompt total. The
 /// details object is emitted only when Vertex reports a cached count.
+///
+/// `thoughtsTokenCount` is separate from `candidatesTokenCount`, while
+/// OpenAI counts `completion_tokens_details.reasoning_tokens` inside
+/// `completion_tokens`, so thoughts are added to the completion total.
+/// The details object is emitted only when Vertex reports a thought
+/// count. `totalTokenCount` already includes thoughts and is kept as-is.
 fn convert_usage(usage: &Value) -> Value {
     let prompt = usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
-    let completion = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
+    let candidates = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
+    let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    let completion = candidates.saturating_add(thoughts.unwrap_or(0));
     let total = usage
         .get("totalTokenCount")
         .and_then(Value::as_u64)
-        .unwrap_or(prompt + completion);
+        .unwrap_or_else(|| prompt.saturating_add(completion));
 
-    let mut converted = Map::with_capacity(4);
+    let mut converted = Map::with_capacity(5);
     converted.insert("prompt_tokens".to_owned(), Value::from(prompt));
     converted.insert("completion_tokens".to_owned(), Value::from(completion));
     converted.insert("total_tokens".to_owned(), Value::from(total));
     if let Some(cached) = usage.get("cachedContentTokenCount").and_then(Value::as_u64) {
         converted.insert("prompt_tokens_details".to_owned(), json!({"cached_tokens": cached}));
+    }
+    if let Some(reasoning) = thoughts {
+        converted.insert(
+            "completion_tokens_details".to_owned(),
+            json!({"reasoning_tokens": reasoning}),
+        );
     }
     Value::Object(converted)
 }
@@ -1160,6 +1174,10 @@ mod tests {
             parsed["usage"].get("prompt_tokens_details").is_none(),
             "no cached count means no prompt_tokens_details"
         );
+        assert!(
+            parsed["usage"].get("completion_tokens_details").is_none(),
+            "no thought count means no completion_tokens_details"
+        );
     }
 
     #[test]
@@ -1190,6 +1208,56 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
         assert_eq!(parsed["usage"]["prompt_tokens_details"], json!({"cached_tokens": 0}));
+    }
+
+    #[test]
+    fn thoughts_token_count_counts_inside_completion_tokens() {
+        let body = br#"{
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 80, "thoughtsTokenCount": 200, "totalTokenCount": 330}
+        }"#;
+        let output = transform_response(body, "gemini-2.5-flash").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["usage"]["prompt_tokens"], 50);
+        assert_eq!(
+            parsed["usage"]["completion_tokens"], 280,
+            "thought tokens count inside completion_tokens"
+        );
+        assert_eq!(parsed["usage"]["total_tokens"], 330, "provider total is retained");
+        assert_eq!(
+            parsed["usage"]["completion_tokens_details"],
+            json!({"reasoning_tokens": 200})
+        );
+    }
+
+    #[test]
+    fn missing_total_falls_back_to_prompt_plus_completion_with_thoughts() {
+        let body = br#"{
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 80, "thoughtsTokenCount": 200}
+        }"#;
+        let output = transform_response(body, "gemini-2.5-flash").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["usage"]["completion_tokens"], 280);
+        assert_eq!(parsed["usage"]["total_tokens"], 330);
+    }
+
+    #[test]
+    fn zero_thoughts_token_count_is_preserved() {
+        let body = br#"{
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 1, "thoughtsTokenCount": 0, "totalTokenCount": 5}
+        }"#;
+        let output = transform_response(body, "gemini-2.5-flash").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["usage"]["completion_tokens"], 1);
+        assert_eq!(
+            parsed["usage"]["completion_tokens_details"],
+            json!({"reasoning_tokens": 0})
+        );
     }
 
     #[test]
@@ -2157,7 +2225,33 @@ mod tests {
         assert_eq!(usage["usage"]["completion_tokens"], 1);
         assert_eq!(usage["usage"]["total_tokens"], 4);
         assert!(usage["usage"].get("prompt_tokens_details").is_none());
+        assert!(usage["usage"].get("completion_tokens_details").is_none());
         assert_eq!(usage["id"], parsed["id"]);
+    }
+
+    #[test]
+    fn stream_trailing_usage_counts_thoughts_from_latest_frame() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}],"usageMetadata":{"promptTokenCount":50,"thoughtsTokenCount":200}}"#,
+        );
+        translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":80,"thoughtsTokenCount":200,"totalTokenCount":330}}"#,
+        );
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 50);
+        assert_eq!(usage["usage"]["completion_tokens"], 280);
+        assert_eq!(usage["usage"]["total_tokens"], 330);
+        assert_eq!(
+            usage["usage"]["completion_tokens_details"],
+            json!({"reasoning_tokens": 200})
+        );
     }
 
     #[test]

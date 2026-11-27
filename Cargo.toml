@@ -47,6 +47,7 @@ jsonschema = { version = "0.62.0", default-features = false }
 nix = { version = "0.32.0", default-features = false, features = ["process", "resource", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "9.0.0"
+object_store = { version = "0.14.2", default-features = false }
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"

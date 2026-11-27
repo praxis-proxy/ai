@@ -46,7 +46,8 @@ pub use mcp_client::McpStreamingSelectorFilter;
 #[cfg(feature = "mcp-client")]
 pub mod mcp_session {
     pub use crate::mcp_client::{
-        McpExchangeStage, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit, McpStreamingRequested,
+        McpExchangeStage, McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
+        McpStreamingRequested,
     };
 }
 pub mod openai;

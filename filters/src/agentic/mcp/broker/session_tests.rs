@@ -16,7 +16,9 @@ use praxis_filter::{FilterAction, HttpFilter as _};
 
 use super::{
     BackendSessions, McpBrokerFilter,
-    backend::{BackendCallout, BackendInit, BackendTarget, McpBackendClient, McpBackendError},
+    backend::{
+        BackendCallout, BackendInit, BackendTarget, InitializeFailure, IssuedSession, McpBackendClient, McpBackendError,
+    },
     config::{McpBrokerConfig, build_config},
 };
 
@@ -33,6 +35,8 @@ struct MockBackend {
     minted: AtomicUsize,
     /// Error returned by `initialize`, when set.
     initialize_error: Mutex<Option<McpBackendError>>,
+    /// A failing `initialize` reports that it issued this session first.
+    initialize_issued: Option<&'static str>,
     /// Error returned by `send_initialized`, when set.
     initialized_error: Mutex<Option<McpBackendError>>,
     /// Delay applied to `initialize`.
@@ -74,7 +78,7 @@ impl McpBackendClient for MockBackend {
         target: BackendTarget<'_>,
         protocol_version: &str,
         callout: &BackendCallout,
-    ) -> Result<BackendInit, McpBackendError> {
+    ) -> Result<BackendInit, InitializeFailure> {
         let auth = callout
             .forwarded_headers
             .get("authorization")
@@ -91,7 +95,13 @@ impl McpBackendClient for MockBackend {
         }
         let scripted = self.initialize_error.lock().unwrap().clone();
         if let Some(error) = scripted {
-            return Err(error);
+            return Err(InitializeFailure {
+                error,
+                issued: self.initialize_issued.map(|id| IssuedSession {
+                    session_id: HeaderValue::from_static(id),
+                    endpoint: Some(Arc::from("10.0.0.9:3001")),
+                }),
+            });
         }
         let n = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(BackendInit {
@@ -127,6 +137,23 @@ impl McpBackendClient for MockBackend {
             started.notify_one();
             proceed.notified().await;
         }
+        Ok(())
+    }
+
+    async fn terminate_issued(
+        &self,
+        target: BackendTarget<'_>,
+        session: &IssuedSession,
+        callout: &BackendCallout,
+    ) -> Result<(), McpBackendError> {
+        let auth = callout
+            .forwarded_headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let id = session.session_id.to_str().unwrap_or_default();
+        let endpoint = session.endpoint.as_deref().unwrap_or_default();
+        self.record("terminate_issued", target, format!("{id}|{endpoint}|{auth}"));
         Ok(())
     }
 }
@@ -1003,6 +1030,47 @@ async fn initialized_failure_terminates_new_session() {
         1,
         "a half-initialized session must be terminated"
     );
+}
+
+#[tokio::test]
+async fn failed_initialize_terminates_the_session_it_issued() {
+    let mock = Arc::new(MockBackend {
+        initialize_issued: Some("backend-half"),
+        ..MockBackend::default()
+    });
+    *mock.initialize_error.lock().unwrap() = Some(McpBackendError::Rejected { status: 400 });
+    let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+
+    let routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
+
+    let (_, body) = rejection_json(&routed.action);
+    assert_eq!(
+        body["error"]["data"]["reason"], "rejected",
+        "the failure keeps its class"
+    );
+    let calls = mock.calls.lock().unwrap().clone();
+    let ended: Vec<_> = calls.iter().filter(|(e, ..)| e == "terminate_issued").collect();
+    assert_eq!(ended.len(), 1, "the issued session must be terminated: {calls:?}");
+    assert!(
+        ended[0].2.starts_with("backend-half|10.0.0.9:3001|"),
+        "the issued session is ended on the endpoint that issued it: {calls:?}"
+    );
+    assert_eq!(mock.count("initialized"), 0, "the handshake is not confirmed");
+    assert!(routed.cluster.is_none(), "no tool call may be forwarded");
+}
+
+#[tokio::test]
+async fn failed_initialize_without_a_session_terminates_nothing() {
+    let mock = Arc::new(MockBackend::default());
+    *mock.initialize_error.lock().unwrap() = Some(McpBackendError::Timeout);
+    let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+
+    let _routed = route(&filter, &call_request(Some(gw_1.as_str()), None), "weather_get_weather").await;
+
+    assert_eq!(mock.count("terminate_issued"), 0, "no session was issued");
+    assert_eq!(mock.count("terminate"), 0, "no session was issued");
 }
 
 #[tokio::test]

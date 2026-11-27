@@ -28,7 +28,7 @@ impl MessageHistory {
     }
 
     /// Whether the history is empty.
-    #[cfg(any(feature = "store", feature = "openai-compact", feature = "openai-responses", test))]
+    #[cfg(any(feature = "store", feature = "openai-compact", test))]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -43,26 +43,6 @@ impl MessageHistory {
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&Value> {
         self.0.get(index).map(AsRef::as_ref)
-    }
-
-    /// Find the highest position whose contiguous run equals the items of
-    /// `needle`.
-    ///
-    /// `needle` is itself a shared history (the immutable client input) so the
-    /// comparison borrows both sides without materializing a second `Vec<Value>`.
-    #[must_use]
-    pub fn rposition_run(&self, needle: &MessageHistory) -> Option<usize> {
-        let needle_len = needle.len();
-        if needle_len == 0 || needle_len > self.len() {
-            return None;
-        }
-        (0..=self.len().saturating_sub(needle_len)).rev().find(|&start| {
-            (0..needle_len).all(|offset| {
-                self.get(start + offset)
-                    .zip(needle.get(offset))
-                    .is_some_and(|(item, want)| item == want)
-            })
-        })
     }
 
     /// Mutably borrow one item, copying its payload only if shared.

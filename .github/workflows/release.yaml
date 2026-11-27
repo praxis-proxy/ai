@@ -85,6 +85,13 @@ jobs:
       - name: Schema tests
         run: make test-schema
 
+      - name: Install independent S3 client
+        run: |
+          curl -fsSL https://awscli.amazonaws.com/v2/install.sh -o "$RUNNER_TEMP/install-aws-cli.sh"
+          bash "$RUNNER_TEMP/install-aws-cli.sh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/aws" --version
+
       - name: Integration tests
         run: make test-integration
 

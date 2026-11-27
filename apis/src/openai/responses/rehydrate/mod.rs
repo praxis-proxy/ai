@@ -1464,6 +1464,7 @@ pub(super) fn rehydrate_existing_state(
     let replay = replay_messages_from_stored(&stored);
     state.history_rehydrated = true;
     state.messages.prepend_shared(replay);
+    state.sync_current_input_start();
     state
         .provider_compaction_ids
         .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
@@ -1486,6 +1487,7 @@ pub(super) fn build_state(
     let mut state = ResponsesState::from_managed_request_body(parsed_body);
     state.history_rehydrated = true;
     state.messages.prepend_shared(replay);
+    state.sync_current_input_start();
     state
         .provider_compaction_ids
         .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));

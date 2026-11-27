@@ -181,6 +181,8 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             )
         if "trigger cached usage" in user_text.lower():
             response["usageMetadata"]["cachedContentTokenCount"] = 8
+        if "trigger thought usage" in user_text.lower():
+            response["usageMetadata"].update({"thoughtsTokenCount": 20, "totalTokenCount": 35})
         self._send_json_response(200, response)
 
     def _handle_streaming(self, request_json: dict[str, Any]) -> None:
@@ -216,6 +218,8 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
                     chunk.pop("responseId", None)
             if "trigger cached usage" in user_text.lower():
                 chunks[-1]["usageMetadata"]["cachedContentTokenCount"] = 8
+            if "trigger thought usage" in user_text.lower():
+                chunks[-1]["usageMetadata"].update({"thoughtsTokenCount": 20, "totalTokenCount": 35})
             if "trigger text metadata" in user_text.lower():
                 chunks[0]["candidates"][0]["content"]["parts"][0]["thought"] = False
                 chunks[-1]["candidates"][0]["content"]["parts"].append(
@@ -840,6 +844,49 @@ class TestVertexGeminiChatCompletions:
         assert usage_chunk.usage.prompt_tokens == 10
         assert usage_chunk.usage.prompt_tokens_details is not None
         assert usage_chunk.usage.prompt_tokens_details.cached_tokens == 8
+
+    def test_thought_usage_counts_inside_completion_tokens(self, openai_client: OpenAI) -> None:
+        """thoughtsTokenCount is added to completion_tokens and reported as reasoning_tokens."""
+        response = openai_client.chat.completions.create(
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "Trigger thought usage"}],
+        )
+
+        assert response.usage is not None
+        assert response.usage.prompt_tokens == 10
+        assert response.usage.completion_tokens == 25
+        assert response.usage.total_tokens == 35
+        assert response.usage.completion_tokens_details is not None
+        assert response.usage.completion_tokens_details.reasoning_tokens == 20
+
+    def test_usage_without_thoughts_omits_completion_tokens_details(self, openai_client: OpenAI) -> None:
+        """Usage without thoughtsTokenCount carries no reasoning-token details."""
+        response = openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+
+        assert response.usage is not None
+        assert response.usage.completion_tokens == 5
+        assert response.usage.completion_tokens_details is None
+
+    def test_streaming_thought_usage_counts_inside_completion_tokens(self, openai_client: OpenAI) -> None:
+        """The trailing include_usage chunk counts thoughts inside completion_tokens."""
+        with openai_client.chat.completions.create(
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "Trigger thought usage"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        ) as stream:
+            chunks = list(stream)
+
+        usage_chunk = chunks[-1]
+        assert usage_chunk.choices == []
+        assert usage_chunk.usage is not None
+        assert usage_chunk.usage.completion_tokens == 25
+        assert usage_chunk.usage.total_tokens == 35
+        assert usage_chunk.usage.completion_tokens_details is not None
+        assert usage_chunk.usage.completion_tokens_details.reasoning_tokens == 20
 
     def test_truncated_stream_raises_after_preserving_valid_data(self, openai_client: OpenAI) -> None:
         """A clean EOF without finishReason is an SDK-visible failure."""

@@ -105,6 +105,11 @@ pub struct McpMockConfig {
     /// stream open after the JSON-RPC response, which MCP Streamable HTTP
     /// permits (the server only *should* close it).
     pub sse_initialize_held_open: bool,
+
+    /// Answer `initialize` on a `text/event-stream` response that first
+    /// carries a `ping` request with id `mock-ping-<session>`, and hold the
+    /// `initialize` result until the client POSTs the pong, as MCP permits.
+    pub ping_before_initialize_result: bool,
 }
 
 impl Default for McpMockConfig {
@@ -123,6 +128,7 @@ impl Default for McpMockConfig {
             enforce_sessions: false,
             oversized_initialize_bytes: None,
             sse_initialize_held_open: false,
+            ping_before_initialize_result: false,
         }
     }
 }
@@ -501,14 +507,7 @@ fn dispatch_json_rpc(
     let id = json.get("id").cloned();
     let tool_name = extract_tool_name(&json);
 
-    let record = McpRecordedRequest {
-        json_rpc_id: id.clone(),
-        json_rpc_method: method.clone(),
-        tool_name: tool_name.clone(),
-        ..build_record(req)
-    };
-
-    record_request(state, record);
+    record_json_rpc(state, req, &id, &method, &tool_name);
 
     if config.enforce_sessions
         && method.as_deref() != Some("initialize")
@@ -519,13 +518,31 @@ fn dispatch_json_rpc(
     }
 
     match method.as_deref() {
-        Some("initialize") => handle_initialize(stream, config, &id, sessions),
+        Some("initialize") => handle_initialize(stream, config, &id, sessions, state),
+        None if json.get("result").is_some() || json.get("error").is_some() => handle_notification(stream),
         Some("notifications/initialized") => handle_notification(stream),
         Some("tools/list") => handle_tools_list(stream, config, &id),
         Some("tools/call") => handle_tools_call(stream, config, &id, tool_name),
         Some("ping") => handle_ping(stream, &id),
         _ => handle_unknown_method(stream, &id),
     }
+}
+
+/// Record a parsed JSON-RPC request with its id, method, and tool name.
+fn record_json_rpc(
+    state: &Mutex<Vec<McpRecordedRequest>>,
+    req: &AgenticHttpRequest,
+    id: &Option<Value>,
+    method: &Option<String>,
+    tool_name: &Option<String>,
+) {
+    let record = McpRecordedRequest {
+        json_rpc_id: id.clone(),
+        json_rpc_method: method.clone(),
+        tool_name: tool_name.clone(),
+        ..build_record(req)
+    };
+    record_request(state, record);
 }
 
 /// HTTP reason phrase for early-rejection status codes.
@@ -560,19 +577,14 @@ fn request_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a
 
 /// Capabilities envelope; emits `MCP-Session-Id`
 /// when `stateful_sessions` is set.
-fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option<Value>, sessions: &MockSessions) {
-    let mut result = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "protocolVersion": config.protocol_version,
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": config.server_name,
-                "version": DEFAULT_SERVER_VERSION,
-            }
-        }
-    });
+fn handle_initialize(
+    stream: &mut TcpStream,
+    config: &McpMockConfig,
+    id: &Option<Value>,
+    sessions: &MockSessions,
+    state: &Mutex<Vec<McpRecordedRequest>>,
+) {
+    let mut result = initialize_result(config, id);
 
     let session_id = mint_session(config, sessions);
 
@@ -587,6 +599,11 @@ fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
         return;
     }
 
+    if config.ping_before_initialize_result {
+        write_sse_after_ping(stream, &result.to_string(), session_id.as_deref(), state);
+        return;
+    }
+
     let body = result.to_string();
     let mut headers: Vec<(&str, String)> = vec![("Content-Type", "application/json".to_owned())];
 
@@ -595,6 +612,22 @@ fn handle_initialize(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
     }
 
     write_response(stream, 200, "OK", &headers, &body);
+}
+
+/// The `initialize` result envelope for request `id`.
+fn initialize_result(config: &McpMockConfig, id: &Option<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "protocolVersion": config.protocol_version,
+            "capabilities": { "tools": {} },
+            "serverInfo": {
+                "name": config.server_name,
+                "version": DEFAULT_SERVER_VERSION,
+            }
+        }
+    })
 }
 
 /// Session id for an `initialize` reply: unique and tracked under
@@ -631,6 +664,46 @@ fn write_held_open_sse(stream: &mut TcpStream, message: &str, session_id: Option
         if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
             return;
         }
+    }
+}
+
+/// Send a `ping` on the `initialize` SSE stream, wait for the client's pong
+/// POST (a response with the ping id), then send `message` and close.
+fn write_sse_after_ping(
+    stream: &mut TcpStream,
+    message: &str,
+    session_id: Option<&str>,
+    state: &Mutex<Vec<McpRecordedRequest>>,
+) {
+    let mut head = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n");
+    if let Some(session_id) = session_id {
+        head.push_str("MCP-Session-Id: ");
+        head.push_str(session_id);
+        head.push_str("\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let ping_id = format!("mock-ping-{}", session_id.unwrap_or("none"));
+    let ping = json!({ "jsonrpc": "2.0", "id": ping_id, "method": "ping" });
+    if stream.write_all(head.as_bytes()).is_err()
+        || stream.write_all(format!("data: {ping}\n\n").as_bytes()).is_err()
+        || stream.flush().is_err()
+    {
+        return;
+    }
+    let ping_id = Value::String(ping_id);
+    for _ in 0..100 {
+        let answered = state
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.json_rpc_method.is_none() && r.json_rpc_id.as_ref() == Some(&ping_id));
+        if answered {
+            let _sent = stream
+                .write_all(format!("data: {message}\n\n").as_bytes())
+                .and_then(|()| stream.flush());
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
