@@ -9,6 +9,17 @@
 
 mod backend;
 pub(crate) mod config;
+mod discovery;
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
+mod discovery_tests;
 mod gateway;
 mod selector;
 #[cfg(test)]
@@ -71,6 +82,10 @@ use self::{
         MCP_SESSION_ID, McpBackendClient, McpBackendError,
     },
     config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
+    discovery::{
+        BrokerView, CallerCatalog, CalloutSettings, Discovery, DiscoveryError, DiscoveryRun, McpToolPages, RunScope,
+        ServerTools,
+    },
     gateway::GatewaySessions,
     sessions::{
         BackendSessionKey, BackendSessionStore, BoundSession, Publish, RetiredSession, SessionSlot, SlotUnavailable,
@@ -119,6 +134,9 @@ const MAX_GATEWAY_SESSION_ID_LEN: usize = 256;
 /// Name of the generated backend handshake chain.
 const BACKEND_CHAIN_NAME: &str = "mcp-backend-sessions";
 
+/// Name of the generated stateless-profile discovery chain.
+const DISCOVERY_CHAIN_NAME: &str = "mcp-discovery";
+
 // -----------------------------------------------------------------------------
 // Backend Sessions
 // -----------------------------------------------------------------------------
@@ -128,8 +146,12 @@ const BACKEND_CHAIN_NAME: &str = "mcp-backend-sessions";
 struct BrokerServer {
     /// Top-level cluster name.
     cluster: Arc<str>,
+    /// Configured server name.
+    name: String,
     /// Backend MCP endpoint path.
     path: String,
+    /// Prefix added to every exposed tool name.
+    tool_prefix: Option<String>,
 }
 
 /// Most retired backend sessions terminated concurrently; beyond that the
@@ -211,6 +233,14 @@ struct ForwardedCall {
 /// refreshed or re-minted gets `409` on its own session until the older
 /// backend sessions expire.
 ///
+/// A server with `discover: true` contributes the tools its own `tools/list`
+/// returns, fetched with the caller's forwarded credential (inside the
+/// caller's backend session in the current profile, which needs
+/// `backend_sessions`), vetted under the server's `tool_policy`, and cached
+/// per caller. A static `tools:` entry with a discovered tool's name
+/// overrides its description or hides it (`hidden: true`). A server whose
+/// discovery fails keeps the caller's last good tools for it.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -240,10 +270,10 @@ pub(crate) struct McpBrokerFilter {
     cache_scope: CacheScope,
     /// Cache TTL in milliseconds for stateless responses.
     cache_ttl_ms: u64,
-    /// Static tool catalog built from config.
-    catalog: Vec<CatalogTool>,
     /// Protocol version the broker uses in responses.
     default_version: String,
+    /// Per-caller runtime tool discovery, when any server discovers.
+    discovery: Option<Discovery>,
     /// Shared JSON-RPC parser configuration.
     json_rpc_config: JsonRpcConfig,
     /// Maximum body bytes for `StreamBuffer`.
@@ -254,6 +284,10 @@ pub(crate) struct McpBrokerFilter {
     public_path: String,
     /// Configured servers in configuration order.
     servers: Vec<BrokerServer>,
+    /// The catalog every caller sees without discovery.
+    static_catalog: CallerCatalog,
+    /// Each server's static tools, in configuration order.
+    static_tools: Vec<ServerTools>,
     /// Implemented versions used for protocol version negotiation.
     supported_versions: Vec<String>,
 }
@@ -283,6 +317,10 @@ impl McpBrokerFilter {
     /// Returns [`FilterError`] if the config is invalid, if
     /// `backend_sessions` is configured without a chain-binding context, or
     /// if the generated handshake chain cannot be bound.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "binds the session and discovery transports in one place"
+    )]
     pub(crate) fn from_config_with_binding(
         config: &serde_yaml::Value,
         binding: Option<&ChainBindingContext<'_>>,
@@ -293,29 +331,69 @@ impl McpBrokerFilter {
             .backend_sessions
             .as_ref()
             .map(|sessions| sessions.outbound_filters.clone());
+        let discovery_filters = cfg
+            .discovery
+            .as_ref()
+            .and_then(|discovery| discovery.outbound_filters.clone())
+            .unwrap_or_default();
         let servers_cfg = cfg.servers.clone();
         let (validated, catalog) = build_config(cfg)?;
+        let mut pages: Option<Arc<dyn McpToolPages>> = None;
         let backend = match (validated.backend_sessions.as_ref(), handshake_filters) {
             (Some(settings), Some(filters)) => {
                 let Some(binding) = binding else {
                     return Err("mcp: backend_sessions requires chain-binding registration".into());
                 };
-                let pipeline = Arc::new(bind_backend_chain(&servers_cfg, filters, binding)?);
+                let pipeline = Arc::new(bind_backend_chain(BACKEND_CHAIN_NAME, &servers_cfg, filters, binding)?);
                 let client = Arc::new(FilteredMcpBackendClient::new(
                     pipeline,
                     settings.max_response_bytes,
                     settings.handshake_timeout,
                 ));
+                let shared: Arc<dyn McpToolPages> = Arc::<FilteredMcpBackendClient>::clone(&client);
+                pages = Some(shared);
                 Some(BackendSessions::new(
                     client,
-                    fallback_client,
+                    fallback_client.clone(),
                     settings,
                     validated.supported_versions.clone(),
                 )?)
             },
             _ => None,
         };
-        Ok(Box::new(Self::build(&validated, catalog, &servers_cfg, backend)))
+        let discovery = match validated.discovery.as_ref() {
+            Some(settings) => {
+                let pages = match (pages, settings.stateless.as_ref()) {
+                    (Some(pages), _) => pages,
+                    (None, Some(stateless)) => {
+                        let Some(binding) = binding else {
+                            return Err("mcp: discover requires chain-binding registration".into());
+                        };
+                        let pipeline = Arc::new(bind_backend_chain(
+                            DISCOVERY_CHAIN_NAME,
+                            &servers_cfg,
+                            discovery_filters,
+                            binding,
+                        )?);
+                        Arc::new(FilteredMcpBackendClient::new(
+                            pipeline,
+                            stateless.max_response_bytes,
+                            stateless.timeout,
+                        ))
+                    },
+                    (None, None) => return Err("mcp: discover requires backend_sessions".into()),
+                };
+                Some(Discovery::new(settings, pages, fallback_client))
+            },
+            None => None,
+        };
+        Ok(Box::new(Self::build(
+            &validated,
+            catalog,
+            &servers_cfg,
+            backend,
+            discovery,
+        )))
     }
 
     /// Assemble the filter from validated parts.
@@ -324,15 +402,24 @@ impl McpBrokerFilter {
         catalog: Vec<CatalogTool>,
         servers: &[McpServerConfig],
         backend: Option<BackendSessions>,
+        discovery: Option<Discovery>,
     ) -> Self {
         let json_rpc_config = super::build_json_rpc_config(validated.max_body_bytes);
+        let static_tools = group_by_server(catalog, servers.len());
+        let static_catalog = CallerCatalog::assemble(&static_tools);
 
         Self {
             backend,
-            cache_scope: validated.cache_scope,
+            // Discovered tools are per caller, so no intermediary may share
+            // a stateless listing between callers.
+            cache_scope: if discovery.is_some() {
+                CacheScope::Private
+            } else {
+                validated.cache_scope
+            },
             cache_ttl_ms: validated.cache_ttl_ms,
-            catalog,
             default_version: validated.default_version.clone(),
+            discovery,
             json_rpc_config,
             max_body_bytes: validated.max_body_bytes,
             protocol_profile: validated.protocol_profile,
@@ -341,9 +428,13 @@ impl McpBrokerFilter {
                 .iter()
                 .map(|server| BrokerServer {
                     cluster: Arc::from(server.cluster.as_str()),
+                    name: server.name.clone(),
                     path: server.path.clone(),
+                    tool_prefix: server.tool_prefix.clone(),
                 })
                 .collect(),
+            static_catalog,
+            static_tools,
             supported_versions: validated.supported_versions.clone(),
         }
     }
@@ -364,7 +455,7 @@ impl McpBrokerFilter {
     ) -> Result<FilterAction, FilterError> {
         match self.protocol_profile {
             ProtocolProfile::Current => self.dispatch_current(ctx, value, envelope, method_str, body).await,
-            ProtocolProfile::Stateless => Ok(self.dispatch_stateless(ctx, value, envelope, method_str, body)),
+            ProtocolProfile::Stateless => Ok(self.dispatch_stateless(ctx, value, envelope, method_str, body).await),
         }
     }
 
@@ -388,7 +479,10 @@ impl McpBrokerFilter {
 
         let action = match method_str {
             "initialize" => self.handle_initialize(ctx, value, envelope),
-            "tools/list" => handle_tools_list(&self.catalog, envelope)?,
+            "tools/list" => match self.caller_catalog(ctx, envelope, None).await {
+                Ok(catalog) => handle_tools_list(&catalog, envelope)?,
+                Err(action) => action,
+            },
             "tools/call" => self.handle_current_tools_call(ctx, value, envelope, body).await,
             "ping" => handle_ping(envelope),
             _ => {
@@ -403,7 +497,7 @@ impl McpBrokerFilter {
     /// Stateless-profile dispatch: validates stateless headers, then dispatches.
     #[expect(clippy::too_many_arguments, reason = "body reference needed for tools/call mutation")]
     #[expect(clippy::too_many_lines, reason = "linear dispatch with early returns")]
-    fn dispatch_stateless(
+    async fn dispatch_stateless(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         value: &serde_json::Value,
@@ -436,8 +530,8 @@ impl McpBrokerFilter {
 
         match method_str {
             "server/discover" => self.handle_server_discover(envelope),
-            "tools/list" => self.handle_stateless_tools_list(envelope),
-            "tools/call" => self.handle_stateless_tools_call(ctx, value, envelope, body),
+            "tools/list" => self.handle_stateless_tools_list(ctx, envelope).await,
+            "tools/call" => self.handle_stateless_tools_call(ctx, value, envelope, body).await,
             "initialize" => json_rpc_error_action_with_status(
                 envelope,
                 404,
@@ -512,7 +606,11 @@ impl McpBrokerFilter {
         let Some(backend) = self.backend.as_ref() else {
             return json_rpc_error_action(envelope, -32601, "method not yet supported");
         };
-        let (tool, server, key, version) = match self.current_call_route(ctx, value, envelope) {
+        let tool = match self.find_call_tool(ctx, value, envelope).await {
+            Ok(tool) => tool,
+            Err(action) => return action,
+        };
+        let (server, key, version) = match self.current_call_route(ctx, &tool, envelope) {
             Ok(route) => route,
             Err(action) => return action,
         };
@@ -530,27 +628,136 @@ impl McpBrokerFilter {
             Err(error) => return session_failure_action(envelope, &tool.server_name, &error),
         };
 
-        forward_current_tools_call(ctx, value, body, tool, &init);
+        forward_current_tools_call(ctx, value, body, &tool, &init);
         record_forwarded_call(ctx, key, slot, init);
         FilterAction::Release
     }
 
-    /// Resolve the catalog tool, its server, the session map key, and the
-    /// backend protocol version for a current-profile `tools/call`, or the
-    /// error to return.
-    fn current_call_route(
+    /// The catalog the caller sees.
+    ///
+    /// Servers whose listing for this caller is missing or older than
+    /// `max_age` are discovered first, concurrently and within one budget:
+    /// `backend_sessions.handshake_timeout_ms` in the current profile, where
+    /// each listing runs in the caller's backend session for that server,
+    /// and `discovery.timeout_ms` in the stateless profile. With `wanted`,
+    /// discovery runs only when the cached catalog does not already expose
+    /// that name, so a `tools/call` does not wait on servers it does not
+    /// need. A server that fails keeps the caller's last good listing, or its
+    /// static entries when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the action answering the request when discovery is needed
+    /// but the request cannot run it: a current-profile request without a
+    /// gateway session (HTTP 400) or with an unsupported protocol version.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cache read, discovery, and fallbacks share one owner"
+    )]
+    async fn caller_catalog(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        envelope: &JsonRpcEnvelope,
+        wanted: Option<&str>,
+    ) -> Result<CallerCatalog, FilterAction> {
+        let Some(discovery) = self.discovery.as_ref() else {
+            return Ok(self.static_catalog.clone());
+        };
+        let view = BrokerView {
+            servers: &self.servers,
+            static_tools: &self.static_tools,
+        };
+        let settings = match (discovery.stateless_transport(), self.backend.as_ref()) {
+            (Some(settings), _) => settings,
+            (None, Some(backend)) => CalloutSettings {
+                fallback_client: backend.fallback_client.as_ref(),
+                forward_headers: &backend.forward_headers,
+                budget: backend.handshake_timeout,
+            },
+            (None, None) => return Ok(self.static_catalog.clone()),
+        };
+        let callout = request_callout(ctx, settings.fallback_client, settings.forward_headers, settings.budget);
+        let forwarded = callout.as_ref().map_or_else(
+            || copy_forwarded_headers(settings.forward_headers, &ctx.request.headers),
+            |callout| callout.forwarded_headers.clone(),
+        );
+        let mut listings = discovery.cached(&forwarded);
+        if listings.needed.is_empty() {
+            return Ok(listings.catalog(view));
+        }
+        if let Some(name) = wanted {
+            let cached = listings.catalog(view);
+            if cached.find(name).is_some() {
+                return Ok(cached);
+            }
+        }
+        let Some(callout) = callout else {
+            discovery.fail_needed(view, &listings, &DiscoveryError::Backend(McpBackendError::Transport));
+            return Ok(listings.catalog(view));
+        };
+        let run = DiscoveryRun {
+            callout,
+            scope: self.discovery_scope(ctx, envelope)?,
+        };
+        Box::pin(discovery.discover(view, &run, &mut listings)).await;
+        if let RunScope::Session { backend, .. } = run.scope {
+            backend.retire(&self.servers, &run.callout);
+        }
+        Ok(listings.catalog(view))
+    }
+
+    /// Where this request's discoveries run, or the action rejecting it.
+    fn discovery_scope<'a>(
+        &'a self,
+        ctx: &'a HttpFilterContext<'_>,
+        envelope: &JsonRpcEnvelope,
+    ) -> Result<RunScope<'a>, FilterAction> {
+        let (ProtocolProfile::Current, Some(backend)) = (self.protocol_profile, self.backend.as_ref()) else {
+            // Stateless dispatch has validated the header.
+            let version = header_str(&ctx.request.headers, "mcp-protocol-version").unwrap_or(&self.default_version);
+            return Ok(RunScope::Stateless { version });
+        };
+        let gateway = gateway_session_id(ctx).ok_or_else(|| {
+            json_rpc_error_action_with_status(envelope, 400, ERR_INVALID_REQUEST, "missing or invalid Mcp-Session-Id")
+        })?;
+        let version = self.requested_backend_version(ctx, envelope)?;
+        Ok(RunScope::Session {
+            backend,
+            gateway,
+            version,
+        })
+    }
+
+    /// The caller's catalog tool a `tools/call` names, or the error to
+    /// return. A name the catalog does not hold gets `unknown tool`: a
+    /// JSON-RPC error with HTTP 200 in the current profile, HTTP 400 in the
+    /// stateless profile.
+    async fn find_call_tool(
         &self,
         ctx: &HttpFilterContext<'_>,
         value: &serde_json::Value,
         envelope: &JsonRpcEnvelope,
-    ) -> Result<(&CatalogTool, &BrokerServer, BackendSessionKey, &str), FilterAction> {
-        let tool_name =
-            extract_tool_name(value).map_err(|detail| json_rpc_error_action(envelope, ERR_INVALID_PARAMS, detail))?;
-        let tool = self
-            .catalog
-            .iter()
-            .find(|t| t.exposed_name == tool_name)
-            .ok_or_else(|| json_rpc_error_action(envelope, ERR_INVALID_PARAMS, "unknown tool"))?;
+    ) -> Result<discovery::ToolRef, FilterAction> {
+        let invalid = |detail: &str| match self.protocol_profile {
+            ProtocolProfile::Current => json_rpc_error_action(envelope, ERR_INVALID_PARAMS, detail),
+            ProtocolProfile::Stateless => invalid_params_action(envelope, detail),
+        };
+        let tool_name = extract_tool_name(value).map_err(invalid)?;
+        self.caller_catalog(ctx, envelope, Some(tool_name))
+            .await?
+            .find(tool_name)
+            .ok_or_else(|| invalid("unknown tool"))
+    }
+
+    /// Resolve the server, the session map key, and the backend protocol
+    /// version for a current-profile `tools/call` of `tool`, or the error to
+    /// return.
+    fn current_call_route(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        tool: &CatalogTool,
+        envelope: &JsonRpcEnvelope,
+    ) -> Result<(&BrokerServer, BackendSessionKey, &str), FilterAction> {
         let gateway = gateway_session_id(ctx).ok_or_else(|| {
             json_rpc_error_action_with_status(envelope, 400, ERR_INVALID_REQUEST, "missing or invalid Mcp-Session-Id")
         })?;
@@ -563,7 +770,7 @@ impl McpBrokerFilter {
             server: tool.server_index,
         };
         let version = self.requested_backend_version(ctx, envelope)?;
-        Ok((tool, server, key, version))
+        Ok((server, key, version))
     }
 
     /// Protocol version offered to the backend: the client's
@@ -819,20 +1026,16 @@ impl McpBrokerFilter {
     }
 
     /// Route a stateless `tools/call` to the configured backend cluster.
-    fn handle_stateless_tools_call(
+    async fn handle_stateless_tools_call(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         value: &serde_json::Value,
         envelope: &JsonRpcEnvelope,
         body: &mut Option<Bytes>,
     ) -> FilterAction {
-        let tool_name = match extract_tool_name(value) {
-            Ok(name) => name,
-            Err(detail) => return invalid_params_action(envelope, detail),
-        };
-
-        let Some(tool) = self.catalog.iter().find(|t| t.exposed_name == tool_name) else {
-            return invalid_params_action(envelope, "unknown tool");
+        let tool = match self.find_call_tool(ctx, value, envelope).await {
+            Ok(tool) => tool,
+            Err(action) => return action,
         };
 
         ctx.cluster = Some(Arc::from(tool.cluster.as_str()));
@@ -850,7 +1053,7 @@ impl McpBrokerFilter {
         ));
 
         trace!(
-            exposed = tool_name,
+            exposed = tool.exposed_name,
             original = tool.original_name,
             cluster = tool.cluster,
             server = tool.server_name,
@@ -861,8 +1064,16 @@ impl McpBrokerFilter {
     }
 
     /// `tools/list` response for the stateless profile with cache metadata.
-    fn handle_stateless_tools_list(&self, envelope: &JsonRpcEnvelope) -> FilterAction {
-        let tools: Vec<serde_json::Value> = self.catalog.iter().map(catalog_tool_to_json).collect();
+    async fn handle_stateless_tools_list(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        envelope: &JsonRpcEnvelope,
+    ) -> FilterAction {
+        let catalog = match self.caller_catalog(ctx, envelope, None).await {
+            Ok(catalog) => catalog,
+            Err(action) => return action,
+        };
+        let tools: Vec<serde_json::Value> = catalog.tools().map(catalog_tool_to_json).collect();
 
         let response = serde_json::json!({
             "jsonrpc": "2.0",
@@ -875,7 +1086,7 @@ impl McpBrokerFilter {
             },
         });
 
-        trace!(tool_count = self.catalog.len(), "serving stateless tools/list");
+        trace!(tool_count = catalog.len(), "serving stateless tools/list");
 
         FilterAction::Reject(
             Rejection::status(200)
@@ -1058,40 +1269,17 @@ impl BackendSessions {
 
     /// Capture request-scoped callout resources, or `None` without a transport.
     fn callout(&self, ctx: &HttpFilterContext<'_>) -> Option<BackendCallout> {
-        let client = ctx
-            .subrequest_client
-            .cloned()
-            .or_else(|| self.fallback_client.clone())?;
-        let iteration_state = ctx.extensions.get::<IterationState>();
-        let now = Instant::now();
-        let step_deadline = now.checked_add(self.handshake_timeout).unwrap_or(now);
-        let deadline = iteration_state
-            .map(IterationState::deadline)
-            .map_or(step_deadline, |parent| parent.min(step_deadline));
-        Some(BackendCallout {
-            client,
-            deadline,
-            depth: callout_depth(iteration_state, &ctx.request.headers),
-            downstream: SubrequestRuntime::new(
-                ctx.client_addr,
-                ctx.downstream_tls,
-                ctx.peer_identity.clone(),
-                ctx.request_start,
-            ),
-            forwarded_headers: self.forwarded_headers(&ctx.request.headers),
-            trace_context: ctx.extensions.get::<TraceContext>().cloned(),
-        })
+        request_callout(
+            ctx,
+            self.fallback_client.as_ref(),
+            &self.forward_headers,
+            self.handshake_timeout,
+        )
     }
 
     /// Copy the allowlisted client headers onto a handshake exchange.
     fn forwarded_headers(&self, request_headers: &http::HeaderMap) -> http::HeaderMap {
-        let mut forwarded = http::HeaderMap::new();
-        for name in &self.forward_headers {
-            for value in request_headers.get_all(name) {
-                forwarded.append(name.clone(), value.clone());
-            }
-        }
-        forwarded
+        copy_forwarded_headers(&self.forward_headers, request_headers)
     }
 
     /// Return the backend session for `key`, running the handshake when the
@@ -1290,10 +1478,63 @@ impl BackendSessions {
 // Backend Session Helpers
 // -----------------------------------------------------------------------------
 
+/// Capture request-scoped resources for backend exchanges that forward
+/// `forward_headers` and share `budget`, or `None` without a transport.
+fn request_callout(
+    ctx: &HttpFilterContext<'_>,
+    fallback_client: Option<&SubRequestClient>,
+    forward_headers: &[http::HeaderName],
+    budget: Duration,
+) -> Option<BackendCallout> {
+    let client = ctx.subrequest_client.or(fallback_client)?.clone();
+    let iteration_state = ctx.extensions.get::<IterationState>();
+    let now = Instant::now();
+    let step_deadline = now.checked_add(budget).unwrap_or(now);
+    let deadline = iteration_state
+        .map(IterationState::deadline)
+        .map_or(step_deadline, |parent| parent.min(step_deadline));
+    Some(BackendCallout {
+        client,
+        deadline,
+        depth: callout_depth(iteration_state, &ctx.request.headers),
+        downstream: SubrequestRuntime::new(
+            ctx.client_addr,
+            ctx.downstream_tls,
+            ctx.peer_identity.clone(),
+            ctx.request_start,
+        ),
+        forwarded_headers: copy_forwarded_headers(forward_headers, &ctx.request.headers),
+        trace_context: ctx.extensions.get::<TraceContext>().cloned(),
+    })
+}
+
+/// Copy the allowlisted client headers onto a backend exchange.
+fn copy_forwarded_headers(names: &[http::HeaderName], request_headers: &http::HeaderMap) -> http::HeaderMap {
+    let mut forwarded = http::HeaderMap::new();
+    for name in names {
+        for value in request_headers.get_all(name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
+}
+
+/// Group catalog entries by server index, one listing per configured server.
+fn group_by_server(catalog: Vec<CatalogTool>, server_count: usize) -> Vec<ServerTools> {
+    let mut grouped: Vec<Vec<CatalogTool>> = (0..server_count).map(|_| Vec::new()).collect();
+    for tool in catalog {
+        if let Some(server) = grouped.get_mut(tool.server_index) {
+            server.push(tool);
+        }
+    }
+    grouped.into_iter().map(Arc::from).collect()
+}
+
 /// Bind the generated handshake chain: the backend selector, any operator
 /// `outbound_filters`, and a `load_balancer` referencing each server's
 /// top-level cluster.
 fn bind_backend_chain(
+    name: &str,
     servers: &[McpServerConfig],
     outbound_filters: Vec<FilterEntry>,
     binding: &ChainBindingContext<'_>,
@@ -1316,13 +1557,12 @@ fn bind_backend_chain(
 
     binding
         .bind_chain(&ChainRef::Inline {
-            name: BACKEND_CHAIN_NAME.to_owned(),
+            name: name.to_owned(),
             filters,
         })
         .map_err(|e| {
             FilterError::from(format!(
-                "mcp: backend_sessions handshake chain failed to bind (declare each server cluster in top-level \
-                 `clusters:`): {e}"
+                "mcp: {name} chain failed to bind (declare each server cluster in top-level `clusters:`): {e}"
             ))
         })
 }
@@ -1826,8 +2066,8 @@ fn initialize_response_body(envelope: &JsonRpcEnvelope, protocol_version: &str) 
     })
 }
 
-/// Returns the aggregated static catalog.
-fn handle_tools_list(catalog: &[CatalogTool], envelope: &JsonRpcEnvelope) -> Result<FilterAction, FilterError> {
+/// Returns the caller's aggregated catalog.
+fn handle_tools_list(catalog: &CallerCatalog, envelope: &JsonRpcEnvelope) -> Result<FilterAction, FilterError> {
     let tools_json = serialize_catalog(catalog)?;
     let id_json = format_id_json(envelope);
     let response_body = format!(r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"tools":{tools_json}}}}}"#,);
@@ -1842,14 +2082,14 @@ fn handle_tools_list(catalog: &[CatalogTool], envelope: &JsonRpcEnvelope) -> Res
 }
 
 /// Serialize the tool catalog to JSON.
-fn serialize_catalog(catalog: &[CatalogTool]) -> Result<String, FilterError> {
-    let tools: Vec<serde_json::Value> = catalog.iter().map(catalog_tool_to_json).collect();
+fn serialize_catalog(catalog: &CallerCatalog) -> Result<String, FilterError> {
+    let tools: Vec<serde_json::Value> = catalog.tools().map(catalog_tool_to_json).collect();
     serde_json::to_string(&tools).map_err(|e| FilterError::from(format!("mcp: failed to serialize tool catalog: {e}")))
 }
 
 /// Produces the MCP tool object shape expected by `tools/list` responses.
 fn catalog_tool_to_json(tool: &CatalogTool) -> serde_json::Value {
-    let mut obj = serde_json::Map::new();
+    let mut obj = tool.extra.clone();
     obj.insert("name".to_owned(), serde_json::Value::String(tool.exposed_name.clone()));
     if let Some(desc) = &tool.description {
         obj.insert("description".to_owned(), serde_json::Value::String(desc.clone()));

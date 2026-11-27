@@ -33,13 +33,14 @@ use rmcp::{
     model::{
         ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest, ClientResult, ErrorCode,
         ErrorData, Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification, JsonRpcMessage,
-        JsonRpcRequest, ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerRequest, ServerResult,
+        JsonRpcRequest, ListToolsResult, ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerRequest, ServerResult,
     },
     transport::streamable_http_client::StreamableHttpError,
 };
 
-use super::subrequest_transport::{
-    McpCallout, McpExchangeStage, McpSubrequestClient, McpTransportError, TransportSignal,
+use super::{
+    listing::McpToolPage,
+    subrequest_transport::{McpCallout, McpExchangeStage, McpSubrequestClient, McpTransportError, TransportSignal},
 };
 use crate::openai::sse::SseFrameParser;
 
@@ -49,6 +50,9 @@ use crate::openai::sse::SseFrameParser;
 
 /// Prefix of the JSON-RPC id used for each `initialize`.
 const INITIALIZE_REQUEST_ID_PREFIX: &str = "praxis-initialize-";
+
+/// Prefix of the JSON-RPC id used for each `tools/list`.
+const TOOLS_LIST_REQUEST_ID_PREFIX: &str = "praxis-tools-list-";
 
 /// Client name reported to MCP servers.
 const CLIENT_NAME: &str = "praxis";
@@ -68,12 +72,17 @@ const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
 /// MCP protocol version header.
 const MCP_PROTOCOL_VERSION: HeaderName = HeaderName::from_static("mcp-protocol-version");
 
-/// Most server requests answered while one `initialize` reply is read.
+/// Stateless-profile method header.
+const MCP_METHOD: HeaderName = HeaderName::from_static("mcp-method");
+
+/// Most server requests answered while one reply is read.
 ///
 /// Before `notifications/initialized` MCP lets a server send only pings (and
 /// logging, which is a notification). One ping checks liveness; a few more
-/// cover a server that pings again while it waits. Each answer is a separate
-/// POST, so the cap bounds the outbound requests one handshake can trigger.
+/// cover a server that pings again while it waits. This client declares no
+/// capabilities, so a later request has nothing more to ask. Each answer is a
+/// separate POST, so the cap bounds the outbound requests one exchange can
+/// trigger.
 const MAX_SERVER_REQUESTS: usize = 4;
 
 // -----------------------------------------------------------------------------
@@ -95,6 +104,18 @@ pub struct McpSessionCallout {
     pub forwarded_headers: HeaderMap,
     /// Request correlation propagated into the exchange.
     pub trace_context: Option<TraceContext>,
+}
+
+/// How a `tools/list` request is sent.
+#[derive(Clone, Copy, Debug)]
+pub enum McpListingScope<'a> {
+    /// On an initialized session, at its negotiated version.
+    Session(&'a McpSessionInit),
+    /// Without a session, under the MCP `2026-07-28` stateless profile.
+    Stateless {
+        /// Protocol version the request declares.
+        protocol_version: &'a str,
+    },
 }
 
 /// Result of a successful `initialize`.
@@ -125,7 +146,7 @@ pub enum McpSessionError {
         /// HTTP status returned by the server.
         status: u16,
     },
-    /// The server answered `initialize` with a JSON-RPC error.
+    /// The server answered the request with a JSON-RPC error.
     JsonRpc {
         /// JSON-RPC error code.
         code: i64,
@@ -271,9 +292,11 @@ impl McpSessionClient {
             stage,
             callout,
             session_id: session_id.as_ref(),
+            // None is negotiated until the result arrives.
+            protocol_version: None,
             answered: 0,
         };
-        let reply = read_initialize_reply(&response, body, self.max_response_bytes, &mut responder)
+        let reply = read_reply(&response, body, self.max_response_bytes, &mut responder)
             .await
             .map_err(|error| past_deadline(error, callout.deadline))?;
         Ok(McpSessionInit {
@@ -314,6 +337,95 @@ impl McpSessionClient {
                 .map_err(|error| past_deadline(error, callout.deadline))
         };
         Box::pin(within(callout.deadline, exchange)).await
+    }
+
+    /// Request one `tools/list` page at `cursor` (`None` for the first).
+    ///
+    /// On a session the request carries its `Mcp-Session-Id` and negotiated
+    /// version. A stateless request carries the declared version in
+    /// `MCP-Protocol-Version` and `params._meta`, with the client info and
+    /// capabilities the profile requires, and `Mcp-Method: tools/list`.
+    /// Server requests that arrive before the reply are answered as during
+    /// `initialize`. Each tool is returned as its JSON object, decoded and
+    /// shape-checked as an MCP `Tool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpSessionError`] on timeout, transport failure, an
+    /// oversized reply, a non-success status, a JSON-RPC error, a reply that
+    /// is not a `tools/list` result, or a failed answer to a server request.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the other lifecycle exchanges plus scope and cursor"
+    )]
+    pub async fn list_tools(
+        &self,
+        path: &str,
+        stage: Arc<dyn McpExchangeStage>,
+        callout: &McpSessionCallout,
+        scope: McpListingScope<'_>,
+        cursor: Option<String>,
+    ) -> Result<McpToolPage<serde_json::Value>, McpSessionError> {
+        let callout = &self.bounded(callout);
+        let transport = self.transport(Arc::clone(&stage), callout);
+        let exchange = self.list_tools_exchange(&transport, &stage, path, callout, scope, cursor);
+        Box::pin(within(callout.deadline, exchange)).await
+    }
+
+    /// POST `tools/list` and decode the page from the reply.
+    #[expect(clippy::large_stack_frames, reason = "executor futures are inherently large")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transport, stage, path, callout, scope, and cursor describe one exchange"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request, headers, and reply handling of one exchange"
+    )]
+    async fn list_tools_exchange(
+        &self,
+        transport: &McpSubrequestClient,
+        stage: &Arc<dyn McpExchangeStage>,
+        path: &str,
+        callout: &McpSessionCallout,
+        scope: McpListingScope<'_>,
+        cursor: Option<String>,
+    ) -> Result<McpToolPage<serde_json::Value>, McpSessionError> {
+        let request_id = request_id(TOOLS_LIST_REQUEST_ID_PREFIX)?;
+        let message = tools_list_message(scope, cursor, &request_id)?;
+        let (session_id, protocol_version) = match scope {
+            McpListingScope::Session(session) => (session.session_id.as_ref(), &*session.protocol_version),
+            McpListingScope::Stateless { protocol_version } => (None, protocol_version),
+        };
+        let mut headers = session_headers(&callout.forwarded_headers, None, protocol_version)?;
+        if matches!(scope, McpListingScope::Stateless { .. }) {
+            headers.insert(MCP_METHOD, HeaderValue::from_static("tools/list"));
+        }
+        let session_str = session_id
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_error| McpSessionError::Malformed("invalid Mcp-Session-Id"))
+            })
+            .transpose()?;
+        let signal = transport.signal_handle();
+        let (response, body) = Box::pin(transport.send_streaming_post(path, &message, session_str, headers, &signal))
+            .await
+            .map_err(|error| self.classify(&error, &signal, callout.deadline))?;
+        let (response, body) = reject_unsuccessful(response, body).await?;
+        let mut responder = ServerRequestResponder {
+            client: self,
+            path,
+            stage,
+            callout,
+            session_id,
+            protocol_version: Some(protocol_version),
+            answered: 0,
+        };
+        let reply = read_reply(&response, body, self.max_response_bytes, &mut responder)
+            .await
+            .map_err(|error| past_deadline(error, callout.deadline))?;
+        tools_list_page(reply, &request_id)
     }
 
     /// Terminate a session with HTTP `DELETE`.
@@ -447,7 +559,7 @@ impl McpSessionClient {
 // Server Requests
 // -----------------------------------------------------------------------------
 
-/// Answers the requests a server sends on the `initialize` response stream.
+/// Answers the requests a server sends on a response stream.
 ///
 /// MCP lets a server send requests on that stream before its response, and
 /// a ping receiver must answer. A server may hold its `initialize` result
@@ -462,8 +574,11 @@ struct ServerRequestResponder<'a> {
     stage: &'a Arc<dyn McpExchangeStage>,
     /// The `initialize` callout: credentials, correlation, and deadline.
     callout: &'a McpSessionCallout,
-    /// `Mcp-Session-Id` from the `initialize` response head.
+    /// `Mcp-Session-Id` of the session the exchange runs on.
     session_id: Option<&'a HeaderValue>,
+    /// Negotiated protocol version, sent on answers; `None` during
+    /// `initialize`.
+    protocol_version: Option<&'a str>,
     /// Server requests answered so far.
     answered: usize,
 }
@@ -493,9 +608,9 @@ impl ServerRequestResponder<'_> {
     /// that created the session, its `Mcp-Session-Id`, and the endpoint
     /// serving the stream. It shares the `initialize` deadline.
     ///
-    /// No `MCP-Protocol-Version` header is sent. MCP requires it on requests
-    /// after initialization, carrying the negotiated version, and none is
-    /// negotiated until the `initialize` result arrives. The offered version
+    /// During `initialize` no `MCP-Protocol-Version` header is sent. MCP
+    /// requires it on requests after initialization, carrying the negotiated
+    /// version, and none is negotiated until the `initialize` result arrives. The offered version
     /// is not a substitute: a server that will select an older one may treat
     /// it as unsupported, and MCP then requires `400 Bad Request`. A server
     /// without the header identifies the version from the session or assumes
@@ -503,7 +618,7 @@ impl ServerRequestResponder<'_> {
     async fn answer(&mut self, request: &JsonRpcRequest<ServerRequest>) -> Result<(), McpSessionError> {
         self.answered = self.answered.saturating_add(1);
         if self.answered > MAX_SERVER_REQUESTS {
-            return Err(McpSessionError::Malformed("too many server requests during initialize"));
+            return Err(McpSessionError::Malformed("too many server requests"));
         }
         let message = server_request_answer(request);
         let session_id = self
@@ -517,7 +632,7 @@ impl ServerRequestResponder<'_> {
         let transport = self.client.transport(self.stage.follow_up(), self.callout);
         let signal = transport.signal_handle();
         let deadline = self.callout.deadline;
-        let headers = self.callout.forwarded_headers.clone();
+        let headers = self.answer_headers()?;
         let (response, body) =
             Box::pin(transport.send_streaming_post(self.path, &message, session_id, headers, &signal))
                 .await
@@ -529,7 +644,19 @@ impl ServerRequestResponder<'_> {
             .await
             .map_err(|error| past_deadline(error, deadline))
     }
+
+    /// The forwarded headers, plus the negotiated version once there is one.
+    fn answer_headers(&self) -> Result<HeaderMap, McpSessionError> {
+        let mut headers = self.callout.forwarded_headers.clone();
+        if let Some(version) = self.protocol_version {
+            let version = HeaderValue::from_str(version)
+                .map_err(|_error| McpSessionError::Malformed("invalid protocol version"))?;
+            headers.insert(MCP_PROTOCOL_VERSION, version);
+        }
+        Ok(headers)
+    }
 }
+
 
 /// The client's answer to a server request: an empty result for `ping`, as
 /// MCP requires, and JSON-RPC `-32601` (method not found) for any other
@@ -562,17 +689,52 @@ fn is_ping(request: &ServerRequest) -> bool {
 // -----------------------------------------------------------------------------
 
 /// A fresh JSON-RPC id for one `initialize`.
+fn initialize_request_id() -> Result<String, McpSessionError> {
+    request_id(INITIALIZE_REQUEST_ID_PREFIX).map(|id| id.to_string())
+}
+
+/// A fresh JSON-RPC id starting with `prefix`.
 ///
 /// Callers that forward their own clients' requests on the same session do
 /// not choose those ids, and MCP forbids reusing an id within a session. A
 /// random id keeps this request from colliding with any id a client picks.
-fn initialize_request_id() -> Result<String, McpSessionError> {
+fn request_id(prefix: &str) -> Result<RequestId, McpSessionError> {
     let mut random = [0_u8; 16];
     crate::hash::random_bytes(&mut random).map_err(|_error| McpSessionError::Transport)?;
-    Ok(format!(
-        "{INITIALIZE_REQUEST_ID_PREFIX}{:032x}",
+    Ok(RequestId::String(Arc::from(format!(
+        "{prefix}{:032x}",
         u128::from_be_bytes(random)
-    ))
+    ))))
+}
+
+/// Build the `tools/list` request for `scope` at `cursor`.
+fn tools_list_message(
+    scope: McpListingScope<'_>,
+    cursor: Option<String>,
+    id: &RequestId,
+) -> Result<ClientJsonRpcMessage, McpSessionError> {
+    let mut params = serde_json::Map::new();
+    if let Some(cursor) = cursor {
+        params.insert("cursor".to_owned(), serde_json::Value::String(cursor));
+    }
+    if let McpListingScope::Stateless { protocol_version } = scope {
+        params.insert(
+            "_meta".to_owned(),
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": protocol_version,
+                "io.modelcontextprotocol/clientInfo": { "name": CLIENT_NAME, "version": CLIENT_VERSION },
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }),
+        );
+    }
+    let message = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/list",
+        "params": params,
+    });
+    serde_json::from_value(message)
+        .map_err(|_error| McpSessionError::Malformed("tools/list request could not be built"))
 }
 
 /// Build the `initialize` request offering `protocol_version`.
@@ -672,7 +834,7 @@ async fn accept_initialize_head(
     }
 }
 
-/// Read the JSON-RPC reply to `initialize` from a success response, within
+/// Read the JSON-RPC reply to a request from a success response, within
 /// `limit` bytes.
 ///
 /// A JSON body is parsed whole. An SSE body is read with the crate's
@@ -681,7 +843,7 @@ async fn accept_initialize_head(
 /// event, so a backend may keep the stream open after it. Server requests
 /// before it are answered through `responder`, and notifications are
 /// skipped; none of their contents is logged.
-async fn read_initialize_reply(
+async fn read_reply(
     response: &SubResponse,
     body: Option<Box<dyn StreamingResponseBody>>,
     limit: usize,
@@ -735,7 +897,7 @@ async fn buffered_reply(
             return Ok(reply);
         }
     }
-    Err(McpSessionError::Malformed("initialize stream has no reply"))
+    Err(McpSessionError::Malformed("stream has no reply"))
 }
 
 /// Read SSE events until the first JSON-RPC response or error, answering
@@ -768,7 +930,7 @@ async fn stream_sse_reply(
             return Err(McpSessionError::ResponseTooLarge { limit });
         }
     }
-    Err(McpSessionError::Malformed("initialize stream has no reply"))
+    Err(McpSessionError::Malformed("stream has no reply"))
 }
 
 /// Read and drop a reply body that carries no message, failing when it
@@ -905,6 +1067,45 @@ fn initialize_result_version(
         return Err(McpSessionError::Malformed("invalid protocolVersion"));
     }
     Ok(Box::from(version))
+}
+
+/// Decode the `tools/list` page in the reply to `request_id`.
+fn tools_list_page(
+    message: ServerJsonRpcMessage,
+    request_id: &RequestId,
+) -> Result<McpToolPage<serde_json::Value>, McpSessionError> {
+    let result = match message {
+        JsonRpcMessage::Response(response) if response.id == *request_id => response.result,
+        JsonRpcMessage::Error(error) if error.id.as_ref() == Some(request_id) => {
+            return Err(McpSessionError::JsonRpc {
+                code: i64::from(error.error.code.0),
+            });
+        },
+        JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {
+            return Err(McpSessionError::Malformed("tools/list reply id does not match"));
+        },
+        _ => return Err(McpSessionError::Malformed("tools/list reply is not a response")),
+    };
+    let not_a_listing =
+        |_error: serde_json::Error| McpSessionError::Malformed("tools/list reply is not a tools/list result");
+    // `ServerResult` is an untagged union, so a listing may decode as another
+    // variant; decode it again as a listing.
+    let listing = match result {
+        ServerResult::ListToolsResult(listing) => listing,
+        other => serde_json::to_value(other)
+            .and_then(serde_json::from_value::<ListToolsResult>)
+            .map_err(not_a_listing)?,
+    };
+    let tools = listing
+        .tools
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(not_a_listing)?;
+    Ok(McpToolPage {
+        tools,
+        next_cursor: listing.next_cursor,
+    })
 }
 
 // -----------------------------------------------------------------------------

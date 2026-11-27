@@ -80,15 +80,15 @@ values. On a mismatch it can `reject` or `ignore`; on a missing header it can
 
 ### Broker architecture
 
-When the config has a `servers` key, the filter acts as an MCP broker with a
-static tool catalog:
+When the config has a `servers` key, the filter acts as an MCP broker over
+one catalog of tools from several servers:
 
 ```text
 Client --> MCP Broker Filter
              |
              +-- initialize: session + version
              |                negotiation
-             +-- tools/list:  aggregated catalog
+             +-- tools/list:  the caller's catalog
              |                from all servers
              +-- ping:        local response (current profile only)
              +-- tools/call:  routes by configured
@@ -102,6 +102,69 @@ Client --> MCP Broker Filter
 Each server entry has a name, upstream cluster, path prefix, tool prefix (for
 namespace isolation), and tool list. `tools/list` returns the tools of all
 configured servers as one catalog.
+
+### Tool discovery
+
+A server with `discover: true` contributes the tools its own `tools/list`
+returns instead of only its static `tools:`. Servers can show different tools
+to different callers, so the catalog is per caller:
+
+- The broker lists a server's tools with the caller's forwarded credential:
+  `backend_sessions.forward_headers` in the current profile and
+  `discovery.forward_headers` in the stateless profile. The listing is cached
+  per caller and server, keyed on the fingerprint of those headers, so a
+  refreshed token is a new caller until #2191 binds callers to a verified
+  identity.
+- In the current profile the listing runs inside the caller's backend session
+  for that server, so a later `tools/call` reuses the session. A `tools/list`
+  therefore opens backend sessions for discovering servers that have none yet,
+  and requires a gateway `Mcp-Session-Id` (HTTP `400` without one). A backend
+  `404` during the listing reopens the session once. The stateless profile
+  sends `tools/list` without a session, with the `Mcp-Method` header and
+  `params._meta` the profile requires, and marks the result
+  `cacheScope: private`. A server `ping` on the listing's response stream is
+  answered as during the handshake.
+- The broker follows `nextCursor` for at most 100 pages, `discovery.max_tools`
+  tools, and 4 MiB of tool definitions, the bounds the hosted MCP connectors
+  use.
+- Servers that need a listing are discovered concurrently, at most
+  `discovery.max_concurrency` at a time, and share one budget:
+  `backend_sessions.handshake_timeout_ms` (handshake and pages together) in the
+  current profile, `discovery.timeout_ms` in the stateless profile.
+- A `tools/call` discovers only when the caller's cached catalog does not
+  expose the name. A name that left the listing gets `unknown tool`.
+
+Each listed tool is vetted before any client sees it. A tool needs a name and
+an object `inputSchema`; an invalid tool is left out, or fails the server's
+listing under `invalid_tool_policy: reject_server`. A name listed twice fails
+the listing. Operator admission then applies the server's `tool_policy`, with
+the rule `tool_admission` applies on the hosted paths: `allow_all` (the
+default) admits every tool, and `read_only` admits only tools annotated
+`readOnlyHint: true` without `destructiveHint: true`.
+
+A static `tools:` entry with the name of a discovered tool overrides its
+description, or hides it with `hidden: true`. The server's own schema and
+annotations are kept. A static entry the server does not list is still
+exposed. Exposed names keep `tool_prefix`. When a server exposes a name an
+earlier server in `servers:` already exposes, the later server is left out of
+that caller's catalog and the collision is logged with both server names.
+
+A listing older than `discovery.max_age_ms` is rediscovered on the caller's
+next request. When discovery fails (timeout, transport error, error status,
+JSON-RPC error, or a bound), the caller keeps its last good listing for that
+server, or the server's static entries when it has none, and the caller's next
+attempt waits 30 seconds (at most `discovery.max_age_ms`), so requests do not
+each wait out the budget on a server that is down. The other servers are
+unaffected. Each failure is logged and counted in
+`praxis_ai_mcp_broker_discovery_failures_total{server, reason}`. The cache
+holds at most `discovery.max_entries` listings, evicting the least recently
+read, and drops a listing no request has read for `discovery.idle_timeout_ms`.
+Each new credential is a new caller, so a client that rotates tokens can fill
+the cache: size `max_entries` with the 4 MiB per-listing bound in mind, as
+`backend_sessions.max_sessions` bounds the sessions those callers open.
+It is per filter instance, so a reload starts empty. Refresh on
+`notifications/tools/list_changed` and dropping tools of unhealthy servers are
+tracked in #2191.
 
 ### Current-profile backend sessions
 

@@ -12,22 +12,27 @@
 //! filters own only their request rewrite, response shapes, and loop wiring.
 
 #[cfg_attr(
-    not(any(test, feature = "openai-mcp-tools")),
+    all(feature = "mcp", not(any(test, feature = "openai-mcp-tools"))),
     expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
 )]
 pub(crate) mod admission;
+#[cfg(feature = "mcp")]
 #[cfg_attr(
     not(any(test, feature = "openai-mcp-tools")),
     expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
 )]
 pub(crate) mod classify;
+#[cfg(feature = "mcp")]
 pub(crate) mod connector;
+#[cfg(feature = "mcp")]
 #[cfg_attr(
     not(feature = "openai-mcp-tools"),
     expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
 )]
 pub(crate) mod execute;
+#[cfg(feature = "mcp")]
 pub(crate) mod fingerprint;
+#[cfg(feature = "mcp")]
 #[cfg_attr(
     not(any(test, feature = "openai-mcp-tools")),
     expect(
@@ -36,9 +41,11 @@ pub(crate) mod fingerprint;
     )
 )]
 pub(crate) mod naming;
+#[cfg(feature = "mcp")]
 #[cfg_attr(
     not(feature = "openai-mcp-tools"),
     expect(dead_code, reason = "parts used only by the OpenAI Responses adapter")
 )]
 pub(crate) mod tool_map;
+#[cfg(feature = "mcp")]
 pub(crate) mod validate;

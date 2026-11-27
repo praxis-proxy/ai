@@ -537,7 +537,9 @@ fn validate_server_paths_rejects_no_leading_slash() {
         name: "bad".to_owned(),
         cluster: "c".to_owned(),
         path: "no-slash".to_owned(),
+        discover: false,
         tool_prefix: None,
+        tool_policy: None,
         tools: vec![],
     }];
     let result = validate_server_paths(&servers);
@@ -555,14 +557,18 @@ fn validate_server_paths_rejects_second_server_bad_path() {
             name: "ok".to_owned(),
             cluster: "c1".to_owned(),
             path: "/valid".to_owned(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![],
         },
         McpServerConfig {
             name: "bad".to_owned(),
             cluster: "c2".to_owned(),
             path: "missing-slash".to_owned(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![],
         },
     ];
@@ -583,7 +589,9 @@ fn valid_cluster_name_passes() {
         name: "s".to_owned(),
         cluster: "my-cluster".to_owned(),
         path: "/mcp".to_owned(),
+        discover: false,
         tool_prefix: None,
+        tool_policy: None,
         tools: vec![],
     }];
     assert!(
@@ -1091,25 +1099,17 @@ fn body_mode_is_stream_buffer() {
 #[test]
 fn static_catalog_builds_correctly() {
     let filter = make_broker_filter();
-    assert_eq!(filter.catalog.len(), 2, "catalog should have two tools");
+    let catalog: Vec<&CatalogTool> = filter.static_catalog.tools().collect();
+    assert_eq!(catalog.len(), 2, "catalog should have two tools");
     assert_eq!(
-        filter.catalog[0].exposed_name, "weather_get_weather",
+        catalog[0].exposed_name, "weather_get_weather",
         "first tool exposed name"
     );
-    assert_eq!(
-        filter.catalog[0].original_name, "get_weather",
-        "first tool original name"
-    );
-    assert_eq!(filter.catalog[0].server_name, "weather", "first tool server name");
-    assert_eq!(
-        filter.catalog[1].exposed_name, "cal_create_event",
-        "second tool exposed name"
-    );
-    assert_eq!(
-        filter.catalog[1].original_name, "create_event",
-        "second tool original name"
-    );
-    assert_eq!(filter.catalog[1].server_name, "calendar", "second tool server name");
+    assert_eq!(catalog[0].original_name, "get_weather", "first tool original name");
+    assert_eq!(catalog[0].server_name, "weather", "first tool server name");
+    assert_eq!(catalog[1].exposed_name, "cal_create_event", "second tool exposed name");
+    assert_eq!(catalog[1].original_name, "create_event", "second tool original name");
+    assert_eq!(catalog[1].server_name, "calendar", "second tool server name");
 }
 
 #[tokio::test]
@@ -2936,7 +2936,7 @@ fn build_broker_filter_from_yaml(yaml: &str) -> McpBrokerFilter {
     let cfg: McpBrokerConfig = serde_yaml::from_str(yaml).unwrap();
     let servers = cfg.servers.clone();
     let (validated, catalog) = build_config(cfg).unwrap();
-    McpBrokerFilter::build(&validated, catalog, &servers, None)
+    McpBrokerFilter::build(&validated, catalog, &servers, None, None)
 }
 
 fn make_mcp_request() -> praxis_filter::Request {

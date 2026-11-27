@@ -71,6 +71,66 @@ fn mcp_session_broker_example_initializes_backend_session() {
 }
 
 #[test]
+fn mcp_session_broker_example_discovers_weather_tools() {
+    let weather = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        tools: vec![
+            McpToolFixture::new("get_weather").with_description("listed description"),
+            McpToolFixture::new("forecast"),
+        ],
+        ..McpMockConfig::default()
+    });
+    let calendar = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        tools: vec![McpToolFixture::new("create_event")],
+        ..McpMockConfig::default()
+    });
+    let config = load_example_config(
+        "mcp-session-broker.yaml",
+        free_port(),
+        HashMap::from([("127.0.0.1:3001", weather.port()), ("127.0.0.1:3002", calendar.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let init = http_send(
+        proxy.addr(),
+        &json_post(
+            "/mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}}"#,
+        ),
+    );
+    let gateway = parse_header(&init, "mcp-session-id").expect("gateway session must be issued");
+
+    let raw = http_send(
+        proxy.addr(),
+        &session_post(&gateway, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "tools/list should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let tools = body["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["weather_get_weather", "weather_forecast", "cal_create_event"],
+        "weather tools come from its tools/list: {body}"
+    );
+    assert_eq!(
+        tools[0]["description"], "Get current weather",
+        "the static entry overrides the listed description"
+    );
+    assert_eq!(weather.method_count("tools/list"), 1);
+
+    let raw = http_send(
+        proxy.addr(),
+        &session_post(
+            &gateway,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"weather_forecast","arguments":{}}}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "a discovered tool is callable: {raw}");
+    assert!(parse_body(&raw).contains("mock result for forecast"), "{raw}");
+}
+
+#[test]
 fn mcp_static_catalog_example_serves_prefixed_catalog() {
     let weather_guard = start_backend_with_shutdown("weather");
     let calendar_guard = start_backend_with_shutdown("calendar");
@@ -275,4 +335,14 @@ fn stateless_post(path: &str, body: &str, method: &str, mcp_name: Option<&str>) 
     headers.push_str("Connection: close\r\n\r\n");
     headers.push_str(body);
     headers
+}
+
+/// A JSON POST on the gateway session.
+fn session_post(gateway: &str, body: &str) -> String {
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nMcp-Session-Id: {gateway}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }

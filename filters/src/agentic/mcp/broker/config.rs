@@ -3,8 +3,9 @@
 
 //! Configuration types for the MCP static catalog filter.
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
+use praxis_ai_apis::mcp_admission::ConnectorToolPolicy;
 use praxis_core::config::FilterEntry;
 use praxis_filter::{
     FilterError, builtins::http::payload_processing::config_validation::validate_max_body_bytes, has_dot_dot_traversal,
@@ -41,6 +42,32 @@ const DEFAULT_HANDSHAKE_RESPONSE_BYTES: usize = 1_048_576;
 /// Upper bound on `backend_sessions.max_response_bytes` (16 MiB).
 const MAX_HANDSHAKE_RESPONSE_BYTES_LIMIT: usize = 16 * 1_048_576;
 
+/// Default maximum number of cached `(caller, server)` tool listings.
+const DEFAULT_MAX_DISCOVERY_ENTRIES: usize = 4_096;
+
+/// Upper bound on `discovery.max_entries`.
+const MAX_DISCOVERY_ENTRIES_LIMIT: usize = 1_000_000;
+
+/// Default age after which a caller's tools for a server are rediscovered
+/// (5 minutes).
+const DEFAULT_DISCOVERY_MAX_AGE_MS: u64 = 300_000;
+
+/// Default time after which a listing no request has read is dropped
+/// (10 minutes).
+const DEFAULT_DISCOVERY_IDLE_TIMEOUT_MS: u64 = 600_000;
+
+/// Default number of servers discovered concurrently for one request.
+const DEFAULT_DISCOVERY_CONCURRENCY: usize = 8;
+
+/// Upper bound on `discovery.max_concurrency`.
+const MAX_DISCOVERY_CONCURRENCY_LIMIT: usize = 64;
+
+/// Default maximum number of tools one server may list.
+const DEFAULT_DISCOVERY_MAX_TOOLS: usize = 512;
+
+/// Upper bound on `discovery.max_tools`.
+const MAX_DISCOVERY_MAX_TOOLS_LIMIT: usize = 10_000;
+
 // -----------------------------------------------------------------------------
 // CacheScope
 // -----------------------------------------------------------------------------
@@ -73,7 +100,7 @@ impl CacheScope {
 /// Behavior when a tool definition has an invalid schema.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum InvalidToolPolicy {
+pub(crate) enum InvalidToolPolicy {
     /// Reject the entire server config at load time.
     #[default]
     RejectServer,
@@ -99,6 +126,36 @@ pub(super) struct ToolConfig {
     pub input_schema: Option<serde_json::Value>,
     /// Optional tool annotations.
     pub annotations: Option<serde_json::Value>,
+    /// Hide the discovered tool of this name. Requires `discover` on the
+    /// server.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+// -----------------------------------------------------------------------------
+// DiscoveryToolPolicy
+// -----------------------------------------------------------------------------
+
+/// Which discovered tools a server may expose.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DiscoveryToolPolicy {
+    /// Expose every tool the server lists. This is the default.
+    #[default]
+    AllowAll,
+    /// Expose only tools the server affirmatively annotates as read-only
+    /// (`readOnlyHint: true` without `destructiveHint: true`).
+    ReadOnly,
+}
+
+impl DiscoveryToolPolicy {
+    /// The admission policy discovered tools are vetted with.
+    fn admission(self) -> ConnectorToolPolicy {
+        match self {
+            Self::AllowAll => ConnectorToolPolicy::AllowAll,
+            Self::ReadOnly => ConnectorToolPolicy::ReadOnly,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -116,11 +173,111 @@ pub(super) struct McpServerConfig {
     /// Backend MCP path.
     #[serde(default = "default_path")]
     pub path: String,
+    /// Discover this server's tools from its `tools/list`.
+    #[serde(default)]
+    pub discover: bool,
     /// Tool prefix for this server.
     pub tool_prefix: Option<String>,
-    /// Statically defined tools.
+    /// Which discovered tools the server may expose. Requires `discover`.
+    pub tool_policy: Option<DiscoveryToolPolicy>,
+    /// Statically defined tools. With `discover`, an entry named like a
+    /// discovered tool overrides its description or hides it.
     #[serde(default)]
     pub tools: Vec<ToolConfig>,
+}
+
+// -----------------------------------------------------------------------------
+// DiscoveryConfig
+// -----------------------------------------------------------------------------
+
+/// Settings shared by every server with `discover: true`.
+///
+/// Current-profile discovery runs inside the caller's backend sessions, so
+/// its credential, transport, and time budget come from `backend_sessions`.
+/// The stateless-only fields configure the same for the stateless profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DiscoveryConfig {
+    /// Request headers copied from the client request onto discovery
+    /// exchanges. Stateless profile only.
+    pub forward_headers: Option<Vec<String>>,
+    /// Time after which a cached listing no request has read is dropped, in
+    /// milliseconds.
+    #[serde(default = "default_discovery_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Age after which a caller's tools for a server are rediscovered, in
+    /// milliseconds. A failed rediscovery keeps serving the older listing.
+    #[serde(default = "default_discovery_max_age_ms")]
+    pub max_age_ms: u64,
+    /// Servers discovered concurrently for one request.
+    #[serde(default = "default_discovery_concurrency")]
+    pub max_concurrency: usize,
+    /// Maximum cached `(caller, server)` tool listings.
+    #[serde(default = "default_max_discovery_entries")]
+    pub max_entries: usize,
+    /// Response body ceiling for each `tools/list` page, in bytes.
+    /// Stateless profile only.
+    pub max_response_bytes: Option<usize>,
+    /// Maximum tools one server may list.
+    #[serde(default = "default_discovery_max_tools")]
+    pub max_tools: usize,
+    /// Extra filters run on each discovery subrequest before the broker's
+    /// generated `load_balancer`. Stateless profile only.
+    pub outbound_filters: Option<Vec<FilterEntry>>,
+    /// Budget for discovering every server one request needs, in
+    /// milliseconds. Stateless profile only.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Normalized discovery settings.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedDiscovery {
+    /// Time after which a cached listing no request has read is dropped.
+    pub idle_timeout: Duration,
+    /// Age after which a caller's tools for a server are rediscovered.
+    pub max_age: Duration,
+    /// Servers discovered concurrently for one request.
+    pub max_concurrency: usize,
+    /// Maximum cached `(caller, server)` tool listings.
+    pub max_entries: usize,
+    /// Maximum tools one server may list.
+    pub max_tools: usize,
+    /// Per-server discovery settings, in configuration order; `None` for a
+    /// server without `discover`.
+    pub servers: Vec<Option<ServerDiscovery>>,
+    /// Stateless-profile transport settings.
+    pub stateless: Option<StatelessDiscovery>,
+}
+
+/// Stateless-profile discovery transport settings.
+#[derive(Debug, Clone)]
+pub(crate) struct StatelessDiscovery {
+    /// Client request headers copied onto discovery exchanges.
+    pub forward_headers: Vec<http::HeaderName>,
+    /// Response body ceiling for each `tools/list` page.
+    pub max_response_bytes: usize,
+    /// Budget for discovering every server one request needs.
+    pub timeout: Duration,
+}
+
+/// Discovery settings for one server.
+#[derive(Debug, Clone)]
+pub(crate) struct ServerDiscovery {
+    /// Behavior for a discovered tool with an invalid input schema.
+    pub invalid_tool_policy: InvalidToolPolicy,
+    /// Static entries by backend tool name.
+    pub overrides: HashMap<String, ToolOverride>,
+    /// Admission policy discovered tools are vetted with.
+    pub tool_policy: ConnectorToolPolicy,
+}
+
+/// Static entry applied to the discovered tool of the same name.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolOverride {
+    /// Replacement description.
+    pub description: Option<String>,
+    /// Whether the tool is hidden.
+    pub hidden: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -195,6 +352,8 @@ pub(super) struct McpBrokerConfig {
     pub cache_ttl_ms: Option<u64>,
     /// Fallback MCP protocol version. When omitted, derived from the profile.
     pub default_version: Option<String>,
+    /// Runtime tool discovery settings for servers with `discover: true`.
+    pub discovery: Option<DiscoveryConfig>,
     /// Behavior when a tool has an invalid schema.
     #[serde(default)]
     pub invalid_tool_policy: InvalidToolPolicy,
@@ -231,6 +390,8 @@ pub(super) struct ValidatedBrokerConfig {
     pub cache_ttl_ms: u64,
     /// Fallback MCP protocol version.
     pub default_version: String,
+    /// Runtime tool discovery settings, when any server discovers.
+    pub discovery: Option<ValidatedDiscovery>,
     /// Maximum body size in bytes.
     pub max_body_bytes: usize,
     /// Public MCP path handled by Praxis.
@@ -258,6 +419,9 @@ pub(crate) struct CatalogTool {
     pub description: Option<String>,
     /// Exposed (prefixed) tool name visible to clients.
     pub exposed_name: String,
+    /// Other fields of a discovered tool definition (`title`,
+    /// `outputSchema`, ...), served unchanged. Empty for static tools.
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// MCP input schema.
     pub input_schema: serde_json::Value,
     /// Original tool name on the backend.
@@ -308,6 +472,31 @@ fn default_handshake_response_bytes() -> usize {
     DEFAULT_HANDSHAKE_RESPONSE_BYTES
 }
 
+/// Default discovery cache entry cap.
+fn default_max_discovery_entries() -> usize {
+    DEFAULT_MAX_DISCOVERY_ENTRIES
+}
+
+/// Default discovery idle timeout.
+fn default_discovery_idle_timeout_ms() -> u64 {
+    DEFAULT_DISCOVERY_IDLE_TIMEOUT_MS
+}
+
+/// Default discovery age.
+fn default_discovery_max_age_ms() -> u64 {
+    DEFAULT_DISCOVERY_MAX_AGE_MS
+}
+
+/// Default discovery concurrency.
+fn default_discovery_concurrency() -> usize {
+    DEFAULT_DISCOVERY_CONCURRENCY
+}
+
+/// Default per-server tool cap.
+fn default_discovery_max_tools() -> usize {
+    DEFAULT_DISCOVERY_MAX_TOOLS
+}
+
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
@@ -321,6 +510,8 @@ pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(ValidatedBrokerConfi
     let backend_sessions = validate_profile_fields(profile, &cfg)?;
 
     let catalog = validate_and_build_catalog(&cfg)?;
+
+    let discovery = validate_discovery(profile, &cfg)?;
 
     let default_version = cfg
         .default_version
@@ -343,6 +534,7 @@ pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(ValidatedBrokerConfi
         cache_scope,
         cache_ttl_ms,
         default_version,
+        discovery,
         max_body_bytes: cfg.max_body_bytes,
         path: cfg.path,
         protocol_profile: profile,
@@ -413,7 +605,7 @@ fn validate_backend_sessions(
     }
 
     Ok(ValidatedBackendSessions {
-        forward_headers: validate_forward_headers(&cfg.forward_headers)?,
+        forward_headers: validate_forward_headers("backend_sessions", &cfg.forward_headers)?,
         handshake_timeout: Duration::from_millis(cfg.handshake_timeout_ms),
         idle_timeout: Duration::from_millis(cfg.idle_timeout_ms),
         max_sessions: cfg.max_sessions,
@@ -444,16 +636,13 @@ fn validate_backend_session_limits(cfg: &BackendSessionsConfig) -> Result<(), Fi
 }
 
 /// Parse forwarded header names, rejecting names the broker or transport owns.
-fn validate_forward_headers(names: &[String]) -> Result<Vec<http::HeaderName>, FilterError> {
+fn validate_forward_headers(block: &str, names: &[String]) -> Result<Vec<http::HeaderName>, FilterError> {
     let mut parsed = Vec::with_capacity(names.len());
     for raw in names {
-        let name = http::HeaderName::from_bytes(raw.as_bytes()).map_err(|_e| {
-            FilterError::from(format!(
-                "mcp: backend_sessions.forward_headers has invalid name '{raw}'"
-            ))
-        })?;
+        let name = http::HeaderName::from_bytes(raw.as_bytes())
+            .map_err(|_e| FilterError::from(format!("mcp: {block}.forward_headers has invalid name '{raw}'")))?;
         if is_reserved_forward_header(&name) {
-            return Err(format!("mcp: backend_sessions.forward_headers must not include '{name}'").into());
+            return Err(format!("mcp: {block}.forward_headers must not include '{name}'").into());
         }
         if !parsed.contains(&name) {
             parsed.push(name);
@@ -473,6 +662,180 @@ fn is_reserved_forward_header(name: &http::HeaderName) -> bool {
         http::header::ACCEPT | http::header::CONTENT_LENGTH | http::header::CONTENT_TYPE | http::header::HOST
     ) || matches!(s, "mcp-session-id" | "mcp-protocol-version" | "last-event-id")
         || s.starts_with("x-praxis-")
+}
+
+/// Validate per-server discovery fields and normalize the `discovery` block.
+///
+/// Returns `None` when no server discovers.
+#[expect(clippy::too_many_lines, reason = "linear validation with early returns")]
+fn validate_discovery(
+    profile: ProtocolProfile,
+    cfg: &McpBrokerConfig,
+) -> Result<Option<ValidatedDiscovery>, FilterError> {
+    validate_server_discovery_fields(&cfg.servers)?;
+    let any_discovers = cfg.servers.iter().any(|server| server.discover);
+    if !any_discovers {
+        if cfg.discovery.is_some() {
+            return Err("mcp: discovery requires at least one server with discover: true".into());
+        }
+        return Ok(None);
+    }
+    let settings = cfg.discovery.clone().unwrap_or_else(|| DiscoveryConfig {
+        forward_headers: None,
+        idle_timeout_ms: DEFAULT_DISCOVERY_IDLE_TIMEOUT_MS,
+        max_age_ms: DEFAULT_DISCOVERY_MAX_AGE_MS,
+        max_concurrency: DEFAULT_DISCOVERY_CONCURRENCY,
+        max_entries: DEFAULT_MAX_DISCOVERY_ENTRIES,
+        max_response_bytes: None,
+        max_tools: DEFAULT_DISCOVERY_MAX_TOOLS,
+        outbound_filters: None,
+        timeout_ms: None,
+    });
+    validate_discovery_limits(&settings)?;
+    let stateless = match profile {
+        ProtocolProfile::Current => {
+            validate_current_discovery(cfg, &settings)?;
+            None
+        },
+        ProtocolProfile::Stateless => {
+            if cfg.cache_scope == Some(CacheScope::Public) {
+                return Err(
+                    "mcp: cache_scope 'public' conflicts with discover: true; discovered tools are per caller".into(),
+                );
+            }
+            Some(validate_stateless_discovery(&settings)?)
+        },
+    };
+    let servers = cfg
+        .servers
+        .iter()
+        .map(|server| {
+            server.discover.then(|| ServerDiscovery {
+                invalid_tool_policy: cfg.invalid_tool_policy,
+                overrides: server
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        (
+                            tool.name.clone(),
+                            ToolOverride {
+                                description: tool.description.clone(),
+                                hidden: tool.hidden,
+                            },
+                        )
+                    })
+                    .collect(),
+                tool_policy: server.tool_policy.unwrap_or_default().admission(),
+            })
+        })
+        .collect();
+    Ok(Some(ValidatedDiscovery {
+        idle_timeout: Duration::from_millis(settings.idle_timeout_ms),
+        max_age: Duration::from_millis(settings.max_age_ms),
+        max_concurrency: settings.max_concurrency,
+        max_entries: settings.max_entries,
+        max_tools: settings.max_tools,
+        servers,
+        stateless,
+    }))
+}
+
+/// Reject `tool_policy` and `hidden` on servers that do not discover.
+fn validate_server_discovery_fields(servers: &[McpServerConfig]) -> Result<(), FilterError> {
+    for server in servers.iter().filter(|server| !server.discover) {
+        if server.tool_policy.is_some() {
+            return Err(format!("mcp: server '{}' tool_policy requires discover: true", server.name).into());
+        }
+        if let Some(tool) = server.tools.iter().find(|tool| tool.hidden) {
+            return Err(format!(
+                "mcp: server '{}' tool '{}' hidden requires discover: true",
+                server.name, tool.name
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Range-check numeric discovery settings.
+fn validate_discovery_limits(settings: &DiscoveryConfig) -> Result<(), FilterError> {
+    if settings.max_entries == 0 || settings.max_entries > MAX_DISCOVERY_ENTRIES_LIMIT {
+        return Err(format!("mcp: discovery.max_entries must be between 1 and {MAX_DISCOVERY_ENTRIES_LIMIT}").into());
+    }
+    if settings.max_age_ms == 0 {
+        return Err("mcp: discovery.max_age_ms must be greater than 0".into());
+    }
+    if settings.idle_timeout_ms == 0 {
+        return Err("mcp: discovery.idle_timeout_ms must be greater than 0".into());
+    }
+    if settings.max_concurrency == 0 || settings.max_concurrency > MAX_DISCOVERY_CONCURRENCY_LIMIT {
+        return Err(
+            format!("mcp: discovery.max_concurrency must be between 1 and {MAX_DISCOVERY_CONCURRENCY_LIMIT}").into(),
+        );
+    }
+    if settings.max_tools == 0 || settings.max_tools > MAX_DISCOVERY_MAX_TOOLS_LIMIT {
+        return Err(format!("mcp: discovery.max_tools must be between 1 and {MAX_DISCOVERY_MAX_TOOLS_LIMIT}").into());
+    }
+    Ok(())
+}
+
+/// Current-profile discovery runs in backend sessions: require them, and
+/// reject the stateless-only transport fields.
+fn validate_current_discovery(cfg: &McpBrokerConfig, settings: &DiscoveryConfig) -> Result<(), FilterError> {
+    if cfg.backend_sessions.is_none() {
+        return Err("mcp: discover: true requires backend_sessions in protocol_profile 'current'".into());
+    }
+    let stateless_only = [
+        ("forward_headers", settings.forward_headers.is_some()),
+        ("max_response_bytes", settings.max_response_bytes.is_some()),
+        ("outbound_filters", settings.outbound_filters.is_some()),
+        ("timeout_ms", settings.timeout_ms.is_some()),
+    ];
+    if let Some((field, _)) = stateless_only.iter().find(|(_, set)| *set) {
+        return Err(format!(
+            "mcp: discovery.{field} requires protocol_profile 'stateless'; current-profile discovery uses \
+             backend_sessions.{}",
+            match *field {
+                "timeout_ms" => "handshake_timeout_ms",
+                other => other,
+            }
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Normalize stateless-profile discovery transport settings.
+fn validate_stateless_discovery(settings: &DiscoveryConfig) -> Result<StatelessDiscovery, FilterError> {
+    let timeout_ms = settings.timeout_ms.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        return Err("mcp: discovery.timeout_ms must be greater than 0".into());
+    }
+    let max_response_bytes = settings.max_response_bytes.unwrap_or(DEFAULT_HANDSHAKE_RESPONSE_BYTES);
+    if max_response_bytes == 0 || max_response_bytes > MAX_HANDSHAKE_RESPONSE_BYTES_LIMIT {
+        return Err(format!(
+            "mcp: discovery.max_response_bytes must be between 1 and {MAX_HANDSHAKE_RESPONSE_BYTES_LIMIT}"
+        )
+        .into());
+    }
+    if settings
+        .outbound_filters
+        .iter()
+        .flatten()
+        .any(|entry| entry.filter_type == "load_balancer")
+    {
+        return Err(
+            "mcp: discovery.outbound_filters must not contain load_balancer; the broker routes discovery to each \
+             server's top-level cluster"
+                .into(),
+        );
+    }
+    let forward_headers = settings.forward_headers.clone().unwrap_or_else(default_forward_headers);
+    Ok(StatelessDiscovery {
+        forward_headers: validate_forward_headers("discovery", &forward_headers)?,
+        max_response_bytes,
+        timeout: Duration::from_millis(timeout_ms),
+    })
 }
 
 /// Rejects versions that the selected profile does not recognize.
@@ -599,7 +962,7 @@ fn validate_unique_exposed_names(catalog: &[CatalogTool]) -> Result<(), FilterEr
 fn build_catalog(servers: &[McpServerConfig], policy: InvalidToolPolicy) -> Result<Vec<CatalogTool>, FilterError> {
     let mut catalog = Vec::new();
     for (server_index, server) in servers.iter().enumerate() {
-        for tool in &server.tools {
+        for tool in server.tools.iter().filter(|tool| !tool.hidden) {
             if let Err(reason) = validate_tool_schemas(tool) {
                 match policy {
                     InvalidToolPolicy::RejectServer => {
@@ -632,7 +995,7 @@ fn validate_tool_schemas(tool: &ToolConfig) -> Result<(), String> {
 }
 
 /// Tool schemas without `type: object` confuse clients that validate calls.
-fn validate_schema_object(label: &str, schema: &serde_json::Value) -> Result<(), String> {
+pub(super) fn validate_schema_object(label: &str, schema: &serde_json::Value) -> Result<(), String> {
     if !schema.is_object() {
         return Err(format!("{label} must be a JSON object"));
     }
@@ -674,6 +1037,7 @@ fn build_catalog_entry(server_index: usize, server: &McpServerConfig, tool: &Too
         cluster: server.cluster.clone(),
         description: tool.description.clone(),
         exposed_name,
+        extra: serde_json::Map::new(),
         input_schema: tool.input_schema.clone().unwrap_or_else(default_input_schema),
         original_name: tool.name.clone(),
         server_index,
@@ -884,6 +1248,7 @@ schema:
     #[test]
     fn tool_with_no_schema_is_valid() {
         let tool = ToolConfig {
+            hidden: false,
             name: "t".into(),
             description: None,
             input_schema: None,
@@ -895,6 +1260,7 @@ schema:
     #[test]
     fn tool_with_valid_schema_is_valid() {
         let tool = ToolConfig {
+            hidden: false,
             name: "t".into(),
             description: None,
             input_schema: Some(serde_json::json!({"type": "object"})),
@@ -906,6 +1272,7 @@ schema:
     #[test]
     fn tool_with_invalid_schema_returns_error() {
         let tool = ToolConfig {
+            hidden: false,
             name: "t".into(),
             description: None,
             input_schema: Some(serde_json::json!("not-object")),
@@ -920,10 +1287,13 @@ schema:
             name: "srv".into(),
             cluster: "c".into(),
             path: "/backend".into(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![],
         };
         let tool = ToolConfig {
+            hidden: false,
             name: "my_tool".into(),
             description: Some("desc".into()),
             input_schema: Some(serde_json::json!({"type": "object"})),
@@ -946,10 +1316,13 @@ schema:
             name: "srv".into(),
             cluster: "c".into(),
             path: "/mcp".into(),
+            discover: false,
             tool_prefix: Some("ns_".into()),
+            tool_policy: None,
             tools: vec![],
         };
         let tool = ToolConfig {
+            hidden: false,
             name: "action".into(),
             description: None,
             input_schema: None,
@@ -1026,14 +1399,18 @@ schema:
                 name: "a".into(),
                 cluster: "c".into(),
                 path: "/mcp".into(),
+                discover: false,
                 tool_prefix: None,
+                tool_policy: None,
                 tools: vec![],
             },
             McpServerConfig {
                 name: "b".into(),
                 cluster: "c".into(),
                 path: "/mcp".into(),
+                discover: false,
                 tool_prefix: None,
+                tool_policy: None,
                 tools: vec![],
             },
         ];
@@ -1047,14 +1424,18 @@ schema:
                 name: "dup".into(),
                 cluster: "c".into(),
                 path: "/mcp".into(),
+                discover: false,
                 tool_prefix: None,
+                tool_policy: None,
                 tools: vec![],
             },
             McpServerConfig {
                 name: "dup".into(),
                 cluster: "c2".into(),
                 path: "/mcp".into(),
+                discover: false,
                 tool_prefix: None,
+                tool_policy: None,
                 tools: vec![],
             },
         ];
@@ -1068,7 +1449,9 @@ schema:
             name: String::new(),
             cluster: "c".into(),
             path: "/mcp".into(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![],
         }];
         let err = validate_unique_server_names(&servers).unwrap_err();
@@ -1086,7 +1469,9 @@ schema:
             name: "s".into(),
             cluster: String::new(),
             path: "/mcp".into(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![],
         }];
         let err = validate_server_clusters(&servers).unwrap_err();
@@ -1099,12 +1484,15 @@ schema:
             name: "s".into(),
             cluster: "c".into(),
             path: "/mcp".into(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![ToolConfig {
                 name: String::new(),
                 description: None,
                 input_schema: None,
                 annotations: None,
+                hidden: false,
             }],
         }];
         let err = validate_tool_names(&servers).unwrap_err();
@@ -1117,19 +1505,23 @@ schema:
             name: "s".into(),
             cluster: "c".into(),
             path: "/mcp".into(),
+            discover: false,
             tool_prefix: None,
+            tool_policy: None,
             tools: vec![
                 ToolConfig {
                     name: "a".into(),
                     description: None,
                     input_schema: None,
                     annotations: None,
+                    hidden: false,
                 },
                 ToolConfig {
                     name: "b".into(),
                     description: None,
                     input_schema: None,
                     annotations: None,
+                    hidden: false,
                 },
             ],
         }];
@@ -1145,6 +1537,7 @@ schema:
                 cluster: "c".into(),
                 description: None,
                 exposed_name: "dup".into(),
+                extra: serde_json::Map::new(),
                 input_schema: serde_json::json!({"type": "object"}),
                 original_name: "a".into(),
                 server_index: 0,
@@ -1156,6 +1549,7 @@ schema:
                 cluster: "c2".into(),
                 description: None,
                 exposed_name: "dup".into(),
+                extra: serde_json::Map::new(),
                 input_schema: serde_json::json!({"type": "object"}),
                 original_name: "b".into(),
                 server_index: 0,
@@ -1174,6 +1568,7 @@ schema:
             cluster: "c".into(),
             description: None,
             exposed_name: "unique".into(),
+            extra: serde_json::Map::new(),
             input_schema: serde_json::json!({"type": "object"}),
             original_name: "x".into(),
             server_index: 0,

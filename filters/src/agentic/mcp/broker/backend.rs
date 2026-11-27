@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! MCP backend session callouts for the current-profile broker.
+//! MCP backend callouts the broker issues itself.
 //!
-//! [`McpBackendClient`] isolates the backend session lifecycle exchanges the
-//! broker issues itself (`initialize`, `notifications/initialized`, and
-//! session `DELETE`). `tools/call` is not a callout: once a backend session
+//! [`McpBackendClient`] isolates the backend session lifecycle exchanges
+//! (`initialize`, `notifications/initialized`, and session `DELETE`), and
+//! [`McpToolPages`] the `tools/list` pages tool discovery requests, on a
+//! session or under the stateless profile. `tools/call` is not a callout: once a backend session
 //! exists the broker forwards the client's request through the main proxy
 //! path so streaming and every main-chain policy still apply.
 //!
@@ -21,11 +22,15 @@ use std::{fmt, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
 use praxis_ai_apis::mcp_session::{
-    McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
+    McpInitializeError, McpListingScope, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
+    McpToolPage,
 };
 use praxis_filter::FilterPipeline;
 
-use super::selector::BrokerBackendCluster;
+use super::{
+    discovery::{ListingScope, McpToolPages},
+    selector::BrokerBackendCluster,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -314,6 +319,42 @@ impl McpBackendClient for FilteredMcpBackendClient {
         )
         .await
         .map_err(McpBackendError::from)
+    }
+}
+
+#[async_trait]
+impl McpToolPages for FilteredMcpBackendClient {
+    async fn list_tools_page(
+        &self,
+        target: BackendTarget<'_>,
+        scope: ListingScope<'_>,
+        cursor: Option<String>,
+        callout: &BackendCallout,
+    ) -> Result<McpToolPage<serde_json::Value>, McpBackendError> {
+        let page = match scope {
+            // A backend session exists only on the endpoint that issued it.
+            ListingScope::Session(session) => {
+                let stage = Arc::new(pinned_stage(target, session));
+                let init = session_init(session);
+                Box::pin(
+                    self.client
+                        .list_tools(target.path, stage, callout, McpListingScope::Session(&init), cursor),
+                )
+                .await
+            },
+            ListingScope::Stateless { protocol_version } => {
+                let stage = Arc::new(BrokerBackendCluster::new(Arc::clone(target.cluster), None));
+                Box::pin(self.client.list_tools(
+                    target.path,
+                    stage,
+                    callout,
+                    McpListingScope::Stateless { protocol_version },
+                    cursor,
+                ))
+                .await
+            },
+        };
+        page.map_err(McpBackendError::from)
     }
 }
 

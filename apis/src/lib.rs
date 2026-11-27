@@ -36,7 +36,7 @@ pub mod json_body;
     expect(dead_code, reason = "the hosted MCP adapters use the rest of the client")
 )]
 pub(crate) mod mcp_client;
-#[cfg(feature = "mcp")]
+#[cfg(feature = "mcp-client")]
 pub(crate) mod mcp_core;
 /// Outbound MCP chain selector shared by every MCP adapter. Registered under
 /// its historical `openai_mcp_streaming_selector` name for config stability.
@@ -46,8 +46,17 @@ pub use mcp_client::McpStreamingSelectorFilter;
 #[cfg(feature = "mcp-client")]
 pub mod mcp_session {
     pub use crate::mcp_client::{
-        McpExchangeStage, McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
-        McpStreamingRequested,
+        MAX_LISTING_RESPONSE_BYTES, MAX_PAGES, McpExchangeStage, McpInitializeError, McpListingError, McpListingLimits,
+        McpListingScope, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit, McpStreamingRequested,
+        McpToolPage, paginate_tools,
+    };
+}
+/// Operator admission of MCP tool metadata, for callers that discover tools
+/// through their own sessions.
+#[cfg(feature = "mcp-client")]
+pub mod mcp_admission {
+    pub use crate::mcp_core::admission::{
+        AdmissionBasis, ConnectorToolPolicy, McpDenyReason, McpToolVerdict, evaluate_operator_tool,
     };
 }
 pub mod openai;
