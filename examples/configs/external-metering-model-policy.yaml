@@ -4,6 +4,11 @@
 # enabled: the entitlement response's `modelAllowed` verdict decides whether
 # the tenant may use the requested public model, independently of budget.
 #
+# Prerequisites (not started by this config): a metering service answering
+# the balance check on 127.0.0.1:9090 and an inference backend on
+# 127.0.0.1:3000. Without the metering service the preflight rejects with
+# 503 — the model gate is always fail-closed, regardless of fail_open.
+#
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/external-metering-model-policy.yaml
 #   curl -X POST http://localhost:8080/v1/chat/completions \
@@ -23,7 +28,10 @@
 #   - verdict unavailable (missing,  -> 503 metering system unavailable:
 #     null, wrong type, unusable        model authorization is always
 #     payload, non-2xx, timeout,        fail-closed, independent of the
-#     transport error)                  billing fail_open below
+#     transport error)                  billing fail_open below; an
+#                                       unavailable hasAccess instead follows
+#                                       billing fail_open (true: continue,
+#                                       false: 503)
 #
 # Model resolution for the preflight: the trusted {prefix}model identity
 # header, the model_to_provider client model, and (when no client model was
@@ -35,10 +43,12 @@
 # is enabled, a request without a trusted tenant identity or a resolvable
 # public model is rejected with 403 before dispatch, and so is a request
 # whose model sources conflict, including a body "model" member that is
-# ambiguous (duplicate or escaped key spellings) or undecodable (escaped or
-# non-string value) (403 "conflicting model inputs for model
-# authorization") — authorizing one source would not authorize the model
-# the provider receives. When identity comes from raw {prefix}* request
+# ambiguous (duplicate key spellings, whether plain or escaped) or
+# undecodable (an escaped or non-string value) (403 "conflicting model
+# inputs for model authorization") — authorizing one source would not
+# authorize the model the provider receives. A single escaped key
+# spelling such as "\u006dodel" still names "model" and is a normal
+# model source. When identity comes from raw {prefix}* request
 # headers, the ingress boundary must strip client-supplied copies and set
 # the headers from authenticated data: the filter cannot distinguish
 # client-set headers.
