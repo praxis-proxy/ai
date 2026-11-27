@@ -261,20 +261,20 @@ pub struct McpMockServerGuard {
     /// Captured requests.
     state: Arc<Mutex<Vec<McpRecordedRequest>>>,
 
-    /// Live sessions when `enforce_sessions` is set.
+    /// Live sessions and replaced tools, shared with every connection.
     sessions: Arc<MockSessions>,
-
-    /// Tools served instead of the configured ones, once replaced.
-    tools: Arc<Mutex<Option<Vec<McpToolFixture>>>>,
 }
 
-/// Session bookkeeping for `enforce_sessions`.
+/// Runtime state every connection shares: session bookkeeping for
+/// `enforce_sessions` and the tools [`McpMockServerGuard::set_tools`] set.
 #[derive(Default)]
 struct MockSessions {
     /// Sessions minted so far.
     minted: AtomicUsize,
     /// Currently valid session ids.
     live: Mutex<HashSet<String>>,
+    /// Tools served instead of the configured ones, once replaced.
+    tools: Mutex<Option<Vec<McpToolFixture>>>,
 }
 
 impl McpMockServerGuard {
@@ -287,7 +287,7 @@ impl McpMockServerGuard {
     /// poisoned.
     pub fn set_tools(&self, tools: Vec<McpToolFixture>) {
         validate_tool_schemas(&tools);
-        *self.tools.lock().unwrap() = Some(tools);
+        *self.sessions.tools.lock().unwrap() = Some(tools);
     }
 
     /// Expire every live session so the next request carrying one gets 404.
@@ -417,8 +417,6 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
     let state: Arc<Mutex<Vec<McpRecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
 
     let sessions = Arc::new(MockSessions::default());
-    let tools: Arc<Mutex<Option<Vec<McpToolFixture>>>> = Arc::new(Mutex::new(None));
-    let shared_tools = Arc::clone(&tools);
     let flag = Arc::clone(&shutdown);
     let shared_state = Arc::clone(&state);
     let shared_sessions = Arc::clone(&sessions);
@@ -433,8 +431,7 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
             let cfg = Arc::clone(&config);
             let st = Arc::clone(&shared_state);
             let ss = Arc::clone(&shared_sessions);
-            let tt = Arc::clone(&shared_tools);
-            std::thread::spawn(move || handle_connection(stream, &cfg, &st, &ss, &tt));
+            std::thread::spawn(move || handle_connection(stream, &cfg, &st, &ss));
         }
     });
 
@@ -444,7 +441,6 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
         shutdown,
         state,
         sessions,
-        tools,
     }
 }
 
@@ -459,7 +455,6 @@ fn handle_connection(
     config: &McpMockConfig,
     state: &Mutex<Vec<McpRecordedRequest>>,
     sessions: &MockSessions,
-    tools: &Mutex<Option<Vec<McpToolFixture>>>,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -492,9 +487,7 @@ fn handle_connection(
         return;
     }
 
-    let replaced = tools.lock().unwrap().clone();
-    let tools = replaced.as_deref().unwrap_or(&config.tools);
-    dispatch_json_rpc(&mut stream, config, tools, state, sessions, &req);
+    dispatch_json_rpc(&mut stream, config, state, sessions, &req);
 }
 
 /// `Some(status)` when the request is invalid before
@@ -516,7 +509,6 @@ fn reject_early(req: &AgenticHttpRequest, config: &McpMockConfig) -> Option<u16>
 fn dispatch_json_rpc(
     stream: &mut TcpStream,
     config: &McpMockConfig,
-    tools: &[McpToolFixture],
     state: &Mutex<Vec<McpRecordedRequest>>,
     sessions: &MockSessions,
     req: &AgenticHttpRequest,
@@ -541,6 +533,8 @@ fn dispatch_json_rpc(
         return;
     }
 
+    let replaced = sessions.tools.lock().unwrap().clone();
+    let tools = replaced.as_deref().unwrap_or(&config.tools);
     match method.as_deref() {
         Some("initialize") => handle_initialize(stream, config, &id, sessions, state),
         None if json.get("result").is_some() || json.get("error").is_some() => handle_notification(stream),

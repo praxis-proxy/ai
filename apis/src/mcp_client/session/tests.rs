@@ -1813,7 +1813,7 @@ async fn session_listing_sends_the_session_and_reads_the_page() {
     let names: Vec<&str> = page.tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["a", "b"]);
     assert_eq!(page.next_cursor.as_deref(), Some("next"), "the next cursor is returned");
-    let received = received.lock().unwrap();
+    let received = received.lock().unwrap().clone();
     let request = &received[0];
     let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
     assert_eq!(body["method"], "tools/list");
@@ -1855,7 +1855,7 @@ async fn stateless_listing_declares_the_profile() {
 
     assert_eq!(page.tools.len(), 1);
     assert!(page.next_cursor.is_none(), "the last page has no cursor");
-    let received = received.lock().unwrap();
+    let received = received.lock().unwrap().clone();
     let request = &received[0];
     let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
     let meta = &body["params"]["_meta"];
@@ -1919,7 +1919,7 @@ async fn ping_during_a_listing_is_answered_with_the_negotiated_version() {
     let page = list_via(&url, McpListingScope::Session(&session), None).await.unwrap();
 
     assert_eq!(page.tools.len(), 1, "the reply after the ping is read");
-    let received = received.lock().unwrap();
+    let received = received.lock().unwrap().clone();
     let pong = received
         .iter()
         .find(|request| !request.body.contains("tools/list"))
