@@ -52,6 +52,27 @@ jobs:
               NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED|INVALID_ARGUMENT|RESOURCE_EXHAUSTED|FAILED_PRECONDITION|UNAVAILABLE) ;;
               *) code=unavailable ;;
             esac
+            # Classify known error details without printing provider strings.
+            diagnostic=$(jq -r '
+              .error as $error |
+              ($error.message // "" | ascii_downcase) as $message |
+              if any($error.details[]?; .reason == "USER_PROJECT_DENIED")
+                then "quota project permission"
+              elif any($error.details[]?; .reason == "SERVICE_DISABLED")
+                then "Vertex API disabled"
+              elif any($error.details[]?.fieldViolations[]?;
+                       (.field // "" | test("maxOutputTokens|max_output_tokens"; "i"))) or
+                   ($message | test("maxoutputtokens|max_output_tokens|output token"))
+                then "output token limit"
+              elif ($message | test("thinking")) then "thinking configuration"
+              elif ($message | test("location|region|endpoint")) then "location or endpoint"
+              elif ($message | test("billing|quota project|consumer project")) then "billing or quota project"
+              elif ($message | test("role|contents|part")) then "request content"
+              elif ($message | test("model|publisher")) then "model selection"
+              else "unclassified"
+              end
+            ' "$response" 2>/dev/null) || diagnostic="unclassified"
+            echo "Vertex AI diagnostic: $diagnostic"
             echo "::error::Vertex AI request failed ($code)."
             exit 1
           fi
