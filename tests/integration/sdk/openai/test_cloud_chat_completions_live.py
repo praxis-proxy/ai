@@ -99,7 +99,7 @@ def live_client(tmp_path):
             wait_for_gateway(gateway, port)
             with OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="gateway-test",
                         max_retries=0, timeout=60) as client:
-                yield client, model
+                yield client, model, provider
         finally:
             gateway.terminate()
             try:
@@ -110,7 +110,7 @@ def live_client(tmp_path):
 
 
 def test_tool_result_streams_through_cloud_translation(live_client):
-    client, model = live_client
+    client, model, provider = live_client
     tools = [{"type": "function", "function": {
         "name": "status",
         "description": "Get status for a service.",
@@ -129,8 +129,10 @@ def test_tool_result_streams_through_cloud_translation(live_client):
         tool_choice={"type": "function", "function": {"name": "status"}},
     )
     choice, = first.choices
-    assert choice.finish_reason == "tool_calls"
     call, = choice.message.tool_calls
+    # Azure can report stop for a forced function call.
+    expected_finish_reasons = {"tool_calls", "stop"} if provider == "azure" else {"tool_calls"}
+    assert choice.finish_reason in expected_finish_reasons
     assert call.id and call.function.name == "status"
     assert json.loads(call.function.arguments) == {"service": "gateway"}
     assert first.usage.prompt_tokens > 0
@@ -154,7 +156,7 @@ def test_tool_result_streams_through_cloud_translation(live_client):
 
 
 def test_invalid_output_limit_returns_bad_request(live_client):
-    client, model = live_client
+    client, model, _ = live_client
     with pytest.raises(BadRequestError) as error:
         client.chat.completions.create(
             model=model, max_completion_tokens=-1,
