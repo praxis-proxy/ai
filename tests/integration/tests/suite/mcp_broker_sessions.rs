@@ -334,6 +334,27 @@ fn current_profile_handshake_completes_on_sse_reply_that_stays_open() {
 }
 
 #[test]
+fn current_profile_handshake_works_through_a_buffering_outbound_filter() {
+    // `json_body` buffers response bodies, so the handshake reply is read
+    // whole instead of streamed.
+    let weather = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let extra = "outbound_filters:\n            - filter: json_body\n              content_types: [application/json]\n              request_extract:\n                - pointer: /method\n                  metadata: mcp.method";
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, extra)).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 6, "weather_get_weather"));
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["result"]["content"][0]["text"], "mock result for get_weather",
+        "a chain that buffers responses must still complete the handshake: {body}"
+    );
+    assert_eq!(weather.method_count("initialize"), 1, "one handshake");
+}
+
+#[test]
 fn current_profile_tools_call_without_gateway_session_is_rejected() {
     let weather = start_session_backend("get_weather");
     let calendar = start_session_backend("create_event");

@@ -185,6 +185,7 @@ impl McpSessionClient {
         callout: &McpSessionCallout,
         protocol_version: &str,
     ) -> Result<McpSessionInit, McpSessionError> {
+        let callout = &self.bounded(callout);
         let transport = self.transport(stage, callout);
         let exchange = self.initialize_exchange(&transport, path, callout, protocol_version);
         Box::pin(within(callout.deadline, exchange)).await
@@ -211,11 +212,7 @@ impl McpSessionClient {
         let (response, body, session_id) = accept_initialize_head(response, body).await?;
         let reply = read_initialize_reply(&response, body, self.max_response_bytes)
             .await
-            .map_err(|error| match error {
-                // The executor ends the body at the exchange deadline.
-                McpSessionError::Transport if Instant::now() >= callout.deadline => McpSessionError::Timeout,
-                other => other,
-            })?;
+            .map_err(|error| past_deadline(error, callout.deadline))?;
         Ok(McpSessionInit {
             protocol_version: initialize_result_version(&reply, &request_id)?,
             session_id,
@@ -235,6 +232,7 @@ impl McpSessionClient {
         callout: &McpSessionCallout,
         session: &McpSessionInit,
     ) -> Result<(), McpSessionError> {
+        let callout = &self.bounded(callout);
         let transport = self.transport(stage, callout);
         let message = ClientJsonRpcMessage::notification(ClientNotification::InitializedNotification(
             InitializedNotification::default(),
@@ -247,9 +245,10 @@ impl McpSessionClient {
                 Box::pin(transport.send_streaming_post(path, &message, session_id, headers, &signal))
                     .await
                     .map_err(|error| self.classify(&error, &signal, callout.deadline))?;
-            let (_response, body) = reject_unsuccessful(response, body).await?;
-            cancel(body).await;
-            Ok(())
+            let (response, body) = reject_unsuccessful(response, body).await?;
+            discard_within(&response, body, self.max_response_bytes)
+                .await
+                .map_err(|error| past_deadline(error, callout.deadline))
         };
         Box::pin(within(callout.deadline, exchange)).await
     }
@@ -273,6 +272,7 @@ impl McpSessionClient {
         let Some(session_id) = session.session_id.as_ref() else {
             return Ok(());
         };
+        let callout = &self.bounded(callout);
         let transport = self.transport(stage, callout);
         let headers = session_headers(&callout.forwarded_headers, Some(session_id), &session.protocol_version)?;
         let signal = Arc::new(OnceLock::new());
@@ -295,6 +295,17 @@ impl McpSessionClient {
         Box::pin(within(callout.deadline, exchange)).await
     }
 
+    /// `callout` with its deadline capped by one step, so the executor, the
+    /// outer timeout, and error classification all use the same instant.
+    fn bounded(&self, callout: &McpSessionCallout) -> McpSessionCallout {
+        let now = Instant::now();
+        let step = now.checked_add(self.step_timeout).unwrap_or(now);
+        McpSessionCallout {
+            deadline: callout.deadline.min(step),
+            ..callout.clone()
+        }
+    }
+
     /// Transport for one exchange through the bound chain.
     fn transport(&self, stage: Arc<dyn McpExchangeStage>, callout: &McpSessionCallout) -> McpSubrequestClient {
         let mcp_callout = McpCallout::from_parts(
@@ -308,41 +319,31 @@ impl McpSessionClient {
         McpSubrequestClient::for_chain(mcp_callout, self.step_timeout, self.max_response_bytes, stage)
     }
 
-    /// Map a transport failure to a structured, credential-free error.
+    /// Map a failure to send the request or receive the response head to a
+    /// structured, credential-free error.
     fn classify(
         &self,
         error: &StreamableHttpError<McpTransportError>,
         signal: &OnceLock<TransportSignal>,
         deadline: Instant,
     ) -> McpSessionError {
-        if let Some(TransportSignal::ResponseTooLarge { limit }) = signal.get() {
-            return McpSessionError::ResponseTooLarge { limit: *limit };
+        // The executor's ceiling may be the doubled streaming backstop; callers
+        // see the configured limit.
+        if matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { .. }))
+            || matches!(error, StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        {
+            return McpSessionError::ResponseTooLarge {
+                limit: self.max_response_bytes,
+            };
         }
         match error {
-            StreamableHttpError::Client(McpTransportError::ResponseTooLarge) => McpSessionError::ResponseTooLarge {
-                limit: self.max_response_bytes,
+            StreamableHttpError::Client(McpTransportError::InvalidStatus) => {
+                McpSessionError::Malformed("unrepresentable status or session header")
             },
-            StreamableHttpError::Client(
-                McpTransportError::Transport
-                | McpTransportError::Target
-                | McpTransportError::SsrfBlocked
-                | McpTransportError::Setup,
-            )
-            | StreamableHttpError::Io(_)
-            | StreamableHttpError::Sse(sse_stream::Error::Body(_))
-            | StreamableHttpError::UnexpectedEndOfStream
-            | StreamableHttpError::TransportChannelClosed => {
-                if Instant::now() >= deadline {
-                    McpSessionError::Timeout
-                } else {
-                    McpSessionError::Transport
-                }
+            StreamableHttpError::Client(McpTransportError::Serialize) => {
+                McpSessionError::Malformed("request could not be serialized")
             },
-            StreamableHttpError::UnexpectedContentType(_) => McpSessionError::Malformed("unexpected content type"),
-            StreamableHttpError::UnexpectedServerResponse(_) => {
-                McpSessionError::Malformed("initialize reply is missing")
-            },
-            _ => McpSessionError::Malformed("initialize reply is not a JSON-RPC message"),
+            _ => past_deadline(McpSessionError::Transport, deadline),
         }
     }
 }
@@ -523,22 +524,64 @@ async fn stream_sse_reply(
     // byte becomes a three-byte U+FFFD, so three times the read limit covers
     // any input within it.
     let mut parser = SseFrameParser::new(limit.saturating_mul(3));
-    let mut read = 0_usize;
-    while let Some(chunk) = next_chunk(body).await? {
-        read = read
-            .checked_add(chunk.len())
-            .filter(|total| *total <= limit)
-            .ok_or(McpSessionError::ResponseTooLarge { limit })?;
+    // The limit covers the bytes through the event that carries the reply.
+    // Only the part of each chunk that still fits is parsed, so the result
+    // does not depend on how the transport splits the stream.
+    let mut remaining = limit;
+    while let Some(chunk) = next_chunk(body, limit).await? {
+        let (within, beyond) = chunk.split_at(chunk.len().min(remaining));
+        remaining = remaining.saturating_sub(within.len());
         let frames = parser
-            .parse_chunk(&chunk)
+            .parse_chunk(within)
             .map_err(|_overflow| McpSessionError::ResponseTooLarge { limit })?;
         for frame in frames {
             if let Some(reply) = sse_reply(&frame.data)? {
                 return Ok(reply);
             }
         }
+        if !beyond.is_empty() {
+            return Err(McpSessionError::ResponseTooLarge { limit });
+        }
     }
     Err(McpSessionError::Malformed("initialize stream has no reply"))
+}
+
+/// Read and drop a reply body that carries no message, failing when it
+/// exceeds `limit` bytes.
+async fn discard_within(
+    response: &SubResponse,
+    body: Option<Box<dyn StreamingResponseBody>>,
+    limit: usize,
+) -> Result<(), McpSessionError> {
+    let Some(mut body) = body else {
+        return if response.body.len() > limit {
+            Err(McpSessionError::ResponseTooLarge { limit })
+        } else {
+            Ok(())
+        };
+    };
+    let mut read = 0_usize;
+    let result = loop {
+        match next_chunk(&mut body, limit).await {
+            Ok(Some(chunk)) => match read.checked_add(chunk.len()).filter(|total| *total <= limit) {
+                Some(total) => read = total,
+                None => break Err(McpSessionError::ResponseTooLarge { limit }),
+            },
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    body.cancel().await;
+    result
+}
+
+/// A transport failure at or past `deadline` is the executor ending the
+/// exchange there, so it is a timeout.
+fn past_deadline(error: McpSessionError, deadline: Instant) -> McpSessionError {
+    match error {
+        McpSessionError::Transport if Instant::now() >= deadline => McpSessionError::Timeout,
+        other => other,
+    }
 }
 
 /// Buffer a streamed JSON body within `limit` bytes and parse it.
@@ -547,7 +590,7 @@ async fn collect_json_reply(
     limit: usize,
 ) -> Result<ServerJsonRpcMessage, McpSessionError> {
     let mut buf = BytesMut::new();
-    while let Some(chunk) = next_chunk(body).await? {
+    while let Some(chunk) = next_chunk(body, limit).await? {
         if buf.len().checked_add(chunk.len()).is_none_or(|total| total > limit) {
             return Err(McpSessionError::ResponseTooLarge { limit });
         }
@@ -556,15 +599,16 @@ async fn collect_json_reply(
     parse_reply(&buf)
 }
 
-/// The next body chunk; an overflow the executor reports stays a size failure
-/// and any other read failure is a transport failure.
-async fn next_chunk(body: &mut Box<dyn StreamingResponseBody>) -> Result<Option<Bytes>, McpSessionError> {
+/// The next body chunk. An overflow the executor reports stays a size failure,
+/// reported against the configured `limit` rather than the executor's looser
+/// streaming backstop; any other read failure is a transport failure.
+async fn next_chunk(body: &mut Box<dyn StreamingResponseBody>, limit: usize) -> Result<Option<Bytes>, McpSessionError> {
     body.next_chunk().await.map_err(|error| {
-        error
-            .downcast_ref::<CalloutResponseTooLarge>()
-            .map_or(McpSessionError::Transport, |overflow| {
-                McpSessionError::ResponseTooLarge { limit: overflow.limit }
-            })
+        if error.downcast_ref::<CalloutResponseTooLarge>().is_some() {
+            McpSessionError::ResponseTooLarge { limit }
+        } else {
+            McpSessionError::Transport
+        }
     })
 }
 

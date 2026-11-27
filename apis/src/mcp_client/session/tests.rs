@@ -139,10 +139,11 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Received> {
 
 /// A complete HTTP/1.1 response with `Content-Length`.
 fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
-    let mut out = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
+    let mut out = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+    // RFC 9110 §8.6: a server MUST NOT send Content-Length in a 204 response.
+    if !status.starts_with("204") {
+        out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     for (name, value) in headers {
         out.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -614,6 +615,95 @@ fn notification_content_before_the_reply_is_not_logged() {
     );
 }
 
+/// An SSE reply followed by a large keepalive comment, written as one HTTP
+/// chunk or as two chunks a moment apart; the stream stays open.
+fn reply_then_keepalive(body: &str, split: bool) -> Reply {
+    let event = format!("data: {}\n\n", init_result(body, "2025-06-18"));
+    let keepalive = format!(": {}\n\n", "k".repeat(8 * 1024));
+    let chunk = |payload: &str| format!("{:x}\r\n{payload}\r\n", payload.len());
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let bytes = if split {
+        [head, &chunk(&event)].concat()
+    } else {
+        [head, &chunk(&format!("{event}{keepalive}"))].concat()
+    };
+    Reply {
+        bytes: bytes.into_bytes(),
+        hold: Duration::from_secs(30),
+    }
+}
+
+#[tokio::test]
+async fn sse_limit_does_not_depend_on_chunking() {
+    // The reply fits in 4 KiB; the keepalive after it does not.
+    let mut results = Vec::new();
+    for split in [false, true] {
+        let (result, _) = initialize_with(
+            move |body| reply_then_keepalive(body, split),
+            4 * 1024,
+            Duration::from_secs(3),
+        )
+        .await;
+        results.push(result.map(|init| init.protocol_version));
+    }
+
+    assert_eq!(
+        results[0], results[1],
+        "the same bytes must give the same result in one chunk or two"
+    );
+    assert!(
+        results[0].is_ok(),
+        "a reply within the limit must complete: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn reply_past_the_limit_before_the_reply_event_is_too_large() {
+    let (result, _) = initialize_with(
+        |body| {
+            let events = format!(
+                ": {}\n\ndata: {}\n\n",
+                "k".repeat(8 * 1024),
+                init_result(body, "2025-06-18")
+            );
+            Reply::closed(http_response(
+                "200 OK",
+                &[("Content-Type", "text/event-stream")],
+                &events,
+            ))
+        },
+        4 * 1024,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(McpSessionError::ResponseTooLarge { limit: 4 * 1024 }),
+        "bytes before the reply count toward the limit"
+    );
+}
+
+#[tokio::test]
+async fn stall_at_a_shorter_step_timeout_is_a_timeout() {
+    let client = McpSessionClient::new(streaming_pipeline(), 1 << 20, Duration::from_millis(300));
+    let (result, _) = initialize_via(
+        client,
+        |_body| Reply {
+            bytes: b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            hold: Duration::from_secs(30),
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(McpSessionError::Timeout),
+        "the step timeout is the exchange deadline when it is earlier"
+    );
+}
+
 #[tokio::test]
 async fn open_stream_without_reply_times_out() {
     let (result, _) = initialize_with(
@@ -822,6 +912,31 @@ async fn initialized_notification_carries_session_and_version() {
         request.header("authorization"),
         Some("Bearer first"),
         "credential forwarded"
+    );
+}
+
+#[tokio::test]
+async fn oversized_initialized_reply_is_too_large() {
+    let (url, _) = scripted_backend(vec![Reply::closed(http_response(
+        "200 OK",
+        &[("Content-Type", "application/json")],
+        &"x".repeat(8 * 1024),
+    ))])
+    .await;
+
+    let result = session_client(4 * 1024)
+        .send_initialized(
+            "/mcp",
+            staged(&url).await,
+            &callout(Duration::from_secs(5)),
+            &session(Some("s-9")),
+        )
+        .await;
+
+    assert_eq!(
+        result,
+        Err(McpSessionError::ResponseTooLarge { limit: 4 * 1024 }),
+        "the reply to notifications/initialized is bounded too"
     );
 }
 
