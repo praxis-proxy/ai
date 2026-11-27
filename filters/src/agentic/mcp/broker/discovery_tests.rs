@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 
 use super::{
     BackendSessions, McpBrokerFilter,
-    backend::{BackendCallout, BackendInit, BackendTarget, McpBackendClient, McpBackendError},
+    backend::{
+        BackendCallout, BackendInit, BackendTarget, InitializeFailure, IssuedSession, McpBackendClient, McpBackendError,
+    },
     config::{McpBrokerConfig, build_config},
     discovery::{Discovery, ListingScope, METRIC_DISCOVERY_FAILURES_TOTAL, McpToolPages},
 };
@@ -118,7 +120,7 @@ impl McpBackendClient for ScriptedBackend {
         target: BackendTarget<'_>,
         protocol_version: &str,
         _callout: &BackendCallout,
-    ) -> Result<BackendInit, McpBackendError> {
+    ) -> Result<BackendInit, InitializeFailure> {
         let mut initialized = self.initialized.lock().unwrap();
         initialized.push(target.cluster.to_string());
         let n = initialized.len();
@@ -143,6 +145,15 @@ impl McpBackendClient for ScriptedBackend {
         &self,
         _target: BackendTarget<'_>,
         _session: &BackendInit,
+        _callout: &BackendCallout,
+    ) -> Result<(), McpBackendError> {
+        Ok(())
+    }
+
+    async fn terminate_issued(
+        &self,
+        _target: BackendTarget<'_>,
+        _session: &IssuedSession,
         _callout: &BackendCallout,
     ) -> Result<(), McpBackendError> {
         Ok(())
