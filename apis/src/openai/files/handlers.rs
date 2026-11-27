@@ -34,16 +34,15 @@ pub(super) fn parse_list_query(query: Option<&str>) -> Result<ListFilesQuery, In
             continue;
         }
         let value = decode_query_component_strict(raw_value).map_err(malformed)?;
-        let value = if key == "limit" {
-            let limit = value.parse::<u32>().map_err(|_e| InvalidQuery {
-                param: Some("limit".to_owned()),
-                message: format!("Invalid value for 'limit': '{value}' is not a valid integer."),
-            })?;
-            Value::from(limit)
-        } else {
-            Value::String(value.into_owned())
-        };
-        fields.insert(key.into_owned(), value);
+        fields.insert(key.into_owned(), Value::String(value.into_owned()));
+    }
+    // Convert after the loop so only the final `limit` occurrence is checked.
+    if let Some(Value::String(raw)) = fields.get("limit") {
+        let limit = raw.parse::<u32>().map_err(|_e| InvalidQuery {
+            param: Some("limit".to_owned()),
+            message: format!("Invalid value for 'limit': '{raw}' is not a valid integer."),
+        })?;
+        fields.insert("limit".to_owned(), Value::from(limit));
     }
     ListFilesQuery::deserialize(Value::Object(fields.clone())).map_err(|error| InvalidQuery {
         // Serde errors do not name the field; re-check each one alone.
@@ -184,6 +183,11 @@ mod tests {
             assert_eq!(value["error"]["param"], json!(param));
         }
         assert!(parse_list_query(Some("limit=1")).is_ok());
+        assert!(parse_list_query(Some("limit=abc&limit=5")).is_ok());
+        assert_eq!(
+            parse_list_query(Some("limit=5&limit=abc")).unwrap_err().param.as_deref(),
+            Some("limit")
+        );
         assert!(parse_list_query(Some("limit=10000")).is_ok());
     }
 

@@ -11,7 +11,9 @@ Handles the local Files metadata and deletion endpoints.
 
 A delete hides the file at once and marks it for physical deletion; the bytes are removed later by a background cleanup. Only the delete that hides the file succeeds.
 
-A trusted owner is required: place `state_owner` earlier in the chain. A request without one is rejected with 401. Missing, expired, pending, failed, deleted and other tenants' files all return the same 404, for retrieve and delete alike. Query errors return 400 and catalog failures a generic 500; catalog error text never reaches the client or the logs.
+The three local operations require a trusted owner: place `state_owner` earlier in the chain. Such a request without one is rejected with 401. Missing, expired, pending, failed, deleted and other tenants' files all return the same 404, for retrieve and delete alike. Query errors return 400 and catalog failures a generic 500; catalog error text never reaches the client or the logs.
+
+Not yet available: the filter is not registered, so the pipeline rejects it until catalog provisioning and registration land (#504).
 
 No settings yet: catalog and store provisioning land with the serving runtime wiring. Unknown fields are rejected so a misspelled setting fails at pipeline construction.
 

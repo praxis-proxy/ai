@@ -38,11 +38,14 @@ use crate::state_owner::{StateOwner, require_state_owner};
 /// bytes are removed later by a background cleanup. Only the delete that hides
 /// the file succeeds.
 ///
-/// A trusted owner is required: place `state_owner` earlier in the chain. A
-/// request without one is rejected with 401. Missing, expired, pending,
-/// failed, deleted and other tenants' files all return the same 404, for
-/// retrieve and delete alike. Query errors return 400 and catalog failures a
+/// The three local operations require a trusted owner: place `state_owner`
+/// earlier in the chain. Such a request without one is rejected with 401.
+/// Missing, expired, pending, failed, deleted and other tenants' files all
+/// return the same 404, for retrieve and delete alike. Query errors return 400 and catalog failures a
 /// generic 500; catalog error text never reaches the client or the logs.
+///
+/// Not yet available: the filter is not registered, so the pipeline rejects it
+/// until catalog provisioning and registration land (#504).
 ///
 /// # YAML
 ///
