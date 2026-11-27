@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Conversions between the service DTOs and the catalog records.
+//! Conversions between the service DTOs, the catalog records and the wire
+//! contract.
 
 use praxis_ai_store::{CatalogError, FileListQuery, FileRecord, FileRecordPage, SortDirection};
 
-use super::{FileInfo, FileList, FileListOrder, FilePage, FilePurpose};
+use super::{
+    FileInfo, FileList, FileListOrder, FilePage, FilePurpose,
+    contracts::{ListFilesQuery, ListFilesResponse, OpenAiFile},
+};
 
 impl From<FileListOrder> for SortDirection {
     fn from(order: FileListOrder) -> Self {
@@ -61,5 +65,33 @@ impl TryFrom<FileRecordPage> for FilePage {
             data,
             has_more: page.has_more,
         })
+    }
+}
+
+impl From<FileInfo> for OpenAiFile {
+    fn from(info: FileInfo) -> Self {
+        let file = Self::new(info.id, info.bytes, info.created_at, info.filename, info.purpose);
+        match info.expires_at {
+            Some(expires_at) => file.with_expires_at(expires_at),
+            None => file,
+        }
+    }
+}
+
+/// `first_id` and `last_id` are derived from the page.
+impl From<FilePage> for ListFilesResponse {
+    fn from(page: FilePage) -> Self {
+        Self::new(page.data.into_iter().map(OpenAiFile::from).collect(), page.has_more)
+    }
+}
+
+impl From<ListFilesQuery> for FileList {
+    fn from(query: ListFilesQuery) -> Self {
+        Self {
+            limit: query.effective_limit(),
+            purpose: query.purpose,
+            order: query.order,
+            after: query.after,
+        }
     }
 }

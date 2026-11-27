@@ -9,7 +9,7 @@ use bytes::Bytes;
 use super::FileStream;
 
 #[cfg(feature = "openai-files-s3")]
-mod object_store_adapter;
+pub(crate) mod object_store_adapter;
 #[cfg(feature = "openai-files-s3")]
 mod s3;
 #[cfg(feature = "openai-files-s3")]

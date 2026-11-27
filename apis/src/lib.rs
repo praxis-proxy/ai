@@ -154,7 +154,7 @@ pub(crate) mod test_utils {
     /// Installs a thread-local subscriber, so parallel tests sharing the
     /// process-wide subscriber are unaffected. Use it to assert that request
     /// or response content never reaches logs.
-    #[cfg(any(feature = "openai-responses", feature = "mcp-client"))]
+    #[cfg(any(feature = "openai-responses", feature = "mcp-client", feature = "openai-files"))]
     pub(crate) fn capture_log_output<F: FnOnce()>(f: F) -> String {
         use std::{
             fmt::Write as _,

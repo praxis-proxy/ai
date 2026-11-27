@@ -5,10 +5,18 @@
 //!
 //! With `openai-files`, this module also exposes the service, metadata
 //! catalog, and byte-store contracts for a local implementation. The default
-//! service is currently a placeholder.
+//! service implements `retrieve` and `list`; upload, content and delete are
+//! still placeholders. The `openai_files` filter serves list and retrieve
+//! locally and passes the other operations through.
 
 #[cfg(feature = "openai-files")]
+mod config;
+#[cfg(feature = "openai-files")]
 pub(crate) mod contracts;
+#[cfg(feature = "openai-files")]
+mod filter;
+#[cfg(feature = "openai-files")]
+mod handlers;
 #[cfg(feature = "openai-files")]
 mod mapping;
 #[cfg(feature = "openai-files")]
@@ -23,6 +31,8 @@ mod store;
 
 #[cfg(feature = "openai-files")]
 pub use contracts::{FilePurpose, InvalidField, ListOrder as FileListOrder, UploadPurpose};
+#[cfg(feature = "openai-files")]
+pub use filter::OpenaiFilesFilter;
 #[cfg(feature = "openai-files")]
 pub use model::{FileExpiration, FileInfo, FileList, FilePage, FileStream, FileUploadMetadata};
 #[cfg(feature = "openai-files")]

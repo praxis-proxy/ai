@@ -19,6 +19,8 @@ pub mod files;
 #[cfg(feature = "store")]
 pub(crate) mod include;
 mod operation;
+#[cfg(any(feature = "store", feature = "openai-files"))]
+pub(crate) mod query;
 pub(crate) mod responses;
 pub(crate) mod sse;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]

@@ -24,6 +24,7 @@ Parse client request bodies, publish protocol facts, and translate between OpenA
 | [`openai_chat_completions_to_anthropic`](apis/openai_chat_completions_to_anthropic.md) | Translates OpenAI Chat Completions requests only when the selected `ExternalModel` candidate uses Anthropic Messages; OpenAI candidates pass through with their configured path and model. |
 | [`openai_chat_completions_to_anthropic_stream`](apis/openai_chat_completions_to_anthropic_stream.md) | Converts the selected Anthropic provider's event stream incrementally. OpenAI-compatible candidates are left byte-for-byte unchanged. |
 | [`openai_client_tool_compat`](apis/openai_client_tool_compat.md) | Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back. |
+| [`openai_files`](apis/openai_files.md) | Handles the local Files metadata and deletion endpoints. |
 | [`openai_responses_model_rewrite`](apis/openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
 | [`openai_responses_request`](apis/openai_responses_request.md) | Processes a Responses request body once and initializes state. |
 | [`openai_responses_to_chat_completions`](apis/openai_responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |

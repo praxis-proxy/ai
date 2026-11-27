@@ -153,10 +153,10 @@ fn review_target_schema() -> RefOr<Schema> {
 impl<'error> ErrorResponse<'error> {
     /// Borrow error fields until serialization without copying request data.
     #[cfg_attr(
-        all(not(feature = "openai-conversations"), not(test)),
+        all(not(feature = "openai-conversations"), not(feature = "openai-files"), not(test)),
         expect(
             dead_code,
-            reason = "Files declares the envelope in its contract; local Files handlers construct it (#499-#501)"
+            reason = "only the Conversations and Files handlers construct the envelope"
         )
     )]
     pub(crate) const fn new(
