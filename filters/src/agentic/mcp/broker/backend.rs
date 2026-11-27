@@ -20,7 +20,9 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use praxis_ai_apis::mcp_session::{McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit};
+use praxis_ai_apis::mcp_session::{
+    McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit,
+};
 use praxis_filter::FilterPipeline;
 
 use super::selector::BrokerBackendCluster;
@@ -62,6 +64,31 @@ pub(crate) struct BackendInit {
     /// forwarded calls are pinned to it, because a backend session exists
     /// only on the endpoint that issued it. `None` when unknown.
     pub endpoint: Option<Arc<str>>,
+}
+
+/// A backend session an `initialize` created but the handshake never
+/// confirmed, because the exchange failed after the backend issued it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IssuedSession {
+    /// Backend `Mcp-Session-Id` from the `initialize` response head.
+    pub session_id: HeaderValue,
+    /// Endpoint address that issued it. `None` when unknown.
+    pub endpoint: Option<Arc<str>>,
+}
+
+/// A failed backend `initialize`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InitializeFailure {
+    /// Why the exchange failed.
+    pub error: McpBackendError,
+    /// Session the backend issued before the failure; the broker ends it.
+    pub issued: Option<IssuedSession>,
+}
+
+impl From<McpBackendError> for InitializeFailure {
+    fn from(error: McpBackendError) -> Self {
+        Self { error, issued: None }
+    }
 }
 
 /// Structured backend lifecycle failure.
@@ -163,7 +190,7 @@ pub(crate) trait McpBackendClient: Send + Sync {
         target: BackendTarget<'_>,
         protocol_version: &str,
         callout: &BackendCallout,
-    ) -> Result<BackendInit, McpBackendError>;
+    ) -> Result<BackendInit, InitializeFailure>;
 
     /// Send `notifications/initialized` on an initialized session.
     async fn send_initialized(
@@ -178,6 +205,14 @@ pub(crate) trait McpBackendClient: Send + Sync {
         &self,
         target: BackendTarget<'_>,
         session: &BackendInit,
+        callout: &BackendCallout,
+    ) -> Result<(), McpBackendError>;
+
+    /// Terminate a session a failed `initialize` left on the backend.
+    async fn terminate_issued(
+        &self,
+        target: BackendTarget<'_>,
+        session: &IssuedSession,
         callout: &BackendCallout,
     ) -> Result<(), McpBackendError>;
 }
@@ -209,7 +244,7 @@ impl McpBackendClient for FilteredMcpBackendClient {
         target: BackendTarget<'_>,
         protocol_version: &str,
         callout: &BackendCallout,
-    ) -> Result<BackendInit, McpBackendError> {
+    ) -> Result<BackendInit, InitializeFailure> {
         // Unpinned: the load balancer picks the endpoint, and the selector
         // records it so later exchanges reach the session's endpoint.
         let staged = BrokerBackendCluster::new(Arc::clone(target.cluster), None);
@@ -218,7 +253,14 @@ impl McpBackendClient for FilteredMcpBackendClient {
             self.client
                 .initialize(target.path, Arc::new(staged), callout, protocol_version),
         )
-        .await?;
+        .await
+        .map_err(|failure: McpInitializeError| InitializeFailure {
+            error: failure.error.into(),
+            issued: failure.issued_session.map(|session_id| IssuedSession {
+                session_id,
+                endpoint: dialed.get().cloned(),
+            }),
+        })?;
         Ok(BackendInit {
             protocol_version: init.protocol_version,
             session_id: init.session_id,
@@ -251,6 +293,24 @@ impl McpBackendClient for FilteredMcpBackendClient {
         Box::pin(
             self.client
                 .terminate(target.path, stage, callout, &session_init(session)),
+        )
+        .await
+        .map_err(McpBackendError::from)
+    }
+
+    async fn terminate_issued(
+        &self,
+        target: BackendTarget<'_>,
+        session: &IssuedSession,
+        callout: &BackendCallout,
+    ) -> Result<(), McpBackendError> {
+        let stage = Arc::new(BrokerBackendCluster::new(
+            Arc::clone(target.cluster),
+            session.endpoint.clone(),
+        ));
+        Box::pin(
+            self.client
+                .terminate_issued(target.path, stage, callout, &session.session_id),
         )
         .await
         .map_err(McpBackendError::from)

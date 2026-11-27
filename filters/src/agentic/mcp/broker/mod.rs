@@ -67,8 +67,8 @@ use tracing::{debug, trace, warn};
 pub use self::selector::McpBrokerBackendSelectorFilter;
 use self::{
     backend::{
-        BackendCallout, BackendInit, BackendTarget, FilteredMcpBackendClient, MCP_PROTOCOL_VERSION, MCP_SESSION_ID,
-        McpBackendClient, McpBackendError,
+        BackendCallout, BackendInit, BackendTarget, FilteredMcpBackendClient, IssuedSession, MCP_PROTOCOL_VERSION,
+        MCP_SESSION_ID, McpBackendClient, McpBackendError,
     },
     config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
     gateway::GatewaySessions,
@@ -1233,14 +1233,23 @@ impl BackendSessions {
     ///
     /// A backend that answers `initialize` with a version outside
     /// `supported_versions` is never confirmed: its session is terminated and
-    /// no call is forwarded.
+    /// no call is forwarded. A session the backend issued in an `initialize`
+    /// that then failed is terminated too.
     async fn handshake(
         &self,
         target: BackendTarget<'_>,
         protocol_version: &str,
         callout: &BackendCallout,
     ) -> Result<BackendInit, McpBackendError> {
-        let init = self.client.initialize(target, protocol_version, callout).await?;
+        let init = match self.client.initialize(target, protocol_version, callout).await {
+            Ok(init) => init,
+            Err(failure) => {
+                if let Some(issued) = failure.issued.as_ref() {
+                    self.abandon_issued(target, issued, callout).await;
+                }
+                return Err(failure.error);
+            },
+        };
         if !self
             .supported_versions
             .iter()
@@ -1263,6 +1272,15 @@ impl BackendSessions {
     async fn abandon(&self, target: BackendTarget<'_>, init: &BackendInit, callout: &BackendCallout) {
         let cleanup = self.detached_callout(callout, callout.forwarded_headers.clone());
         if let Err(cleanup) = self.client.terminate(target, init, &cleanup).await {
+            debug!(reason = cleanup.reason(), "mcp backend session cleanup failed");
+        }
+    }
+
+    /// Best-effort termination of a session a failed `initialize` left on the
+    /// backend, with a fresh deadline as in [`Self::abandon`].
+    async fn abandon_issued(&self, target: BackendTarget<'_>, issued: &IssuedSession, callout: &BackendCallout) {
+        let cleanup = self.detached_callout(callout, callout.forwarded_headers.clone());
+        if let Err(cleanup) = self.client.terminate_issued(target, issued, &cleanup).await {
             debug!(reason = cleanup.reason(), "mcp backend session cleanup failed");
         }
     }

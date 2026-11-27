@@ -54,7 +54,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 #[cfg(any(test, feature = "openai-mcp-tools"))]
 pub(crate) use self::subrequest_transport::validate_mcp_target;
 pub use self::{
-    session::{McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit},
+    session::{McpInitializeError, McpSessionCallout, McpSessionClient, McpSessionError, McpSessionInit},
     streaming_selector::McpStreamingSelectorFilter,
     subrequest_transport::{McpExchangeStage, McpStreamingRequested},
 };
