@@ -99,6 +99,15 @@ TERMINAL_RESPONSE_EVENTS = {
     "response.failed",
     "response.incomplete",
 }
+WEB_SEARCH_FR = {"type": "web_search", "user_location": {"type": "approximate", "country": "FR"}}
+WEB_SEARCH_PREVIEW_FR = {
+    "type": "web_search_preview",
+    "user_location": {"type": "approximate", "country": "FR"},
+}
+WEB_SEARCH_PREVIEW_DE = {
+    "type": "web_search_preview",
+    "user_location": {"type": "approximate", "country": "DE"},
+}
 
 if VLLM_TEST_BACKEND not in {"live", "simulator"}:
     raise RuntimeError(
@@ -3640,6 +3649,53 @@ class TestOpenAIResponsesVLLM:
         finally:
             BraveSearchHandler.reset()
 
+    @pytest.mark.parametrize("restricted_last", [False, True], ids=["unrestricted-last", "restricted-last"])
+    def test_hosted_web_search_applies_last_tool_filters(self, witness_tool_client, restricted_last):
+        """Only the last web-search tool's ``filters`` apply, as on OpenAI (#2142).
+
+        An earlier tool's ``allowed_domains`` is ignored, so it neither restricts
+        results nor conflicts with a later tool that declares no filters.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Outside Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result outside the allowed domains",
+            }
+        ]
+        restricted = {"type": "web_search", "filters": {"allowed_domains": ["example.com"]}}
+        unrestricted = {"type": "web_search_preview"}
+        tools = [unrestricted, restricted] if restricted_last else [restricted, unrestricted]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-LAST-2142",
+                tools=tools,
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                f"the response should complete: {getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            sources = [s["url"] for s in response.output[0].model_dump()["action"]["sources"]]
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            if restricted_last:
+                assert sources == ["https://example.com/mock"], sources
+                assert "outside.example" not in reentry, "the last tool's allow-list must apply"
+            else:
+                assert sources == ["https://example.com/mock", "https://outside.example/result"], sources
+                assert "outside.example" in reentry, "an earlier tool's allow-list must not apply"
+        finally:
+            BraveSearchHandler.reset()
+
     def test_hosted_web_search_rejects_unenforceable_filters(self, witness_tool_client):
         """Unenforceable web-search ``filters`` fail closed before any round (#1768)."""
         client, forwarded = witness_tool_client
@@ -3671,132 +3727,87 @@ class TestOpenAIResponsesVLLM:
         assert BraveSearchHandler.request_count == 0, "preflight must precede any callout"
         assert forwarded == [], "preflight must precede any inference round"
 
-    def test_hosted_web_search_skips_null_location_for_later_country(
-        self, witness_tool_client,
+    @pytest.mark.parametrize(
+        ("tools", "tool_choice", "expected_country"),
+        [
+            pytest.param([{"type": "web_search"}], None, "US", id="omitted"),
+            pytest.param(
+                [{"type": "web_search", "user_location": None}], None, "US", id="null"
+            ),
+            pytest.param(
+                [{"type": "web_search", "user_location": {"type": "approximate"}}],
+                None,
+                None,
+                id="countryless",
+            ),
+            pytest.param([WEB_SEARCH_FR], None, "FR", id="explicit"),
+            pytest.param(
+                [{"type": "web_search", "user_location": None}, WEB_SEARCH_PREVIEW_FR],
+                None,
+                "FR",
+                id="null-then-fr",
+            ),
+            pytest.param(
+                [WEB_SEARCH_FR, {"type": "web_search_preview", "user_location": None}],
+                None,
+                "US",
+                id="fr-then-null",
+            ),
+            pytest.param(
+                [
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "country": None},
+                    },
+                    WEB_SEARCH_PREVIEW_FR,
+                ],
+                None,
+                "FR",
+                id="null-country-then-fr",
+            ),
+            pytest.param(
+                [WEB_SEARCH_FR, WEB_SEARCH_PREVIEW_DE], None, "DE", id="fr-then-de"
+            ),
+            pytest.param(
+                [WEB_SEARCH_PREVIEW_DE, WEB_SEARCH_FR],
+                {"type": "web_search_preview"},
+                "FR",
+                id="tool-choice-names-earlier-type",
+            ),
+        ],
+    )
+    def test_hosted_web_search_forwards_last_tool_country(
+        self, witness_tool_client, tools, tool_choice, expected_country,
     ):
-        """An earlier ``user_location: null`` must not mask a later country (#1769).
+        """Dispatch forwards the last web-search tool's country, as OpenAI does (#2142).
 
-        Chat Completions translation rejects more than one web-search tool, so
-        this covers the native Responses full-flow path. Dispatch must forward
-        ``FR`` as Brave's ``X-Loc-Country`` header rather than inventing a US
-        default for the unset earlier tool.
+        An omitted or null ``user_location`` means US; a location without a
+        country sends none. Earlier web-search tools and ``tool_choice`` do not
+        affect the selection. Chat Completions translation rejects more than one
+        web-search tool, so this covers the native Responses full-flow path.
         """
         client, forwarded = witness_tool_client
         BraveSearchHandler.reset()
         ResponsesWitnessHandler.tool_round_count = 0
+        extra = {} if tool_choice is None else {"tool_choice": tool_choice}
         try:
             response = client.responses.create(
                 model="sdk-conversation-tool-stream",
-                input="COUNTRY-PICK-NULL-LOCATION-1769",
-                tools=[
-                    {"type": "web_search", "user_location": None},
-                    {
-                        "type": "web_search_preview",
-                        "user_location": {
-                            "type": "approximate",
-                            "country": "FR",
-                        },
-                    },
-                ],
+                input="COUNTRY-PICK-2142",
+                tools=tools,
                 max_tool_calls=1,
                 store=False,
                 extra_headers={"x-user-brave-key": "controlled-test-only"},
+                **extra,
             )
             assert response.status == "completed", (
-                "null-then-FR country pick should complete: "
-                f"{getattr(response, 'error', None)}"
+                f"country pick should complete: {getattr(response, 'error', None)}"
             )
             assert BraveSearchHandler.request_count == 1, (
                 "the dispatcher should issue exactly one provider request"
             )
-            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == "FR", (
-                "first real country must reach Brave as X-Loc-Country; "
-                f"headers={BraveSearchHandler.request_headers[-1]!r}"
-            )
-            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
-        finally:
-            BraveSearchHandler.reset()
-
-    def test_hosted_web_search_skips_null_country_for_later_country(
-        self, witness_tool_client,
-    ):
-        """An earlier ``country: null`` must not mask a later country (#1769)."""
-        client, forwarded = witness_tool_client
-        BraveSearchHandler.reset()
-        ResponsesWitnessHandler.tool_round_count = 0
-        try:
-            response = client.responses.create(
-                model="sdk-conversation-tool-stream",
-                input="COUNTRY-PICK-NULL-COUNTRY-1769",
-                tools=[
-                    {
-                        "type": "web_search",
-                        "user_location": {
-                            "type": "approximate",
-                            "country": None,
-                        },
-                    },
-                    {
-                        "type": "web_search_preview",
-                        "user_location": {
-                            "type": "approximate",
-                            "country": "FR",
-                        },
-                    },
-                ],
-                max_tool_calls=1,
-                store=False,
-                extra_headers={"x-user-brave-key": "controlled-test-only"},
-            )
-            assert response.status == "completed", (
-                "null-country-then-FR pick should complete: "
-                f"{getattr(response, 'error', None)}"
-            )
-            assert BraveSearchHandler.request_count == 1, (
-                "the dispatcher should issue exactly one provider request"
-            )
-            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == "FR", (
-                "first real country must reach Brave as X-Loc-Country; "
-                f"headers={BraveSearchHandler.request_headers[-1]!r}"
-            )
-            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
-        finally:
-            BraveSearchHandler.reset()
-
-    def test_hosted_web_search_omits_country_when_every_location_is_unset(
-        self, witness_tool_client,
-    ):
-        """All-unset locations must leave ``X-Loc-Country`` off the callout (#1769)."""
-        client, forwarded = witness_tool_client
-        BraveSearchHandler.reset()
-        ResponsesWitnessHandler.tool_round_count = 0
-        try:
-            response = client.responses.create(
-                model="sdk-conversation-tool-stream",
-                input="COUNTRY-PICK-ALL-UNSET-1769",
-                tools=[
-                    {"type": "web_search", "user_location": None},
-                    {
-                        "type": "web_search_preview",
-                        "user_location": {
-                            "type": "approximate",
-                            "country": None,
-                        },
-                    },
-                ],
-                max_tool_calls=1,
-                store=False,
-                extra_headers={"x-user-brave-key": "controlled-test-only"},
-            )
-            assert response.status == "completed", (
-                "all-unset country pick should complete: "
-                f"{getattr(response, 'error', None)}"
-            )
-            assert BraveSearchHandler.request_count == 1, (
-                "the dispatcher should issue exactly one provider request"
-            )
-            assert "x-loc-country" not in BraveSearchHandler.request_headers[-1], (
-                "unset locations must not invent a country header; "
+            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == expected_country, (
+                f"expected X-Loc-Country={expected_country!r}; "
                 f"headers={BraveSearchHandler.request_headers[-1]!r}"
             )
             assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"

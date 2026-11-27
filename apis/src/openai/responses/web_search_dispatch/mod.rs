@@ -79,6 +79,10 @@ const MAX_CALLS_METADATA: &str = "responses.web_search_max_calls_per_round";
 /// stream filter, so it can bound a model-streamed item before dispatch runs.
 const MAX_QUERY_METADATA: &str = "responses.web_search_max_query_bytes";
 
+/// Country forwarded when the selected web-search tool omits `user_location` or
+/// sets it to `null`, matching the hosted OpenAI default.
+const DEFAULT_COUNTRY: &str = "US";
+
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 
@@ -166,7 +170,7 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// A client's web-search `filters.allowed_domains` and `filters.blocked_domains`
 /// are enforced by the proxy on every provider result, so a result outside the
 /// allow-list (or under a blocked domain) never reaches the model or
-/// `action.sources`. Malformed, unsupported, or conflicting `filters` are
+/// `action.sources`. Malformed or unsupported `filters` are
 /// rejected with HTTP 400 before the first inference round whenever the
 /// request's `tool_choice` leaves a web-search tool eligible; a request that
 /// forbids every hosted search with `"none"` is not validated because no search
@@ -182,10 +186,21 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// is active a result whose URL is not an absolute `http`/`https` URL with a
 /// verifiable host is dropped. Hosted does not document how the two lists
 /// combine; dispatch applies the allow-list and then removes blocked domains,
-/// so a host matching both is blocked. Requests whose web-search tools declare
-/// different `filters` are rejected because dispatch applies one filter to
-/// every search in the request; hosted behavior for that disagreement is
+/// so a host matching both is blocked.
+///
+/// When a request declares more than one web-search tool, only the last one is
+/// used, whatever its type and regardless of `tool_choice`. Its `user_location`,
+/// `filters`, and `search_context_size` apply to every search in the request;
+/// the same settings on earlier web-search tools are ignored and not validated.
+/// An earlier tool's `allowed_domains` or `blocked_domains` therefore does not
+/// restrict results when a later web-search tool declares different or no
+/// `filters`. This matches observed hosted OpenAI behavior, which is
 /// undocumented.
+///
+/// Only `user_location.country` is forwarded to the provider. An omitted or
+/// `null` `user_location` forwards `US`, the hosted OpenAI default; a location
+/// without a `country`, such as `{"type": "approximate"}`, forwards none.
+/// Tavily accepts no location field, so it never receives a country.
 ///
 /// # YAML
 ///
@@ -485,34 +500,13 @@ impl WebSearchDispatchFilter {
     /// explicitly so a location-sensitive search never runs with location
     /// semantics the caller did not actually get.
     ///
-    /// A request may declare more than one web-search tool (e.g. `web_search`
-    /// alongside `web_search_preview`), so every declared tool's `user_location` is
-    /// inspected: an unsupported field on any of them is rejected. Because dispatch
-    /// forwards a single country, tools that declare *different* countries are also
-    /// rejected — honoring only the first would silently drop the others.
+    /// Only the selected (last) web-search tool is checked; the others are
+    /// ignored, as on hosted OpenAI. See [`selected_web_search_tool`].
     fn preflight_location_support(&self, state: &ResponsesState) -> Result<(), Rejection> {
-        let mut countries: Vec<&str> = Vec::new();
-        for user_location in web_search_user_locations_from_state(state) {
+        if let Some(user_location) = selected_web_search_tool(state).and_then(|tool| tool.get("user_location")) {
             self.reject_unsupported_location_fields(user_location)?;
-            if let Some(country) = user_location
-                .get("country")
-                .and_then(Value::as_str)
-                .filter(|country| !country.is_empty())
-                && !countries.contains(&country)
-            {
-                countries.push(country);
-            }
         }
-        if countries.len() > 1 {
-            return Err(responses_error_rejection_with_code(
-                400,
-                "invalid_request_error",
-                "invalid_value",
-                "web-search tools declare conflicting user_location.country values; \
-                 dispatch forwards a single country, so declare the same country on every tool.",
-            ));
-        }
-        if let Some(country) = countries.first() {
+        if let Some(country) = web_search_country_from_state(state) {
             self.reject_unrepresentable_country(country)?;
         }
         Ok(())
@@ -1320,49 +1314,41 @@ fn status_and_notice(successful: usize, n_queries: usize, query_cap: usize) -> (
     ("completed", None)
 }
 
+/// The web-search tool declaration preflight and dispatch honor: the last one
+/// in `tools`.
+///
+/// Hosted OpenAI keeps only the last web-search tool, whatever its type, and
+/// ignores the others, including their `user_location`, `filters`, and
+/// `search_context_size`. `tool_choice` does not change the selection.
+fn selected_web_search_tool(state: &ResponsesState) -> Option<&Value> {
+    state.tools.iter().rev().find(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    })
+}
+
 /// Recover per-request search context after IRR resets step-local metadata.
 fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
-    state.tools.iter().find_map(|tool| {
-        let tool_type = tool.get("type").and_then(Value::as_str)?;
-        if is_web_search_tool_type(tool_type) {
-            tool.get("search_context_size").and_then(Value::as_str)
-        } else {
-            None
-        }
-    })
+    selected_web_search_tool(state)?
+        .get("search_context_size")
+        .and_then(Value::as_str)
 }
 
-/// Every web-search tool's `user_location` object from request state, in
-/// declaration order.
+/// The ISO `country` code to forward, from the selected web-search tool.
 ///
-/// A request may declare more than one web-search tool, so the round-0 preflight
-/// and outbound country pick inspect them all rather than only the first — an
-/// unsupported field or a conflicting country on a later tool must not slip
-/// past, and an earlier unset location must not hide a later country.
-fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator<Item = &Value> {
-    state.tools.iter().filter_map(|tool| {
-        let tool_type = tool.get("type").and_then(Value::as_str)?;
-        is_web_search_tool_type(tool_type)
-            .then(|| tool.get("user_location"))
-            .flatten()
-    })
-}
-
-/// Extract the supported ISO `country` code to forward from web-search tools.
-///
-/// Only `country` is forwarded to providers; the round-0 preflight already
-/// rejected any unsupported field and any *conflicting* countries, so a value
-/// returned here is known to be provider-supported. Walk every web-search tool
-/// the same way preflight does: a null `user_location`, a missing/null/empty
-/// `country`, or a non-object location is unset and must not hide a later
-/// tool's real country.
+/// An omitted or `null` `user_location` means [`DEFAULT_COUNTRY`], as on hosted
+/// OpenAI. A location with a missing, null, or empty `country` (e.g.
+/// `{"type": "approximate"}`) forwards no country. The round-0 preflight already
+/// rejected a country the provider cannot honor.
 fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
-    web_search_user_locations_from_state(state).find_map(|user_location| {
-        user_location
+    match selected_web_search_tool(state)?.get("user_location") {
+        None | Some(Value::Null) => Some(DEFAULT_COUNTRY),
+        Some(user_location) => user_location
             .get("country")
             .and_then(Value::as_str)
-            .filter(|country| !country.is_empty())
-    })
+            .filter(|country| !country.is_empty()),
+    }
 }
 
 /// Fail closed with a 400 when the initial request declares web-search `filters`
@@ -1371,31 +1357,11 @@ fn preflight_domain_filters(state: &ResponsesState) -> Result<(), Rejection> {
     web_search_domain_filters_from_state(state).map(drop)
 }
 
-/// Resolve the domain filters every declared web-search tool agrees on.
+/// Resolve the selected web-search tool's domain filters.
 ///
-/// A model's `web_search_call` cannot be attributed to one declared tool, so
-/// tools that declare different filters — including one restricted tool next
-/// to an unrestricted one — are rejected rather than silently widened to the
-/// least restrictive declaration (issue #1768).
+/// Filters on other web-search tools are ignored, as on hosted OpenAI.
 fn web_search_domain_filters_from_state(state: &ResponsesState) -> Result<DomainFilters, Rejection> {
-    let mut tools = state.tools.iter().filter(|tool| {
-        tool.get("type")
-            .and_then(Value::as_str)
-            .is_some_and(is_web_search_tool_type)
-    });
-    let Some(first) = tools.next() else {
-        return Ok(DomainFilters::Unrestricted);
-    };
-    let filters = tool_domain_filters(first)?;
-    for tool in tools {
-        if tool_domain_filters(tool)? != filters {
-            return Err(invalid_filters(
-                "web-search tools declare conflicting filters; \
-                 dispatch applies a single domain filter, so declare the same filters on every tool.",
-            ));
-        }
-    }
-    Ok(filters)
+    selected_web_search_tool(state).map_or(Ok(DomainFilters::Unrestricted), tool_domain_filters)
 }
 
 /// Parse one web-search tool's `filters`, rejecting members dispatch cannot enforce.
