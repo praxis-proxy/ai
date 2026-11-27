@@ -4,7 +4,7 @@
 //! Tests for model-to-header filter behavior.
 
 use praxis_core::config::Config;
-use praxis_test_utils::{free_port, http_post, start_backend_with_shutdown, start_proxy};
+use praxis_test_utils::{StatefulCapturingBackend, free_port, http_post, start_backend_with_shutdown, start_proxy};
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -60,6 +60,34 @@ fn model_to_header_continues_without_model_field() {
     let (status, body) = http_post(proxy.addr(), "/v1/chat", r#"{"messages":[]}"#);
     assert_eq!(status, 200, "missing model field should return 200");
     assert_eq!(body, "default-response", "missing model should fall through to default");
+}
+
+#[test]
+fn model_to_header_rejects_repeated_model_before_routing() {
+    let port_a_guard = StatefulCapturingBackend::new(vec![(200, "model-a-response".to_owned())]).start_with_shutdown();
+    let port_a = port_a_guard.port();
+    let port_default_guard =
+        StatefulCapturingBackend::new(vec![(200, "default-response".to_owned())]).start_with_shutdown();
+    let port_default = port_default_guard.port();
+    let proxy_port = free_port();
+    let yaml = make_yaml(proxy_port, "mistral-large-latest", port_a, port_default);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+    for body in [
+        r#"{"model":"unknown","messages":[],"model":"mistral-large-latest"}"#,
+        r#"{"model":"mistral-large-latest","model":"mistral-large-latest"}"#,
+    ] {
+        let (status, _response) = http_post(proxy.addr(), "/v1/chat", body);
+        assert_eq!(status, 400, "a repeated model must be refused: {body}");
+    }
+    assert!(
+        port_a_guard.requests().is_empty(),
+        "the model-a backend must not see an ambiguous model"
+    );
+    assert!(
+        port_default_guard.requests().is_empty(),
+        "the fallback backend must not see an ambiguous model"
+    );
 }
 
 // -----------------------------------------------------------------------------

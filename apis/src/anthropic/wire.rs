@@ -123,6 +123,19 @@ pub(crate) struct MessageResponse<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub(crate) enum ContentBlock<'a> {
+    /// Extended-thinking output.
+    ///
+    /// Surfaces upstream reasoning translated from a Chat Completions
+    /// `reasoning`/`reasoning_content` field. The upstream protocol carries no
+    /// Anthropic signature, so `signature` is empty: the block preserves the
+    /// reasoning the backend produced and billed, but it cannot be replayed to
+    /// a native Anthropic API, whose signature verification would reject it.
+    Thinking {
+        /// Opaque signing payload. Always empty for translated reasoning.
+        signature: &'a str,
+        /// The reasoning text.
+        thinking: &'a str,
+    },
     /// Assistant-generated text.
     Text {
         /// Source citations, when available.
@@ -144,6 +157,17 @@ pub(crate) enum ContentBlock<'a> {
 }
 
 impl<'a> ContentBlock<'a> {
+    /// Create an extended-thinking block from translated upstream reasoning.
+    ///
+    /// The signature is empty: the Chat Completions protocol a translated
+    /// thinking block came from has nothing to sign with.
+    pub(crate) fn thinking(thinking: &'a str) -> Self {
+        Self::Thinking {
+            signature: "",
+            thinking,
+        }
+    }
+
     /// Create an assistant-generated text block.
     pub(crate) fn text(text: &'a str) -> Self {
         Self::Text { citations: None, text }

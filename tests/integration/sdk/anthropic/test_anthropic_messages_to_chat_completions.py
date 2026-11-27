@@ -84,6 +84,8 @@ class RecordingBackend(BaseHTTPRequestHandler):
     matched_stop_stream_once: str | None = None
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
+    reasoning_reply_once = False
+    reasoning_stream_once = False
     fragmented_stream_once = False
     error_response_once = False
     named_tool_finish_gate = threading.Event()
@@ -141,6 +143,9 @@ class RecordingBackend(BaseHTTPRequestHandler):
             elif RecordingBackend.many_tool_calls_stream_once:
                 RecordingBackend.many_tool_calls_stream_once = False
                 self._send_many_tool_calls_stream()
+            elif RecordingBackend.reasoning_stream_once:
+                RecordingBackend.reasoning_stream_once = False
+                self._send_reasoning_stream()
             else:
                 self._send_invalid_tool_id_stream()
             return
@@ -171,6 +176,9 @@ class RecordingBackend(BaseHTTPRequestHandler):
                 choice["finish_reason"] = "content_filter"
             else:
                 choice["message"]["refusal"] = "blocked"
+        if RecordingBackend.reasoning_reply_once:
+            RecordingBackend.reasoning_reply_once = False
+            choice["message"]["reasoning_content"] = "thinking it through"
         if body.get("stop"):
             # vLLM reports the matched stop string in a choice-level
             # `stop_reason`; pretend the first sequence was generated.
@@ -190,6 +198,36 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(reply)))
         self.end_headers()
         self.wfile.write(reply)
+
+    def _send_reasoning_stream(self):
+        outcomes = [
+            ({"role": "assistant"}, None),
+            ({"reasoning_content": "thinking it through"}, None),
+            ({"content": "4"}, None),
+            ({}, "stop"),
+        ]
+        chunks = []
+        for delta, finish_reason in outcomes:
+            chunk = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+            }
+            chunks.append(f"data: {json.dumps(chunk)}\n\n")
+        chunks.append("data: [DONE]\n\n")
+        wire = "".join(chunks).encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
 
     def _send_invalid_tool_id_stream(self):
         valid_prefix = {
@@ -1271,6 +1309,44 @@ class TestRequestFieldHandling:
 
         assert response.stop_reason == "end_turn"
         assert response.stop_sequence is None
+
+    def test_upstream_reasoning_surfaces_as_a_thinking_block(self, anthropic_client):
+        """Finite reasoning_content is surfaced, never silently dropped (#2047)."""
+        RecordingBackend.reasoning_reply_once = True
+        try:
+            message = anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+        finally:
+            RecordingBackend.reasoning_reply_once = False
+
+        assert [block.type for block in message.content] == ["thinking", "text"]
+        thinking = message.content[0]
+        assert thinking.thinking == "thinking it through"
+        assert thinking.signature == "", "translated reasoning carries no signature"
+        assert message.content[1].text == "4"
+
+    def test_upstream_streaming_reasoning_surfaces_as_a_thinking_block(
+        self, anthropic_client
+    ):
+        """Streaming reasoning_content is surfaced, never silently dropped (#2047)."""
+        RecordingBackend.reasoning_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=8192,
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            ) as stream:
+                message = stream.get_final_message()
+        finally:
+            RecordingBackend.reasoning_stream_once = False
+
+        assert [block.type for block in message.content] == ["thinking", "text"]
+        assert message.content[0].thinking == "thinking it through"
+        assert message.content[1].text == "4"
+        assert message.stop_reason == "end_turn"
 
     def test_chat_completions_field_whose_output_is_discarded_is_rejected(
         self, anthropic_client

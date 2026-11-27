@@ -340,15 +340,20 @@ surfaces:
           counter, so cache-write billing is invisible.
         evidence: apis/src/anthropic/wire.rs:200-214; apis/src/anthropic/messages_to_chat_completions/response.rs:285-309; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1022-1042
       reasoning-content:
-        status: dropped
+        status: translated-lossy
         note: >-
-          Upstream message.reasoning_content is never read on either path, so
-          billed reasoning output vanishes. A non-null finite `refusal` is read
-          and refused (the upstream success is rejected with 500); a non-null
-          streaming delta.refusal emits a terminal Anthropic error instead of
-          being silently dropped.
-        blocker: https://github.com/praxis-proxy/ai/issues/2047
-        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:178-184; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:714-735; apis/src/anthropic/messages_to_chat_completions/response.rs:113-121; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:624-645
+          Upstream message reasoning (the vLLM `reasoning` field, falling back
+          to the deprecated `reasoning_content` alias) is surfaced as a leading
+          Anthropic thinking block on both the finite and the streaming path,
+          so billed reasoning output no longer vanishes. Lossy because the
+          Chat Completions protocol carries no Anthropic signature: the
+          translated block's signature is empty and cannot be replayed to a
+          native Anthropic API. A non-string reasoning field is rejected on
+          the finite path. A non-null finite `refusal` is read and refused
+          (the upstream success is rejected with 500); a non-null streaming
+          delta.refusal emits a terminal Anthropic error instead of being
+          silently dropped.
+        evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:110-121; apis/src/anthropic/messages_to_chat_completions/response.rs:186-209; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:806-830; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1160-1240
       request-reasoning-cache-controls:
         status: rejected
         note: >-
