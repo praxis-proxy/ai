@@ -319,8 +319,8 @@
           "feature": "usage-accounting",
           "label": "Token usage accounting",
           "status": "translated-lossy",
-          "note": "A prompt token count delivered before content generation begins is passed through to message_start with the same non-cached semantics as the terminal delta. When the upstream withholds usage until the final chunk (OpenAI, vLLM), message_start reports 0 because the pinned Anthropic schema requires non-nullable integer token counts; the final message_delta reports complete usage.",
-          "evidence": "apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:679-684; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1124-1143",
+          "note": "A prompt token count present in the first upstream JSON chunk is passed through to message_start with the same non-cached semantics as the terminal delta. Usage arriving in later chunks, even before the first text delta, is reported only in the final message_delta because the opening event has already been emitted. When the upstream withholds usage until the final chunk (OpenAI, vLLM), message_start reports 0 because the pinned Anthropic schema requires non-nullable integer token counts.",
+          "evidence": "apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:679-685; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1127-1143",
           "blocker": null
         },
         {

@@ -12,7 +12,7 @@
     "version": 1,
     "linked_ids": {
       "chatcmpl-controlled-0001": "chatcmpl-recorded-0002",
-      "msg_18eba0c550ba57e4": "msg_recorded_0001"
+      "msg_18ebea14fe86ce87": "msg_recorded_0001"
     }
   },
   "turns": [
@@ -132,7 +132,7 @@
             "frames": [
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-first-chunk-usage-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":5}}}",
+                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-first-chunk-usage-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":5},\"total_tokens\":13}}",
                 "id": null,
                 "retry": null
               },

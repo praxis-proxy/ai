@@ -679,7 +679,7 @@ fn transform_chunk(
     let started = matches!(state.progress, StreamProgress::Started);
 
     // Retain usage before emitting `message_start` so a prompt token count
-    // delivered before content generation begins reaches the opening event.
+    // carried by the first upstream chunk reaches the opening event.
     extract_usage_tokens(state, chunk);
 
     if !started {
@@ -1127,11 +1127,12 @@ fn collect_delta_usage(state: &StreamState) -> MessageDeltaUsage {
 ///
 /// The pinned Anthropic schema requires `input_tokens` and `output_tokens` as
 /// non-nullable integers, so an unknown count has no representation other than
-/// `0`. When the upstream delivers a prompt token count before content
-/// generation begins, it is reported here — with the same non-cached semantics
-/// as the terminal delta — instead of asserting a false zero. `output_tokens`
-/// stays `0`: the authoritative output count arrives in the final
-/// `message_delta` usage.
+/// `0`. A prompt token count carried by the first upstream chunk is reported
+/// here — with the same non-cached semantics as the terminal delta — instead
+/// of asserting a false zero; usage arriving in later chunks, even before the
+/// first text delta, can only surface in the final `message_delta` because the
+/// opening event has already been emitted. `output_tokens` stays `0`: the
+/// authoritative output count arrives in the final `message_delta` usage.
 fn message_start_usage(state: &StreamState) -> MessageUsage {
     let input_tokens = state.input_tokens.map(|pt| match state.cache_read_tokens {
         Some(cached) => pt.saturating_sub(cached),
@@ -1643,7 +1644,7 @@ mod tests {
     fn message_start_reports_usage_from_first_chunk() {
         let (filter, mut ctx) = make_filter_and_context();
 
-        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n";
+        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":0,\"total_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n";
         let mut body = Some(Bytes::from(chunk));
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
 
@@ -1695,6 +1696,36 @@ mod tests {
         let usage = event.get("usage").unwrap();
         assert_u64_field(usage, "input_tokens", 14, "message_delta usage");
         assert_u64_field(usage, "output_tokens", 2, "message_delta usage");
+    }
+
+    #[test]
+    fn usage_after_first_chunk_waits_for_message_delta() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        // A role-only first chunk emits `message_start` immediately; prompt
+        // usage arriving in a later chunk — even before the first text delta —
+        // can only surface in the final `message_delta`.
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let out1 = String::from_utf8(body1.unwrap().to_vec()).unwrap();
+        let start = event_data(&out1, "message_start");
+        let start_usage = start.pointer("/message/usage").unwrap();
+        assert_u64_field(start_usage, "input_tokens", 0, "message_start usage");
+
+        let chunk2 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":0,\"total_tokens\":13}}\n\n";
+        let mut body2 = Some(Bytes::from(chunk2));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body3 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let out3 = String::from_utf8(body3.unwrap().to_vec()).unwrap();
+        let delta = event_data(&out3, "message_delta");
+        let delta_usage = delta.get("usage").unwrap();
+        assert_u64_field(delta_usage, "input_tokens", 13, "message_delta usage");
     }
 
     #[test]

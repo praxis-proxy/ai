@@ -1,6 +1,6 @@
 version: 1
 id: messages/first-chunk-usage-stream
-description: A prompt token count delivered before content generation begins is reported in message_start usage.
+description: Prompt usage carried by the first upstream JSON chunk is reported in message_start; later chunks report through the final message_delta.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000

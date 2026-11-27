@@ -2181,7 +2181,7 @@ mod tests {
         assert_scenario(
             &first_chunk_usage,
             "messages/first-chunk-usage-stream",
-            "A prompt token count delivered before content generation begins is reported in message_start usage.",
+            "Prompt usage carried by the first upstream JSON chunk is reported in message_start; later chunks report through the final message_delta.",
             &["messages.streaming.usage_first_chunk"],
             "Say hello in one sentence.",
             true,
