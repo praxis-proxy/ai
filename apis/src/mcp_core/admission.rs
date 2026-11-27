@@ -13,7 +13,7 @@
 //! JSON. Client fields, tool descriptions, annotations, labels, or a matching
 //! URL can neither grant nor broaden the configured policy.
 //!
-//! The verdicts are recorded in [`McpAdmissionDecisions`], a request-scoped
+//! The verdicts are recorded in `McpAdmissionDecisions`, a request-scoped
 //! snapshot held in `ResponsesState`. Because the resolver re-runs on every
 //! request (fresh, cached, or restored) and extends the decisions through
 //! deferred discovery and IRR re-entry, the applicable policy and target are
