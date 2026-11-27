@@ -174,7 +174,10 @@ pub(crate) fn is_chat_completions_create(method: &http::Method, path: &str) -> b
 /// Returns [`DuplicateModel`] when the body repeats its top-level `model`,
 /// which leaves the routing model ambiguous. Every other unclassifiable body
 /// is reported through the returned format instead.
-pub(crate) fn classify_request_body(body: &[u8], format: Option<AiRequestFormat>) -> Result<ClassifiedRequest, DuplicateModel> {
+pub(crate) fn classify_request_body(
+    body: &[u8],
+    format: Option<AiRequestFormat>,
+) -> Result<ClassifiedRequest, DuplicateModel> {
     if body.is_empty() {
         return Ok(empty_result(AiRequestFormat::NonJson));
     }
@@ -562,7 +565,10 @@ mod tests {
     #[test]
     fn the_owned_path_moves_the_model_out_of_its_throwaway_parse() {
         let body = br#"{"model":"gpt-4.1","input":"hi"}"#;
-        assert_eq!(classify_request_body(body, None).unwrap().model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().model.as_deref(),
+            Some("gpt-4.1")
+        );
     }
 
     #[cfg(feature = "openai-responses")]
@@ -583,10 +589,6 @@ mod tests {
         );
     }
     use super::*;
-
-    fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
-        super::classify_request_body(body, None)
-    }
 
     #[test]
     fn responses_string_input() {
@@ -1274,14 +1276,20 @@ mod tests {
     fn chat_image_url_sets_image_modality() {
         let body = br#"{"model":"gpt-4.1","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
     }
 
     #[test]
     fn chat_image_and_audio_set_combined_modality() {
         let body = br#"{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}]}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::ImageAudio));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::ImageAudio)
+        );
     }
 
     #[test]
@@ -1289,21 +1297,30 @@ mod tests {
         let body =
             br#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"input_image","file_id":"file_123"}]}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
     }
 
     #[test]
     fn anthropic_base64_image_sets_image_modality() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
     }
 
     #[test]
     fn responses_computer_screenshot_sets_image_modality() {
         let body = br#"{"input":[{"type":"computer_call_output","call_id":"call_123","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,AAAA"}}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
     }
 
     #[test]
@@ -1311,7 +1328,10 @@ mod tests {
         let image =
             br#"{"prompt":{"id":"pmpt_123","variables":{"picture":{"type":"input_image","file_id":"file_123"}}}}"#;
         let text = br#"{"prompt":{"id":"pmpt_123","variables":{"picture":"data:image/png;base64,AAAA"}}}"#;
-        assert_eq!(classify_request_body(image, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(image, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
         assert_eq!(classify_request_body(text, None).unwrap().modality, None);
     }
 
@@ -1319,7 +1339,10 @@ mod tests {
     fn anthropic_detects_images_in_successful_web_fetch_results() {
         let image = br#"{"max_tokens":128,"messages":[{"content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}}}}]}]}"#;
         let text = br#"{"max_tokens":128,"messages":[{"content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"content","content":[{"type":"text","text":"data:image/png;base64,AAAA"}]}}}}]}]}"#;
-        assert_eq!(classify_request_body(image, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(image, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
         assert_eq!(classify_request_body(text, None).unwrap().modality, None);
     }
 
@@ -1328,7 +1351,10 @@ mod tests {
         let body = br#"{"input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"file_123"}}]}"#;
         let missing =
             br#"{"input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":""}}]}"#;
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
         assert_eq!(classify_request_body(missing, None).unwrap().modality, None);
     }
 
@@ -1337,7 +1363,10 @@ mod tests {
         let body =
             br#"{"input":[{"type":"custom_tool_call_output","output":[{"type":"input_image","file_id":"file_123"}]}]}"#;
         let text = br#"{"input":[{"type":"custom_tool_call_output","output":"data:image/png;base64,AAAA"}]}"#;
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
         assert_eq!(classify_request_body(text, None).unwrap().modality, None);
     }
 
@@ -1345,7 +1374,10 @@ mod tests {
     fn anthropic_document_only_detects_images_in_content_sources() {
         let image = br#"{"max_tokens":128,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}}]}]}"#;
         let text = br#"{"max_tokens":128,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"text","text":"data:image/png;base64,AAAA"}]}}]}]}"#;
-        assert_eq!(classify_request_body(image, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(image, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
         assert_eq!(classify_request_body(text, None).unwrap().modality, None);
     }
 
@@ -1353,14 +1385,20 @@ mod tests {
     fn responses_function_output_image_sets_image_modality() {
         let body = br#"{"input":[{"type":"function_call_output","call_id":"call_123","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
     }
 
     #[test]
     fn anthropic_tool_result_image_sets_image_modality() {
         let body = br#"{"max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"text","text":"result"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}"#;
 
-        assert_eq!(classify_request_body(body, None).unwrap().modality, Some(ContentModality::Image));
+        assert_eq!(
+            classify_request_body(body, None).unwrap().modality,
+            Some(ContentModality::Image)
+        );
     }
 
     #[test]
@@ -1391,7 +1429,11 @@ mod tests {
             r#"{"messages":[{"content":[{"type":"input_image","file_id":"file_123"}]}]}"#,
             r#"{"input":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#,
         ] {
-            assert_eq!(classify_request_body(body.as_bytes(), None).unwrap().modality, None, "{body}");
+            assert_eq!(
+                classify_request_body(body.as_bytes(), None).unwrap().modality,
+                None,
+                "{body}"
+            );
         }
     }
 
