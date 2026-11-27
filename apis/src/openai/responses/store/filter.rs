@@ -77,7 +77,10 @@ use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     json_body::MAX_JSON_BODY_BYTES,
-    openai::include::{IncludeFields, decode_query_component_strict, parse_include},
+    openai::{
+        include::{IncludeFields, parse_include},
+        query::decode_query_component_strict,
+    },
     service::responses::{
         InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, StoredOutputPlan, build_record, list_input_items,
     },

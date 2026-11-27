@@ -24,7 +24,10 @@ use super::{
     validate::{MetadataError, validate_metadata},
 };
 use crate::{
-    openai::include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
+    openai::{
+        include::{IncludeFields, parse_include, project_item},
+        query::decode_query_component_strict,
+    },
     service::{
         conversations::{build_item_records, duplicate_item_id, normalize_legacy_mcp_error, validate_item_count},
         responses::{MAX_PAGE_LIMIT, input_items::DEFAULT_PAGE_LIMIT},

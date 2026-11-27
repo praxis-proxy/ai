@@ -11,7 +11,7 @@ use serde::{Deserialize as _, Serialize};
 use serde_json::{Map, Value};
 
 use super::{FileServiceError, contracts::ListFilesQuery};
-use crate::openai::{error::ErrorResponse, include::decode_query_component_strict};
+use crate::openai::{error::ErrorResponse, query::decode_query_component_strict};
 
 /// A rejected query parameter.
 #[derive(Debug, Eq, PartialEq)]

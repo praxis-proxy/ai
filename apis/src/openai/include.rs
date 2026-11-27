@@ -16,11 +16,10 @@
 //! Parsing and projection therefore live here once rather than being
 //! duplicated per endpoint module.
 
-use std::borrow::Cow;
-
-use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::openai::query::decode_query_component_strict;
 
 /// The spellings match OpenAI's `IncludeEnum` exactly. Runtime query parsing
 /// and generated `OpenAPI` both consume this enum.
@@ -136,20 +135,6 @@ pub(crate) fn parse_include(query: Option<&str>) -> Result<IncludeFields, String
         includes.insert(field);
     }
     Ok(includes)
-}
-
-/// Strictly decode one query component, including form-style `+` spaces.
-pub(crate) fn decode_query_component_strict(value: &str) -> Result<Cow<'_, str>, String> {
-    if value.contains('+') {
-        let normalized = value.replace('+', " ");
-        return percent_decode_str(&normalized)
-            .decode_utf8()
-            .map(|decoded| Cow::Owned(decoded.into_owned()))
-            .map_err(|e| format!("query parameter must be valid UTF-8: {e}"));
-    }
-    percent_decode_str(value)
-        .decode_utf8()
-        .map_err(|e| format!("query parameter must be valid UTF-8: {e}"))
 }
 
 /// Remove optional fields that were not requested through `include`.
