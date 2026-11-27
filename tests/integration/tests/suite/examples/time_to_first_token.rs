@@ -79,6 +79,37 @@ fn example_config_time_to_first_token_chat_completions_passthrough() {
 }
 
 #[test]
+fn example_config_time_to_first_token_rejects_repeated_chat_model() {
+    // The chat model fact can drive branch routing, so a body that repeats its
+    // top-level model is refused instead of publishing one of the occurrences.
+    let backend = Backend::fixed(JSON_BODY)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "time-to-first-token.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"model":"gpt-4o"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "a repeated model must be refused");
+    let error: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        error["error"]["type"], "invalid_request_error",
+        "the refusal uses the OpenAI error shape"
+    );
+}
+
+#[test]
 fn example_config_time_to_first_token_json_passthrough() {
     let backend = Backend::fixed(JSON_BODY)
         .header("content-type", "application/json")

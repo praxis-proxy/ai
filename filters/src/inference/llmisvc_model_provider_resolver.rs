@@ -72,7 +72,9 @@ fn default_header() -> String {
 /// modified -- `KServe` routes on the publisher ID.
 ///
 /// If the header is absent/empty, or the body has no `"model"` field,
-/// this filter is a no-op (it does not invent a body `"model"`).
+/// this filter is a no-op (it does not invent a body `"model"`). It relies on
+/// the earlier `model_to_header` to refuse a body that repeats its top-level
+/// `"model"`, so it rewrites a single, unambiguous field.
 ///
 /// Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform
 /// weighted provider selection, rewrite `Host`, or inject credentials.

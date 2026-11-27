@@ -9,6 +9,8 @@ Promotes the JSON `"model"` field from the request body to a request header.
 
 The promoted value is also published to `model_to_header.model` metadata for downstream consumers (e.g. the `llm_metrics` model label), so those readers use the server-validated value instead of a client-supplied request header.
 
+A body whose top-level `model` occurs more than once, including identical repeats, is refused with HTTP 400 before anything is promoted. The delegated core extractor keeps the last occurrence, while a backend reading the forwarded bytes could honor another.
+
 Promotion is deferred until end-of-stream so a later body-writing filter (for example `llmisvc_model_provider_resolver`) can observe the pending header in the same `StreamBuffer` pre-read pass.
 
 Body inspection inherits the pipeline's `body_limits.max_buffer_bytes` and `body_limits.max_request_bytes`; the smaller bound applies. To accept requests above the default 10 MiB request limit, raise `max_request_bytes` and ensure `max_buffer_bytes` is at least as large (its default is 64 MiB). These bounds govern the shared pipeline buffer even when another filter declares a smaller buffer. Filters can still enforce separate validation limits while processing the body.

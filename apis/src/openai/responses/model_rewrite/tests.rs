@@ -649,6 +649,59 @@ async fn non_object_json_reject_returns_400() {
     );
 }
 
+#[tokio::test]
+async fn repeated_top_level_model_is_rejected_under_every_on_invalid() {
+    for (config, path) in [
+        (ALIAS_CONFIG, "/v1/responses"),
+        (REJECT_CONFIG, "/v1/responses"),
+        (DEFAULT_CONFIG, "/v1/chat/completions"),
+    ] {
+        for raw in [
+            r#"{"model":"codex-mini-latest","input":"hi","model":"gpt-4o"}"#,
+            r#"{"model":"codex-mini-latest","model":"codex-mini-latest"}"#,
+        ] {
+            let filter = make_filter(config);
+            let req: &'static praxis_filter::Request =
+                Box::leak(Box::new(crate::test_utils::make_request(http::Method::POST, path)));
+            let mut ctx = crate::test_utils::make_filter_context(req);
+            let original = Bytes::from_static(raw.as_bytes());
+            let mut body = Some(original.clone());
+
+            let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+            let FilterAction::Reject(rejection) = action else {
+                panic!("{path}: repeated model must be refused: {raw}");
+            };
+            assert_eq!(rejection.status, 400, "{path}: client error");
+            assert_eq!(body, Some(original), "{path}: a refused body is not rewritten");
+            assert!(
+                ctx.filter_metadata.is_empty(),
+                "{path}: no rewrite fact is promoted: {:?}",
+                ctx.filter_metadata
+            );
+            assert!(
+                ctx.extra_request_headers.is_empty(),
+                "{path}: no routing header is promoted"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn nested_model_keys_do_not_block_the_rewrite() {
+    let (_, body) = run_filter_with_body(
+        ALIAS_CONFIG,
+        r#"{"model":"codex-mini-latest","input":[{"role":"user","content":"hi","model":"codex-mini-latest"}]}"#,
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["model"], "llama-3.3-70b", "top-level model is rewritten");
+    assert_eq!(
+        value["input"][0]["model"], "codex-mini-latest",
+        "nested model is untouched"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Body Processing — Mutation
 // -----------------------------------------------------------------------------

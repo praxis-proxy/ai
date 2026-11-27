@@ -61,7 +61,8 @@ endif
 .PHONY: all build release check clean \
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
 	test-schema test-integration test-integration-core test-integration-experimental \
-	test-inference-fixtures test-inference-fixtures-core test-inference-xtask bench-model-to-provider \
+	test-inference-fixtures test-inference-fixtures-core test-inference-xtask \
+	bench-model-to-provider bench-model-to-header \
 	test-anthropic-sdk test-anthropic-sdk-v1 test-anthropic-sdk-v2 \
 	test-store-features test-store-features-check test-store-features-clippy \
 	test-store-features-clippy-group test-store-features-test print-store-clippy-groups \
@@ -157,6 +158,11 @@ test-unit-filters:
 bench-model-to-provider:
 	cargo test --locked --release -p praxis-ai-filters --lib \
 		inference::model_to_provider::tests::mapping_latency_microbenchmark \
+		-- --ignored --exact --nocapture
+
+bench-model-to-header:
+	cargo test --locked --release -p praxis-ai-filters --lib \
+		inference::model_to_header::tests::duplicate_model_scan_latency_microbenchmark \
 		-- --ignored --exact --nocapture
 
 test-unit-proxy:
@@ -1054,6 +1060,7 @@ help:
 	@echo "  test-anthropic-sdk-v1    Anthropic SDK 1.17.0 Messages compatibility lane"
 	@echo "  test-anthropic-sdk-v2    Anthropic SDK 2.3.0 Messages compatibility lane"
 	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
+	@echo "  bench-model-to-header    optimized duplicate-model scan and promotion timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  test-s3-file-store       S3 unit tests and live RustFS FileStore E2E (needs Docker/Podman and AWS CLI)"

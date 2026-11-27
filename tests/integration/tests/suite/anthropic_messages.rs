@@ -514,6 +514,33 @@ fn backend_owned_empty_messages_reaches_backend() {
 }
 
 #[test]
+fn repeated_model_is_refused_with_anthropic_error() {
+    let backend = start_backend_with_shutdown("backend-owned");
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&passthrough_yaml(proxy_port, backend.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_post(
+            "/v1/messages",
+            r#"{"model":"mock-model","messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"model":"other-model"}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "a repeated model is refused even under the default on_invalid: continue"
+    );
+    let body = parse_body(&raw);
+    assert_ne!(body, "backend-owned", "the request must not reach the backend");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error", "the refusal uses the Anthropic error envelope");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+}
+
+#[test]
 fn response_headers() {
     let recording = Recording::load("anthropic/messages/response_headers.json");
     let response_body = recording.response_body();
