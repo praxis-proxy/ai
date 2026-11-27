@@ -1,8 +1,6 @@
 name: OIDC smoke
 
 on:
-  push:
-    branches: [test-oidc]
   workflow_dispatch:
 
 permissions:
@@ -14,15 +12,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  smoke:
+  vertex:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: providers-live
     steps:
-      # ------------------------------------------------------------------
-      # GCP / Vertex AI
-      # ------------------------------------------------------------------
-
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
@@ -33,24 +28,42 @@ jobs:
         env:
           VERTEX_AI_PROJECT: ${{ secrets.VERTEX_AI_PROJECT }}
           VERTEX_AI_LOCATION: us-central1
-          # Matches the model used by the fake-backend SDK tests
-          # (tests/integration/sdk/openai/test_vertex_gemini_chat_completions.py).
-          GEMINI_MODEL: gemini-2.0-flash
+          GEMINI_MODEL: ${{ vars.VERTEX_GEMINI_MODEL || 'gemini-2.0-flash' }}
         run: |
           set -euo pipefail
           token=$(gcloud auth application-default print-access-token)
           echo "::add-mask::$token"
-          response=$(curl -sS -f \
-            -H "Authorization: Bearer $token" \
-            -H "Content-Type: application/json" \
-            "https://aiplatform.googleapis.com/v1/projects/${VERTEX_AI_PROJECT}/locations/${VERTEX_AI_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent" \
-            -d '{"contents":[{"parts":[{"text":"Reply with the single word: ok"}]}]}')
-          echo "$response" | jq '{model, text: .candidates[0].content.parts[0].text}'
+          : "${VERTEX_AI_PROJECT:?Missing Vertex project}"
+          : "${VERTEX_AI_LOCATION:?Missing Vertex location}"
+          : "${GEMINI_MODEL:?Missing Vertex model}"
+          response=$(mktemp)
+          trap 'rm -- "$response"' EXIT
+          status=$(printf 'Authorization: Bearer %s\n' "$token" |
+            curl --silent --max-time 60 --header @- \
+              --header "Content-Type: application/json" \
+              --output "$response" --write-out '%{http_code}' \
+              "https://aiplatform.googleapis.com/v1/projects/${VERTEX_AI_PROJECT}/locations/${VERTEX_AI_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent" \
+              --data '{"contents":[{"parts":[{"text":"Reply with the single word: ok"}]}],"generationConfig":{"maxOutputTokens":64}}') ||
+            { echo "::error::Vertex request failed before an HTTP response."; exit 1; }
+          echo "Vertex AI HTTP $status"
+          if [[ "$status" != 200 ]]; then
+            code=$(jq -r '.error.status' "$response" 2>/dev/null) || code=
+            case "$code" in
+              NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED|INVALID_ARGUMENT|RESOURCE_EXHAUSTED|FAILED_PRECONDITION|UNAVAILABLE) ;;
+              *) code=unavailable ;;
+            esac
+            echo "::error::Vertex AI request failed ($code)."
+            exit 1
+          fi
+          jq -e 'any(.candidates[]?.content.parts[]?; (.text | type == "string" and length > 0))' "$response" >/dev/null 2>&1 ||
+            { echo "::error::Vertex AI returned no candidate text."; exit 1; }
 
-      # ------------------------------------------------------------------
-      # Azure
-      # ------------------------------------------------------------------
-
+  azure:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: providers-live
+    steps:
       - name: Authenticate to Azure
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
@@ -64,17 +77,31 @@ jobs:
           AZURE_OPENAI_RESOURCE_GROUP: ${{ secrets.AZURE_OPENAI_RESOURCE_GROUP }}
         run: |
           set -euo pipefail
-          # identity -> az CLI -> short-lived account key, masked. The v1
-          # API takes the deployment name as "model" in the body
-          # (https://<resource>.openai.azure.com/openai/v1).
+          : "${AZURE_OPENAI_RESOURCE:?Missing Azure resource}"
+          : "${AZURE_OPENAI_RESOURCE_GROUP:?Missing Azure resource group}"
           key=$(az cognitiveservices account keys list \
             --name "$AZURE_OPENAI_RESOURCE" \
-            --resource-group "$AZURE_OPENAI_RESOURCE_GROUP" \
-            --query key1 -o tsv)
+            --resource-group "$AZURE_OPENAI_RESOURCE_GROUP" --query key1 -o tsv)
+          : "${key:?Azure returned no account key}"
           echo "::add-mask::$key"
-          response=$(curl -sS -f \
-            -H "api-key: $key" \
-            -H "Content-Type: application/json" \
-            "https://${AZURE_OPENAI_RESOURCE}.openai.azure.com/openai/v1/chat/completions" \
-            -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Reply with the single word: ok"}]}')
-          echo "$response" | jq '{model: .model, text: .choices[0].message.content}'
+          response=$(mktemp)
+          trap 'rm -- "$response"' EXIT
+          status=$(printf 'api-key: %s\n' "$key" |
+            curl --silent --max-time 60 --header @- \
+              --header "Content-Type: application/json" \
+              --output "$response" --write-out '%{http_code}' \
+              "https://${AZURE_OPENAI_RESOURCE}.openai.azure.com/openai/v1/chat/completions" \
+              --data '{"model":"gpt-4o","messages":[{"role":"user","content":"Reply with the single word: ok"}],"max_completion_tokens":64}') ||
+            { echo "::error::Azure request failed before an HTTP response."; exit 1; }
+          echo "Azure OpenAI HTTP $status"
+          if [[ "$status" != 200 ]]; then
+            code=$(jq -r '.error.code' "$response" 2>/dev/null) || code=
+            case "$code" in
+              DeploymentNotFound|ResourceNotFound|Unauthorized|Forbidden|InvalidRequest|BadRequest|TooManyRequests|content_filter) ;;
+              *) code=unavailable ;;
+            esac
+            echo "::error::Azure OpenAI request failed ($code)."
+            exit 1
+          fi
+          jq -e 'any(.choices[]?; (.message.content | type == "string" and length > 0))' "$response" >/dev/null 2>&1 ||
+            { echo "::error::Azure OpenAI returned no assistant text."; exit 1; }
