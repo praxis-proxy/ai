@@ -157,6 +157,9 @@ unaffected. Each failure is logged and counted in
 `praxis_ai_mcp_broker_discovery_failures_total{server, reason}`. The cache
 holds at most `discovery.max_entries` listings, evicting the least recently
 read, and drops a listing no request has read for `discovery.idle_timeout_ms`.
+Each new credential is a new caller, so a client that rotates tokens can fill
+the cache: size `max_entries` with the 4 MiB per-listing bound in mind, as
+`backend_sessions.max_sessions` bounds the sessions those callers open.
 It is per filter instance, so a reload starts empty. Refresh on
 `notifications/tools/list_changed` and dropping tools of unhealthy servers are
 tracked in #2191.
