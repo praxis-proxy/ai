@@ -514,6 +514,16 @@ pub(crate) struct ResponsesState {
     /// the edited item, leaving this view pointing at the original payload.
     pub input: MessageHistory,
 
+    /// Index in [`Self::messages`] where the current-request input run begins.
+    ///
+    /// Rehydrate prepends stored history and compaction replaces the history
+    /// prefix; both update this index so selected-input merge can find the
+    /// agentic tool suffix without matching message content. Document and file
+    /// preprocessing rewrite the current-input run in place and must leave this
+    /// index unchanged — `state.input` stays the original client snapshot while
+    /// the working history may diverge (#1907).
+    pub current_input_start: usize,
+
     /// Original JSON shape of the request's `input` (missing/null/string/object/
     /// array), kept so the current-request view reproduces the client's form
     /// without retaining a second decoded copy in [`Self::request_body`] (#1618).
@@ -1140,6 +1150,7 @@ impl Default for ResponsesState {
             current_round_output_start: None,
             history_rehydrated: false,
             input: MessageHistory::default(),
+            current_input_start: 0,
             input_form: InputForm::default(),
             iteration: 0,
             deferred_mcp: Vec::new(),
@@ -1400,6 +1411,20 @@ impl ResponsesState {
             pending_local_tool_synthesis: Vec::new(),
             ..Default::default()
         }
+    }
+
+    /// Record where the current-request input run starts in [`Self::messages`].
+    ///
+    /// Call after layout changes that prepend or replace history around the
+    /// immutable `input` length (rehydrate, compaction). Do not call after the
+    /// agentic loop appends tool results — those sit after the current input and
+    /// must not move this boundary.
+    ///
+    /// Only the store-backed rehydrate path and compaction rewrite that layout;
+    /// a plain `openai-responses` build keeps the default start of `0`.
+    #[cfg(any(feature = "store", feature = "openai-compact"))]
+    pub(crate) fn sync_current_input_start(&mut self) {
+        self.current_input_start = self.messages.len().saturating_sub(self.input.len());
     }
 
     /// Identify opaque provider compaction items already present in a stateless

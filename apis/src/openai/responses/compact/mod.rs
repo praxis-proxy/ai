@@ -1907,6 +1907,7 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     state.messages.clear();
     state.messages.push(compaction_item.clone());
     state.messages.append(&mut message_tail);
+    state.sync_current_input_start();
 
     if let (Some(persisted_messages), Some(mut persisted_tail), Some(persisted_compaction_item)) = (
         state.persisted_messages_mut(),

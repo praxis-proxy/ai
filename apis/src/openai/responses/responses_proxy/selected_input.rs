@@ -152,17 +152,10 @@ fn merge<'a>(
     canonical: Vec<Cow<'a, Value>>,
     native: bool,
 ) -> Vec<Cow<'a, Value>> {
-    let appended_start = if state.input.is_empty() {
-        0
-    } else {
-        state
-            .messages
-            .rposition_run(&state.input)
-            .map_or(state.messages.len(), |start| start + state.input.len())
-    };
+    let appended_start = appended_tool_start(state);
     let appended: Vec<_> = state.messages.iter().skip(appended_start).map(Cow::Borrowed).collect();
     if state.history_rehydrated {
-        let history_len = state.messages.len().saturating_sub(state.input.len() + appended.len());
+        let history_len = state.current_input_start.min(state.messages.len());
         if !has_history(&live, state, history_len, native) {
             let mut history: Vec<_> = state.messages.iter().take(history_len).map(Cow::Borrowed).collect();
             history.append(&mut live);
@@ -175,6 +168,18 @@ fn merge<'a>(
         append(&mut live, appended);
     }
     live
+}
+
+/// Index where agentic results begin after the current-input run in `messages`.
+///
+/// Content-independent: [`ResponsesState::current_input_start`] plus the immutable
+/// client input length. Preprocessing may rewrite that run in place and a later
+/// live-body edit may diverge further; neither must hide the tool suffix (#1907).
+fn appended_tool_start(state: &ResponsesState) -> usize {
+    state
+        .current_input_start
+        .saturating_add(state.input.len())
+        .min(state.messages.len())
 }
 
 /// Recognize an already-rehydrated prefix without materializing that history.

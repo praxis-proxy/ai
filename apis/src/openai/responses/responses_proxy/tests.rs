@@ -618,6 +618,213 @@ async fn selected_rebuild_preserves_agentic_results_after_later_input_edit() {
 }
 
 #[tokio::test]
+async fn selected_rebuild_preserves_agentic_results_after_document_preprocessing() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "source.txt",
+            "file_data": "data:text/plain;base64,aGVsbG8="
+        }]
+    });
+    let rewritten = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "[Source: source.txt]\nhello"
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [original]
+    }));
+    *state.messages.get_mut(0).unwrap() = rewritten.clone();
+    state.messages.push(json!({
+        "type": "function_call",
+        "id": "fc_doc",
+        "call_id": "call_doc",
+        "name": "file_search",
+        "arguments": "{\"query\":\"q\"}",
+        "status": "completed"
+    }));
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_doc",
+        "output": "PREPROCESSED_TOOL_RESULT"
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": [rewritten]
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after document preprocessing"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"][0]["type"], "input_text",
+        "selected backend must keep the preprocessed document text"
+    );
+    assert_eq!(
+        selected_backend_body["input"][1]["type"], "function_call",
+        "selected backend must retain the executed tool call after preprocessing"
+    );
+    assert_eq!(
+        selected_backend_body["input"][2]["output"], "PREPROCESSED_TOOL_RESULT",
+        "selected backend must retain the executed tool result after preprocessing"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_preserves_agentic_results_after_preprocess_and_later_edit() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "s.txt",
+            "file_data": "data:text/plain;base64,aGVsbG8="
+        }]
+    });
+    let rewritten = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "[Source: s.txt]\nhello"
+        }]
+    });
+    let edited = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "[Source: s.txt]\nREDACTED"
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [original]
+    }));
+    *state.messages.get_mut(0).unwrap() = rewritten;
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_edit",
+        "output": "EDIT_TOOL_RESULT"
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": [edited]
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after preprocess plus later edit"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"][0]["text"], "[Source: s.txt]\nREDACTED",
+        "selected backend must receive the later live edit"
+    );
+    assert_eq!(
+        selected_backend_body["input"][1]["output"], "EDIT_TOOL_RESULT",
+        "selected backend must retain tool results when preprocess and later edit both diverge"
+    );
+}
+
+#[tokio::test]
+async fn selected_rebuild_preserves_agentic_results_after_file_resolve() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "file_id": "file-abc",
+            "filename": "notes.pdf"
+        }]
+    });
+    let resolved = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "notes.pdf",
+            "file_data": "data:application/pdf;base64,JVBERi0="
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [original]
+    }));
+    *state.messages.get_mut(0).unwrap() = resolved.clone();
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_file_resolve",
+        "output": "FILE_RESOLVE_TOOL_RESULT"
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": [resolved]
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after file_resolve preprocessing"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"][0]["file_data"], "data:application/pdf;base64,JVBERi0=",
+        "selected backend must keep the resolved file_data"
+    );
+    assert_eq!(
+        selected_backend_body["input"][1]["output"], "FILE_RESOLVE_TOOL_RESULT",
+        "selected backend must retain tool results after file_resolve rewriting"
+    );
+}
+
+#[tokio::test]
 async fn selected_rebuild_keeps_selector_only_body_valid_when_adding_state_fields() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
