@@ -29,14 +29,12 @@
 #[cfg(feature = "mcp")]
 use std::collections::{HashMap, HashSet};
 
-#[cfg(feature = "mcp")]
 use serde_json::Value;
 
 #[cfg(feature = "mcp")]
 use super::naming::encode_function_name;
 
 /// Operator admission mode for MCP tool metadata.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum McpAdmissionMode {
     /// Standard advisory behavior. The client selector `allowed_tools.read_only`
@@ -55,14 +53,12 @@ pub(crate) enum McpAdmissionMode {
 /// Carries only the operator decision, never any server- or client-supplied
 /// value. Mirrors the `McpConnectorContextPolicy` snapshot pattern so the
 /// dispatch filter can re-enforce without re-reading filter configuration.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct McpAdmissionPolicy {
     /// Admission mode.
     pub mode: McpAdmissionMode,
 }
 
-#[cfg(feature = "mcp")]
 impl McpAdmissionPolicy {
     /// Whether protected-mode admission applies.
     pub(crate) fn is_protected(self) -> bool {
@@ -71,9 +67,8 @@ impl McpAdmissionPolicy {
 }
 
 /// Operator-selected behavior for tools supplied by one connector.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ConnectorToolPolicy {
+pub enum ConnectorToolPolicy {
     /// Exclude the connector without contacting it. This is the default.
     #[default]
     Deny,
@@ -84,9 +79,8 @@ pub(crate) enum ConnectorToolPolicy {
 }
 
 /// Why a discovered tool was denied admission under protected mode.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum McpDenyReason {
+pub enum McpDenyReason {
     /// The resolving target has no operator permission — a client-selected
     /// direct `server_url`, an unknown connector, or a connector with `deny`.
     UntrustedSource,
@@ -97,9 +91,12 @@ pub(crate) enum McpDenyReason {
     UnverifiedReadOnly,
 }
 
-#[cfg(feature = "mcp")]
 impl McpDenyReason {
     /// Client-safe explanation used in a truthful dispatch rejection.
+    #[cfg_attr(
+        not(feature = "mcp"),
+        expect(dead_code, reason = "dispatch rejections belong to the hosted adapters")
+    )]
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::UntrustedSource => "The platform administrator has forbidden tools from this MCP service.",
@@ -117,9 +114,8 @@ impl McpDenyReason {
 /// admitted states (a `deny` policy, or an unclassified `read_only` admission)
 /// are unrepresentable: the only admitting policies are `allow_all` and a
 /// `read_only` policy with an affirmative classification.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdmissionBasis {
+pub enum AdmissionBasis {
     /// Admitted under `tool_policy: allow_all`; read-only classification is not
     /// consulted.
     AllowAll,
@@ -129,9 +125,8 @@ pub(crate) enum AdmissionBasis {
 }
 
 /// Admission verdict for one discovered tool.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum McpToolVerdict {
+pub enum McpToolVerdict {
     /// The tool is admitted; the basis records which policy admitted it.
     Admitted(AdmissionBasis),
     /// The tool is denied and must not reach the model or dispatch.
@@ -139,7 +134,6 @@ pub(crate) enum McpToolVerdict {
 }
 
 /// Read-only classification of a single tool definition.
-#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadOnlyClass {
     /// The tool is affirmatively classified as read-only.
@@ -156,7 +150,6 @@ enum ReadOnlyClass {
 /// `readOnlyHint: true` is
 /// affirmative unless contradicted by `destructiveHint: true` (conflicting);
 /// `readOnlyHint: false` is writable; absent or non-boolean is unverified.
-#[cfg(feature = "mcp")]
 fn classify_read_only(tool_def: &Value) -> ReadOnlyClass {
     let annotations = tool_def.get("annotations");
     let Some(hint) = annotations.and_then(|a| a.get("readOnlyHint")) else {
@@ -185,7 +178,6 @@ fn classify_read_only(tool_def: &Value) -> ReadOnlyClass {
 ///
 /// Advisory mode never reaches here — callers skip verdict construction entirely
 /// so existing behavior is byte-for-byte unchanged.
-#[cfg(feature = "mcp")]
 pub(crate) fn evaluate_tool(
     policy: McpAdmissionPolicy,
     tool_policy: ConnectorToolPolicy,
@@ -206,6 +198,22 @@ pub(crate) fn evaluate_tool(
             ReadOnlyClass::Unverified => McpToolVerdict::Denied(McpDenyReason::UnverifiedReadOnly),
         },
     }
+}
+
+/// Admission verdict for one tool listed by an operator-configured server,
+/// under protected mode and `tool_policy`.
+///
+/// For callers that discover tools from servers the operator registered, so
+/// every listed tool is vetted before a client sees it.
+#[must_use]
+pub fn evaluate_operator_tool(tool_policy: ConnectorToolPolicy, tool_def: &Value) -> McpToolVerdict {
+    evaluate_tool(
+        McpAdmissionPolicy {
+            mode: McpAdmissionMode::Protected,
+        },
+        tool_policy,
+        tool_def,
+    )
 }
 
 /// Request-scoped record of every admission verdict for the current request.
@@ -373,6 +381,7 @@ impl McpAdmissionDecisions {
 }
 
 #[cfg(test)]
+#[cfg(feature = "mcp")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing, reason = "tests")]
 mod tests {
@@ -380,7 +389,7 @@ mod tests {
 
     use super::{
         AdmissionBasis, ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy,
-        McpDenyReason, McpToolVerdict, evaluate_tool,
+        McpDenyReason, McpToolVerdict, evaluate_operator_tool, evaluate_tool,
     };
 
     fn protected() -> McpAdmissionPolicy {
@@ -408,6 +417,26 @@ mod tests {
             assert!(!reason.message().contains("protected mode"));
             assert!(!reason.message().contains("tool_admission"));
         }
+    }
+
+    #[test]
+    fn operator_tools_are_evaluated_under_protected_mode() {
+        let writable = tool(Some(json!({"readOnlyHint": false})));
+        for (tool_policy, def) in [
+            (ConnectorToolPolicy::AllowAll, &writable),
+            (ConnectorToolPolicy::ReadOnly, &writable),
+            (ConnectorToolPolicy::Deny, &tool(Some(json!({"readOnlyHint": true})))),
+        ] {
+            assert_eq!(
+                evaluate_operator_tool(tool_policy, def),
+                evaluate_tool(protected(), tool_policy, def),
+                "{tool_policy:?}"
+            );
+        }
+        assert_eq!(
+            evaluate_operator_tool(ConnectorToolPolicy::ReadOnly, &writable),
+            McpToolVerdict::Denied(McpDenyReason::Writable)
+        );
     }
 
     #[test]
