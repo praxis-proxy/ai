@@ -4,6 +4,8 @@
 //! MCP protocol filter for body-aware routing and static catalog behavior.
 
 mod broker;
+pub(crate) mod metrics;
+pub(crate) mod audit;
 pub(crate) mod config;
 pub(crate) mod envelope;
 pub(crate) mod protocol;
@@ -22,7 +24,7 @@ pub(crate) mod protocol;
 )]
 mod tests;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -38,6 +40,13 @@ pub use self::broker::McpBrokerBackendSelectorFilter;
 use self::{
     config::{McpConfig, MismatchBehavior, MissingHeaderBehavior, build_config},
     envelope::{McpEnvelope, extract_mcp_envelope},
+};
+use self::metrics::{
+    record_mcp_request, record_filter_rejection, record_tool_call_completed,
+};
+use self::envelope::McpMethod;
+use self::audit::{
+    AuditState, emit_completed, emit_non_tool, emit_rejected,
 };
 
 // -----------------------------------------------------------------------------
@@ -172,16 +181,68 @@ impl HttpFilter for McpFilter {
         ) {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(FilterAction::Continue),
-            Err(action) => return action,
+            Err(action) => {
+                if matches!(&action, Ok(FilterAction::Reject(_)) | Err(_)) {
+                    record_filter_rejection("unknown", "invalid_jsonrpc");
+                    // No audit event: parser-level rejections occur before MCP
+                    // envelope extraction — no method, name, session, or
+                    // protocol_version is available to populate audit fields.
+                }
+                return action;
+            },
         };
 
         let mcp_envelope = extract_mcp_envelope(&parsed.value, &parsed.method, &ctx.request.headers);
 
+        // ── MCP metrics (request phase) ──
+        // Recorded before selector/header validation so rejected requests
+        // are still counted in praxis_mcp_requests_total.
+        let method_str = mcp_envelope.method.as_str();
+        let pv = mcp_envelope
+            .protocol_version
+            .as_deref()
+            .unwrap_or("unknown");
+        record_mcp_request(method_str, pv);
+
+        let tenant_header = ctx.request.headers
+            .get("x-tenant-id")
+            .and_then(|v| v.to_str().ok());
+
         if let Some(action) = reject_missing_required_selector(&mcp_envelope, &parsed.envelope, &self.config) {
+            if matches!(&action, FilterAction::Reject(_)) {
+                // Suppress resource URIs from audit name — may contain credentials
+                let audit_name = if mcp_envelope.method.requires_uri() {
+                    None
+                } else {
+                    mcp_envelope.name.as_deref()
+                };
+                emit_rejected(
+                    mcp_envelope.method.as_str(),
+                    audit_name,
+                    mcp_envelope.session_id.as_deref(),
+                    mcp_envelope.protocol_version.as_deref(),
+                    tenant_header,
+                    "invalid_params",
+                );
+            }
             return Ok(action);
         }
 
-        if let Err(action) = validate_mcp_headers(ctx, &mcp_envelope, &parsed.envelope, &self.config) {
+        if let Err((action, reason)) = validate_mcp_headers(ctx, &mcp_envelope, &parsed.envelope, &self.config) {
+            // Suppress resource URIs from audit name — may contain credentials
+            let audit_name = if mcp_envelope.method.requires_uri() {
+                None
+            } else {
+                mcp_envelope.name.as_deref()
+            };
+            emit_rejected(
+                mcp_envelope.method.as_str(),
+                audit_name,
+                mcp_envelope.session_id.as_deref(),
+                mcp_envelope.protocol_version.as_deref(),
+                tenant_header,
+                reason,
+            );
             return Ok(action);
         }
 
@@ -201,7 +262,61 @@ impl HttpFilter for McpFilter {
             "extracted MCP envelope metadata"
         );
 
+        // ── MCP audit + metrics (request phase) ──────────────────────────
+        // For tools/call: store AuditState in filter_state for response-phase
+        //   metrics recording AND audit event emit.
+        // AuditState replaces McpMetricsState — it carries start time and
+        //   tool_name (for metrics) plus session, tenant (for audit).
+        // For all other methods: emit the audit event now (no response follows).
+        if matches!(mcp_envelope.method, McpMethod::ToolsCall) {
+            ctx.insert_filter_state(AuditState {
+                start: Instant::now(),
+                tool_name: mcp_envelope.name.unwrap_or_default(),
+                session_id: mcp_envelope.session_id,
+                protocol_version: mcp_envelope.protocol_version,
+                tenant: tenant_header.map(str::to_owned),
+            });
+        } else {
+            emit_non_tool(
+                mcp_envelope.method.as_str(),
+                mcp_envelope.session_id.as_deref(),
+                mcp_envelope.protocol_version.as_deref(),
+                tenant_header,
+            );
+        }
+
         Ok(FilterAction::Release)
+    }
+
+    async fn on_response(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+    ) -> Result<FilterAction, FilterError> {
+        // ── MCP metrics + audit (response phase) ──────────────────────────
+        // AuditState replaced McpMetricsState in the request phase.
+        // It carries start time + tool_name (for metrics) plus
+        // session, protocol_version, tenant (for audit).
+        // We record Prometheus metrics AND emit the audit event from it.
+        if let Some(audit) = ctx.get_filter_state::<AuditState>() {
+            let cluster = ctx
+                .cluster_name()
+                .unwrap_or("unknown");
+            let upstream_status = ctx
+                .response_header
+                .as_ref()
+                .map_or(200u16, |r| r.status.as_u16());
+
+            // Prometheus metrics (from PR #2030)
+            let duration_seconds = audit.start.elapsed().as_secs_f64();
+            let transport_status = if upstream_status >= 400 { "error" } else { "ok" };
+            record_tool_call_completed(
+                &audit.tool_name, cluster, transport_status, duration_seconds,
+            );
+
+            // Structured audit log event
+            emit_completed(&audit, cluster, upstream_status);
+        }
+        Ok(FilterAction::Continue)
     }
 }
 
@@ -241,7 +356,10 @@ fn reject_missing_required_selector(
     let requires = mcp.method.requires_name() || mcp.method.requires_uri();
     if requires && mcp.name.is_none() {
         match config.on_invalid {
-            OnInvalidBehavior::Reject | OnInvalidBehavior::Error => Some(mcp_invalid_params_rejection(envelope)),
+            OnInvalidBehavior::Reject | OnInvalidBehavior::Error => {
+                    record_filter_rejection(mcp.method.as_str(), "invalid_params");
+                    Some(mcp_invalid_params_rejection(envelope))
+                },
             OnInvalidBehavior::Continue => Some(FilterAction::Continue),
         }
     } else {
@@ -258,16 +376,18 @@ fn validate_mcp_headers(
     mcp: &McpEnvelope,
     envelope: &praxis_filter::builtins::http::payload_processing::json_rpc::envelope::JsonRpcEnvelope,
     config: &McpConfig,
-) -> Result<(), FilterAction> {
-    validate_single_header(ctx, "mcp-method", mcp.method.as_str(), envelope, config)?;
+) -> Result<(), (FilterAction, &'static str)> {
+    let method = mcp.method.as_str();
+    validate_single_header(ctx, "mcp-method", method, method, envelope, config)?;
 
     if let Some(name) = &mcp.name {
-        validate_single_header(ctx, "mcp-name", name, envelope, config)?;
+        validate_single_header(ctx, "mcp-name", name, method, envelope, config)?;
     } else if ctx.request.headers.get("mcp-name").is_some() {
         match config.header_validation.mismatch {
             MismatchBehavior::Reject => {
                 warn!("client sent Mcp-Name header but body method has no name");
-                return Err(mcp_header_mismatch_rejection(envelope));
+                record_filter_rejection(method, "header_mismatch");
+                return Err((mcp_header_mismatch_rejection(envelope), "header_mismatch"));
             },
             MismatchBehavior::Ignore => {},
         }
@@ -282,16 +402,18 @@ fn validate_single_header(
     ctx: &mut HttpFilterContext<'_>,
     header_name: &str,
     body_value: &str,
+    method: &str,
     envelope: &praxis_filter::builtins::http::payload_processing::json_rpc::envelope::JsonRpcEnvelope,
     config: &McpConfig,
-) -> Result<(), FilterAction> {
+) -> Result<(), (FilterAction, &'static str)> {
     match ctx.request.headers.get(header_name) {
         Some(raw_value) => {
             let Ok(header_value) = raw_value.to_str() else {
                 match config.header_validation.mismatch {
                     MismatchBehavior::Reject => {
                         warn!(header_name = header_name, "MCP header contains invalid UTF-8");
-                        return Err(mcp_header_mismatch_rejection(envelope));
+                        record_filter_rejection(method, "header_mismatch");
+                return Err((mcp_header_mismatch_rejection(envelope), "header_mismatch"));
                     },
                     MismatchBehavior::Ignore => return Ok(()),
                 }
@@ -305,7 +427,8 @@ fn validate_single_header(
                             body_value = body_value,
                             "MCP header/body mismatch"
                         );
-                        return Err(mcp_header_mismatch_rejection(envelope));
+                        record_filter_rejection(method, "header_mismatch");
+                return Err((mcp_header_mismatch_rejection(envelope), "header_mismatch"));
                     },
                     MismatchBehavior::Ignore => {},
                 }
@@ -313,7 +436,8 @@ fn validate_single_header(
         },
         None => match config.header_validation.missing {
             MissingHeaderBehavior::Reject => {
-                return Err(FilterAction::Reject(Rejection::status(400)));
+                record_filter_rejection(method, "missing_header");
+                return Err((FilterAction::Reject(Rejection::status(400)), "missing_header"));
             },
             MissingHeaderBehavior::Synthesize => {
                 if !contains_control_chars(body_value) && body_value.len() <= MAX_DYNAMIC_VALUE_LEN {
