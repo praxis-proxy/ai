@@ -55,6 +55,11 @@ use super::{
 /// Counter of failed discoveries, labeled by server name and reason.
 pub(crate) const METRIC_DISCOVERY_FAILURES_TOTAL: &str = "praxis_ai_mcp_broker_discovery_failures_total";
 
+/// Longest wait before a caller's failed discovery of a server is retried,
+/// so requests do not each wait out the budget on a server that is down.
+/// Capped by `discovery.max_age_ms`.
+const FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 // -----------------------------------------------------------------------------
 // CatalogCaller
 // -----------------------------------------------------------------------------
@@ -174,8 +179,10 @@ struct CacheEntry {
     discovered_at: Instant,
     /// Last time a request read it.
     last_used: Instant,
-    /// The vetted listing.
-    tools: ServerTools,
+    /// No rediscovery before this instant, set after a failure.
+    retry_at: Option<Instant>,
+    /// The last good listing; `None` when no discovery has succeeded.
+    tools: Option<ServerTools>,
 }
 
 /// State behind the cache lock.
@@ -187,18 +194,20 @@ struct CacheInner {
     last_sweep: Instant,
 }
 
-/// A cached listing and whether it is still within `max_age`.
+/// A cached listing and whether it needs rediscovery.
 pub(crate) struct Cached {
-    /// The listing.
-    pub tools: ServerTools,
-    /// Whether it was discovered less than `max_age` ago.
+    /// The last good listing, if any.
+    pub tools: Option<ServerTools>,
+    /// Whether it was discovered less than `max_age` ago, or a recent
+    /// failure defers the next attempt.
     pub fresh: bool,
 }
 
 /// Bounded per-caller listing cache.
 ///
 /// A listing older than `max_age` is rediscovered on the caller's next
-/// request and served until a rediscovery succeeds. A listing no request has
+/// request and served until a rediscovery succeeds. After a failure the next
+/// attempt waits [`FAILURE_RETRY_INTERVAL`], at most `max_age`. A listing no request has
 /// read for `idle_timeout` is dropped. Inserting into a full cache drops the
 /// least recently read listing. The cache is per filter instance, so a
 /// reload starts empty.
@@ -239,8 +248,9 @@ impl DiscoveryCache {
         }
         entry.last_used = entry.last_used.max(now);
         let cached = Cached {
-            tools: Arc::clone(&entry.tools),
-            fresh: now.saturating_duration_since(entry.discovered_at) < self.max_age,
+            tools: entry.tools.as_ref().map(Arc::clone),
+            fresh: entry.retry_at.is_some_and(|retry_at| now < retry_at)
+                || (entry.tools.is_some() && now.saturating_duration_since(entry.discovered_at) < self.max_age),
         };
         drop(inner);
         Some(cached)
@@ -249,26 +259,49 @@ impl DiscoveryCache {
     /// Replace the caller's listing for `server`.
     pub(crate) fn store(&self, caller: CatalogCaller, server: usize, tools: ServerTools, now: Instant) {
         let mut inner = self.lock();
-        self.sweep(&mut inner, now);
-        let key = (caller, server);
-        if !inner.entries.contains_key(&key) && inner.entries.len() >= self.max_entries {
-            let oldest = inner
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                inner.entries.remove(&oldest);
-            }
-        }
+        self.make_room(&mut inner, (caller, server), now);
         inner.entries.insert(
-            key,
+            (caller, server),
             CacheEntry {
                 discovered_at: now,
                 last_used: now,
-                tools,
+                retry_at: None,
+                tools: Some(tools),
             },
         );
+    }
+
+    /// Record a failed discovery: keep the last good listing, if any, and
+    /// defer the caller's next attempt for `server`.
+    pub(crate) fn defer(&self, caller: CatalogCaller, server: usize, now: Instant) {
+        let retry_at = now.checked_add(FAILURE_RETRY_INTERVAL.min(self.max_age));
+        let mut inner = self.lock();
+        self.make_room(&mut inner, (caller, server), now);
+        let entry = inner.entries.entry((caller, server)).or_insert(CacheEntry {
+            discovered_at: now,
+            last_used: now,
+            retry_at: None,
+            tools: None,
+        });
+        entry.retry_at = retry_at;
+        drop(inner);
+    }
+
+    /// Sweep idle listings, then free one entry when `key` is new and the
+    /// cache is full, dropping the least recently read listing.
+    fn make_room(&self, inner: &mut CacheInner, key: (CatalogCaller, usize), now: Instant) {
+        self.sweep(inner, now);
+        if inner.entries.contains_key(&key) || inner.entries.len() < self.max_entries {
+            return;
+        }
+        let oldest = inner
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| *key);
+        if let Some(oldest) = oldest {
+            inner.entries.remove(&oldest);
+        }
     }
 
     /// Number of cached listings.
@@ -346,7 +379,7 @@ pub(crate) fn record_failure(server: &str, error: &DiscoveryError) {
     warn!(
         server = %server,
         reason = error.reason(),
-        "mcp tool discovery failed; serving the caller's last good tools for the server"
+        "mcp tool discovery failed; the caller keeps its last good tools for the server, if any"
     );
     count_failure(server, error.reason());
 }
@@ -715,7 +748,7 @@ impl Discovery {
             if settings.is_some() && !cached.as_ref().is_some_and(|cached| cached.fresh) {
                 needed.push(index);
             }
-            listings.push(cached.map(|cached| cached.tools));
+            listings.push(cached.and_then(|cached| cached.tools));
         }
         CallerListings {
             caller,
@@ -742,14 +775,19 @@ impl Discovery {
                         *slot = Some(tools);
                     }
                 },
-                Err(error) => record_server_failure(view, index, &error),
+                Err(error) => {
+                    self.cache.defer(listings.caller, index, now);
+                    record_server_failure(view, index, &error);
+                },
             }
         }
     }
 
-    /// Log and count every needed server as failed with `error`.
-    pub(crate) fn fail_needed(view: BrokerView<'_>, listings: &CallerListings, error: &DiscoveryError) {
+    /// Log, count, and defer every needed server as failed with `error`.
+    pub(crate) fn fail_needed(&self, view: BrokerView<'_>, listings: &CallerListings, error: &DiscoveryError) {
+        let now = Instant::now();
         for index in &listings.needed {
+            self.cache.defer(listings.caller, *index, now);
             record_server_failure(view, *index, error);
         }
     }
@@ -1144,7 +1182,7 @@ mod tests {
         );
         let cached = cache.get(caller("Bearer a"), 0, start).unwrap();
         assert!(cached.fresh);
-        assert_eq!(names(&cached.tools), ["a"]);
+        assert_eq!(names(cached.tools.as_ref().unwrap()), ["a"]);
 
         // Read just before max_age: stale, kept as last good.
         let later = start + Duration::from_secs(59);
@@ -1157,6 +1195,43 @@ mod tests {
             .get(caller("Bearer a"), 0, start + Duration::from_secs(500))
             .unwrap();
         assert!(!unread.fresh, "a stale listing stays as last good until idle_timeout");
+    }
+
+    #[test]
+    fn a_failure_defers_the_next_attempt_and_keeps_the_last_good_listing() {
+        let cache = DiscoveryCache::new(8, Duration::from_secs(60), Duration::from_secs(600));
+        let start = Instant::now();
+        cache.defer(caller("Bearer a"), 0, start);
+        let first = cache
+            .get(caller("Bearer a"), 0, start + Duration::from_secs(1))
+            .unwrap();
+        assert!(first.fresh, "a failure defers the next attempt");
+        assert!(first.tools.is_none(), "no listing was ever good");
+        let retry = cache
+            .get(caller("Bearer a"), 0, start + Duration::from_secs(31))
+            .unwrap();
+        assert!(!retry.fresh, "the attempt is retried after the interval");
+
+        cache.store(caller("Bearer b"), 0, listing(0, "s", &["b"]), start);
+        let later = start + Duration::from_secs(61);
+        cache.defer(caller("Bearer b"), 0, later);
+        let kept = cache.get(caller("Bearer b"), 0, later).unwrap();
+        assert!(kept.fresh);
+        assert_eq!(
+            names(kept.tools.as_ref().unwrap()),
+            ["b"],
+            "the last good listing stays"
+        );
+
+        let short = DiscoveryCache::new(8, Duration::from_secs(5), Duration::from_secs(600));
+        short.defer(caller("Bearer a"), 0, start);
+        assert!(
+            !short
+                .get(caller("Bearer a"), 0, start + Duration::from_secs(6))
+                .unwrap()
+                .fresh,
+            "the retry interval never exceeds max_age"
+        );
     }
 
     #[test]

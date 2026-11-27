@@ -95,7 +95,7 @@ pub(crate) struct McpConnectorContext<'a> {
 /// Cumulative byte budget for a complete `tools/list` result across all
 /// paginated pages.
 ///
-/// Each page is already wire-bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before
+/// Each page is already wire-bounded to the 1 MiB control-response ceiling before
 /// deserialization, but pagination must not multiply that ceiling: without an
 /// aggregate cap a server could return up to [`MAX_PAGES`] near-ceiling pages —
 /// each carrying a single, count-cheap tool that stays under `max_tools` — and

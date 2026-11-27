@@ -514,6 +514,15 @@ async fn a_failing_server_keeps_the_last_good_tools_and_is_counted() {
         ["weather_forecast", "cal_create_event"],
         "a caller without a good listing sees the static entries and the other servers"
     );
+    assert_eq!(backend.page_requests("weather-mcp").len(), 3);
+
+    assert_eq!(listed_names(&filter, &req).await, before);
+    listed_names(&filter, &request(Some(&gateway), "Bearer bob")).await;
+    assert_eq!(
+        backend.page_requests("weather-mcp").len(),
+        3,
+        "a failed server is not retried on every request"
+    );
 }
 
 #[tokio::test]
@@ -599,6 +608,16 @@ servers:
     let names = listed_names(&filter, &request(None, "Bearer alice")).await;
     assert_eq!(names, ["create_event"]);
     assert!(backend.pages.lock().unwrap().is_empty());
+
+    let gateway = issue(&filter).await;
+    let (action, ..) = send(&filter, &request(Some(&gateway), "Bearer alice"), &call("missing")).await;
+    let (status, body) = json_of(&action);
+    assert_eq!(
+        status, 200,
+        "an unknown tool stays a JSON-RPC error on HTTP 200: {body}"
+    );
+    assert_eq!(body["error"]["code"], -32602);
+    assert_eq!(body["error"]["message"], "unknown tool");
 }
 
 // -----------------------------------------------------------------------------

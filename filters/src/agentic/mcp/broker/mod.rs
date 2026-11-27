@@ -682,11 +682,17 @@ impl McpBrokerFilter {
             |callout| callout.forwarded_headers.clone(),
         );
         let mut listings = discovery.cached(&forwarded);
-        if listings.needed.is_empty() || wanted.is_some_and(|name| listings.catalog(view).find(name).is_some()) {
+        if listings.needed.is_empty() {
             return Ok(listings.catalog(view));
         }
+        if let Some(name) = wanted {
+            let cached = listings.catalog(view);
+            if cached.find(name).is_some() {
+                return Ok(cached);
+            }
+        }
         let Some(callout) = callout else {
-            Discovery::fail_needed(view, &listings, &DiscoveryError::Backend(McpBackendError::Transport));
+            discovery.fail_needed(view, &listings, &DiscoveryError::Backend(McpBackendError::Transport));
             return Ok(listings.catalog(view));
         };
         let run = DiscoveryRun {
@@ -723,18 +729,24 @@ impl McpBrokerFilter {
     }
 
     /// The caller's catalog tool a `tools/call` names, or the error to
-    /// return. A name the catalog does not hold gets `unknown tool`.
+    /// return. A name the catalog does not hold gets `unknown tool`: a
+    /// JSON-RPC error with HTTP 200 in the current profile, HTTP 400 in the
+    /// stateless profile.
     async fn find_call_tool(
         &self,
         ctx: &HttpFilterContext<'_>,
         value: &serde_json::Value,
         envelope: &JsonRpcEnvelope,
     ) -> Result<discovery::ToolRef, FilterAction> {
-        let tool_name = extract_tool_name(value).map_err(|detail| invalid_params_action(envelope, detail))?;
+        let invalid = |detail: &str| match self.protocol_profile {
+            ProtocolProfile::Current => json_rpc_error_action(envelope, ERR_INVALID_PARAMS, detail),
+            ProtocolProfile::Stateless => invalid_params_action(envelope, detail),
+        };
+        let tool_name = extract_tool_name(value).map_err(invalid)?;
         self.caller_catalog(ctx, envelope, Some(tool_name))
             .await?
             .find(tool_name)
-            .ok_or_else(|| invalid_params_action(envelope, "unknown tool"))
+            .ok_or_else(|| invalid("unknown tool"))
     }
 
     /// Resolve the server, the session map key, and the backend protocol

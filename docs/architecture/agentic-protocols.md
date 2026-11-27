@@ -150,7 +150,9 @@ that caller's catalog and the collision is logged with both server names.
 A listing older than `discovery.max_age_ms` is rediscovered on the caller's
 next request. When discovery fails (timeout, transport error, error status,
 JSON-RPC error, or a bound), the caller keeps its last good listing for that
-server, or the server's static entries when it has none. The other servers are
+server, or the server's static entries when it has none, and the caller's next
+attempt waits 30 seconds (at most `discovery.max_age_ms`), so requests do not
+each wait out the budget on a server that is down. The other servers are
 unaffected. Each failure is logged and counted in
 `praxis_ai_mcp_broker_discovery_failures_total{server, reason}`. The cache
 holds at most `discovery.max_entries` listings, evicting the least recently
