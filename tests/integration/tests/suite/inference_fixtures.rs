@@ -324,7 +324,6 @@ fn assert_stream_event_order(actual: &WireFixture, scenario_id: &str, provider: 
             Some("content_block_delta"),
             Some("content_block_delta"),
             Some("content_block_delta"),
-            Some("content_block_delta"),
             Some("content_block_stop"),
             Some("message_delta"),
             Some("message_stop"),

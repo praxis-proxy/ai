@@ -371,6 +371,8 @@ struct StreamState {
     progress: StreamProgress,
     /// Whether the current text block needs closing.
     text_open: bool,
+    /// Whether the current thinking block needs closing.
+    thinking_open: bool,
     /// Next Anthropic content block index.
     block_index: u32,
     /// Number of distinct tool blocks opened against the configured limit.
@@ -805,11 +807,19 @@ fn transform_delta(
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
-    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+    transform_reasoning_delta(state, delta, output);
+
+    if let Some(content) = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+    {
+        close_thinking_block_if_open(state, output);
         emit_text_delta(state, content, output);
     }
 
     if let Some(Value::Array(tool_calls)) = delta.get("tool_calls") {
+        close_thinking_block_if_open(state, output);
         close_text_block_if_open(state, output);
         for tc in tool_calls {
             transform_tool_delta(state, tc, output, max_tool_blocks)?;
@@ -854,6 +864,26 @@ fn emit_text_delta(state: &mut StreamState, content: &str, output: &mut Vec<u8>)
 // -----------------------------------------------------------------------------
 // Tool Delta Transformation
 // -----------------------------------------------------------------------------
+
+/// Transform one delta's reasoning field, if any.
+///
+/// A malformed reasoning field is an upstream outcome Anthropic's schema
+/// cannot represent, the same treatment a refusal gets: the stream fails
+/// closed instead of completing without the reasoning.
+fn transform_reasoning_delta(state: &mut StreamState, delta: &Value, output: &mut Vec<u8>) {
+    match delta_reasoning(delta) {
+        ReasoningDelta::Absent => {},
+        ReasoningDelta::Text(reasoning) => {
+            close_open_tool_blocks(state, output);
+            close_text_block_if_open(state, output);
+            emit_thinking_delta(state, reasoning, output);
+        },
+        ReasoningDelta::Malformed => {
+            emit_upstream_transform_error(output);
+            mark_stream_failed(state);
+        },
+    }
+}
 
 /// Transform a tool call delta into Anthropic content block events.
 fn transform_tool_delta(
@@ -1069,6 +1099,9 @@ fn emit_done(state: &mut StreamState, output: &mut Vec<u8>) {
 
 /// Close any open content block at end of stream.
 fn emit_final_block_stop(state: &mut StreamState, output: &mut Vec<u8>) {
+    if is_thinking_block_open(state) {
+        close_thinking_block_if_open(state, output);
+    }
     if is_text_block_open(state) {
         close_text_block_if_open(state, output);
     }
@@ -1141,6 +1174,121 @@ fn map_stop_reason(reason: &str) -> &str {
 /// Check whether a text content block is currently open.
 fn is_text_block_open(state: &StreamState) -> bool {
     state.text_open
+}
+
+/// What one upstream delta's reasoning field carries.
+enum ReasoningDelta<'a> {
+    /// No reasoning field, or an empty string: nothing to emit.
+    Absent,
+    /// Reasoning text to surface.
+    Text(&'a str),
+    /// A reasoning field that is neither null nor a string. The finite path
+    /// rejects the same shape, so the stream must not silently drop it.
+    Malformed,
+}
+
+/// Read one upstream delta's reasoning field.
+///
+/// The field list is shared with the finite translator
+/// ([`REASONING_FIELDS`](crate::anthropic::messages_to_chat_completions::response::REASONING_FIELDS))
+/// so the two paths cannot drift when an alias is added: vLLM prefers
+/// `reasoning` and keeps `reasoning_content` as a deprecated alias, and other
+/// backends emit only `reasoning_content`.
+fn delta_reasoning(delta: &Value) -> ReasoningDelta<'_> {
+    for field in crate::anthropic::messages_to_chat_completions::response::REASONING_FIELDS {
+        let Some(value) = delta.get(field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        // An empty string falls through to the next alias, like the finite
+        // path's field preference does.
+        if let Some(reasoning) = value.as_str() {
+            if !reasoning.is_empty() {
+                return ReasoningDelta::Text(reasoning);
+            }
+        } else {
+            return ReasoningDelta::Malformed;
+        }
+    }
+    ReasoningDelta::Absent
+}
+
+/// Close every open tool block, in block order, before other content opens.
+///
+/// Interleaved thinking arrives after a tool call's arguments; Anthropic
+/// permits one open block at a time, so the tool closes first and the
+/// thinking follows it.
+fn close_open_tool_blocks(state: &mut StreamState, output: &mut Vec<u8>) {
+    for (_, tool_call_key) in open_tool_blocks(state) {
+        close_tool_block(state, &tool_call_key, output);
+    }
+}
+
+/// Whether the current thinking block needs closing.
+fn is_thinking_block_open(state: &StreamState) -> bool {
+    state.thinking_open
+}
+
+/// Emit a thinking content delta, opening a new block if needed.
+///
+/// Mirrors Anthropic's extended-thinking event sequence: the block opens as
+/// an empty thinking block, deltas append reasoning, and closing emits an
+/// empty `signature_delta` — the upstream Chat Completions protocol has no
+/// signature to carry, so the block cannot be replayed to a native Anthropic
+/// API, but the reasoning itself is preserved.
+fn emit_thinking_delta(state: &mut StreamState, reasoning: &str, output: &mut Vec<u8>) {
+    if !is_thinking_block_open(state) {
+        let idx = get_block_index(state);
+        let content_block = ContentBlock::thinking("");
+        emit_event(
+            output,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": content_block
+            }),
+        );
+        state.thinking_open = true;
+    }
+
+    let idx = get_block_index(state);
+    emit_event(
+        output,
+        "content_block_delta",
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {"type": "thinking_delta", "thinking": reasoning}
+        }),
+    );
+}
+
+/// Close the open thinking block, emitting the empty signature delta.
+fn close_thinking_block_if_open(state: &mut StreamState, output: &mut Vec<u8>) {
+    if !is_thinking_block_open(state) {
+        return;
+    }
+
+    let idx = get_block_index(state);
+    emit_event(
+        output,
+        "content_block_delta",
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {"type": "signature_delta", "signature": ""}
+        }),
+    );
+    emit_event(
+        output,
+        "content_block_stop",
+        &serde_json::json!({"type": "content_block_stop", "index": idx}),
+    );
+    increment_block_index(state);
+    state.thinking_open = false;
 }
 
 /// Get the current block index.
@@ -1498,6 +1646,162 @@ mod tests {
             Some(&Value::Null),
             "streaming text citations should be null"
         );
+    }
+
+    #[test]
+    fn reasoning_deltas_open_a_thinking_block() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let role = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(role));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        let start = event_data(&out, "content_block_start");
+        assert_pointer(&start, "/index", &Value::from(0_u64));
+        assert_pointer(&start, "/content_block/type", &Value::String("thinking".into()));
+        assert_pointer(&start, "/content_block/signature", &Value::String(String::new()));
+
+        let delta = event_data(&out, "content_block_delta");
+        assert_pointer(&delta, "/delta/type", &Value::String("thinking_delta".into()));
+        assert_pointer(&delta, "/delta/thinking", &Value::String("let me think".into()));
+    }
+
+    #[test]
+    fn text_after_reasoning_closes_the_thinking_block_first() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let text = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(text));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        let signature = event_data(&out, "content_block_delta");
+        assert_pointer(&signature, "/delta/type", &Value::String("signature_delta".into()));
+        assert_pointer(&signature, "/delta/signature", &Value::String(String::new()));
+        assert!(
+            out.contains("content_block_stop"),
+            "the thinking block must close before text opens"
+        );
+
+        let text_start = event_data(&out, "content_block_start");
+        assert_pointer(&text_start, "/index", &Value::from(1_u64));
+        assert_pointer(&text_start, "/content_block/type", &Value::String("text".into()));
+        assert!(out.contains("Hello"));
+    }
+
+    #[test]
+    fn an_empty_leading_content_chunk_does_not_preempt_the_thinking_block() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        // vLLM's usual first chunk carries an empty content string; it must
+        // not open an empty text block ahead of the reasoning that follows.
+        let first = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(first));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            !out.contains("content_block_start"),
+            "an empty content string must not open a block: {out}"
+        );
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        let start = event_data(&out, "content_block_start");
+        assert_pointer(&start, "/index", &Value::from(0_u64));
+        assert_pointer(&start, "/content_block/type", &Value::String("thinking".into()));
+    }
+
+    #[test]
+    fn reasoning_after_tool_calls_closes_the_tool_block_first() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let tool_delta = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(tool_delta));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"between calls\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        assert!(
+            out.contains("content_block_stop"),
+            "the open tool block must close before thinking opens: {out}"
+        );
+        let start = event_data(&out, "content_block_start");
+        assert_pointer(&start, "/content_block/type", &Value::String("thinking".into()));
+        assert_pointer(&start, "/index", &Value::from(1_u64));
+    }
+
+    #[test]
+    fn a_malformed_reasoning_delta_fails_the_stream_closed() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let role = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(role));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let malformed = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":7},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(malformed));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        assert!(
+            out.contains("error"),
+            "a non-string reasoning delta must fail the stream: {out}"
+        );
+        assert!(
+            is_stream_failed(state_mut(&mut ctx)),
+            "the stream must be marked failed"
+        );
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, true).unwrap());
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        assert!(
+            !out.contains("message_stop"),
+            "a failed stream must not terminate as a success"
+        );
+    }
+
+    #[test]
+    fn a_reasoning_only_stream_closes_the_thinking_block_at_done() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let role = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(role));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning\":\"only thinking\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let reasoning_out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            reasoning_out.contains("thinking_delta"),
+            "the reasoning field is read too: {reasoning_out}"
+        );
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, true).unwrap());
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+
+        assert!(
+            out.contains("signature_delta") && out.contains("content_block_stop"),
+            "DONE must close the open thinking block: {out}"
+        );
+        assert!(out.contains("message_stop"), "the stream still terminates");
     }
 
     #[test]
@@ -3087,6 +3391,11 @@ mod tests {
             expected,
             "{label} should have {expected} open tool blocks"
         );
+    }
+
+    /// Assert one JSON pointer path in an event's data.
+    fn assert_pointer(value: &Value, path: &str, expected: &Value) {
+        assert_eq!(value.pointer(path), Some(expected), "at {path}: {value}");
     }
 
     fn event_data(output: &str, event_type: &str) -> Value {
