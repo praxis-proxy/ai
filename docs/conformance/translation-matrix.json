@@ -294,10 +294,10 @@
         {
           "feature": "streaming-terminal-events",
           "label": "Streaming terminates correctly",
-          "status": "dropped",
-          "note": "Terminal events are emitted only from the [DONE] branch. If the upstream stream ends without the sentinel, no message_delta and no message_stop are sent — a truncated response reported as success. Anthropic's documented `ping` keep-alive is never emitted either.",
-          "evidence": "apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:539-541; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:965-982; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:344-372",
-          "blocker": "https://github.com/praxis-proxy/ai/issues/2044"
+          "status": "translated",
+          "note": "A stream that ends with the [DONE] sentinel emits the normal content_block_stop / message_delta / message_stop terminal sequence. A stream that closes without [DONE] emits a terminal Anthropic error event. Anthropic's documented ping keep-alive is not emitted: the filter is a synchronous chunk-by-chunk transform with no independent timer, and the upstream Chat Completions protocol has no ping concept to forward.",
+          "evidence": "apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:452-454; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:482-484; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1245-1260",
+          "blocker": null
         },
         {
           "feature": "upstream-error-midstream",
@@ -1342,11 +1342,11 @@
     }
   ],
   "status_totals": {
-    "dropped": 17,
+    "dropped": 16,
     "n-a": 10,
     "passthrough": 21,
     "rejected": 19,
-    "translated": 39,
+    "translated": 40,
     "translated-lossy": 24
   }
 }

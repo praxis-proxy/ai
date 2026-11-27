@@ -6,6 +6,11 @@
 //! Transforms Chat Completions SSE events into Anthropic Messages SSE
 //! events per-chunk while buffering partial events. Any Chat
 //! Completions-compatible backend is a valid source, not only OpenAI.
+//!
+//! Anthropic's documented `ping` keep-alive event is not emitted: this
+//! filter is a synchronous chunk-by-chunk transform with no independent
+//! timer, and the upstream Chat Completions protocol has no ping concept
+//! to forward.
 
 mod config;
 
@@ -387,6 +392,8 @@ struct StreamState {
     input_tokens: Option<u64>,
     /// Most recently reported cached prompt token count.
     cache_read_tokens: Option<u64>,
+    /// Whether the upstream `[DONE]` sentinel was received.
+    done_received: bool,
 }
 
 /// Seed or access instance state in direct-hook tests.
@@ -442,6 +449,9 @@ fn process_sse_chunk(
         }
     }
     store_event_buffer(state, buffer, consumed, end_of_stream, max_partial_event_bytes)?;
+    if end_of_stream && !state.done_received && !is_stream_failed(state) {
+        emit_missing_done_error(state, &mut output);
+    }
     Ok(Bytes::from(output))
 }
 
@@ -469,6 +479,9 @@ fn process_unbuffered_chunk(
     buffer.pending_cr = pending_cr;
     buffer.emitted_cr = !pending_cr && text.ends_with('\r');
     store_event_buffer(state, buffer, 0, end_of_stream, max_partial_event_bytes)?;
+    if end_of_stream && !state.done_received && !is_stream_failed(state) {
+        emit_missing_done_error(state, &mut output);
+    }
     Ok(Bytes::from(output))
 }
 
@@ -1052,6 +1065,7 @@ fn close_tool_block(state: &mut StreamState, tool_call_key: &str, output: &mut V
 /// `message_stop` never appear without the required opening event, yielding a
 /// structurally valid (empty) Anthropic stream instead of a malformed one.
 fn emit_done(state: &mut StreamState, output: &mut Vec<u8>) {
+    state.done_received = true;
     if is_stream_failed(state) {
         return;
     }
@@ -1225,6 +1239,22 @@ fn emit_upstream_transform_error(output: &mut Vec<u8>) {
     output.extend_from_slice(b"\n\n");
 }
 
+/// Emit a terminal error when the upstream stream closes without a `[DONE]`
+/// sentinel. Distinguishes between a stream that delivered content (truncated)
+/// and one that never started.
+fn emit_missing_done_error(state: &mut StreamState, output: &mut Vec<u8>) {
+    let message = if matches!(state.progress, StreamProgress::Started) {
+        "upstream stream ended without a terminal event"
+    } else {
+        "upstream stream ended before delivering any content"
+    };
+    let body = crate::anthropic::wire::error_body(crate::anthropic::wire::ErrorType::Api, message, None);
+    output.extend_from_slice(b"event: error\ndata: ");
+    output.extend_from_slice(&body);
+    output.extend_from_slice(b"\n\n");
+    mark_stream_failed(state);
+}
+
 /// Normalize SSE line endings: `\r\n` → `\n`, standalone `\r` → `\n`.
 ///
 /// LF-only input is returned borrowed.
@@ -1343,6 +1373,136 @@ mod tests {
         let mut body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
         drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
         assert!(ctx.get_filter_state::<StreamState>().is_none());
+    }
+
+    #[test]
+    fn eof_without_done_after_content_emits_error() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk =
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let mut body2 = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        assert!(
+            out.contains("event: error"),
+            "EOF without [DONE] after content should emit error event: {out}"
+        );
+        assert!(
+            out.contains("upstream stream ended without a terminal event"),
+            "error message should indicate missing terminal event: {out}"
+        );
+        assert!(
+            !out.contains("message_stop"),
+            "no message_stop should follow the error: {out}"
+        );
+    }
+
+    #[test]
+    fn eof_without_done_before_content_emits_error() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let mut body: Option<Bytes> = None;
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            out.contains("event: error"),
+            "EOF without [DONE] before content should emit error event: {out}"
+        );
+        assert!(
+            out.contains("upstream stream ended before delivering any content"),
+            "error message should indicate no content delivered: {out}"
+        );
+    }
+
+    #[test]
+    fn eof_with_done_unchanged() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body2 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        assert!(
+            out.contains("message_stop"),
+            "normal [DONE] at EOF should still emit message_stop: {out}"
+        );
+        assert!(
+            !out.contains("event: error"),
+            "normal [DONE] at EOF should not emit error: {out}"
+        );
+    }
+
+    #[test]
+    fn eof_without_done_releases_state() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk =
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let mut body2 = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
+
+        assert!(
+            ctx.get_filter_state::<StreamState>().is_none(),
+            "state should be released after EOF without [DONE]"
+        );
+    }
+
+    #[test]
+    fn eof_without_done_after_error_does_not_double_emit() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"refusal\":\"blocked\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let out1 = String::from_utf8(body1.unwrap().to_vec()).unwrap();
+        assert!(out1.contains("event: error"), "refusal should emit error: {out1}");
+
+        let mut body2 = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
+
+        assert_eq!(
+            body2,
+            Some(Bytes::new()),
+            "EOF after a stream error must not emit a second error"
+        );
+    }
+
+    #[test]
+    fn eof_without_done_none_body() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk =
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let mut body2: Option<Bytes> = None;
+        drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        assert!(
+            out.contains("event: error"),
+            "EOF with None body should still emit error: {out}"
+        );
+        assert!(
+            out.contains("upstream stream ended without a terminal event"),
+            "error message should indicate missing terminal event: {out}"
+        );
     }
 
     #[test]
