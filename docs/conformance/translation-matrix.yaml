@@ -124,6 +124,7 @@ features:
     label: Token usage accounting
   - id: cache-accounting
     label: Prompt-cache token accounting
+  # Covers reasoning payloads. Provider metadata used to resume a turn is outside this row.
   - id: reasoning-content
     label: Reasoning / thinking content
   - id: request-reasoning-cache-controls
@@ -663,9 +664,10 @@ surfaces:
           on finite responses and on the trailing include_usage chunk; the
           details object is omitted when Vertex reports no thought count.
           Thought text has no Chat Completions field, so a Part with
-          thought:true fails the response. A text or metadata-only Part's
-          thoughtSignature is not surfaced, since Gemini does not require it
-          on a later non-function-call turn.
+          thought:true fails the response. This row covers reasoning payloads.
+          Gemini thoughtSignature is continuation metadata. Function-call
+          signatures round-trip through extra_content.google.thought_signature.
+          The translator omits signatures on text and metadata-only Parts.
         evidence: apis/src/vertex/gemini/response.rs:354-372; apis/src/vertex/gemini/response.rs:529-565; apis/src/vertex/gemini/response.rs:733-755
       request-reasoning-cache-controls:
         status: rejected
@@ -922,13 +924,11 @@ surfaces:
 # ---------------------------------------------------------------------------
 cross_surface_gaps:
   - id: reasoning-and-cache-tokens-vanish
-    affects: [anthropic-messages-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse]
+    affects: [anthropic-messages-to-chat-completions, chat-completions-to-bedrock-converse]
     summary: >-
-      Reasoning content is silently discarded on the Anthropic and Bedrock
-      paths, and its token count on Vertex. Cache-token counters are discarded
-      entirely on Vertex and Bedrock; Anthropic maps cache reads and loses
-      only the cache-write counter. Customers are billed for tokens the matrix
-      would otherwise claim they receive.
+      The Anthropic and Bedrock translations can silently discard reasoning
+      content. Bedrock drops both cache-token counters, and Anthropic maps
+      cache reads while omitting the cache-write counter.
     blocker: https://github.com/praxis-proxy/ai/issues/2058
 
   - id: oversized-body-generic-413
