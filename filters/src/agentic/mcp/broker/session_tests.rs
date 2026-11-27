@@ -205,7 +205,7 @@ fn broker_from_yaml(mock: Arc<MockBackend>, yaml: &str) -> McpBrokerFilter {
         validated.supported_versions.clone(),
     )
     .unwrap();
-    McpBrokerFilter::build(&validated, catalog, &servers, Some(backend))
+    McpBrokerFilter::build(&validated, catalog, &servers, Some(backend), None)
 }
 
 fn call_request(session: Option<&str>, auth: Option<&str>) -> praxis_filter::Request {

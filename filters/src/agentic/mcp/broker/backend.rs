@@ -317,6 +317,20 @@ impl McpBackendClient for FilteredMcpBackendClient {
     }
 }
 
+// TODO(#2234): send through `McpSessionClient::list_tools` once it lands.
+#[async_trait]
+impl super::discovery::McpToolPages for FilteredMcpBackendClient {
+    async fn list_tools_page(
+        &self,
+        _target: BackendTarget<'_>,
+        _scope: super::discovery::ListingScope<'_>,
+        _cursor: Option<String>,
+        _callout: &BackendCallout,
+    ) -> Result<praxis_ai_apis::mcp_session::McpToolPage<serde_json::Value>, McpBackendError> {
+        Err(McpBackendError::Malformed("tools/list is not available"))
+    }
+}
+
 /// Destination for an exchange on an existing session: its cluster, pinned to
 /// the endpoint that holds the session.
 fn pinned_stage(target: BackendTarget<'_>, session: &BackendInit) -> BrokerBackendCluster {
