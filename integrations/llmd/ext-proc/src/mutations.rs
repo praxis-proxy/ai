@@ -25,6 +25,27 @@ use crate::{
     },
 };
 
+/// Reserved header name on the EPP response.
+const EPP_DESTINATION_NAME: &str = "x-gateway-destination-endpoint";
+/// Typed key for the reserved destination in Core's mutation queues.
+const EPP_DESTINATION: http::HeaderName = http::HeaderName::from_static(EPP_DESTINATION_NAME);
+
+/// Deferred llm-d callouts carry the routing contract and request correlation.
+/// Credentials from ingress or gateway policy can use arbitrary header names.
+const EPP_REQUEST_HEADERS: &[&str] = &[
+    "content-type",
+    "host",
+    "traceparent",
+    "tracestate",
+    "x-request-id",
+    "x-gateway-model-name",
+    "x-gateway-base-model-name",
+    "x-llm-d-inference-objective",
+    "x-gateway-inference-objective",
+    "x-llm-d-model-name-rewrite",
+    "x-gateway-model-name-rewrite",
+];
+
 // -----------------------------------------------------------------------------
 // Request -> Proto
 // -----------------------------------------------------------------------------
@@ -36,6 +57,61 @@ use crate::{
 /// the Envoy `ext_proc` convention that external processors
 /// expect.
 pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeaders {
+    serialize_request_headers(ctx, &ctx.request.headers, false)
+}
+
+/// Start a picker exchange with no destination inherited from before the call.
+pub(crate) fn prepare_deferred_request(ctx: &mut HttpFilterContext<'_>) -> HttpHeaders {
+    let headers = effective_request_to_proto_headers(ctx);
+    clear_picker_destination(ctx);
+    headers
+}
+
+/// Project the post-policy request onto the picker header contract.
+fn effective_request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeaders {
+    if ctx.request_headers_to_remove.is_empty()
+        && ctx.request_headers_to_set.is_empty()
+        && ctx.request_header_mutations.is_empty()
+    {
+        return serialize_request_headers(ctx, &ctx.request.headers, true);
+    }
+
+    // Core already applied the pre-read log. Replay policy edits and leave
+    // extra_request_headers on the worker hop. That queue holds egress
+    // additions, including credentials scoped to the selected worker cluster.
+    let mut headers = ctx.request.headers.clone();
+    for name in &ctx.request_headers_to_remove {
+        headers.remove(name);
+    }
+    for (name, value) in &ctx.request_headers_to_set {
+        headers.insert(name.clone(), value.clone());
+    }
+    for mutation in &ctx.request_header_mutations {
+        mutation.apply_to(&mut headers);
+    }
+    serialize_request_headers(ctx, &headers, true)
+}
+
+/// Clear earlier edits so only this EPP exchange can publish a destination.
+fn clear_picker_destination(ctx: &mut HttpFilterContext<'_>) {
+    ctx.request_headers_to_set.retain(|(name, _)| *name != EPP_DESTINATION);
+    ctx.extra_request_headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case(EPP_DESTINATION_NAME));
+    ctx.request_header_mutations
+        .retain(|edit| !edit.matches_header(&EPP_DESTINATION));
+    ctx.pre_read_mutations
+        .retain(|edit| !edit.matches_header(&EPP_DESTINATION));
+    if !ctx.request_headers_to_remove.contains(&EPP_DESTINATION) {
+        ctx.request_headers_to_remove.push(EPP_DESTINATION);
+    }
+}
+
+/// Encode pseudo-headers and the chosen request header view for gRPC.
+fn serialize_request_headers(
+    ctx: &HttpFilterContext<'_>,
+    request_headers: &http::HeaderMap,
+    epp_only: bool,
+) -> HttpHeaders {
     let path = ctx
         .request
         .uri
@@ -49,12 +125,21 @@ pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeade
         proto_header(":scheme", scheme),
     ];
 
-    if let Some(authority) = ctx.request.headers.get(http::header::HOST) {
+    if let Some(authority) = request_headers.get(http::header::HOST) {
         headers.push(proto_header_value(":authority", authority));
     }
 
-    for (name, value) in &ctx.request.headers {
+    for (name, value) in request_headers {
+        if epp_only && !EPP_REQUEST_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
         headers.push(proto_header_value(name.as_str(), value));
+    }
+    if epp_only
+        && request_headers.contains_key(http::header::CONTENT_LENGTH)
+        && let Some(body) = &ctx.buffered_request_body
+    {
+        headers.push(proto_header("content-length", &body.len().to_string()));
     }
 
     HttpHeaders {
@@ -124,26 +209,45 @@ pub(crate) fn apply_headers_response(hr: &HeadersResponse, ctx: &mut HttpFilterC
 /// [`extra_request_headers`]: HttpFilterContext::extra_request_headers
 /// [`request_headers_to_set`]: HttpFilterContext::request_headers_to_set
 pub(crate) fn apply_request_header_mutation(mutation: &HeaderMutation, ctx: &mut HttpFilterContext<'_>) {
-    remove_request_headers(&mutation.remove_headers, ctx);
-    set_request_headers(&mutation.set_headers, ctx);
+    apply_request_mutation(mutation, ctx, false);
+}
+
+/// Apply EPP edits after earlier request-phase policy has run.
+pub(crate) fn apply_deferred_request_header_mutation(mutation: &HeaderMutation, ctx: &mut HttpFilterContext<'_>) {
+    apply_request_mutation(mutation, ctx, true);
+}
+
+/// Process removals before sets in the exchange's request phase.
+fn apply_request_mutation(mutation: &HeaderMutation, ctx: &mut HttpFilterContext<'_>, deferred: bool) {
+    remove_request_headers(&mutation.remove_headers, ctx, deferred);
+    set_request_headers(&mutation.set_headers, ctx, deferred);
 }
 
 /// Queue request header removals, skipping pseudo-headers and `Host`.
-fn remove_request_headers(names: &[String], ctx: &mut HttpFilterContext<'_>) {
+fn remove_request_headers(names: &[String], ctx: &mut HttpFilterContext<'_>, deferred: bool) {
     for name in names {
         if is_pseudo_header(name) || is_request_authority(name) {
             continue;
         }
         if let Ok(header_name) = http::HeaderName::try_from(name.as_str()) {
-            begin_ordered_pre_read_mutations(ctx);
-            ctx.request_headers_to_remove.push(header_name.clone());
-            ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(header_name));
+            if deferred {
+                if header_name == EPP_DESTINATION {
+                    clear_picker_destination(ctx);
+                } else {
+                    ctx.request_header_mutations
+                        .push(TrustedHeaderMutation::Remove(header_name));
+                }
+            } else {
+                begin_ordered_pre_read_mutations(ctx);
+                ctx.request_headers_to_remove.push(header_name.clone());
+                ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(header_name));
+            }
         }
     }
 }
 
 /// Apply set-header mutations to the request context.
-fn set_request_headers(headers: &[HeaderValueOption], ctx: &mut HttpFilterContext<'_>) {
+fn set_request_headers(headers: &[HeaderValueOption], ctx: &mut HttpFilterContext<'_>, deferred: bool) {
     for hvo in headers {
         let Some(hv) = &hvo.header else { continue };
         if is_pseudo_header(&hv.key) || is_request_authority(&hv.key) {
@@ -152,7 +256,80 @@ fn set_request_headers(headers: &[HeaderValueOption], ctx: &mut HttpFilterContex
         let Ok(name) = http::HeaderName::try_from(hv.key.as_str()) else {
             continue;
         };
-        dispatch_request_header(hvo, hv, name, ctx);
+        if deferred {
+            if name == EPP_DESTINATION {
+                apply_picker_destination(hvo, hv, ctx);
+            } else {
+                apply_deferred_request_header(hvo, hv, name, ctx);
+            }
+        } else {
+            dispatch_request_header(hvo, hv, name, ctx);
+        }
+    }
+}
+
+/// Resolve a conditional reply edit before worker-only header injections run.
+fn effective_request_has_header(ctx: &HttpFilterContext<'_>, name: &http::HeaderName) -> bool {
+    if let Some(edit) = ctx
+        .request_header_mutations
+        .iter()
+        .rev()
+        .find(|edit| edit.matches_header(name))
+    {
+        return !matches!(edit, TrustedHeaderMutation::Remove(_));
+    }
+    ctx.request_headers_to_set.iter().any(|(header, _)| header == name)
+        || (ctx.request.headers.contains_key(name) && !ctx.request_headers_to_remove.contains(name))
+}
+
+/// Apply the reply after earlier policy, preserving replacement on worker
+/// writeback for the append action previously routed through the extras queue.
+fn apply_deferred_request_header(
+    hvo: &HeaderValueOption,
+    hv: &HeaderValue,
+    name: http::HeaderName,
+    ctx: &mut HttpFilterContext<'_>,
+) {
+    let action = resolve_append_action(hvo);
+    if (action == HeaderAppendAction::OverwriteIfExists && !effective_request_has_header(ctx, &name))
+        || (action == HeaderAppendAction::AddIfAbsent && effective_request_has_header(ctx, &name))
+    {
+        return;
+    }
+    if let Ok(value) = http::HeaderValue::try_from(header_value_string(hv)) {
+        ctx.request_header_mutations
+            .push(TrustedHeaderMutation::Set(name, value));
+    }
+}
+
+/// Publish the reserved destination through the existing selector's queues.
+fn apply_picker_destination(hvo: &HeaderValueOption, hv: &HeaderValue, ctx: &mut HttpFilterContext<'_>) {
+    // The deferred exchange starts with no destination. Conditional actions
+    // can see earlier picker replies, never the original client header.
+    let exists = ctx
+        .request_headers_to_set
+        .iter()
+        .any(|(name, _)| *name == EPP_DESTINATION)
+        || ctx
+            .extra_request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(EPP_DESTINATION_NAME));
+    let action = resolve_append_action(hvo);
+    let value = header_value_string(hv);
+    let Ok(header_value) = http::HeaderValue::from_str(&value) else {
+        return;
+    };
+    match action {
+        HeaderAppendAction::OverwriteIfExists if !exists => (),
+        HeaderAppendAction::AddIfAbsent if exists => (),
+        HeaderAppendAction::OverwriteIfExists | HeaderAppendAction::OverwriteIfExistsOrAdd => {
+            clear_picker_destination(ctx);
+            ctx.request_headers_to_set.push((EPP_DESTINATION, header_value));
+        },
+        HeaderAppendAction::AppendIfExistsOrAdd | HeaderAppendAction::AddIfAbsent => {
+            ctx.extra_request_headers
+                .push((Cow::Borrowed(EPP_DESTINATION_NAME), value));
+        },
     }
 }
 

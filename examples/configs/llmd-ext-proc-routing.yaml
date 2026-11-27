@@ -13,8 +13,18 @@ listeners:
 filter_chains:
   - name: llmd-chain
     filters:
+      - filter: model_to_header
+        header: X-Gateway-Model-Name
+      - filter: headers
+        request_remove:
+          - x-gateway-base-model-name
+          - x-gateway-inference-objective
+          - x-llm-d-inference-objective
+          - x-gateway-model-name-rewrite
+          - x-llm-d-model-name-rewrite
       - filter: ext_proc
         target: "http://127.0.0.1:3001"
+        defer_request_processing: true
         message_timeout_ms: 5000
         lifecycle_timeout_ms: 10000
         status_on_error: 503
