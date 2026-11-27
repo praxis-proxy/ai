@@ -8,13 +8,14 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import subprocess
 import sys
 import time
 
 import pytest
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
 
 def identifier(name):
@@ -75,7 +76,8 @@ def wait_for_gateway(process, port):
     pytest.fail("Praxis gateway did not start")
 
 
-def test_live_cloud_chat_completion(tmp_path):
+@pytest.fixture
+def live_client(tmp_path):
     provider = os.getenv("PRAXIS_CLOUD_SMOKE_PROVIDER")
     if not provider:
         pytest.skip("Enable a live cloud provider explicitly")
@@ -97,15 +99,7 @@ def test_live_cloud_chat_completion(tmp_path):
             wait_for_gateway(gateway, port)
             with OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="gateway-test",
                         max_retries=0, timeout=60) as client:
-                response = client.chat.completions.create(
-                    model=model, max_completion_tokens=64,
-                    messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-                )
-            choice, = response.choices
-            assert choice.message.role == "assistant"
-            assert choice.message.content
-            assert response.usage.prompt_tokens > 0
-            assert response.usage.completion_tokens > 0
+                yield client, model
         finally:
             gateway.terminate()
             try:
@@ -113,6 +107,62 @@ def test_live_cloud_chat_completion(tmp_path):
             except subprocess.TimeoutExpired:
                 gateway.kill()
                 gateway.wait()
+
+
+def test_tool_result_streams_through_cloud_translation(live_client):
+    client, model = live_client
+    tools = [{"type": "function", "function": {
+        "name": "status",
+        "description": "Get status for a service.",
+        "parameters": {
+            "type": "object",
+            "properties": {"service": {"type": "string", "enum": ["gateway"]}},
+            "required": ["service"],
+        },
+    }}]
+    messages = [{
+        "role": "user",
+        "content": "Call status for service gateway, then repeat its result verbatim.",
+    }]
+    first = client.chat.completions.create(
+        model=model, max_completion_tokens=128, messages=messages, tools=tools,
+        tool_choice={"type": "function", "function": {"name": "status"}},
+    )
+    choice, = first.choices
+    assert choice.finish_reason == "tool_calls"
+    call, = choice.message.tool_calls
+    assert call.id and call.function.name == "status"
+    assert json.loads(call.function.arguments) == {"service": "gateway"}
+    assert first.usage.prompt_tokens > 0
+    assert first.usage.completion_tokens > 0
+
+    result = secrets.token_hex(4)
+    messages.extend([
+        choice.message.model_dump(exclude_none=True, include={"role", "content", "tool_calls"}),
+        {"role": "tool", "tool_call_id": call.id, "content": result},
+    ])
+    with client.chat.completions.create(
+        model=model, max_completion_tokens=128, messages=messages, tools=tools,
+        tool_choice="none", stream=True, stream_options={"include_usage": True},
+    ) as stream:
+        chunks = list(stream)
+    choices = [item for chunk in chunks for item in chunk.choices]
+    assert result in "".join(item.delta.content or "" for item in choices)
+    assert [item.finish_reason for item in choices if item.finish_reason] == ["stop"]
+    assert any(chunk.usage and chunk.usage.prompt_tokens > 0
+               and chunk.usage.completion_tokens > 0 for chunk in chunks)
+
+
+def test_invalid_output_limit_returns_bad_request(live_client):
+    client, model = live_client
+    with pytest.raises(BadRequestError) as error:
+        client.chat.completions.create(
+            model=model, max_completion_tokens=-1,
+            messages=[{"role": "user", "content": "Reply with OK."}],
+        )
+    assert error.value.status_code == 400
+    assert isinstance(error.value.body, dict)
+    assert isinstance(error.value.body.get("message"), str)
 
 
 if __name__ == "__main__":
