@@ -120,8 +120,10 @@ to different callers, so the catalog is per caller:
   therefore opens backend sessions for discovering servers that have none yet,
   and requires a gateway `Mcp-Session-Id` (HTTP `400` without one). A backend
   `404` during the listing reopens the session once. The stateless profile
-  sends `tools/list` without a session and marks the result
-  `cacheScope: private`.
+  sends `tools/list` without a session, with the `Mcp-Method` header and
+  `params._meta` the profile requires, and marks the result
+  `cacheScope: private`. A server `ping` on the listing's response stream is
+  answered as during the handshake.
 - The broker follows `nextCursor` for at most 100 pages, `discovery.max_tools`
   tools, and 4 MiB of tool definitions, the bounds the hosted MCP connectors
   use.

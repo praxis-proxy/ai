@@ -444,6 +444,69 @@ fn current_profile_handshake_works_through_a_buffering_outbound_filter() {
 }
 
 #[test]
+fn current_profile_discovery_follows_a_changed_tool_list() {
+    let weather = start_session_backend("radar");
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&discovery_broker_yaml(&weather, &calendar)).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let first = listed_tools(proxy.addr(), &gateway);
+    assert_eq!(
+        first,
+        ["weather_radar", "weather_get_weather", "cal_create_event"],
+        "the weather tools come from its tools/list, kept prefixed, with its unlisted static entry"
+    );
+    assert_eq!(
+        weather.session_ids_for("tools/list"),
+        vec![Some("mock-mcp-session-1".to_owned())],
+        "discovery runs inside the caller's backend session"
+    );
+    assert_eq!(
+        calendar.method_count("initialize"),
+        0,
+        "static servers are not contacted"
+    );
+
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 3, "weather_radar"));
+    assert_eq!(parse_status(&raw), 200, "a discovered tool is callable: {raw}");
+    assert!(parse_body(&raw).contains("mock result for radar"), "{raw}");
+    assert_eq!(
+        weather.session_ids_for("tools/call"),
+        vec![Some("mock-mcp-session-1".to_owned())],
+        "the call reuses the discovery session"
+    );
+    assert_eq!(weather.sessions_minted(), 1);
+
+    weather.set_tools(vec![McpToolFixture::new("alerts")]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let second = loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let tools = listed_tools(proxy.addr(), &gateway);
+        if tools != first || std::time::Instant::now() >= deadline {
+            break tools;
+        }
+    };
+    assert_eq!(
+        second,
+        ["weather_alerts", "weather_get_weather", "cal_create_event"],
+        "a rediscovery after max_age replaces the server's tools"
+    );
+    assert_eq!(
+        weather.method_count("tools/list"),
+        2,
+        "the listing was rediscovered once"
+    );
+
+    let raw = http_send(proxy.addr(), &tools_call(&gateway, 4, "weather_radar"));
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["error"]["message"], "unknown tool",
+        "a removed tool is unknown: {body}"
+    );
+    assert_eq!(weather.tool_call_count("radar"), 1, "the removed tool is not forwarded");
+}
+
+#[test]
 fn current_profile_tools_call_without_gateway_session_is_rejected() {
     let weather = start_session_backend("get_weather");
     let calendar = start_session_backend("create_event");
@@ -627,6 +690,40 @@ insecure_options:
         weather = weather.endpoint(),
         calendar = calendar.endpoint(),
     )
+}
+
+/// [`session_broker_yaml`] with discovery on the weather server, rediscovered
+/// after 200 ms.
+fn discovery_broker_yaml(weather: &McpMockServerGuard, calendar: &McpMockServerGuard) -> String {
+    session_broker_yaml(weather, calendar, "")
+        .replace(
+            "        backend_sessions:",
+            "        discovery:\n          max_age_ms: 200\n        backend_sessions:",
+        )
+        .replace(
+            "            tool_prefix: \"weather_\"",
+            "            tool_prefix: \"weather_\"\n            discover: true",
+        )
+}
+
+/// The tool names a gateway session's `tools/list` returns.
+fn listed_tools(addr: &str, gateway: &str) -> Vec<String> {
+    let raw = http_send(
+        addr,
+        &json_post(
+            "/mcp",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            Some(gateway),
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "tools/list should succeed: {raw}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    body["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list must return tools: {body}"))
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 /// Wait until a stopped mock no longer accepts connections on `endpoint`.

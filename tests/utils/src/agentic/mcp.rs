@@ -134,6 +134,7 @@ impl Default for McpMockConfig {
 }
 
 /// A tool fixture advertised by the mock MCP server.
+#[derive(Clone)]
 pub struct McpToolFixture {
     /// Tool name used for matching in `tools/call`.
     pub name: String,
@@ -262,6 +263,9 @@ pub struct McpMockServerGuard {
 
     /// Live sessions when `enforce_sessions` is set.
     sessions: Arc<MockSessions>,
+
+    /// Tools served instead of the configured ones, once replaced.
+    tools: Arc<Mutex<Option<Vec<McpToolFixture>>>>,
 }
 
 /// Session bookkeeping for `enforce_sessions`.
@@ -274,6 +278,18 @@ struct MockSessions {
 }
 
 impl McpMockServerGuard {
+    /// Serve `tools` from now on, in `tools/list` and `tools/call`, instead
+    /// of the configured tools.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tools` has an invalid schema or the tools mutex is
+    /// poisoned.
+    pub fn set_tools(&self, tools: Vec<McpToolFixture>) {
+        validate_tool_schemas(&tools);
+        *self.tools.lock().unwrap() = Some(tools);
+    }
+
     /// Expire every live session so the next request carrying one gets 404.
     ///
     /// # Panics
@@ -401,6 +417,8 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
     let state: Arc<Mutex<Vec<McpRecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
 
     let sessions = Arc::new(MockSessions::default());
+    let tools: Arc<Mutex<Option<Vec<McpToolFixture>>>> = Arc::new(Mutex::new(None));
+    let shared_tools = Arc::clone(&tools);
     let flag = Arc::clone(&shutdown);
     let shared_state = Arc::clone(&state);
     let shared_sessions = Arc::clone(&sessions);
@@ -415,7 +433,8 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
             let cfg = Arc::clone(&config);
             let st = Arc::clone(&shared_state);
             let ss = Arc::clone(&shared_sessions);
-            std::thread::spawn(move || handle_connection(stream, &cfg, &st, &ss));
+            let tt = Arc::clone(&shared_tools);
+            std::thread::spawn(move || handle_connection(stream, &cfg, &st, &ss, &tt));
         }
     });
 
@@ -425,6 +444,7 @@ pub fn start_mcp_mock_server_with_config(config: McpMockConfig) -> McpMockServer
         shutdown,
         state,
         sessions,
+        tools,
     }
 }
 
@@ -439,6 +459,7 @@ fn handle_connection(
     config: &McpMockConfig,
     state: &Mutex<Vec<McpRecordedRequest>>,
     sessions: &MockSessions,
+    tools: &Mutex<Option<Vec<McpToolFixture>>>,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -471,7 +492,9 @@ fn handle_connection(
         return;
     }
 
-    dispatch_json_rpc(&mut stream, config, state, sessions, &req);
+    let replaced = tools.lock().unwrap().clone();
+    let tools = replaced.as_deref().unwrap_or(&config.tools);
+    dispatch_json_rpc(&mut stream, config, tools, state, sessions, &req);
 }
 
 /// `Some(status)` when the request is invalid before
@@ -493,6 +516,7 @@ fn reject_early(req: &AgenticHttpRequest, config: &McpMockConfig) -> Option<u16>
 fn dispatch_json_rpc(
     stream: &mut TcpStream,
     config: &McpMockConfig,
+    tools: &[McpToolFixture],
     state: &Mutex<Vec<McpRecordedRequest>>,
     sessions: &MockSessions,
     req: &AgenticHttpRequest,
@@ -521,8 +545,8 @@ fn dispatch_json_rpc(
         Some("initialize") => handle_initialize(stream, config, &id, sessions, state),
         None if json.get("result").is_some() || json.get("error").is_some() => handle_notification(stream),
         Some("notifications/initialized") => handle_notification(stream),
-        Some("tools/list") => handle_tools_list(stream, config, &id),
-        Some("tools/call") => handle_tools_call(stream, config, &id, tool_name),
+        Some("tools/list") => handle_tools_list(stream, tools, &id),
+        Some("tools/call") => handle_tools_call(stream, config, tools, &id, tool_name),
         Some("ping") => handle_ping(stream, &id),
         _ => handle_unknown_method(stream, &id),
     }
@@ -736,9 +760,8 @@ fn handle_notification(stream: &mut TcpStream) {
 
 /// Every emitted tool includes `inputSchema` to
 /// satisfy the MCP spec shape requirement.
-fn handle_tools_list(stream: &mut TcpStream, config: &McpMockConfig, id: &Option<Value>) {
-    let tools: Vec<Value> = config
-        .tools
+fn handle_tools_list(stream: &mut TcpStream, tools: &[McpToolFixture], id: &Option<Value>) {
+    let tools: Vec<Value> = tools
         .iter()
         .map(|t| {
             let mut tool = json!({
@@ -773,9 +796,15 @@ fn handle_tools_list(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
 
 /// Known tools get a content result; unknown tools
 /// get `-32602` so tests can distinguish.
-fn handle_tools_call(stream: &mut TcpStream, config: &McpMockConfig, id: &Option<Value>, tool_name: Option<String>) {
+fn handle_tools_call(
+    stream: &mut TcpStream,
+    config: &McpMockConfig,
+    tools: &[McpToolFixture],
+    id: &Option<Value>,
+    tool_name: Option<String>,
+) {
     let name = tool_name.unwrap_or_default();
-    let known = config.tools.iter().any(|t| t.name == name);
+    let known = tools.iter().any(|t| t.name == name);
 
     if !known {
         write_unknown_tool_error(stream, id);
