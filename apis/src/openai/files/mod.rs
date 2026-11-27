@@ -31,6 +31,8 @@ pub use openapi::implementation_openapi_json;
 pub use praxis_ai_store::{CatalogError, FileCatalog};
 #[cfg(feature = "openai-files")]
 pub use service::{DefaultFileService, FileDownload, FileService, FileServiceError, FileUploadSession};
+#[cfg(feature = "openai-files-s3")]
+pub use store::S3FileStore;
 #[cfg(feature = "openai-files")]
 pub use store::{FileStore, FileStoreError, FileStoreWriter};
 

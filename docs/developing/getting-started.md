@@ -5,8 +5,10 @@
 - Rust stable 1.96+
 - Rust nightly
 - CMake 3.31+
-- Docker 29.3.0+ or Podman (for container builds; the FIPS image, its
-  compliance check and Red Hat's scanner need podman on Linux)
+- Docker 29.3.0+ or Podman (for container builds and RustFS S3 integration
+  tests; the FIPS image, its compliance check and Red Hat's scanner need
+  podman on Linux)
+- AWS CLI v2 (for `make test-integration` and `make test-s3-file-store-e2e`)
 - Go 1.26+ (`make fips-scanner`, optional)
 
 Install the development-only Cargo tools used by the Make targets:
@@ -46,14 +48,16 @@ make test
 make test-integration
 ```
 
-The aggregate targets cover more than one suite; CI runs some of them as separate targets:
+CI runs some suites from the local aggregate targets separately.
 
 | Local target | Runs | CI targets |
 | --- | --- | --- |
-| `make test-integration` | store-all suite and its experimental filter permutation | `make test-integration-core`, `make test-integration-experimental` |
+| `make test-integration` | store-all suite, its experimental filter permutation, and live RustFS S3 FileStore tests | `make test-integration-core`, `make test-integration-experimental`, `make test-s3-file-store` |
 | `make test-inference-fixtures` | inference fixtures and the xtask fixture tests | `make test-inference-fixtures-core`, `make test-inference-xtask` |
 | `make test-environment-suite` | `make test-environment`'s environment tests and the llmd-ext-proc integration suite | |
 | `make test-store-features` | feature graph checks, per-group Clippy, and API tests | its `-check`, `-clippy`, and `-test` targets |
+
+The RustFS container requires an available port at `127.0.0.1:9000`.
 
 ### OpenAI SDK Integration Tests (Dual 2.x / 3.x Lanes)
 

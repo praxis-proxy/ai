@@ -12,7 +12,8 @@ to the human contributor responsible for the change.
 - Rust stable 1.96+
 - Rust nightly (for `rustfmt`)
 - CMake 3.31+ (for Pingora build via praxis dep)
-- Docker 29.3.0+ or Podman (for container builds)
+- Docker 29.3.0+ or Podman (for container builds and RustFS S3 integration tests)
+- AWS CLI v2 (for `make test-integration` and `make test-s3-file-store-e2e`)
 - Optional Praxis core checkout at `../praxis` for testing local core
   changes through `make patch-praxis`
 
