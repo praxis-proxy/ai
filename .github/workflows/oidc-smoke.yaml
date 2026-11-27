@@ -43,7 +43,7 @@ jobs:
               --header "Content-Type: application/json" \
               --output "$response" --write-out '%{http_code}' \
               "https://aiplatform.googleapis.com/v1/projects/${VERTEX_AI_PROJECT}/locations/${VERTEX_AI_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent" \
-              --data '{"contents":[{"parts":[{"text":"Reply with the single word: ok"}]}],"generationConfig":{"maxOutputTokens":64}}') ||
+              --data '{"contents":[{"role":"user","parts":[{"text":"Reply with the single word: ok"}]}],"generationConfig":{"maxOutputTokens":64}}') ||
             { echo "::error::Vertex request failed before an HTTP response."; exit 1; }
           echo "Vertex AI HTTP $status"
           if [[ "$status" != 200 ]]; then
