@@ -172,8 +172,8 @@ struct ForwardedCall {
     /// overlapping call open a second backend session. Dropping the request
     /// context releases it on every path.
     slot: Arc<SessionSlot>,
-    /// Backend session id sent upstream.
-    session_id: http::HeaderValue,
+    /// Backend session id sent upstream, `None` when the backend issued none.
+    session_id: Option<http::HeaderValue>,
     /// Endpoint the backend session lives on.
     ///
     /// The broker resolves the session in the request-body phase, but core
@@ -203,7 +203,9 @@ struct ForwardedCall {
 /// cluster with the backend `Mcp-Session-Id`. A backend `404` means that
 /// backend session expired: the broker drops the mapping, answers the call
 /// with a `-32603` JSON-RPC error whose `data.reason` is `session_expired`,
-/// and reinitializes on the next call. The gateway session stays valid.
+/// and reinitializes on the next call. A `404` from a backend that issued no
+/// session is answered with `data.reason` `rejected` instead. The gateway
+/// session stays valid.
 /// Server clusters must be declared in top-level `clusters:` so the handshake
 /// chain can reference them.
 ///
@@ -578,6 +580,19 @@ impl McpBrokerFilter {
             .iter()
             .find(|tool| tool.server_index == index)
             .map_or("", |tool| tool.server_name.as_str())
+    }
+
+    /// Answer for a forwarded call whose backend returned `404`. Passed
+    /// through, that status would tell the client that its gateway session is
+    /// gone (MCP Streamable HTTP, session management item 4), so the broker
+    /// answers the call itself.
+    fn backend_not_found_action(&self, call: &ForwardedCall) -> FilterAction {
+        let server = self.server_name(call.key.server);
+        if call.session_id.is_some() {
+            backend_session_error_action(&call.id, "backend session expired", server, "session_expired", None)
+        } else {
+            backend_session_error_action(&call.id, "backend rejected the call", server, "rejected", Some(404))
+        }
     }
 
     /// Protocol version offered to the backend: the client's
@@ -997,24 +1012,17 @@ impl HttpFilter for McpBrokerFilter {
         let Some(backend) = self.backend.as_ref() else {
             return Ok(FilterAction::Continue);
         };
-        backend.invalidate_forwarded(
-            &call.key,
-            &call.session_id,
-            "mcp backend session expired or unreachable; mapping invalidated",
-        );
+        if let Some(session_id) = call.session_id.as_ref() {
+            backend.invalidate_forwarded(
+                &call.key,
+                session_id,
+                "mcp backend session expired or unreachable; mapping invalidated",
+            );
+        }
         if status == http::StatusCode::BAD_GATEWAY {
             return Ok(FilterAction::Continue);
         }
-        // Passed through, the backend's 404 would tell the client that its
-        // gateway session is gone (MCP Streamable HTTP, session management
-        // item 4), so the broker answers the call itself.
-        Ok(backend_session_error_action(
-            &call.id,
-            "backend session expired",
-            self.server_name(call.key.server),
-            "session_expired",
-            None,
-        ))
+        Ok(self.backend_not_found_action(call))
     }
 
     fn observes_request_completion(&self) -> bool {
@@ -1041,10 +1049,13 @@ impl HttpFilter for McpBrokerFilter {
         let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        if !answered && matches!(status, 502 | 504) {
+        if !answered
+            && matches!(status, 502 | 504)
+            && let Some(session_id) = session_id.as_ref()
+        {
             backend.invalidate_forwarded(
                 &key,
-                &session_id,
+                session_id,
                 "mcp backend endpoint unreachable; mapping invalidated",
             );
         }
@@ -1423,8 +1434,8 @@ fn forward_current_tools_call(
     }
 }
 
-/// Record a forwarded session-bearing call so the header phase can pin its
-/// endpoint and the response can invalidate an expired or unreachable session.
+/// Record a forwarded call so the header phase can pin its session's endpoint
+/// and the response can invalidate an expired or unreachable session.
 fn record_forwarded_call(
     ctx: &mut HttpFilterContext<'_>,
     id: serde_json::Value,
@@ -1432,16 +1443,16 @@ fn record_forwarded_call(
     slot: Arc<SessionSlot>,
     init: BackendInit,
 ) {
-    if let Some(session_id) = init.session_id {
-        ctx.insert_filter_state(ForwardedCall {
-            answered: false,
-            id,
-            key,
-            slot,
-            session_id,
-            endpoint: init.endpoint,
-        });
-    }
+    // A backend that issued no session holds no endpoint state to pin to.
+    let endpoint = init.session_id.as_ref().and(init.endpoint);
+    ctx.insert_filter_state(ForwardedCall {
+        answered: false,
+        id,
+        key,
+        slot,
+        session_id: init.session_id,
+        endpoint,
+    });
 }
 
 /// The client's gateway `Mcp-Session-Id`, when present and well formed.

@@ -555,6 +555,35 @@ async fn backend_404_after_reuse_is_answered_as_session_expired() {
 }
 
 #[tokio::test]
+async fn sessionless_backend_404_is_answered_as_rejected() {
+    let mock = Arc::new(MockBackend {
+        sessionless: true,
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+    let gw_1 = issue(&filter).await;
+    let req = call_request(Some(gw_1.as_str()), None);
+
+    let rejected = route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::NOT_FOUND).await;
+    let next = route(&filter, &req, "weather_get_weather").await;
+
+    let (status, body) = rejection_json(&rejected);
+    assert_eq!(status, 200, "a backend 404 must not reach the client");
+    assert_eq!(body["id"], 9, "request id must be echoed");
+    assert_eq!(body["error"]["code"], -32603, "a rejected call must be -32603");
+    assert_eq!(
+        body["error"]["data"],
+        serde_json::json!({ "server": "weather", "reason": "rejected", "status": 404 }),
+        "the error must name the server, the reason, and the backend status"
+    );
+    assert!(
+        matches!(next.action, FilterAction::Release),
+        "the next call must be forwarded"
+    );
+    assert_eq!(mock.count("initialize"), 1, "no session expired, so none is replaced");
+}
+
+#[tokio::test]
 async fn late_backend_404_keeps_the_newer_session() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));

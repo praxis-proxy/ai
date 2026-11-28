@@ -130,6 +130,8 @@ on the gateway session it would tell the client to reinitialize. The call is
 answered with HTTP `200` and a `-32603` JSON-RPC error carrying
 `data.server` and `data.reason: session_expired`. The gateway session and its
 other backend sessions stay usable, and the client may resend the call.
+A `404` from a backend that issued no session is answered the same way, with
+`data.reason: rejected` and `data.status: 404`.
 
 #### Handshake
 

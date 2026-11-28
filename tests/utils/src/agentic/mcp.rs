@@ -115,6 +115,9 @@ pub struct McpMockConfig {
     /// `notifications/initialized` arrives, so the first request on a freshly
     /// initialized session gets 404.
     pub expire_sessions_once_initialized: bool,
+
+    /// Answer every `tools/call` with HTTP 404.
+    pub tools_call_not_found: bool,
 }
 
 impl Default for McpMockConfig {
@@ -135,6 +138,7 @@ impl Default for McpMockConfig {
             sse_initialize_held_open: false,
             ping_before_initialize_result: false,
             expire_sessions_once_initialized: false,
+            tools_call_not_found: false,
         }
     }
 }
@@ -528,6 +532,7 @@ fn dispatch_json_rpc(
         None if json.get("result").is_some() || json.get("error").is_some() => handle_notification(stream),
         Some("notifications/initialized") => handle_initialized(stream, config, sessions, req),
         Some("tools/list") => handle_tools_list(stream, config, &id),
+        Some("tools/call") if config.tools_call_not_found => write_response(stream, 404, "Not Found", &[], ""),
         Some("tools/call") => handle_tools_call(stream, config, &id, tool_name),
         Some("ping") => handle_ping(stream, &id),
         _ => handle_unknown_method(stream, &id),

@@ -194,6 +194,46 @@ fn current_profile_backend_404_on_first_forwarded_call_keeps_gateway_session() {
 }
 
 #[test]
+fn current_profile_sessionless_backend_404_keeps_gateway_session() {
+    let weather = start_mcp_mock_server_with_config(McpMockConfig {
+        stateful_sessions: false,
+        tools_call_not_found: true,
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let calendar = start_session_backend("create_event");
+    let proxy = start_proxy(&Config::from_yaml(&session_broker_yaml(&weather, &calendar, "")).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let rejected = http_send(proxy.addr(), &tools_call(&gateway, 1, "weather_get_weather"));
+
+    assert_eq!(
+        parse_status(&rejected),
+        200,
+        "a backend 404 must not reach the client: {rejected}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&rejected)).unwrap();
+    assert_eq!(body["id"], 1, "client request id must be preserved: {body}");
+    assert_eq!(body["error"]["code"], -32603, "a rejected call must be -32603: {body}");
+    assert_eq!(
+        body["error"]["data"],
+        serde_json::json!({ "server": "weather", "reason": "rejected", "status": 404 }),
+        "the error must name the server, the reason, and the backend status: {body}"
+    );
+    assert_eq!(
+        weather.session_ids_for("tools/call"),
+        [None],
+        "the call must be dispatched once, without a session"
+    );
+    let other = http_send(proxy.addr(), &tools_call(&gateway, 2, "cal_create_event"));
+    assert_eq!(
+        parse_status(&other),
+        200,
+        "the gateway session must stay usable: {other}"
+    );
+}
+
+#[test]
 fn current_profile_backend_404_leaves_other_backend_sessions_in_use() {
     let weather = start_session_backend("get_weather");
     let calendar = start_session_backend("create_event");
