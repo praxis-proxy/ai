@@ -110,6 +110,14 @@ pub struct McpMockConfig {
     /// carries a `ping` request with id `mock-ping-<session>`, and hold the
     /// `initialize` result until the client POSTs the pong, as MCP permits.
     pub ping_before_initialize_result: bool,
+
+    /// With `enforce_sessions`, forget each session as soon as its
+    /// `notifications/initialized` arrives, so the first request on a freshly
+    /// initialized session gets 404.
+    pub expire_sessions_once_initialized: bool,
+
+    /// Answer every `tools/call` with HTTP 404.
+    pub tools_call_not_found: bool,
 }
 
 impl Default for McpMockConfig {
@@ -129,6 +137,8 @@ impl Default for McpMockConfig {
             oversized_initialize_bytes: None,
             sse_initialize_held_open: false,
             ping_before_initialize_result: false,
+            expire_sessions_once_initialized: false,
+            tools_call_not_found: false,
         }
     }
 }
@@ -520,8 +530,9 @@ fn dispatch_json_rpc(
     match method.as_deref() {
         Some("initialize") => handle_initialize(stream, config, &id, sessions, state),
         None if json.get("result").is_some() || json.get("error").is_some() => handle_notification(stream),
-        Some("notifications/initialized") => handle_notification(stream),
+        Some("notifications/initialized") => handle_initialized(stream, config, sessions, req),
         Some("tools/list") => handle_tools_list(stream, config, &id),
+        Some("tools/call") if config.tools_call_not_found => write_response(stream, 404, "Not Found", &[], ""),
         Some("tools/call") => handle_tools_call(stream, config, &id, tool_name),
         Some("ping") => handle_ping(stream, &id),
         _ => handle_unknown_method(stream, &id),
@@ -543,6 +554,22 @@ fn record_json_rpc(
         ..build_record(req)
     };
     record_request(state, record);
+}
+
+/// Accept `notifications/initialized`, first forgetting its session when
+/// `expire_sessions_once_initialized` is set.
+fn handle_initialized(
+    stream: &mut TcpStream,
+    config: &McpMockConfig,
+    sessions: &MockSessions,
+    req: &AgenticHttpRequest,
+) {
+    if config.expire_sessions_once_initialized
+        && let Some(session) = request_header(&req.headers, "mcp-session-id")
+    {
+        sessions.live.lock().unwrap().remove(session);
+    }
+    handle_notification(stream);
 }
 
 /// HTTP reason phrase for early-rejection status codes.

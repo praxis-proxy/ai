@@ -162,6 +162,9 @@ struct BackendSessions {
 struct ForwardedCall {
     /// Whether a backend response arrived.
     answered: bool,
+    /// The client's JSON-RPC request id, for an error the broker writes in
+    /// the response phase, where the request body is gone.
+    id: serde_json::Value,
     /// Session map key.
     key: BackendSessionKey,
     /// The slot this call uses, held until the request completes so capacity
@@ -169,8 +172,8 @@ struct ForwardedCall {
     /// overlapping call open a second backend session. Dropping the request
     /// context releases it on every path.
     slot: Arc<SessionSlot>,
-    /// Backend session id sent upstream.
-    session_id: http::HeaderValue,
+    /// Backend session id sent upstream, `None` when the backend issued none.
+    session_id: Option<http::HeaderValue>,
     /// Endpoint the backend session lives on.
     ///
     /// The broker resolves the session in the request-body phase, but core
@@ -197,9 +200,14 @@ struct ForwardedCall {
 /// backend `initialize` / `notifications/initialized` handshake once per
 /// `(Mcp-Session-Id, server)` pair through a generated outbound chain that
 /// dials the server's top-level cluster, then forwards the call to that
-/// cluster with the backend `Mcp-Session-Id`. A backend `404` drops the
-/// mapping so the next call reinitializes. Server clusters must be declared
-/// in top-level `clusters:` so the handshake chain can reference them.
+/// cluster with the backend `Mcp-Session-Id`. A backend `404` means that
+/// backend session expired: the broker drops the mapping, answers the call
+/// with a `-32603` JSON-RPC error whose `data.reason` is `session_expired`,
+/// and reinitializes on the next call. A `404` from a backend that issued no
+/// session is answered with `data.reason` `rejected` instead. The gateway
+/// session stays valid.
+/// Server clusters must be declared in top-level `clusters:` so the handshake
+/// chain can reference them.
 ///
 /// With `backend_sessions`, `initialize` issues signed gateway session ids,
 /// and a request carrying a well-formed id the broker did not issue, or one
@@ -531,7 +539,7 @@ impl McpBrokerFilter {
         };
 
         forward_current_tools_call(ctx, value, body, tool, &init);
-        record_forwarded_call(ctx, key, slot, init);
+        record_forwarded_call(ctx, id_value(envelope), key, slot, init);
         FilterAction::Release
     }
 
@@ -564,6 +572,27 @@ impl McpBrokerFilter {
         };
         let version = self.requested_backend_version(ctx, envelope)?;
         Ok((tool, server, key, version))
+    }
+
+    /// Configured name of the server at `index`, as catalog entries carry it.
+    fn server_name(&self, index: usize) -> &str {
+        self.catalog
+            .iter()
+            .find(|tool| tool.server_index == index)
+            .map_or("", |tool| tool.server_name.as_str())
+    }
+
+    /// Answer for a forwarded call whose backend returned `404`. Passed
+    /// through, that status would tell the client that its gateway session is
+    /// gone (MCP Streamable HTTP, session management item 4), so the broker
+    /// answers the call itself.
+    fn backend_not_found_action(&self, call: &ForwardedCall) -> FilterAction {
+        let server = self.server_name(call.key.server);
+        if call.session_id.is_some() {
+            backend_session_error_action(&call.id, "backend session expired", server, "session_expired", None)
+        } else {
+            backend_session_error_action(&call.id, "backend rejected the call", server, "rejected", Some(404))
+        }
     }
 
     /// Protocol version offered to the backend: the client's
@@ -977,16 +1006,23 @@ impl HttpFilter for McpBrokerFilter {
         call.answered = true;
         // 404: the backend forgot the session. 502: an intermediary reports
         // the pinned endpoint unreachable; the session cannot move elsewhere.
-        if matches!(status, http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY)
-            && let Some(backend) = self.backend.as_ref()
-        {
+        if !matches!(status, http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY) {
+            return Ok(FilterAction::Continue);
+        }
+        let Some(backend) = self.backend.as_ref() else {
+            return Ok(FilterAction::Continue);
+        };
+        if let Some(session_id) = call.session_id.as_ref() {
             backend.invalidate_forwarded(
                 &call.key,
-                &call.session_id,
+                session_id,
                 "mcp backend session expired or unreachable; mapping invalidated",
             );
         }
-        Ok(FilterAction::Continue)
+        if status == http::StatusCode::BAD_GATEWAY {
+            return Ok(FilterAction::Continue);
+        }
+        Ok(self.backend_not_found_action(call))
     }
 
     fn observes_request_completion(&self) -> bool {
@@ -1013,10 +1049,13 @@ impl HttpFilter for McpBrokerFilter {
         let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        if !answered && matches!(status, 502 | 504) {
+        if !answered
+            && matches!(status, 502 | 504)
+            && let Some(session_id) = session_id.as_ref()
+        {
             backend.invalidate_forwarded(
                 &key,
-                &session_id,
+                session_id,
                 "mcp backend endpoint unreachable; mapping invalidated",
             );
         }
@@ -1395,23 +1434,25 @@ fn forward_current_tools_call(
     }
 }
 
-/// Record a forwarded session-bearing call so the header phase can pin its
-/// endpoint and the response can invalidate an expired or unreachable session.
+/// Record a forwarded call so the header phase can pin its session's endpoint
+/// and the response can invalidate an expired or unreachable session.
 fn record_forwarded_call(
     ctx: &mut HttpFilterContext<'_>,
+    id: serde_json::Value,
     key: BackendSessionKey,
     slot: Arc<SessionSlot>,
     init: BackendInit,
 ) {
-    if let Some(session_id) = init.session_id {
-        ctx.insert_filter_state(ForwardedCall {
-            answered: false,
-            key,
-            slot,
-            session_id,
-            endpoint: init.endpoint,
-        });
-    }
+    // A backend that issued no session holds no endpoint state to pin to.
+    let endpoint = init.session_id.as_ref().and(init.endpoint);
+    ctx.insert_filter_state(ForwardedCall {
+        answered: false,
+        id,
+        key,
+        slot,
+        session_id: init.session_id,
+        endpoint,
+    });
 }
 
 /// The client's gateway `Mcp-Session-Id`, when present and well formed.
@@ -1446,23 +1487,46 @@ fn session_failure_action(envelope: &JsonRpcEnvelope, server: &str, error: &McpB
     backend_error_action(envelope, server, error)
 }
 
-/// JSON-RPC error for a failed backend handshake. `data` carries only the
-/// server name and a fixed reason label, never backend payloads.
+/// JSON-RPC error for a failed backend handshake.
 fn backend_error_action(envelope: &JsonRpcEnvelope, server: &str, error: &McpBackendError) -> FilterAction {
+    let status = match error {
+        McpBackendError::Rejected { status } => Some(*status),
+        _ => None,
+    };
+    backend_session_error_action(
+        &id_value(envelope),
+        "backend session initialization failed",
+        server,
+        error.reason(),
+        status,
+    )
+}
+
+/// JSON-RPC error for a call its backend session could not serve. The
+/// gateway session is unaffected, so the answer is never a `404`. `data`
+/// carries only the server name, a fixed reason label, and the backend's
+/// HTTP status when it rejected the handshake, never backend payloads.
+fn backend_session_error_action(
+    id: &serde_json::Value,
+    message: &'static str,
+    server: &str,
+    reason: &'static str,
+    status: Option<u16>,
+) -> FilterAction {
     let mut data = serde_json::Map::new();
     data.insert("server".to_owned(), serde_json::Value::from(server));
-    data.insert("reason".to_owned(), serde_json::Value::from(error.reason()));
-    if let McpBackendError::Rejected { status } = error {
-        data.insert("status".to_owned(), serde_json::Value::from(*status));
+    data.insert("reason".to_owned(), serde_json::Value::from(reason));
+    if let Some(status) = status {
+        data.insert("status".to_owned(), serde_json::Value::from(status));
     }
     let response = serde_json::json!({
         "jsonrpc": "2.0",
         "error": {
             "code": ERR_INTERNAL,
-            "message": "backend session initialization failed",
+            "message": message,
             "data": data,
         },
-        "id": id_value(envelope),
+        "id": id,
     });
 
     FilterAction::Reject(
